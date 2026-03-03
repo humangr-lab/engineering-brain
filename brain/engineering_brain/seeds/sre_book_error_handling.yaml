@@ -1,0 +1,339 @@
+layer: rules
+technology: SRE
+domain: error_handling
+knowledge:
+- id: CR-SRE-ERR-001
+  text: Retry logic must use exponential backoff with jitter — not fixed intervals, not immediate retry, not exponential backoff
+    without jitter. Fixed intervals synchronize retries across clients, creating periodic load spikes. Exponential without
+    jitter synchronizes clients that started at the same time.
+  why: 'Google''s overload handling (Chapter 21) describes exponential backoff with jitter as the only acceptable retry strategy.
+    The problem with alternatives: immediate retry = hammering a struggling service. Fixed interval (retry every 5s) = if
+    100 clients fail at the same time, all 100 retry at t+5s, t+10s, t+15s — synchronized load spikes. Exponential backoff
+    (1s, 2s, 4s, 8s) = better, but if 100 clients all fail at t=0, they all retry at t+1s, then t+3s, then t+7s — still synchronized.
+    Exponential with full jitter (random between 0 and backoff_time) = clients spread retries across the entire backoff window,
+    eliminating synchronized spikes. Google''s formula: wait_time = random(0, min(cap, base × 2^attempt)).
+
+    '
+  how_to_do_right: '1. Exponential backoff: base_delay × 2^attempt. Base delay: 100ms-1s. Cap: 30-60 seconds.
+
+    2. Add full jitter: actual_delay = random(0, calculated_delay). This spreads retries uniformly across the backoff window.
+
+    3. Set max retries: 3-5 for interactive requests, 5-10 for background jobs. Don''t retry indefinitely.
+
+    4. Retry only on retryable errors: 500/502/503/504 (server errors) and timeout. Don''t retry 400/401/403/404 (client errors).
+
+    5. Log each retry with attempt number: "Retry attempt 3/5 for POST /payments, waiting 4.2s (backoff with jitter)."
+
+    6. Include client-side retry budget (CR-SRE-RES-004): stop retrying if >10% of recent requests were retries.
+
+    '
+  example_good: "import random\nimport time\n\ndef retry_with_backoff(func, max_retries=5, base_delay=0.5, cap=30):\n    for attempt in range(max_retries):\n        try:\n            return func()\n        except (ConnectionError, TimeoutError) as e:\n            if attempt == max_retries - 1:\n                raise\n            backoff = min(cap, base_delay * (2 ** attempt))\n            jittered = random.uniform(0, backoff)\n            logger.warning(f\"Retry {attempt+1}/{max_retries}, waiting {jittered:.1f}s: {e}\")\n            time.sleep(jittered)\n"
+  example_bad: "import time\n\ndef retry_request(func, max_retries=10):\n    for attempt in range(max_retries):\n        try:\n            return func()\n        except Exception:\n            time.sleep(5)  # Fixed 5s interval — synchronized retries\n"
+  when_applies: "When implementing retry logic for any network call, RPC, or external dependency interaction."
+  severity: high
+  technologies:
+    lang: [general, go, java, python]
+  domains:
+    domain: [architecture, code_quality, reliability]
+    concern: [distributed_systems, error_handling, resilience]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-ERR-002
+  text: Exception handling must be specific — catching broad exceptions (except Exception, catch Throwable) masks bugs and
+    makes debugging impossible. Catch the specific exceptions you expect, let unexpected exceptions propagate and crash with
+    a stack trace.
+  why: 'Google''s simplicity chapter (Chapter 9) and troubleshooting chapter (Chapter 12) both argue against broad exception
+    handling because it hides the actual problem. The anti-pattern: try: do_something() except Exception: log("something went
+    wrong"). This catches: the expected timeout → handled. An unexpected NullPointerException → silently swallowed. A configuration
+    error → silently swallowed. A permission denied → silently swallowed. The service appears to work (no crashes) but produces
+    incorrect results. Worse: the "something went wrong" log provides zero diagnostic information. The developer who wrote
+    the broad catch intended to handle timeouts, but accidentally suppressed every possible error. Google''s rule: catch exactly
+    the exceptions you expect and have a plan for. Let everything else crash — a crash with a stack trace is infinitely more
+    debuggable than a silent failure.
+
+    '
+  how_to_do_right: '1. Catch specific exceptions: except TimeoutError, except ConnectionError, except ValueError. Never except
+    Exception in business logic.
+
+    2. The only place for except Exception is top-level error handlers (API middleware, event loop) that log and return a
+    structured error response.
+
+    3. Each except clause must have a specific recovery action: retry, return default, return error. If you can''t recover,
+    don''t catch.
+
+    4. Re-raise if you can''t fully handle: except ConnectionError: log_warning(); raise. This logs the issue and lets the
+    caller decide.
+
+    5. Never use bare except: (no exception type). This catches SystemExit and KeyboardInterrupt, preventing graceful shutdown.
+
+    6. Test error paths: write tests that trigger each expected exception and verify the handling behavior.
+
+    '
+  example_good: "import logging\n\nlogger = logging.getLogger(__name__)\n\ndef process_payment(order_id: str) -> bool:\n    try:\n        result = payment_gateway.charge(order_id)\n        return result.success\n    except TimeoutError:\n        logger.warning(f\"Payment gateway timeout for order {order_id}, retrying\")\n        raise\n    except ConnectionError as e:\n        logger.error(f\"Payment gateway unreachable for order {order_id}: {e}\")\n        raise\n"
+  example_bad: "def process_payment(order_id):\n    try:\n        result = payment_gateway.charge(order_id)\n        return result.success\n    except Exception:\n        logger.error(\"something went wrong\")  # Swallows ALL errors, no context\n        return False\n"
+  when_applies: "When writing try/except blocks around any operation that can raise exceptions in business logic or service code."
+  severity: high
+  technologies:
+    lang: [general, go, java, python]
+  domains:
+    domain: [code_quality, reliability]
+    concern: [error_handling]
+  sources:
+  - url: https://sre.google/sre-book/simplicity/
+    title: 'Google SRE Book — Chapter 9: Simplicity'
+  validation_status: cross_checked
+- id: CR-SRE-ERR-003
+  text: Error propagation must preserve context — wrapping errors without including the original error loses the root cause.
+    "Failed to process order" without "because database connection refused on host db-primary:5432" makes debugging impossible.
+  why: 'Google''s troubleshooting chapter (Chapter 12) emphasizes that root cause identification requires the complete error
+    chain. The anti-pattern: service A calls service B, which calls the database. Database returns "too many connections."
+    Service B catches the error and returns "Internal error" to service A. Service A catches the error and returns "Failed
+    to process request" to the user. The on-call engineer sees "Failed to process request" and has NO idea that the root cause
+    is database connection exhaustion. Google''s approach: each layer wraps the error with its own context while preserving
+    the original error. The final error chain: "Failed to process order: payment service returned error: database connection
+    refused on db-primary:5432: too many connections (max=100)."
+
+    '
+  how_to_do_right: '1. In Python: raise ProcessingError("Failed to process order") from original_exception. The ''from'' clause
+    preserves the chain.
+
+    2. In Go: return fmt.Errorf("failed to process order: %w", err). The %w verb wraps the original error.
+
+    3. In Java: throw new ProcessingException("Failed to process order", originalException). Pass the cause.
+
+    4. Log the full error chain at the top level: don''t log at each layer (creates duplicate log entries). Log once at the
+    handler with the full chain.
+
+    5. Include context in each wrap: which operation failed, which parameters were used, which dependency failed. Not just
+    "error occurred."
+
+    6. In APIs: return the full error chain to internal callers (services), but only the safe summary to external callers
+    (users). Log the full chain server-side.
+
+    '
+  example_good: "class ProcessingError(Exception):\n    pass\n\ndef process_order(order_id: str):\n    try:\n        payment = payment_service.charge(order_id)\n    except ConnectionError as e:\n        raise ProcessingError(\n            f\"Failed to process order {order_id}: payment service unreachable\"\n        ) from e  # 'from e' preserves the full error chain\n"
+  example_bad: "def process_order(order_id):\n    try:\n        payment = payment_service.charge(order_id)\n    except Exception:\n        raise Exception(\"Internal error\")  # Original error lost, no context\n"
+  when_applies: "When catching and re-raising exceptions across service or layer boundaries in any multi-layer application."
+  severity: high
+  technologies:
+    lang: [general, go, java, python]
+  domains:
+    domain: [code_quality, reliability]
+    concern: [error_handling]
+  sources:
+  - url: https://sre.google/sre-book/effective-troubleshooting/
+    title: 'Google SRE Book — Chapter 12: Effective Troubleshooting'
+  validation_status: cross_checked
+- id: CR-SRE-ERR-004
+  text: Graceful degradation means serving SOMETHING useful, not serving errors. When a dependency fails, the system should
+    reduce functionality — not reduce availability. A product page without reviews is better than a 500 error page.
+  why: 'Google''s cascading failure prevention (Chapter 22) distinguishes between "dependency failure → service failure" (bad)
+    and "dependency failure → reduced functionality" (correct). Most services treat any dependency failure as a total failure:
+    the recommendation engine is down → the product page returns 500. But users don''t need recommendations to buy a product.
+    Google''s approach: identify which features depend on which services, and implement per-feature degradation. When a dependency
+    fails: optional features disappear silently (recommendations, recently viewed), informational features show "unavailable"
+    (reviews, shipping estimates), and only truly essential features (authentication, payment processing) cause the operation
+    to fail.
+
+    '
+  how_to_do_right: '1. Classify each feature''s dependencies: essential (feature cannot function without it), important (degraded
+    without it), optional (nice to have).
+
+    2. Essential dependency failure → return error with clear message. The user cannot complete this action.
+
+    3. Important dependency failure → return partial result with indicator: "Shipping estimates temporarily unavailable."
+
+    4. Optional dependency failure → omit the feature silently. Don''t show an error for missing recommendations.
+
+    5. Use async loading for non-essential features: load the page with core data, then fetch optional data asynchronously.
+    If async calls fail, the page is still usable.
+
+    6. Test degradation: disable each dependency and verify the service degrades gracefully. This should be part of regular
+    testing.
+
+    '
+  example_good: "import asyncio\nimport logging\n\nlogger = logging.getLogger(__name__)\n\nasync def get_product_page(product_id: str) -> dict:\n    product = await product_service.get(product_id)  # Essential\n    try:\n        reviews = await review_service.get(product_id)  # Optional\n    except Exception:\n        logger.info(f\"Reviews unavailable for {product_id}, serving without\")\n        reviews = []  # Degrade gracefully — page still works\n    return {\"product\": product, \"reviews\": reviews}\n"
+  example_bad: "async def get_product_page(product_id: str) -> dict:\n    product = await product_service.get(product_id)\n    reviews = await review_service.get(product_id)  # If this fails...\n    return {\"product\": product, \"reviews\": reviews}\n    # ...the entire page returns 500 even though reviews are optional\n"
+  when_applies: "When a user-facing endpoint depends on multiple backend services with varying criticality levels."
+  severity: high
+  technologies:
+    lang: [general, go, java, python]
+  domains:
+    domain: [architecture, code_quality, reliability]
+    concern: [error_handling, resilience]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-ERR-005
+  text: Error budgets bridge the reliability-velocity conflict — when the error budget is exhausted (SLO violated), development
+    velocity must slow down to focus on reliability. When the error budget is healthy, teams should deploy faster and take
+    more risks. This is not a suggestion — it's a policy.
+  why: 'Google invented the error budget concept (Chapter 3) to resolve the inherent tension between SRE (wants stability)
+    and product development (wants features). Without error budgets, every reliability discussion is subjective: "Is 99.9%
+    reliable enough?" depends on who you ask. Error budgets make it objective: SLO = 99.95% availability over 30 days → error
+    budget = 0.05% → 21.6 minutes of downtime allowed. If 15 minutes of budget remain: deploy cautiously, require canary testing,
+    limit risky changes. If 21 minutes of budget remain: deploy freely, experiment, launch features. If 0 minutes remain (budget
+    exhausted): freeze deployments, fix reliability, pay back the debt. The error budget is a quantitative framework for risk
+    management that eliminates subjective arguments.
+
+    '
+  how_to_do_right: '1. Define SLOs with error budgets: 99.9% availability = 43 minutes/month budget. 99.95% = 21.6 minutes/month.
+
+    2. Track error budget consumption in real-time on a dashboard visible to both SRE and product teams.
+
+    3. When error budget is healthy (>50% remaining): deploy freely, launch features, run experiments. Velocity is prioritized.
+
+    4. When error budget is concerning (10-50% remaining): require canary deployments, increase testing, defer risky changes.
+
+    5. When error budget is exhausted (0% remaining): freeze feature deployments. All engineering effort goes to reliability
+    until budget is restored.
+
+    6. Review error budget monthly: what consumed the budget (deployments, infrastructure, dependencies)? Where should the
+    team invest?
+
+    '
+  example_good: "# Prometheus recording rule for error budget tracking\n# error_budget_remaining = 1 - (errors / total) / (1 - slo_target)\n- record: slo:error_budget_remaining:ratio\n  expr: |\n    1 - (\n      sum(rate(http_requests_total{status=~\"5..\"}[30d]))\n      / sum(rate(http_requests_total[30d]))\n    ) / (1 - 0.999)\n\n# Alert when budget is exhausted\n- alert: ErrorBudgetExhausted\n  expr: slo:error_budget_remaining:ratio < 0\n  for: 5m\n  labels:\n    severity: critical\n  annotations:\n    summary: \"Error budget exhausted — freeze deployments\"\n"
+  example_bad: "# No error budget tracking — reliability discussions are subjective\n# Team deploys whenever they want regardless of SLO violations\n# On-call says '99.9% seems fine' with no data to back it up\n# No freeze policy when reliability degrades\n"
+  when_applies: "When defining the relationship between development velocity and reliability for any production service with an SLO."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [grafana, prometheus]
+  domains:
+    domain: [code_quality, management, culture, reliability]
+    concern: [error_handling, availability, error_budget, slo]
+  sources:
+  - url: https://sre.google/sre-book/embracing-risk/
+    title: 'Google SRE Book — Chapter 3: Embracing Risk'
+  validation_status: cross_checked
+- id: CR-SRE-ERR-006
+  text: Panic recovery middleware must exist in every production service — an unhandled exception in a single request handler
+    must not crash the entire process. Catch panics at the framework level, log the full stack trace, return a 500 response,
+    and continue serving other requests.
+  why: 'Google designs services to isolate failures at the request level because a single malformed request or edge case should
+    not take down a process that handles thousands of other requests. Without panic recovery: a nil pointer dereference in
+    one request handler crashes the entire Go process, or an unhandled exception in Python kills the worker, or a stack overflow
+    in Java takes down the JVM. With panic recovery middleware: the framework catches the panic, logs the full stack trace
+    (for debugging), returns a 500 response to the affected request, and continues processing all other requests normally.
+    The crashing request is isolated — it doesn''t affect any other concurrent request.
+
+    '
+  how_to_do_right: '1. Install panic recovery middleware in your HTTP framework: Go (recover() in middleware), Python (ASGI
+    exception handler), Java (ExceptionHandler annotation).
+
+    2. Log the FULL stack trace on panic: the stack trace is the most valuable debugging information. Don''t truncate it.
+
+    3. Include request context in the panic log: URL, method, headers (minus auth), request ID. This enables correlation.
+
+    4. Return a structured 500 response, not the raw panic message (which may contain sensitive internal details).
+
+    5. Increment a panic counter metric: frequent panics indicate a bug that needs fixing, not just recovery.
+
+    6. Send panic alerts: more than 1 panic per minute on a single instance warrants immediate investigation.
+
+    '
+  example_good: "from starlette.middleware.base import BaseHTTPMiddleware\nimport traceback\nimport logging\n\nlogger = logging.getLogger(__name__)\n\nclass PanicRecoveryMiddleware(BaseHTTPMiddleware):\n    async def dispatch(self, request, call_next):\n        try:\n            return await call_next(request)\n        except Exception as exc:\n            logger.error(\n                f\"Unhandled exception in {request.method} {request.url.path} \"\n                f\"request_id={request.headers.get('X-Request-ID', 'unknown')}\\n\"\n                f\"{traceback.format_exc()}\"\n            )\n            return JSONResponse(status_code=500, content={\"error\": \"internal_error\"})\n"
+  example_bad: "# No panic recovery middleware — one unhandled exception\n# in a single request handler crashes the entire process,\n# killing all in-flight requests for all users.\n# app = FastAPI()\n# @app.get('/items/{id}')\n# def get_item(id): ...  # NullPointerError here kills the server\n"
+  when_applies: "When building any HTTP/gRPC service that must remain available even when individual request handlers encounter unexpected errors."
+  severity: high
+  technologies:
+    lang: [general, go, java, python]
+  domains:
+    domain: [code_quality, reliability]
+    concern: [error_handling, resilience]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-ERR-007
+  text: Structured logging with correlation IDs enables tracing a single request across all services in a microservice architecture.
+    Without correlation IDs, finding the logs for one user's failed request in a system processing millions of requests per
+    minute is like finding a needle in a haystack.
+  why: 'Google''s troubleshooting practices (Chapter 12) require the ability to trace a single request end-to-end across all
+    services. The flow: user sends request → API gateway → service A → service B → database → response. If the request fails,
+    the engineer needs logs from: the API gateway (what did the user send?), service A (what did it do?), service B (what
+    went wrong?), and the database (was the query valid?). Without correlation IDs, finding the relevant log entries in each
+    service''s million-line log file is nearly impossible. With correlation IDs: a unique ID (X-Request-ID or trace_id) is
+    generated at the edge, passed to every service in the chain, and included in every log entry. Searching for one ID returns
+    the complete story.
+
+    '
+  how_to_do_right: '1. Generate a unique request ID (UUID or ULID) at the API gateway/edge. Include it in the X-Request-ID
+    header.
+
+    2. Every service must: extract the request ID from the incoming header, include it in ALL log entries for that request,
+    and forward it in ALL outbound requests.
+
+    3. Use structured logging (JSON): {"timestamp": "...", "request_id": "abc123", "service": "payment", "level": "error",
+    "message": "timeout"}.
+
+    4. If the incoming request has no request ID, generate one. If it has one, propagate it.
+
+    5. Include the request ID in error responses: the user can provide it when reporting issues, enabling instant log lookup.
+
+    6. Use OpenTelemetry trace context (traceparent header) for full distributed tracing: it includes trace_id, span_id, and
+    flags in a standardized format.
+
+    '
+  example_good: "import uuid\nimport logging\nimport json\n\nlogger = logging.getLogger(__name__)\n\ndef middleware(request, call_next):\n    request_id = request.headers.get(\"X-Request-ID\", str(uuid.uuid4()))\n    # Structured JSON log with correlation ID\n    logger.info(json.dumps({\n        \"request_id\": request_id,\n        \"method\": request.method,\n        \"path\": request.url.path,\n        \"event\": \"request_start\"\n    }))\n    response = call_next(request)\n    response.headers[\"X-Request-ID\"] = request_id\n    return response\n"
+  example_bad: "import logging\n\ndef handle_request(request):\n    logging.info(\"Processing request\")  # No request ID, no structure\n    result = service_b.call()  # No request ID propagated\n    logging.info(\"Done\")  # Impossible to correlate across services\n    return result\n"
+  when_applies: "When building any microservice or distributed system where requests traverse multiple services and debugging requires end-to-end tracing."
+  severity: high
+  technologies:
+    lang: [general, go, java, python]
+    platform: [opentelemetry]
+  domains:
+    domain: [code_quality, observability, reliability]
+    concern: [error_handling, logging]
+  sources:
+  - url: https://sre.google/sre-book/effective-troubleshooting/
+    title: 'Google SRE Book — Chapter 12: Effective Troubleshooting'
+  validation_status: cross_checked
+- id: CR-SRE-ERR-008
+  text: Timeout values must be layered — client timeout > server timeout > dependency timeout. If the client waits 10 seconds,
+    the server should abort at 9 seconds, and each downstream call should timeout at 2-3 seconds. Inverse layering (short
+    client, long server) wastes server resources processing requests the client has already abandoned.
+  why: 'Google''s overload management (Chapter 21) describes timeout layering as essential for resource conservation. The
+    anti-pattern: client timeout = 5s, server timeout = 30s, database timeout = 60s. The client sends a request, waits 5 seconds,
+    gives up. The server continues processing for another 25 seconds. The database continues for another 30 seconds after
+    the server gives up. Total: 65 seconds of compute wasted on a request that nobody will read. With proper layering: client
+    timeout = 10s, server timeout = 9s, database timeout = 3s, external API timeout = 2s. The server aborts before the client
+    gives up (preserving the response window). Downstream calls timeout quickly (preserving the server''s computation window).
+    No wasted resources.
+
+    '
+  how_to_do_right: '1. Layer timeouts from outside in: client > server processing > individual dependency calls. Each inner
+    timeout must be shorter.
+
+    2. Propagate deadlines: if the client has 10s remaining, the server knows it has 9s max. Pass remaining deadline in headers.
+
+    3. Database query timeout: 1-5 seconds for interactive queries. If a query takes 5+ seconds, it''s probably a full table
+    scan.
+
+    4. External API timeout: 2-5 seconds. If an external API doesn''t respond in 5 seconds, a retry (or fallback) is better
+    than waiting.
+
+    5. Total budget: sum of sequential dependency timeouts must be less than the server timeout. If you call 3 services sequentially
+    at 3s each = 9s, your server needs 10s+.
+
+    6. Parallel dependency calls: if you call 3 services in parallel, timeout = max(individual timeouts) not sum. Prefer parallel
+    when possible.
+
+    '
+  example_good: "import httpx\n\n# Layered timeouts: client (10s) > server (9s) > dependency (3s)\nCLIENT_TIMEOUT = 10.0\nSERVER_TIMEOUT = 9.0\nDB_TIMEOUT = 3.0\nEXTERNAL_API_TIMEOUT = 2.0\n\nasync def handle_request():\n    async with httpx.AsyncClient(timeout=EXTERNAL_API_TIMEOUT) as client:\n        resp = await client.get(\"https://api.partner.com/data\")\n    result = await db.execute(query, timeout=DB_TIMEOUT)\n    return result\n"
+  example_bad: "import httpx\n\n# Inverted timeouts: client gives up before server finishes\nCLIENT_TIMEOUT = 5   # Client gives up at 5s\nSERVER_TIMEOUT = 30  # Server keeps working for 25s after client left\nDB_TIMEOUT = 60      # DB keeps query running for 30s after server gave up\n# Total wasted: 55 seconds of compute nobody will read\n"
+  when_applies: "When configuring timeouts for any request path that involves multiple layers or downstream dependencies."
+  severity: high
+  technologies:
+    lang: [general, go, python]
+    platform: [grpc]
+  domains:
+    domain: [architecture, code_quality, reliability]
+    concern: [distributed_systems, error_handling, fault_tolerance, timeout]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked

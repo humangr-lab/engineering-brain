@@ -1,0 +1,861 @@
+layer: rules
+domain: security
+knowledge:
+- id: DSEC-001
+  text: >
+    Classify all data assets into 4 tiers before implementing any storage or access control:
+    Public (freely shareable), Internal (employees only), Confidential (need-to-know roles),
+    Restricted (encryption mandatory, access logged, DPO approval required). Apply the
+    classification at the column level in databases, not just the table level. A single
+    table can contain columns of different classification tiers.
+  why: >
+    Security controls applied uniformly to all data are either too weak (protecting nothing
+    adequately) or too strong (operational friction that drives shadow IT). Column-level
+    classification enables proportionate controls: a `users` table may have `id` (Internal),
+    `email` (Confidential), and `cpf` (Restricted) — applying Restricted controls to all
+    of `users` makes analytics impossible, while applying Internal controls to all of `users`
+    exposes CPF to everyone. Netflix and Stripe both document column-level data classification
+    as a core data governance practice.
+  how_to_do_right: |
+    1. Define tier controls:
+       PUBLIC: no access control beyond application auth
+       INTERNAL: employee access only, no external sharing
+       CONFIDENTIAL: RBAC, logged access, no logging of values
+       RESTRICTED: encrypted at rest + in transit, access logged with justification,
+                   30-day access review, data minimization in API responses
+    2. Tag every model field: DataClass.RESTRICTED, DataClass.CONFIDENTIAL, etc.
+    3. API response DTOs must never include Restricted fields unless endpoint explicitly needs them
+    4. Add a linting rule: any new field without a classification tag fails CI
+    5. Semi-annual reclassification review: data that was Internal may become Confidential
+       as regulation evolves (biometric identifiers reclassified by LGPD 2018)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security, compliance]
+    concern: [data_classification, access_control, governance]
+  example_good: |
+    from enum import Enum
+    from typing import Annotated
+
+    class DataClass(Enum):
+        PUBLIC = "public"           # No restrictions, freely shareable
+        INTERNAL = "internal"       # Employee access, standard auth
+        CONFIDENTIAL = "confidential"  # RBAC, access logged
+        RESTRICTED = "restricted"   # Encrypted, access audited, minimized
+
+    # Pydantic model with per-field classification
+    class UserRecord(BaseModel):
+        id: Annotated[str, DataClass.INTERNAL]
+        username: Annotated[str, DataClass.INTERNAL]
+        email: Annotated[str, DataClass.CONFIDENTIAL]
+        cpf: Annotated[str, DataClass.RESTRICTED]
+        health_plan_id: Annotated[str, DataClass.RESTRICTED]
+        created_at: Annotated[str, DataClass.INTERNAL]
+
+    # API response DTO — only exposes what this endpoint needs
+    class UserPublicDTO(BaseModel):
+        id: str
+        username: str
+        # cpf and email intentionally excluded from public endpoint
+
+    class UserAdminDTO(BaseModel):
+        id: str
+        username: str
+        email: str  # CONFIDENTIAL — admin role required
+        # cpf still excluded — must have RESTRICTED accessor with audit log
+  example_bad: |
+    class User(Base):
+        __tablename__ = 'users'
+        id = Column(Integer, primary_key=True)
+        username = Column(String)
+        email = Column(String)
+        cpf = Column(String)
+        health_plan_id = Column(String)
+        # No classification — same access control applied to all fields
+        # Any endpoint returning user/ returns everything including CPF and health data
+        # Analyst with DB read access sees all PII — no proportionality
+  when_applies: Every data model, before the first migration is created. Retrofitting classification onto an existing unclassified schema is 10-20x more expensive than designing with classification from the start.
+  sources:
+    - "NIST SP 800-60 Vol 1 Rev 1 — Data categorization: https://csrc.nist.gov/publications/detail/sp/800-60/vol-1-rev-1/final"
+    - "ISO/IEC 27001:2022 Annex A.5.12 — Classification of information: https://www.iso.org/standard/82875.html"
+    - "PCI DSS v4.0 Requirement 3 — Data classification: https://www.pcisecuritystandards.org/document_library/"
+
+- id: DSEC-002
+  text: >
+    Identify all PII (Personally Identifiable Information) fields using a standardized
+    pattern catalog and tag them at the schema level. Brazilian PII includes: CPF, CNPJ,
+    RG, full name, email, phone, address, IP address, device ID, and biometric data.
+    Any combination of quasi-identifiers that enables re-identification is also PII.
+  why: >
+    Engineers routinely fail to recognize PII in schemas because they focus on functional
+    purpose, not data sensitivity. A `session_token` field is not PII; the `device_fingerprint`
+    that generates it is. A `zipcode` alone is not PII; zipcode + age + gender can re-identify
+    87% of individuals (Sweeney 1997). Unrecognized PII receives no protection, creating
+    LGPD/GDPR violations that are discovered only during audits or breaches. Automated PII
+    detection in schema review prevents this — both for database columns and API response fields.
+  how_to_do_right: |
+    1. Define PII pattern catalog (regex + field name heuristics):
+       CPF: r'\d{3}\.?\d{3}\.?\d{3}-?\d{2}'
+       Email: r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+       Phone BR: r'(\+55)?[\s\-]?\(?\d{2}\)?[\s\-]?\d{4,5}[\s\-]?\d{4}'
+       Credit card: r'\b4[0-9]{12}(?:[0-9]{3})?\b' (Visa pattern)
+    2. Field name heuristics: any field named *_cpf, *_email, *_phone, *_name,
+       *_address, *_ip, *_fingerprint is presumptively PII
+    3. Run automated PII detection on migrations and model changes in CI
+    4. For quasi-identifiers: any 3+ combination of {age, gender, zip, city, state,
+       job_title, employer} requires DPO review before collection
+    5. API response linting: scan all FastAPI response schemas for unclassified fields
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security, compliance]
+    concern: [pii_detection, data_classification, lgpd]
+  example_good: |
+    import re
+    from dataclasses import dataclass
+
+    @dataclass
+    class PIIPattern:
+        name: str
+        pattern: re.Pattern
+        category: str
+
+    PII_PATTERNS = [
+        PIIPattern("cpf_formatted", re.compile(r'\d{3}\.?\d{3}\.?\d{3}-?\d{2}'), "Brazilian CPF"),
+        PIIPattern("email", re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'), "Email"),
+        PIIPattern("phone_br", re.compile(r'(\+55)?[\s\-]?\(?\d{2}\)?[\s\-]?\d{4,5}[\s\-]?\d{4}'), "BR Phone"),
+        PIIPattern("credit_card", re.compile(r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14})\b'), "Credit Card"),
+    ]
+
+    PII_FIELD_NAMES = {
+        "cpf", "cnpj", "rg", "email", "phone", "telefone", "celular",
+        "name", "nome", "address", "endereco", "ip_address", "device_id",
+        "fingerprint", "biometric", "birth_date", "data_nascimento"
+    }
+
+    def detect_pii_in_schema(model_fields: dict) -> list[str]:
+        """Returns list of fields that appear to contain PII."""
+        pii_fields = []
+        for field_name in model_fields:
+            if any(pii_term in field_name.lower() for pii_term in PII_FIELD_NAMES):
+                pii_fields.append(f"Field name match: {field_name}")
+        return pii_fields
+  example_bad: |
+    # WRONG: Schema with unidentified PII — no tags, no controls
+    class EventLog(Base):
+        __tablename__ = 'event_logs'
+        id = Column(Integer, primary_key=True)
+        event_type = Column(String)
+        user_agent = Column(String)    # Contains browser fingerprint — PII
+        ip_address = Column(String)    # PII — can identify individual, LGPD-covered
+        geo_location = Column(String)  # PII — location data
+        # "It's just analytics data" — incorrect; IP address is PII under LGPD
+        # No RBAC, no encryption, retained indefinitely
+  when_applies: Every database migration, API response schema definition, and data export. Add automated PII detection to migration review CI step to catch unclassified fields before they reach production.
+  sources:
+    - "NIST SP 800-122 — PII definition and handling: https://csrc.nist.gov/publications/detail/sp/800-122/final"
+    - "LGPD Art. 5 — definition of personal data: https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2018/lei/l13709.htm"
+    - "Sweeney k-anonymity (re-identification via quasi-identifiers): https://dataprivacylab.org/dataprivacy/projects/kanonymity/"
+
+- id: DSEC-003
+  text: >
+    Encrypt Restricted classification columns at the application level (not just TDE) using
+    AES-256-GCM with per-user DEKs managed via envelope encryption. Column-level encryption
+    (CLE) ensures that a database dump, backup, or SQL injection result set returns only
+    ciphertext — not plaintext PII — to the attacker.
+  why: >
+    Transparent Data Encryption (TDE) at the database level protects data files on disk
+    but does NOT protect against: SQL injection (attacker reads plaintext through the
+    application's DB connection), compromised DB admin credentials, or unauthorized backup
+    access via the application's decryption context. The 2021 Facebook breach (533M records)
+    and the 2022 LastPass breach both involved attackers who had application-level database
+    access and received plaintext data despite storage-level encryption. Application-level
+    CLE adds a layer that is independent of the database engine.
+  how_to_do_right: |
+    1. Identify Restricted classification columns (CPF, health data, financial identifiers)
+    2. Before INSERT: encrypt field value with user-specific DEK (envelope encryption)
+    3. Store: encrypted_value (bytes), key_reference (kms_key_id + key_version)
+    4. On SELECT: decrypt in application layer before returning to caller
+    5. Search on encrypted columns: use deterministic encryption (HMAC of value) for equality
+       search, or maintain a separate search index with privacy-preserving tokens
+    6. Never log decrypted values of Restricted fields
+    7. SQLAlchemy custom type for transparent encrypt/decrypt:
+       class EncryptedString(TypeDecorator): ... (encrypt on process_bind_param, decrypt on process_result_value)
+    8. Performance: cache decrypted DEKs in memory (TTL 5min) to reduce KMS calls
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security]
+    concern: [encryption, column_level, data_at_rest]
+  example_good: |
+    import os
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from sqlalchemy import TypeDecorator, LargeBinary
+    from base64 import b64encode, b64decode
+
+    class EncryptedColumn(TypeDecorator):
+        """SQLAlchemy type that transparently encrypts/decrypts column values."""
+        impl = LargeBinary
+        cache_ok = True
+
+        def __init__(self, key_provider, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.key_provider = key_provider
+
+        def process_bind_param(self, value: str | None, dialect) -> bytes | None:
+            """Encrypt before storing."""
+            if value is None:
+                return None
+            key = self.key_provider.get_current_dek()
+            nonce = os.urandom(12)
+            ct = AESGCM(key).encrypt(nonce, value.encode(), None)
+            return nonce + ct
+
+        def process_result_value(self, value: bytes | None, dialect) -> str | None:
+            """Decrypt after reading."""
+            if value is None:
+                return None
+            key = self.key_provider.get_current_dek()
+            nonce, ct = value[:12], value[12:]
+            return AESGCM(key).decrypt(nonce, ct, None).decode()
+
+    # Usage in SQLAlchemy model
+    class User(Base):
+        __tablename__ = 'users'
+        id = Column(Integer, primary_key=True)
+        email = Column(String)  # CONFIDENTIAL — no encryption (but RBAC)
+        cpf = Column(EncryptedColumn(key_provider))  # RESTRICTED — encrypted
+  example_bad: |
+    class User(Base):
+        __tablename__ = 'users'
+        id = Column(Integer, primary_key=True)
+        cpf = Column(String)  # RESTRICTED — plaintext in database
+        health_data = Column(JSON)  # RESTRICTED — plaintext in database
+
+    # Even with TDE (database-level encryption):
+    # SELECT cpf FROM users WHERE id = 1;
+    # Returns plaintext CPF to anyone with DB access or via SQL injection
+  when_applies: All database columns classified as Restricted. Required before any Restricted column reaches a production database. Implement as a SQLAlchemy TypeDecorator or Django field subclass for transparency.
+  sources:
+    - "NIST SP 800-111 — Storage encryption technologies: https://csrc.nist.gov/publications/detail/sp/800-111/final"
+    - "OWASP Cryptographic Storage Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html"
+    - "PCI DSS v4.0 Req 3.5 — Primary Account Number protection: https://www.pcisecuritystandards.org/document_library/"
+
+- id: DSEC-004
+  text: >
+    Mask all Restricted and Confidential data in non-production environments (dev, staging,
+    test). Non-production environments have weaker access controls and broader team access
+    than production — they must never contain real PII. Use realistic synthetic data generated
+    by tools like Faker (Python) with consistent relationships preserved, not simple randomization
+    that breaks foreign key constraints.
+  why: >
+    In 2018, GitLab accidentally exposed 300GB of production data copied to staging that had
+    a misconfigured public access policy. Heroku's 2022 breach exposed developer OAuth tokens
+    because staging environments had access to production OAuth secrets. LGPD and GDPR both
+    consider copying PII to non-production environments as a separate processing activity
+    requiring its own legal basis — which most organizations cannot satisfy. Using real data
+    in dev/test is not a convenience; it is a compliance violation that creates unnecessary
+    breach surface.
+  how_to_do_right: |
+    1. Data masking pipeline: before copying to staging, apply masking to all PII columns
+    2. Masking strategies by field type:
+       - email: user+{random_suffix}@{masked-domain}.com (preserves format)
+       - CPF: generate valid CPF check digit with random numbers
+       - name: Faker('pt_BR').name() (consistent between first/last)
+       - phone: Faker('pt_BR').phone_number()
+       - address: Faker('pt_BR').address()
+       - credit_card: Luhn-valid random number (never use real card numbers)
+    3. Preserve referential integrity: same user_id always maps to same masked values
+    4. Run masking as part of staging refresh pipeline (not a one-time step)
+    5. Audit: run PII detection scan on staging DB monthly to catch missed columns
+    6. Never give developers direct production DB access — use masked staging only
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security, compliance]
+    concern: [data_masking, non_production, pii]
+  example_good: |
+    from faker import Faker
+    from hashlib import md5
+    import string, random
+
+    fake = Faker('pt_BR')
+
+    def mask_email(real_email: str, user_id: int) -> str:
+        """Deterministic masking: same user_id always gets same masked email."""
+        seed = int(md5(f"email-{user_id}".encode()).hexdigest(), 16)
+        random.seed(seed)
+        suffix = ''.join(random.choices(string.ascii_lowercase, k=8))
+        return f"user_{suffix}@masked-staging.com"
+
+    def mask_cpf(user_id: int) -> str:
+        """Generate a structurally valid CPF (but not a real person's)."""
+        random.seed(int(md5(f"cpf-{user_id}".encode()).hexdigest(), 16))
+        digits = [random.randint(0, 9) for _ in range(9)]
+        # Calculate check digits (CPF algorithm)
+        d1 = (sum((10 - i) * d for i, d in enumerate(digits)) * 10) % 11 % 10
+        d2 = (sum((11 - i) * d for i, d in enumerate(digits)) * 10 + d1 * 2) % 11 % 10
+        return f"{''.join(map(str, digits))}{d1}{d2}"
+
+    def mask_user_row(user: dict, user_id: int) -> dict:
+        """Mask all PII fields for staging environment."""
+        return {
+            **user,
+            "email": mask_email(user["email"], user_id),
+            "cpf": mask_cpf(user_id),
+            "name": fake.seed_instance(user_id).name(),
+            "phone": fake.seed_instance(user_id).phone_number(),
+        }
+  example_bad: |
+    # WRONG: Copying production data dump to staging
+    # pg_dump production_db > prod_backup.sql
+    # psql staging_db < prod_backup.sql
+    # Developer laptops now have 500K real CPFs and emails
+    # Staging has weaker access controls — breach surface multiplied
+
+    # ALSO WRONG: Simple random replacement without determinism
+    def mask_email_bad(real_email: str) -> str:
+        import uuid
+        return f"{uuid.uuid4()}@test.com"
+        # Different email every run → foreign key joins break
+        # Cannot reproduce staging-specific bugs consistently
+  when_applies: Every staging refresh, CI test data setup, and developer environment setup. The masking pipeline must run automatically — never rely on manual "don't use real data" policies.
+  sources:
+    - "OWASP Testing Guide — Test data management: https://owasp.org/www-project-web-security-testing-guide/"
+    - "NIST SP 800-188 — De-identification of government datasets: https://csrc.nist.gov/publications/detail/sp/800-188/final"
+    - "Faker Python library: https://faker.readthedocs.io/en/master/"
+
+- id: DSEC-005
+  text: >
+    Identify and protect PCI DSS scope: Primary Account Numbers (PAN), CVV/CVC, expiry dates,
+    and cardholder names are in-scope. Tokenize PANs at the earliest point of entry using
+    a PCI-compliant tokenization vault (Stripe, Braintree, or an on-premise vault). The
+    goal is to minimize the PCI scope to as few systems as possible — ideally zero systems
+    in your own infrastructure handle raw PANs.
+  why: >
+    PCI DSS v4.0 (effective March 2024, fully mandatory by March 2025) introduces stricter
+    requirements for authentication, logging, and network security. Every system that touches
+    a raw PAN is PCI in-scope and subject to annual QSA audits. By tokenizing at the point
+    of entry (payment form), your backend handles only tokens — which are out of PCI scope.
+    The 2013 Target breach (40M card numbers) occurred because POS systems were in the same
+    network segment as corporate email servers — PCI scope containment prevents lateral
+    movement from compromised adjacent systems.
+  how_to_do_right: |
+    1. Use Stripe Elements or Braintree Drop-in UI — card data never touches your servers
+    2. On your server: receive only the payment_method_id or nonce, not raw PAN
+    3. For validation that a card exists: Stripe SetupIntent + card fingerprint
+    4. Never log any portion of PAN — even last 4 digits must not appear in application logs
+    5. If you must handle PANs (on-premise POS): implement network segmentation
+       - PCI zone: isolated VLAN, no internet, monitored
+       - All other systems: separate VLAN, cannot communicate with PCI zone
+    6. Verify PCI scope quarterly: run a PAN discovery scan using PCI-approved tools
+    7. CVV must NEVER be stored after authorization — it is explicitly prohibited by PCI DSS
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [security, compliance]
+    concern: [pci_dss, payment_security, tokenization]
+  example_good: |
+    import stripe
+    from fastapi import APIRouter, HTTPException
+    from pydantic import BaseModel
+
+    router = APIRouter()
+    stripe.api_key = "sk_live_..."  # From secrets manager, never hardcoded
+
+    class PaymentRequest(BaseModel):
+        payment_method_id: str  # Stripe token, never raw PAN
+        amount_cents: int
+        currency: str = "brl"
+
+    @router.post("/payments/charge")
+    async def charge_customer(req: PaymentRequest):
+        # Raw PAN never reaches this server — only Stripe's payment_method_id
+        try:
+            intent = stripe.PaymentIntent.create(
+                amount=req.amount_cents,
+                currency=req.currency,
+                payment_method=req.payment_method_id,
+                confirm=True,
+            )
+            return {"status": intent.status, "id": intent.id}
+        except stripe.error.CardError as e:
+            raise HTTPException(400, str(e.user_message))
+        # CVV is never seen by this code — Stripe handles it client-side
+  example_bad: |
+    class PaymentBad(BaseModel):
+        card_number: str  # RAW PAN — your server is now PCI in-scope
+        cvv: str          # CRITICAL: CVV must NEVER be stored server-side
+        expiry: str
+        cardholder: str
+
+    @router.post("/payments/charge_bad")
+    async def charge_bad(req: PaymentBad):
+        # This server now stores and processes PANs — full PCI audit required
+        # If this endpoint is logged, the card number appears in logs (PCI violation)
+        # If DB is breached, cardholder data is compromised
+        logger.info(f"Processing card {req.card_number[:4]}...")  # Even this is a violation
+  when_applies: "Any feature that involves payment processing. The rule is absolute: your application code should never see raw PANs. Use Stripe Elements, Braintree Drop-in, or equivalent to ensure client-side tokenization."
+  sources:
+    - "PCI DSS v4.0: https://www.pcisecuritystandards.org/document_library/"
+    - "Stripe Elements documentation: https://stripe.com/docs/payments/elements"
+    - "PCI DSS v4.0 Key Changes — Bluefin: https://www.bluefin.com/bluefin-news/whats-new-pci-dss-v4-0/"
+
+- id: DSEC-006
+  text: >
+    Implement database audit logging that is tamper-evident for all access to Restricted
+    classification data. Audit log entries must be immutable once written (append-only
+    storage), include: accessor identity, timestamp, data category accessed, query or
+    operation type, and row identifiers. Anomaly detection on audit logs is the primary
+    insider threat detection mechanism.
+  why: >
+    The 2023 Morgan Stanley data disposal breach resulted in $35M SEC fine in part because
+    they could not demonstrate what data was accessed before disposal. PCI DSS Requirement
+    10 mandates audit logging of all access to cardholder data. LGPD Art. 46 requires
+    "adoption of security measures." An audit log that can be modified by the same user
+    being audited (attacker deletes evidence) provides no compliance benefit. Postgres's
+    `pgaudit` extension, immutable S3 buckets, and CloudWatch Logs with deletion protection
+    are the standard approaches.
+  how_to_do_right: |
+    1. Enable pgaudit for PostgreSQL:
+       shared_preload_libraries = 'pgaudit'
+       pgaudit.log = 'read, write, ddl'
+       pgaudit.log_relation = on
+    2. Application-layer audit logging for Restricted field access:
+       class AuditLogger:
+           def log_pii_access(self, accessor_id, entity_id, field_names, operation):
+               entry = {
+                   "timestamp": datetime.utcnow().isoformat(),
+                   "accessor_id": accessor_id,
+                   "entity_id": entity_id,
+                   "fields_accessed": field_names,  # NOT the values, just field names
+                   "operation": operation,
+               }
+               audit_log_sink.write(json.dumps(entry))  # Append-only sink
+    3. Immutable storage: AWS S3 with Object Lock (COMPLIANCE mode), or
+       CloudWatch Logs with immutable log group (deletion prevention policy)
+    4. Retention: 1 year online + 6 years archive for PCI; 5 years for LGPD
+    5. Alerting: > 100 Restricted field accesses by one accessor in 1 hour → alert
+    6. Never log the VALUES of Restricted fields — only the access event
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security, compliance]
+    concern: [audit_logging, insider_threat, tamper_proof]
+  example_good: |
+    import json
+    import logging
+    from datetime import datetime, timezone
+    from functools import wraps
+
+    # Append-only audit logger — writes to immutable sink (S3 Object Lock or CloudWatch)
+    audit_logger = logging.getLogger("audit.pii_access")
+
+    def audit_pii_access(data_class: str, fields: list[str]):
+        """Decorator that logs PII field access."""
+        def decorator(func):
+            @wraps(func)
+            async def wrapper(*args, **kwargs):
+                result = await func(*args, **kwargs)
+                # Log the access event — NOT the values
+                audit_logger.info(json.dumps({
+                    "event": "PII_ACCESS",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "function": func.__name__,
+                    "data_class": data_class,
+                    "fields_accessed": fields,
+                    # accessor_id injected from request context in production
+                }))
+                return result
+            return wrapper
+        return decorator
+
+    @audit_pii_access(data_class="RESTRICTED", fields=["cpf", "health_data"])
+    async def get_restricted_user_data(user_id: str, db) -> dict:
+        return await db.fetchrow(
+            "SELECT cpf, health_data FROM users WHERE id = $1", user_id
+        )
+  example_bad: |
+    # WRONG: No audit logging on Restricted data access
+    @app.get("/users/{user_id}/cpf")
+    async def get_cpf(user_id: str, db: Session = Depends(get_db)):
+        user = db.query(User).filter(User.id == user_id).first()
+        return {"cpf": user.cpf}
+        # No logging of who accessed whose CPF, when, or why
+        # Insider threat: anyone with access to this endpoint can query any user's CPF
+        # No detection capability whatsoever
+
+    # ALSO WRONG: Logging CPF values
+    logger.info(f"CPF accessed: {user.cpf}")  # Never log PII values in application logs
+  when_applies: All endpoints and database queries that access Restricted or Confidential classified data. Audit logging is a compliance requirement for PCI DSS (Req 10), LGPD (Art. 46), and SOC 2 Type II.
+  sources:
+    - "PCI DSS v4.0 Requirement 10 — Audit logs: https://www.pcisecuritystandards.org/document_library/"
+    - "pgaudit extension: https://github.com/pgaudit/pgaudit"
+    - "OWASP Logging Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html"
+
+- id: DSEC-007
+  text: >
+    Implement tokenization for searchable Restricted fields (CPF, email, phone) using
+    format-preserving encryption (FPE) or HMAC-based deterministic tokens. Tokenization
+    replaces the real value with a surrogate that can be searched and indexed without
+    exposing the real value. Use a separate tokenization vault (not the main database)
+    to store the mapping.
+  why: >
+    Column-level encryption prevents search: `WHERE cpf = ?` requires decrypting all rows.
+    Tokenization solves this with a format-preserving token: the CPF
+    `123.456.789-09` becomes a valid-looking CPF token `987.654.321-01` stored in the
+    database. Searching for the real CPF generates the same token (deterministic) allowing
+    indexed queries, but the token is worthless without the vault key. Stripe and Braintree
+    use this exact approach: payment tokens look like real card numbers but are surrogate values.
+  how_to_do_right: |
+    1. Architecture:
+       - Tokenization vault: separate service/database holding (token, real_value) pairs
+       - Main database: stores only tokens, never real values
+       - Vault access: only the tokenization service; all other services use tokens
+    2. Simple HMAC-based tokenization (not format-preserving but searchable):
+       token = hmac.new(vault_key, real_value.encode(), sha256).hexdigest()[:16]
+       # Deterministic: same real_value always generates same token
+       # Irreversible without vault_key
+    3. For format-preserving tokenization: use ff3-1 cipher (NIST SP 800-38G Rev 1)
+    4. Token storage: {token_id, encrypted_real_value, created_at, last_accessed_at}
+    5. Token rotation: generate new token for each re-tokenization event (triggered by breach)
+    6. Detokenization access: logged, rate-limited, role-restricted
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [security]
+    concern: [tokenization, searchable_encryption, data_protection]
+  example_good: |
+    import hmac
+    import hashlib
+    import os
+    from base64 import urlsafe_b64encode
+
+    class TokenizationVault:
+        def __init__(self, vault_key: bytes):
+            if len(vault_key) < 32:
+                raise ValueError("Vault key must be 32+ bytes")
+            self.vault_key = vault_key
+            self._store: dict[str, bytes] = {}  # In prod: separate encrypted DB
+
+        def tokenize(self, real_value: str) -> str:
+            """Returns deterministic token. Same real_value → same token."""
+            token = hmac.new(
+                self.vault_key, real_value.encode(), hashlib.sha256
+            ).hexdigest()[:24]
+            # Store real value encrypted in vault (for detokenization)
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            nonce = os.urandom(12)
+            encrypted = AESGCM(self.vault_key[:32]).encrypt(nonce, real_value.encode(), None)
+            self._store[token] = nonce + encrypted
+            return token
+
+        def detokenize(self, token: str) -> str:
+            """Reverses tokenization. Raises KeyError if token unknown."""
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            stored = self._store[token]
+            nonce, ct = stored[:12], stored[12:]
+            return AESGCM(self.vault_key[:32]).decrypt(nonce, ct, None).decode()
+
+    vault = TokenizationVault(vault_key=os.urandom(32))
+    cpf_token = vault.tokenize("123.456.789-09")  # Store token in DB, not CPF
+    real_cpf = vault.detokenize(cpf_token)         # Only when business logic requires it
+  example_bad: |
+    # WRONG: Plaintext CPF stored in main database — searchable but no protection
+    class User(Base):
+        cpf = Column(String, index=True)  # Searchable but exposed
+
+    # WRONG: Non-deterministic encryption — breaks search capability
+    def encrypt_cpf(cpf: str) -> bytes:
+        nonce = os.urandom(12)  # Different nonce each time
+        return nonce + AESGCM(key).encrypt(nonce, cpf.encode(), None)
+        # WHERE encrypted_cpf = encrypt_cpf("123.456.789-09") → returns different bytes
+        # Cannot search by CPF — defeats the purpose
+  when_applies: Any Restricted field that must be searchable or used as a join key (CPF, email, phone, account number). Implement tokenization vault before first PII data ingestion.
+  sources:
+    - "NIST SP 800-38G Rev 1 — Format-preserving encryption: https://csrc.nist.gov/publications/detail/sp/800-38g/rev-1/final"
+    - "PCI DSS Tokenization guidelines: https://www.pcisecuritystandards.org/document_library/"
+    - "What is data tokenization — Piiano: https://www.piiano.com/blog/data-tokenization"
+
+- id: DSEC-008
+  text: >
+    Scan application logs, error messages, and API responses for accidental PII leakage
+    as part of CI and as a continuous production monitor. PII in logs is a LGPD Art. 46
+    violation and provides attackers with a secondary exfiltration channel when log systems
+    are compromised. CPF numbers, email addresses, and full names must never appear in
+    structured logs.
+  why: >
+    In 2023, Samsung's ChatGPT integration incident exposed source code and customer data
+    because engineers pasted PII-containing outputs into ChatGPT sessions. More commonly:
+    FastAPI's default exception handler logs full request bodies — which may contain PII
+    from form submissions. The average production application leaks PII to 3+ log destinations
+    (application log, APM, error tracking, audit trail) before the issue is identified.
+    DataDog, Splunk, and Elastic are common repositories of accidentally logged PII.
+  how_to_do_right: |
+    1. Implement PII scrubbing in logging handler:
+       class PIIScrubFilter(logging.Filter):
+           CPF_PATTERN = re.compile(r'\d{3}\.?\d{3}\.?\d{3}-?\d{2}')
+           EMAIL_PATTERN = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
+           def filter(self, record):
+               record.msg = self.CPF_PATTERN.sub('[CPF REDACTED]', str(record.msg))
+               record.msg = self.EMAIL_PATTERN.sub('[EMAIL REDACTED]', record.msg)
+               return True
+    2. Add PIIScrubFilter to all log handlers (file, CloudWatch, DataDog)
+    3. Override FastAPI exception handler to avoid logging request bodies for PII routes
+    4. CI scan: run detect-secrets + custom PII regex on log output of integration tests
+    5. Production monitor: run PII scan weekly on sample of log lines from all destinations
+    6. Sentry: configure before_send hook to scrub PII from exception reports
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security, compliance]
+    concern: [log_scrubbing, pii_leakage, data_protection]
+  example_good: |
+    import re
+    import logging
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
+
+    class PIIScrubFilter(logging.Filter):
+        PATTERNS = [
+            re.compile(r'\d{3}\.?\d{3}\.?\d{3}-?\d{2}'),  # CPF
+            re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'),  # Email
+            re.compile(r'(\+55)?[\s\-]?\(?\d{2}\)?[\s\-]?\d{4,5}[\s\-]?\d{4}'),  # BR Phone
+        ]
+        REPLACEMENTS = ['[CPF REDACTED]', '[EMAIL REDACTED]', '[PHONE REDACTED]']
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            msg = str(record.getMessage())
+            for pattern, replacement in zip(self.PATTERNS, self.REPLACEMENTS):
+                msg = pattern.sub(replacement, msg)
+            record.msg = msg
+            record.args = ()
+            return True
+
+    # Apply to all handlers
+    for handler in logging.root.handlers:
+        handler.addFilter(PIIScrubFilter())
+
+    # Protect FastAPI exception handler
+    app = FastAPI()
+
+    @app.exception_handler(Exception)
+    async def safe_exception_handler(request: Request, exc: Exception):
+        # Log exception WITHOUT the request body (may contain PII)
+        logging.error(f"Unhandled exception: {type(exc).__name__}: {exc}")
+        return JSONResponse(status_code=500, content={"error": "Internal server error"})
+  example_bad: |
+    import logging
+    from fastapi import FastAPI, Request
+
+    logger = logging.getLogger(__name__)
+    app = FastAPI()
+
+    @app.post("/users/register")
+    async def register(request: Request):
+        body = await request.json()
+        logger.info(f"Registration request: {body}")  # LOGS CPF, EMAIL, PHONE in plaintext
+        # body = {"name": "João Silva", "cpf": "123.456.789-09", "email": "joao@email.com"}
+        # Now in CloudWatch, DataDog, Splunk — accessible to log team, third-party SIEMs
+  when_applies: From the first log statement in any application that handles PII. Apply PIIScrubFilter at the logging configuration level — not per-logger — to ensure all log destinations are protected.
+  sources:
+    - "OWASP Logging Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html"
+    - "NIST SP 800-92 — Log management: https://csrc.nist.gov/publications/detail/sp/800-92/final"
+    - "LGPD Art. 46 security measures: https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2018/lei/l13709.htm"
+
+- id: DSEC-009
+  text: >
+    Implement data retention enforcement with automated deletion jobs: scheduled processes
+    that identify and delete (or anonymize) records past their retention deadline. Retention
+    policies must account for ALL storage layers: primary database, read replicas, data
+    warehouses (BigQuery, Redshift), analytical tables, object storage (S3), and application
+    caches. A deletion in the primary DB that is not propagated to the data warehouse leaves
+    the data subject's rights unfulfilled.
+  why: >
+    The ANPD and GDPR supervisory authorities have consistently ruled that "deletion" means
+    deletion from all storage locations, including backups (where technically feasible).
+    Crypto-shredding (DSEC strategy) satisfies backup retention because backups contain
+    ciphertext that becomes unreadable after DEK destruction. Manual deletion from analytical
+    databases is consistently forgotten — a user who requests deletion under LGPD Art. 18
+    may remain in the BigQuery data warehouse for years because no automated propagation
+    exists.
+  how_to_do_right: |
+    1. Map all storage layers that receive personal data (data flow diagram)
+    2. For each layer: implement deletion propagation or crypto-shredding
+    3. Primary DB → Data Warehouse: use CDC (Change Data Capture) with DELETE events
+    4. Automated retention job (run nightly):
+       - Query: SELECT id FROM users WHERE deletion_due_at < NOW() AND status != 'legal_hold'
+       - For each: trigger deletion cascade across all storage layers
+       - Log: deletion_id, user_id, timestamp, layers_deleted, crypto_shredded
+    5. Verification job (weekly): sample 100 deleted users, verify absence across all layers
+    6. Backup strategy: crypto-shredding covers backup compliance; document this in privacy policy
+    7. Cache TTL: Redis/Memcache entries with PII must have TTL matching retention policy
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security, compliance]
+    concern: [data_retention, deletion_propagation, lgpd]
+  example_good: |
+    import asyncio
+    from datetime import datetime, timezone
+    from dataclasses import dataclass
+
+    @dataclass
+    class DeletionResult:
+        user_id: str
+        deleted_from: list[str]
+        crypto_shredded: bool
+        completed_at: datetime
+
+    class DataRetentionEnforcer:
+        def __init__(self, db, warehouse, cache, key_vault):
+            self.db = db
+            self.warehouse = warehouse
+            self.cache = cache
+            self.key_vault = key_vault
+
+        async def run_retention_cycle(self) -> list[DeletionResult]:
+            expired = await self.db.fetch(
+                "SELECT id FROM users WHERE deletion_due_at < NOW() "
+                "AND status != 'legal_hold'"
+            )
+            results = []
+            for row in expired:
+                result = await self.delete_user(row['id'])
+                results.append(result)
+            return results
+
+        async def delete_user(self, user_id: str) -> DeletionResult:
+            deleted_from = []
+            # 1. Crypto-shred DEK (covers primary DB + backups)
+            await self.key_vault.destroy_dek(user_id)
+            # 2. Delete from primary DB
+            await self.db.execute("DELETE FROM users WHERE id = $1", user_id)
+            deleted_from.append("primary_db")
+            # 3. Propagate to warehouse
+            await self.warehouse.execute(f"DELETE FROM users WHERE id = '{user_id}'")
+            deleted_from.append("data_warehouse")
+            # 4. Invalidate cache entries
+            await self.cache.delete(f"user:{user_id}:*")
+            deleted_from.append("cache")
+            return DeletionResult(user_id, deleted_from, crypto_shredded=True,
+                                  completed_at=datetime.now(timezone.utc))
+  example_bad: |
+    # WRONG: Manual deletion that only touches primary database
+    @app.delete("/users/{user_id}")
+    async def delete_user(user_id: str, db: Session = Depends(get_db)):
+        db.query(User).filter(User.id == user_id).delete()
+        db.commit()
+        return {"status": "deleted"}
+        # User still exists in:
+        # - BigQuery analytics warehouse (synced daily via ETL)
+        # - Elasticsearch search index (full-text search on email, name)
+        # - Redis cache (15-minute TTL → still queryable for 15 minutes)
+        # - S3 exported CSV files (never auto-deleted)
+        # - RDS automated backups (retained 35 days by default)
+  when_applies: Every data deletion operation, whether triggered by DSAR, account closure, or automated retention policy. Deletion without propagation is non-compliance.
+  sources:
+    - "LGPD Art. 16 and Art. 18 deletion rights: https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2018/lei/l13709.htm"
+    - "AWS crypto-shredding pattern: https://aws.amazon.com/blogs/security/how-to-delete-user-data-in-an-amazon-kinesis-data-streams-application/"
+    - "PCI DSS v4.0 Req 3.2 — Data retention: https://www.pcisecuritystandards.org/document_library/"
+
+- id: DSEC-010
+  text: >
+    Protect data in transit between internal services using mutual TLS (mTLS) in addition to
+    application-layer authentication. In a zero-trust architecture, every service-to-service
+    call must authenticate BOTH parties — mTLS provides cryptographic proof of identity at
+    the transport layer, independent of application-layer tokens that can be stolen.
+  why: >
+    Application-layer JWT tokens are Bearer tokens — anyone who possesses the token can use
+    it, regardless of where they are in the network. In the 2020 SolarWinds attack, attackers
+    moved laterally between internal services using stolen service account tokens because
+    internal services trusted any bearer token without verifying the caller's identity at the
+    network level. mTLS binds authentication to the specific network connection — a stolen
+    token is worthless if the attacker cannot present a valid client certificate for the
+    calling service. AWS App Mesh, Istio, and Linkerd all implement mTLS as a zero-trust
+    control between microservices.
+  how_to_do_right: |
+    1. Issue service certificates from internal CA (HashiCorp Vault PKI):
+       vault write pki/issue/service-cert common_name=payments-service \
+         ttl=24h alt_names=payments-service.svc.cluster.local
+    2. Configure Python httpx client with client certificate:
+       ctx = ssl.create_default_context(cafile='internal-ca.pem')
+       ctx.load_cert_chain('service.crt', 'service.key')
+       client = httpx.Client(verify=ctx)
+    3. Server-side verification:
+       ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH, cafile='internal-ca.pem')
+       ctx.verify_mode = ssl.CERT_REQUIRED  # Reject calls without valid client cert
+       ctx.load_cert_chain('server.crt', 'server.key')
+    4. Rotate service certificates automatically (24-hour TTL with auto-renewal)
+    5. Mesh option: deploy Istio/Linkerd — implements mTLS transparently between all services
+    6. External-facing APIs: standard TLS with JWT/API key (mTLS for external is optional)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [security]
+    concern: [mtls, zero_trust, service_to_service, transport_security]
+  example_good: |
+    import ssl
+    import httpx
+    from fastapi import FastAPI
+    import uvicorn
+
+    # Client: mTLS when calling internal services
+    def create_internal_client(ca_cert: str, client_cert: str, client_key: str) -> httpx.Client:
+        ctx = ssl.create_default_context(cafile=ca_cert)
+        ctx.load_cert_chain(certfile=client_cert, keyfile=client_key)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        return httpx.Client(verify=ctx, timeout=30.0)
+
+    # Server: require client certificate (mTLS)
+    def create_mtls_server_config(ca_cert: str, server_cert: str, server_key: str) -> ssl.SSLContext:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_verify_locations(cafile=ca_cert)
+        ctx.verify_mode = ssl.CERT_REQUIRED  # Reject calls without valid client cert
+        ctx.load_cert_chain(certfile=server_cert, keyfile=server_key)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        return ctx
+
+    # uvicorn command for mTLS server:
+    # uvicorn app:app --ssl-keyfile server.key --ssl-certfile server.crt \
+    #   --ssl-ca-certs internal-ca.pem --ssl-cert-reqs CERT_REQUIRED
+  example_bad: |
+    import httpx
+
+    # WRONG: Internal service calls with no mTLS — only bearer token
+    async def call_payments_service(token: str, payload: dict) -> dict:
+        async with httpx.AsyncClient(verify=False) as client:  # WRONG: no TLS verification
+            response = await client.post(
+                "http://payments-service:8080/charge",  # HTTP, not HTTPS — no encryption
+                headers={"Authorization": f"Bearer {token}"},
+                json=payload,
+            )
+        # Any process on the internal network can:
+        # 1. Intercept the plaintext HTTP traffic
+        # 2. Steal the Bearer token and reuse it
+        # 3. Impersonate the payments service (no server cert verification)
+  when_applies: All service-to-service communication in microservice architectures, especially between services that handle financial, health, or other sensitive data. Use a service mesh (Istio, Linkerd) for automatic mTLS at the platform level.
+  sources:
+    - "NIST SP 800-207 — Zero trust architecture: https://csrc.nist.gov/publications/detail/sp/800-207/final"
+    - "HashiCorp Vault PKI secrets engine: https://developer.hashicorp.com/vault/docs/secrets/pki"
+    - "Istio mTLS documentation: https://istio.io/latest/docs/concepts/security/#mutual-tls-authentication"

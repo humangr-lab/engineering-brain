@@ -1,0 +1,1115 @@
+layer: rules
+domain: security
+knowledge:
+- id: SEC-AUTH-ADV-001
+  text: "OAuth2/OIDC implementation must use Authorization Code flow with PKCE for all clients (including server-side). Never use Implicit flow — it exposes tokens in URLs and browser history."
+  why: >
+    A team used the Implicit flow for their React SPA. Access tokens appeared in URL fragments,
+    were logged by proxy servers, cached in browser history, and leaked via Referer headers.
+    An attacker extracted tokens from a shared computer's browser history and accessed 47 user
+    accounts. The Implicit flow was deprecated in OAuth 2.1 draft specifically because of these
+    vulnerabilities. PKCE prevents authorization code interception even on public clients.
+  how_to_do_right: |
+    1. Use Authorization Code flow with PKCE for ALL clients (SPA, mobile, server-side)
+    2. Generate code_verifier: 43-128 character random string (cryptographically secure)
+    3. Generate code_challenge: SHA256(code_verifier), base64url-encoded
+    4. Send code_challenge in authorization request
+    5. Send code_verifier in token exchange — server verifies SHA256 match
+    6. Store tokens in memory (SPA) or httpOnly cookies, never localStorage
+    7. Use your OIDC provider's SDK (Clerk, Auth0) — do not implement from scratch
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [clerk, jose, passlib]
+  domains:
+    domain: [security, architecture]
+    concern: [web]
+  example_good: |
+    import hashlib
+    import base64
+    import secrets
+
+    def generate_pkce_pair() -> tuple[str, str]:
+        """Generate PKCE code_verifier and code_challenge."""
+        code_verifier = secrets.token_urlsafe(64)  # 64 bytes = 86 chars
+        code_challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode()).digest()
+        ).rstrip(b"=").decode()
+        return code_verifier, code_challenge
+
+    # FastAPI: OIDC callback endpoint
+    @app.get("/auth/callback")
+    async def auth_callback(code: str, state: str):
+        stored = await session_store.get(state)
+        if not stored:
+            raise HTTPException(401, "Invalid state")
+        # Exchange code with PKCE verifier
+        token_response = await httpx_client.post(
+            f"{OIDC_ISSUER}/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": REDIRECT_URI,
+                "client_id": CLIENT_ID,
+                "code_verifier": stored["code_verifier"],  # PKCE
+            },
+        )
+        tokens = token_response.json()
+        return set_auth_cookies(tokens)
+  example_bad: |
+    # BAD: Implicit flow — tokens in URL, deprecated in OAuth 2.1
+    # /authorize?response_type=token&client_id=...
+    # Redirect: https://app.com/callback#access_token=eyJ...
+    # Token visible in URL bar, browser history, proxy logs, Referer header
+
+    # Also BAD: Auth Code without PKCE — vulnerable to code interception
+    # /authorize?response_type=code&client_id=...
+    # No code_challenge — attacker can intercept the code and exchange it
+  when_applies: Any application implementing OAuth2/OIDC authentication, including SPAs, mobile apps, and server-side apps
+  sources: ["https://tools.ietf.org/html/rfc7636"]
+
+- id: SEC-AUTH-ADV-002
+  text: "JWT access tokens must be short-lived (15 minutes max). Use rotating refresh tokens with single-use enforcement. A compromised access token has a 15-minute blast radius instead of hours or days."
+  why: >
+    A platform used 24-hour access tokens. A token was leaked via a server log. The attacker
+    had 23 hours of unrestricted access before the token expired. With 15-minute tokens, the
+    blast radius would have been 15 minutes. Rotating refresh tokens ensure that if a refresh
+    token is stolen, it can only be used once — the legitimate user's next refresh will fail,
+    triggering re-authentication and invalidating the stolen token.
+  how_to_do_right: |
+    1. Access token TTL: 15 minutes (max)
+    2. Refresh token TTL: 7 days, single-use (rotate on every refresh)
+    3. On refresh: issue new access token AND new refresh token, invalidate old refresh token
+    4. If old refresh token is reused: revoke ALL tokens for that user (potential theft detected)
+    5. Store refresh tokens hashed in database (never plaintext)
+    6. Include "jti" (JWT ID) in access tokens for revocation capability
+    7. Include "iat" (issued at) and "exp" (expiration) — validate both
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [clerk, jose, passlib]
+  domains:
+    domain: [security, architecture]
+    concern: [web]
+  example_good: |
+    from jose import jwt
+    from datetime import datetime, timedelta, timezone
+    import hashlib
+
+    ACCESS_TOKEN_TTL = timedelta(minutes=15)
+    REFRESH_TOKEN_TTL = timedelta(days=7)
+
+    def create_access_token(user_id: str, roles: list[str]) -> str:
+        now = datetime.now(timezone.utc)
+        return jwt.encode({
+            "sub": user_id,
+            "roles": roles,
+            "jti": str(uuid4()),
+            "iat": now.timestamp(),
+            "exp": (now + ACCESS_TOKEN_TTL).timestamp(),
+            "type": "access",
+        }, SECRET_KEY, algorithm="HS256")
+
+    async def refresh_tokens(refresh_token: str) -> dict:
+        token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
+        stored = await db.get_refresh_token(token_hash)
+        if not stored or stored.used:
+            if stored and stored.used:
+                # Reuse detected — potential theft! Revoke all user tokens
+                await db.revoke_all_tokens(stored.user_id)
+                raise HTTPException(401, "Token reuse detected — all sessions revoked")
+            raise HTTPException(401, "Invalid refresh token")
+        # Mark old token as used
+        await db.mark_used(token_hash)
+        # Issue new pair
+        new_access = create_access_token(stored.user_id, stored.roles)
+        new_refresh = secrets.token_urlsafe(64)
+        await db.store_refresh_token(stored.user_id, hashlib.sha256(new_refresh.encode()).hexdigest())
+        return {"access_token": new_access, "refresh_token": new_refresh}
+  example_bad: |
+    # BAD: Long-lived access tokens, non-rotating refresh tokens
+    def create_access_token(user_id):
+        return jwt.encode({
+            "sub": user_id,
+            "exp": datetime.utcnow() + timedelta(hours=24),  # 24 hours!
+        }, SECRET_KEY)
+
+    # Refresh token never rotated — if stolen, attacker has permanent access
+    async def refresh(refresh_token):
+        user = verify_refresh(refresh_token)
+        return {"access_token": create_access_token(user.id)}
+        # Same refresh token reusable forever
+  when_applies: Any system using JWT tokens for authentication
+  sources: ["https://tools.ietf.org/html/rfc7519"]
+
+- id: SEC-AUTH-ADV-003
+  text: "RBAC for financial platforms must use hierarchical roles with explicit permission grants. Never use string-based role checks scattered in code — use a centralized permission matrix."
+  why: >
+    A prediction market had role checks like `if user.role == "admin"` scattered across 200 endpoints.
+    When they needed to add a "compliance_officer" role that could view transactions but not modify
+    them, they had to audit all 200 endpoints to determine which checks to add. They missed 3
+    endpoints, giving compliance officers the ability to modify market parameters — a regulatory
+    violation discovered during an audit.
+  how_to_do_right: |
+    1. Define permissions as granular actions: "market:create", "market:read", "bet:place", "user:ban"
+    2. Define roles as collections of permissions in a centralized matrix
+    3. Check permissions, not roles: has_permission("market:create"), not is_role("admin")
+    4. Use a Permission class with decorator for endpoint protection
+    5. Role hierarchy: admin > moderator > analyst > user (inherits lower permissions)
+    6. Audit: log every permission check with user, action, resource, and result
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [clerk, jose, passlib]
+  domains:
+    domain: [security, architecture]
+    concern: [web]
+  example_good: |
+    from enum import Enum
+    from functools import wraps
+
+    class Permission(str, Enum):
+        MARKET_CREATE = "market:create"
+        MARKET_READ = "market:read"
+        MARKET_MODIFY = "market:modify"
+        BET_PLACE = "bet:place"
+        BET_READ = "bet:read"
+        USER_BAN = "user:ban"
+        TRANSACTION_READ = "transaction:read"
+        TRANSACTION_MODIFY = "transaction:modify"
+
+    ROLE_PERMISSIONS: dict[str, set[Permission]] = {
+        "user": {Permission.MARKET_READ, Permission.BET_PLACE, Permission.BET_READ},
+        "analyst": {Permission.MARKET_READ, Permission.BET_READ, Permission.TRANSACTION_READ},
+        "moderator": {Permission.MARKET_READ, Permission.MARKET_MODIFY, Permission.BET_READ,
+                      Permission.USER_BAN, Permission.TRANSACTION_READ},
+        "admin": set(Permission),  # All permissions
+    }
+
+    def require_permission(permission: Permission):
+        def decorator(func):
+            @wraps(func)
+            async def wrapper(*args, current_user=Depends(get_current_user), **kwargs):
+                user_perms = ROLE_PERMISSIONS.get(current_user.role, set())
+                if permission not in user_perms:
+                    audit_log(current_user.id, permission, "denied")
+                    raise HTTPException(403, f"Missing permission: {permission}")
+                audit_log(current_user.id, permission, "granted")
+                return await func(*args, current_user=current_user, **kwargs)
+            return wrapper
+        return decorator
+
+    @app.post("/markets")
+    @require_permission(Permission.MARKET_CREATE)
+    async def create_market(market: MarketCreate, current_user: User = Depends(get_current_user)):
+        return await market_service.create(market)
+  example_bad: |
+    # BAD: String-based role checks scattered everywhere
+    @app.post("/markets")
+    async def create_market(market: MarketCreate, user=Depends(get_user)):
+        if user.role != "admin":  # Hardcoded, no centralized matrix
+            raise HTTPException(403)
+        return await market_service.create(market)
+
+    @app.delete("/users/{user_id}")
+    async def ban_user(user_id: str, user=Depends(get_user)):
+        if user.role not in ["admin", "moderator"]:  # Duplicated logic
+            raise HTTPException(403)
+  when_applies: Any platform with multiple user roles, especially financial or regulatory environments
+  sources: ["https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html"]
+
+- id: SEC-AUTH-ADV-004
+  text: "ABAC (Attribute-Based Access Control) must be used for fine-grained permissions that RBAC cannot express. Use policy rules that evaluate user attributes, resource attributes, and context attributes at runtime."
+  why: >
+    A fintech platform needed rules like "users can only view transactions from their own region"
+    and "analysts can only access markets they are assigned to." RBAC could not express these
+    without creating hundreds of roles (analyst_us, analyst_eu, analyst_apac...). ABAC evaluates
+    attributes at runtime: if user.region == resource.region AND user.clearance >= resource.sensitivity.
+    Without ABAC, the team created 47 roles that became unmaintainable.
+  how_to_do_right: |
+    1. Define attributes: user (role, region, department), resource (owner, sensitivity), context (time, IP)
+    2. Define policies as rules: "allow if user.region == resource.region AND user.role in ['analyst', 'admin']"
+    3. Evaluate policies at request time with all available attributes
+    4. Cache policy decisions for 60 seconds (invalidate on attribute change)
+    5. Log all policy evaluations for audit
+    6. Start with RBAC, add ABAC only for rules RBAC cannot express
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [clerk, jose, passlib]
+  domains:
+    domain: [security, architecture]
+    concern: [web]
+  example_good: |
+    from dataclasses import dataclass
+
+    @dataclass
+    class PolicyContext:
+        user_attrs: dict  # role, region, department, clearance
+        resource_attrs: dict  # owner_id, region, sensitivity, type
+        context_attrs: dict  # time, ip, device
+
+    class ABACPolicy:
+        def __init__(self, name: str, condition: Callable[[PolicyContext], bool]):
+            self.name = name
+            self.condition = condition
+
+    class PolicyEngine:
+        def __init__(self):
+            self.policies: list[ABACPolicy] = []
+
+        def add_policy(self, policy: ABACPolicy):
+            self.policies.append(policy)
+
+        def evaluate(self, action: str, ctx: PolicyContext) -> bool:
+            for policy in self.policies:
+                if not policy.condition(ctx):
+                    audit_log(ctx, action, policy.name, "denied")
+                    return False
+            audit_log(ctx, action, "all", "granted")
+            return True
+
+    # Define policies
+    engine = PolicyEngine()
+    engine.add_policy(ABACPolicy(
+        "region_match",
+        lambda ctx: ctx.user_attrs["region"] == ctx.resource_attrs["region"]
+    ))
+    engine.add_policy(ABACPolicy(
+        "clearance_level",
+        lambda ctx: ctx.user_attrs["clearance"] >= ctx.resource_attrs["sensitivity"]
+    ))
+    engine.add_policy(ABACPolicy(
+        "business_hours",
+        lambda ctx: 6 <= ctx.context_attrs["hour"] <= 22 or ctx.user_attrs["role"] == "admin"
+    ))
+  example_bad: |
+    # BAD: Hundreds of roles to express attribute-based rules
+    ROLES = [
+        "analyst_us_low_clearance",
+        "analyst_us_high_clearance",
+        "analyst_eu_low_clearance",
+        "analyst_eu_high_clearance",
+        "analyst_apac_low_clearance",
+        # ... 47 more roles
+    ]
+    if user.role == "analyst_us_high_clearance":
+        # Unmaintainable, error-prone, doesn't scale
+  when_applies: Platforms needing fine-grained access control beyond role-based (regional, departmental, sensitivity-based)
+  sources: ["https://www.nist.gov/publications/attribute-based-access-control-abac-definition-and-considerations"]
+
+- id: SEC-AUTH-ADV-005
+  text: "Multi-tenant authentication must isolate tenant data at the token level. Every JWT must include tenant_id, and every database query must filter by tenant_id. A missing tenant filter is a data breach."
+  why: >
+    A SaaS platform forgot to add tenant_id filtering on the /api/users endpoint. A user from
+    Tenant A could see all users from Tenant B by calling the API directly. The breach exposed
+    3,000 user records across 15 tenants. The fix was a one-line WHERE clause, but the damage
+    (mandatory breach notification, lost contracts, legal fees) cost $400,000.
+  how_to_do_right: |
+    1. Include tenant_id in JWT claims at login time
+    2. Extract tenant_id from token in middleware, set on request context
+    3. Use SQLAlchemy event listener or query filter to automatically add tenant_id to ALL queries
+    4. Never allow API endpoints to accept tenant_id as a parameter (always from token)
+    5. Test: verify that User A from Tenant 1 cannot access Tenant 2 resources
+    6. Use database row-level security (PostgreSQL RLS) as defense-in-depth
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [clerk, jose, passlib]
+  domains:
+    domain: [security, architecture]
+    concern: [web]
+  example_good: |
+    from contextvars import ContextVar
+    from sqlalchemy import event
+
+    current_tenant: ContextVar[str] = ContextVar("current_tenant")
+
+    # Middleware: extract tenant from token, set context
+    @app.middleware("http")
+    async def tenant_middleware(request: Request, call_next):
+        token = await get_validated_token(request)
+        tenant_id = token.get("tenant_id")
+        if not tenant_id:
+            return JSONResponse(status_code=401, content={"error": "Missing tenant"})
+        current_tenant.set(tenant_id)
+        return await call_next(request)
+
+    # Auto-filter: every query gets tenant_id WHERE clause
+    @event.listens_for(Session, "do_orm_execute")
+    def filter_by_tenant(execute_state):
+        if execute_state.is_select:
+            tenant_id = current_tenant.get(None)
+            if tenant_id:
+                execute_state.statement = execute_state.statement.filter_by(tenant_id=tenant_id)
+
+    # PostgreSQL RLS as defense-in-depth
+    # ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+    # CREATE POLICY tenant_isolation ON users
+    #   USING (tenant_id = current_setting('app.current_tenant'));
+  example_bad: |
+    # BAD: No tenant isolation — cross-tenant data access
+    @app.get("/api/users")
+    async def list_users():
+        return await db.execute("SELECT * FROM users")  # ALL tenants!
+
+    # Also BAD: Tenant from request parameter — attacker controls it
+    @app.get("/api/users")
+    async def list_users(tenant_id: str):  # Attacker sends any tenant_id
+        return await db.execute("SELECT * FROM users WHERE tenant_id = :t", {"t": tenant_id})
+  when_applies: Any multi-tenant SaaS application where tenant data isolation is required
+  sources: ["https://cheatsheetseries.owasp.org/cheatsheets/Multi-Tenancy_Cheat_Sheet.html"]
+
+- id: SEC-AUTH-ADV-006
+  text: "Session management for financial platforms must use server-side sessions with opaque session IDs. Stateless JWTs for sessions have inherent revocation limitations that are unacceptable for financial operations."
+  why: >
+    A trading platform used stateless JWTs for sessions. When a user reported their account
+    compromised, the support team could not immediately revoke the session — the JWT was valid
+    for 15 more minutes. In those 15 minutes, the attacker placed trades worth $50,000.
+    Server-side sessions can be revoked instantly by deleting the session record. For financial
+    platforms, instant revocation is not optional.
+  how_to_do_right: |
+    1. Use server-side sessions stored in Redis (fast lookup + TTL support)
+    2. Session ID: cryptographically random, 256 bits minimum, opaque (not JWT)
+    3. Store session data server-side: user_id, roles, permissions, created_at, last_activity
+    4. Session ID sent to client in httpOnly, Secure, SameSite=Strict cookie
+    5. On compromise report: delete session from Redis = instant revocation
+    6. Session TTL: 30 minutes idle, 8 hours absolute maximum
+    7. Use JWT only for API-to-API service auth, not for user sessions
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [clerk, jose, passlib]
+  domains:
+    domain: [security, fintech]
+    concern: [web]
+  example_good: |
+    import secrets
+    import redis.asyncio as redis
+
+    SESSION_TTL = 1800  # 30 minutes
+    SESSION_MAX_AGE = 28800  # 8 hours absolute max
+
+    class SessionManager:
+        def __init__(self, redis_client: redis.Redis):
+            self.redis = redis_client
+
+        async def create_session(self, user_id: str, roles: list[str]) -> str:
+            session_id = secrets.token_urlsafe(32)  # 256 bits
+            session_data = {
+                "user_id": user_id,
+                "roles": json.dumps(roles),
+                "created_at": datetime.utcnow().isoformat(),
+                "last_activity": datetime.utcnow().isoformat(),
+            }
+            await self.redis.hset(f"session:{session_id}", mapping=session_data)
+            await self.redis.expire(f"session:{session_id}", SESSION_TTL)
+            return session_id
+
+        async def get_session(self, session_id: str) -> dict | None:
+            data = await self.redis.hgetall(f"session:{session_id}")
+            if not data:
+                return None
+            # Check absolute max age
+            created = datetime.fromisoformat(data["created_at"])
+            if (datetime.utcnow() - created).total_seconds() > SESSION_MAX_AGE:
+                await self.revoke_session(session_id)
+                return None
+            # Refresh idle timeout
+            await self.redis.expire(f"session:{session_id}", SESSION_TTL)
+            return data
+
+        async def revoke_session(self, session_id: str):
+            """Instant revocation — effective immediately."""
+            await self.redis.delete(f"session:{session_id}")
+
+        async def revoke_all_user_sessions(self, user_id: str):
+            """Nuclear option: revoke ALL sessions for a user."""
+            async for key in self.redis.scan_iter(f"session:*"):
+                data = await self.redis.hgetall(key)
+                if data.get("user_id") == user_id:
+                    await self.redis.delete(key)
+  example_bad: |
+    # BAD: Stateless JWT for sessions — cannot be instantly revoked
+    def login(user):
+        token = jwt.encode({"sub": user.id, "exp": datetime.utcnow() + timedelta(hours=1)}, SECRET)
+        return {"access_token": token}
+        # If user reports compromise, token is valid for up to 1 hour
+        # Adding a blocklist defeats the purpose of stateless JWT
+  when_applies: Financial platforms, trading systems, any system where instant session revocation is required
+  sources: ["https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html"]
+
+- id: SEC-AUTH-ADV-007
+  text: "Token revocation must support both individual token revocation and user-level revocation (revoke all tokens for a user). Implement a revocation list checked on every request, cached in Redis with 60-second TTL."
+  why: >
+    A user changed their password after a suspected breach. The old access tokens remained valid
+    for 15 minutes (their TTL). The platform had no mechanism to revoke specific tokens or all
+    tokens for a user. The attacker continued accessing the account for 15 minutes after the
+    password change. The user filed a complaint with the financial regulator, resulting in an
+    investigation.
+  how_to_do_right: |
+    1. Maintain a token revocation list in Redis (fast O(1) lookup)
+    2. Check revocation list on every authenticated request (before processing)
+    3. Support: revoke_token(jti) for single token revocation
+    4. Support: revoke_all_tokens(user_id) by storing user_revoked_at timestamp
+    5. Token is revoked if: jti in revocation list OR token.iat < user.revoked_at
+    6. Cache check result for 60 seconds to reduce Redis load
+    7. On password change, role change, or security event: revoke all user tokens
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [clerk, jose, passlib]
+  domains:
+    domain: [security, architecture]
+    concern: [web]
+  example_good: |
+    class TokenRevocationService:
+        def __init__(self, redis_client):
+            self.redis = redis_client
+
+        async def revoke_token(self, jti: str, ttl: int = 900):
+            """Revoke a single token by its JWT ID."""
+            await self.redis.setex(f"revoked:token:{jti}", ttl, "1")
+
+        async def revoke_user_tokens(self, user_id: str):
+            """Revoke ALL tokens for a user (password change, compromise)."""
+            await self.redis.set(f"revoked:user:{user_id}", datetime.utcnow().isoformat())
+
+        async def is_revoked(self, token_payload: dict) -> bool:
+            jti = token_payload.get("jti")
+            user_id = token_payload.get("sub")
+            iat = token_payload.get("iat", 0)
+
+            # Check individual token revocation
+            if jti and await self.redis.exists(f"revoked:token:{jti}"):
+                return True
+
+            # Check user-level revocation
+            revoked_at = await self.redis.get(f"revoked:user:{user_id}")
+            if revoked_at:
+                revoked_ts = datetime.fromisoformat(revoked_at).timestamp()
+                if iat < revoked_ts:
+                    return True
+            return False
+
+    # Middleware: check revocation on every request
+    @app.middleware("http")
+    async def check_revocation(request: Request, call_next):
+        token = get_token_from_request(request)
+        if token:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+            if await revocation_service.is_revoked(payload):
+                return JSONResponse(401, {"error": "Token revoked"})
+        return await call_next(request)
+  example_bad: |
+    # BAD: No revocation mechanism
+    async def change_password(user_id, new_password):
+        await db.update_password(user_id, hash_password(new_password))
+        # Old tokens still valid! No way to revoke them.
+        return {"message": "Password changed"}
+  when_applies: Any system using JWT tokens, especially financial platforms requiring instant revocation
+  sources: ["https://tools.ietf.org/html/rfc7009"]
+
+- id: SEC-AUTH-ADV-008
+  text: "API key management for service-to-service auth must use hashed storage, automatic rotation, and scope-limited keys. Never share one API key across multiple services."
+  why: >
+    A platform used one API key for all internal services. When the key was accidentally committed
+    to a public GitHub repo (by a contractor), all 12 internal services were compromised. If each
+    service had its own key, only the compromised service would need rotation. The incident
+    required rotating keys across 12 services simultaneously, causing 45 minutes of downtime.
+  how_to_do_right: |
+    1. One API key per service per environment (dev, staging, prod)
+    2. Store keys hashed (SHA-256) in database — never plaintext
+    3. Key format: prefix_randomBytes (e.g., "fk_live_abc123...") — prefix identifies scope
+    4. Automatic rotation: support 2 active keys per service during rotation window
+    5. Scope keys: each key has explicit permissions (read-only, read-write, admin)
+    6. Expiration: keys expire after 90 days, alert 14 days before expiration
+    7. Log all API key usage with source IP and action for audit
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [clerk, jose, passlib]
+  domains:
+    domain: [security, architecture]
+    concern: [web]
+  example_good: |
+    import hashlib
+    import secrets
+
+    class APIKeyManager:
+        KEY_PREFIX_MAP = {
+            "fk_live": "production",
+            "fk_test": "staging",
+            "fk_dev": "development",
+        }
+
+        def create_key(self, service_name: str, env: str, scopes: list[str]) -> str:
+            prefix = f"fk_{env[:4]}"
+            raw_key = f"{prefix}_{secrets.token_urlsafe(32)}"
+            key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+            # Store hash + metadata, never the raw key
+            db.insert("api_keys", {
+                "key_hash": key_hash,
+                "service": service_name,
+                "environment": env,
+                "scopes": scopes,
+                "created_at": datetime.utcnow(),
+                "expires_at": datetime.utcnow() + timedelta(days=90),
+                "active": True,
+            })
+            return raw_key  # Return raw key ONCE to the admin, never stored
+
+        async def validate_key(self, raw_key: str) -> dict | None:
+            key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+            record = await db.get("api_keys", key_hash=key_hash, active=True)
+            if not record:
+                return None
+            if record["expires_at"] < datetime.utcnow():
+                return None
+            audit_log(record["service"], "api_key_used", request.client.host)
+            return {"service": record["service"], "scopes": record["scopes"]}
+
+        async def rotate_key(self, service_name: str, env: str) -> str:
+            """Create new key, keep old key active for 24h migration window."""
+            old_keys = await db.get_active_keys(service_name, env)
+            new_key = self.create_key(service_name, env, old_keys[0]["scopes"])
+            # Schedule old key deactivation in 24 hours
+            for key in old_keys:
+                await schedule_deactivation(key["key_hash"], delay_hours=24)
+            return new_key
+  example_bad: |
+    # BAD: One shared API key, stored plaintext, never rotated
+    API_KEY = "supersecretkey123"  # Hardcoded, shared across all services
+
+    async def validate(request):
+        if request.headers.get("X-API-Key") == API_KEY:
+            return True  # No scope check, no audit, no rotation
+  when_applies: Any service-to-service authentication, internal APIs, third-party integrations
+  sources: ["https://cheatsheetseries.owasp.org/cheatsheets/Key_Management_Cheat_Sheet.html"]
+
+- id: SEC-AUTH-ADV-009
+  text: "Rate limiting per authenticated user must use a sliding window algorithm (not fixed window) and differentiate between endpoints. Auth endpoints get stricter limits (5/min), read endpoints get generous limits (100/min)."
+  why: >
+    A platform used a fixed-window rate limiter at 100 requests/minute. An attacker sent 100
+    requests at 11:59:59 and 100 more at 12:00:01 — 200 requests in 2 seconds. The fixed window
+    reset at the minute boundary. A sliding window would have correctly counted 200 requests in
+    any 60-second window and blocked the second burst. The attacker brute-forced a 4-digit OTP
+    in those 200 requests.
+  how_to_do_right: |
+    1. Use sliding window rate limiting (Redis ZSET with timestamps)
+    2. Auth endpoints: 5 requests/minute (login, register, password reset, OTP verification)
+    3. Write endpoints: 30 requests/minute (create, update, delete)
+    4. Read endpoints: 100 requests/minute (list, get)
+    5. Rate limit by user_id for authenticated requests, by IP for unauthenticated
+    6. Return 429 with Retry-After header
+    7. Log rate limit hits for abuse detection
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [clerk, jose, passlib]
+  domains:
+    domain: [security, architecture]
+    concern: [web]
+  example_good: |
+    import time
+    import redis.asyncio as redis
+
+    class SlidingWindowRateLimiter:
+        def __init__(self, redis_client: redis.Redis):
+            self.redis = redis_client
+
+        async def is_allowed(self, key: str, limit: int, window_seconds: int) -> tuple[bool, int]:
+            now = time.time()
+            window_start = now - window_seconds
+            pipe = self.redis.pipeline()
+            # Remove old entries
+            pipe.zremrangebyscore(f"ratelimit:{key}", 0, window_start)
+            # Count current window
+            pipe.zcard(f"ratelimit:{key}")
+            # Add current request
+            pipe.zadd(f"ratelimit:{key}", {str(now): now})
+            # Set expiry on the key
+            pipe.expire(f"ratelimit:{key}", window_seconds)
+            results = await pipe.execute()
+            current_count = results[1]
+            remaining = max(0, limit - current_count - 1)
+            return current_count < limit, remaining
+
+    RATE_LIMITS = {
+        "auth": (5, 60),       # 5 per minute
+        "write": (30, 60),     # 30 per minute
+        "read": (100, 60),     # 100 per minute
+    }
+
+    @app.middleware("http")
+    async def rate_limit_middleware(request: Request, call_next):
+        user_id = get_user_id(request) or request.client.host
+        endpoint_type = classify_endpoint(request.url.path, request.method)
+        limit, window = RATE_LIMITS.get(endpoint_type, (100, 60))
+        allowed, remaining = await limiter.is_allowed(f"{user_id}:{endpoint_type}", limit, window)
+        if not allowed:
+            return JSONResponse(429, {"error": "Rate limit exceeded"},
+                                headers={"Retry-After": str(window)})
+        response = await call_next(request)
+        response.headers["X-RateLimit-Remaining"] = str(remaining)
+        return response
+  example_bad: |
+    # BAD: Fixed window — vulnerable to burst attacks at window boundary
+    request_counts = {}  # In-memory, lost on restart
+
+    def rate_limit(user_id):
+        minute = int(time.time() / 60)
+        key = f"{user_id}:{minute}"
+        request_counts[key] = request_counts.get(key, 0) + 1
+        return request_counts[key] <= 100  # Same limit for auth and read endpoints
+  when_applies: All authenticated API endpoints, especially auth-related endpoints
+  sources: ["https://cheatsheetseries.owasp.org/cheatsheets/DotNet_Security_Cheat_Sheet.html#rate-limiting"]
+
+- id: SEC-AUTH-ADV-010
+  text: "CSRF protection must use SameSite=Strict cookies for session tokens AND double-submit CSRF tokens for state-changing operations. SameSite alone is insufficient when third-party iframes are involved."
+  why: >
+    A platform relied solely on SameSite=Lax cookies for CSRF protection. An attacker embedded
+    a form in a third-party website that submitted a POST request to the platform's /api/transfer
+    endpoint. SameSite=Lax allows top-level navigation POSTs, so the cookie was sent and the
+    transfer executed. A double-submit CSRF token would have prevented this because the attacker
+    cannot read the CSRF token from the cookie to include in the request body.
+  how_to_do_right: |
+    1. Set session cookie: SameSite=Strict, httpOnly=True, Secure=True
+    2. Generate CSRF token on login, store in separate cookie (SameSite=Strict, NOT httpOnly)
+    3. Client reads CSRF token from cookie, includes in X-CSRF-Token header on every state-changing request
+    4. Server validates: X-CSRF-Token header matches CSRF cookie value
+    5. Rotate CSRF token on every session creation
+    6. CSRF protection required for: POST, PUT, PATCH, DELETE (not GET)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [clerk, jose, passlib]
+  domains:
+    domain: [security, architecture]
+    concern: [web]
+  example_good: |
+    from fastapi import Response
+    import secrets
+
+    def set_auth_cookies(response: Response, session_id: str):
+        csrf_token = secrets.token_urlsafe(32)
+        # Session cookie: httpOnly (JS can't read), Strict
+        response.set_cookie(
+            "session_id", session_id,
+            httponly=True, secure=True, samesite="strict", max_age=1800,
+        )
+        # CSRF cookie: NOT httpOnly (JS must read it), Strict
+        response.set_cookie(
+            "csrf_token", csrf_token,
+            httponly=False, secure=True, samesite="strict", max_age=1800,
+        )
+        # Store CSRF token server-side linked to session
+        session_store.set_csrf(session_id, csrf_token)
+
+    @app.middleware("http")
+    async def csrf_middleware(request: Request, call_next):
+        if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            csrf_cookie = request.cookies.get("csrf_token")
+            csrf_header = request.headers.get("X-CSRF-Token")
+            if not csrf_cookie or not csrf_header or csrf_cookie != csrf_header:
+                return JSONResponse(403, {"error": "CSRF validation failed"})
+        return await call_next(request)
+
+    # Client-side (React):
+    # const csrfToken = document.cookie.match(/csrf_token=([^;]+)/)?.[1];
+    # fetch('/api/transfer', {
+    #   method: 'POST',
+    #   headers: { 'X-CSRF-Token': csrfToken },
+    #   body: JSON.stringify(data),
+    # });
+  example_bad: |
+    # BAD: No CSRF protection at all
+    response.set_cookie("session_id", session_id)  # No SameSite, no httpOnly, no Secure
+    # Any website can submit forms to your API with the user's session
+
+    # Also BAD: SameSite=Lax only — allows top-level navigation attacks
+    response.set_cookie("session_id", session_id, samesite="lax")
+  when_applies: Any web application with cookie-based authentication and state-changing endpoints
+  sources: ["https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html"]
+
+- id: SEC-AUTH-ADV-011
+  text: "Security headers must be set on every response: Content-Security-Policy, Strict-Transport-Security, X-Frame-Options, X-Content-Type-Options, and Permissions-Policy. Use a middleware, not per-endpoint headers."
+  why: >
+    A platform was missing the X-Frame-Options header. An attacker created a fake website with
+    a transparent iframe overlaying the platform's transfer page. Users clicked "claim reward"
+    on the fake site but actually clicked "confirm transfer" on the real platform — a classic
+    clickjacking attack. 23 users lost funds before the attack was discovered. A single header
+    (X-Frame-Options: DENY) would have prevented all of it.
+  how_to_do_right: |
+    1. Add security headers middleware that runs on EVERY response
+    2. Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'
+    3. Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
+    4. X-Frame-Options: DENY (or SAMEORIGIN if you need iframes)
+    5. X-Content-Type-Options: nosniff
+    6. Permissions-Policy: camera=(), microphone=(), geolocation=()
+    7. Referrer-Policy: strict-origin-when-cross-origin
+    8. Test with securityheaders.com — aim for A+ grade
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [clerk, jose, passlib]
+  domains:
+    domain: [security, architecture]
+    concern: [web]
+  example_good: |
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def security_headers(request, call_next):
+        response = await call_next(request)
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: https:; "
+            "connect-src 'self' wss: https:; "
+            "frame-ancestors 'none'"
+        )
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains; preload"
+        )
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Permissions-Policy"] = (
+            "camera=(), microphone=(), geolocation=(), payment=()"
+        )
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["X-XSS-Protection"] = "0"  # Disabled — CSP replaces it
+        return response
+  example_bad: |
+    # BAD: No security headers — vulnerable to clickjacking, MIME sniffing, etc.
+    app = FastAPI()
+    # Default FastAPI sends zero security headers
+    # Every response is missing CSP, HSTS, X-Frame-Options...
+  when_applies: Every web application and API, regardless of framework or use case
+  sources: ["https://cheatsheetseries.owasp.org/cheatsheets/HTTP_Headers_Cheat_Sheet.html"]
+
+- id: SEC-AUTH-ADV-012
+  text: "Password hashing must use Argon2id with memory=65536 KiB, iterations=3, parallelism=4. Never use bcrypt for new projects — Argon2id is the winner of the Password Hashing Competition and resists GPU/ASIC attacks better."
+  why: >
+    Bcrypt has a 72-byte input limit — passwords longer than 72 bytes are silently truncated.
+    A user with a 100-character password had the same hash as someone with just the first 72
+    characters. Bcrypt also lacks memory-hardness, making it more vulnerable to GPU-based
+    cracking than Argon2id. The Password Hashing Competition (2015) selected Argon2 specifically
+    because it resists both GPU and ASIC attacks through tunable memory requirements.
+  how_to_do_right: |
+    1. Use Argon2id (hybrid: resists both side-channel and GPU attacks)
+    2. Parameters: memory=65536 KiB (64 MB), iterations=3, parallelism=4
+    3. Salt: automatically generated (16+ bytes) by the library
+    4. Verify with constant-time comparison (library handles this)
+    5. Store full hash string including parameters: $argon2id$v=19$m=65536,t=3,p=4$salt$hash
+    6. Benchmark on your hardware: hashing should take 0.5-1.0 seconds
+    7. If migrating from bcrypt: verify with bcrypt first, if valid, re-hash with Argon2id on login
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [clerk, jose, passlib]
+  domains:
+    domain: [security]
+    concern: [web]
+  example_good: |
+    from passlib.hash import argon2
+
+    # Configure Argon2id with recommended parameters
+    hasher = argon2.using(
+        type="ID",        # Argon2id (hybrid)
+        memory_cost=65536, # 64 MB
+        time_cost=3,       # 3 iterations
+        parallelism=4,     # 4 threads
+        salt_len=16,       # 16 bytes salt
+    )
+
+    def hash_password(password: str) -> str:
+        return hasher.hash(password)
+
+    def verify_password(password: str, stored_hash: str) -> bool:
+        return hasher.verify(password, stored_hash)
+
+    # Migration from bcrypt: transparent rehash on login
+    async def login(email: str, password: str):
+        user = await get_user_by_email(email)
+        if user.password_hash.startswith("$2b$"):  # bcrypt
+            if bcrypt.verify(password, user.password_hash):
+                # Re-hash with Argon2id
+                user.password_hash = hash_password(password)
+                await save_user(user)
+                return user
+        elif verify_password(password, user.password_hash):
+            return user
+        raise HTTPException(401, "Invalid credentials")
+  example_bad: |
+    # BAD: bcrypt — 72-byte limit, less GPU-resistant
+    import bcrypt
+    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+
+    # BAD: SHA-256 — fast, no salt, trivially crackable
+    import hashlib
+    hashed = hashlib.sha256(password.encode()).hexdigest()
+
+    # BAD: MD5 — broken, never use for anything security-related
+    hashed = hashlib.md5(password.encode()).hexdigest()
+  when_applies: Any system storing user passwords, whether new project or migration from older hashing algorithms
+  sources: ["https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html"]
+
+- id: SEC-AUTH-ADV-013
+  text: "MFA implementation must support TOTP (RFC 6238) as the primary method with recovery codes as backup. Never use SMS-based OTP as the sole MFA factor — it is vulnerable to SIM swapping."
+  why: >
+    A high-profile user on a prediction market had their phone number ported by an attacker
+    via SIM swap ($50 bribe to a carrier employee). The attacker received the SMS OTP, logged in,
+    and withdrew $35,000. TOTP (Google Authenticator, Authy) is device-based and not vulnerable
+    to SIM swapping. SMS OTP should only be offered as a fallback, never as the only MFA option.
+  how_to_do_right: |
+    1. Primary MFA: TOTP (Time-based One-Time Password, RFC 6238)
+    2. Generate 160-bit secret, encode as base32, display as QR code
+    3. Verify with 1-step tolerance (current + previous + next 30-second window)
+    4. Generate 10 recovery codes (8 alphanumeric characters each) at setup
+    5. Store recovery codes hashed, mark as used after single use
+    6. SMS OTP: offer as optional fallback only, warn about SIM swap risk
+    7. Rate limit OTP verification: 5 attempts per 15 minutes, then lock
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [clerk, jose, passlib]
+  domains:
+    domain: [security]
+    concern: [web]
+  example_good: |
+    import pyotp
+    import secrets
+
+    class MFAService:
+        def setup_totp(self, user_id: str) -> dict:
+            """Generate TOTP secret and recovery codes."""
+            secret = pyotp.random_base32(length=32)  # 160 bits
+            totp = pyotp.TOTP(secret)
+            provisioning_uri = totp.provisioning_uri(
+                name=user_id, issuer_name="Forekast"
+            )
+            # Generate 10 recovery codes
+            recovery_codes = [secrets.token_hex(4).upper() for _ in range(10)]  # 8 chars each
+            # Store secret and hashed recovery codes
+            hashed_codes = [hashlib.sha256(c.encode()).hexdigest() for c in recovery_codes]
+            db.store_mfa(user_id, secret_encrypted=encrypt(secret), recovery_codes=hashed_codes)
+            return {
+                "secret": secret,  # Show once for manual entry
+                "qr_uri": provisioning_uri,  # For QR code generation
+                "recovery_codes": recovery_codes,  # Show once, user saves them
+            }
+
+        def verify_totp(self, user_id: str, code: str) -> bool:
+            mfa = db.get_mfa(user_id)
+            secret = decrypt(mfa.secret_encrypted)
+            totp = pyotp.TOTP(secret)
+            return totp.verify(code, valid_window=1)  # ±30 seconds tolerance
+
+        def verify_recovery_code(self, user_id: str, code: str) -> bool:
+            code_hash = hashlib.sha256(code.encode()).hexdigest()
+            mfa = db.get_mfa(user_id)
+            if code_hash in mfa.recovery_codes:
+                mfa.recovery_codes.remove(code_hash)  # Single use
+                db.update_mfa(user_id, recovery_codes=mfa.recovery_codes)
+                return True
+            return False
+  example_bad: |
+    # BAD: SMS-only MFA — vulnerable to SIM swapping
+    def send_otp(phone_number):
+        otp = random.randint(100000, 999999)  # 6 digits
+        sms_provider.send(phone_number, f"Your code is {otp}")
+        cache.set(f"otp:{phone_number}", otp, ttl=300)
+        # SIM swap attack: attacker ports number, receives OTP
+  when_applies: Any platform handling financial transactions, personal data, or sensitive operations
+  sources: ["https://tools.ietf.org/html/rfc6238"]
+
+- id: SEC-AUTH-ADV-014
+  text: "Audit logging for auth events must capture every authentication and authorization decision. Log: who, what, when, where (IP), result (success/failure), and reason (if denied). Logs must be tamper-proof and retained for 1 year minimum."
+  why: >
+    During a security investigation, the team needed to determine which accounts were accessed
+    by a compromised API key over the past 30 days. They had no auth audit logs — only application
+    logs that didn't record failed auth attempts or authorization decisions. They could not determine
+    the blast radius, so they assumed all accounts were compromised and forced password resets for
+    50,000 users. Proper audit logs would have shown only 12 accounts were accessed.
+  how_to_do_right: |
+    1. Log every event: login_success, login_failed, token_refreshed, token_revoked, permission_denied
+    2. Include: user_id, action, resource, ip_address, user_agent, timestamp, result, reason
+    3. Write to append-only audit log (separate from application logs)
+    4. Retention: 1 year minimum (regulatory requirement for financial platforms)
+    5. Tamper protection: write to immutable storage (S3 with Object Lock, or signed log entries)
+    6. Never log: passwords, tokens, secrets, PII beyond user_id
+    7. Alert on: 5+ failed logins in 5 minutes, login from new country, permission denied spike
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [clerk, jose, passlib]
+  domains:
+    domain: [security, compliance]
+    concern: [web]
+  example_good: |
+    import structlog
+    from datetime import datetime, timezone
+
+    audit_logger = structlog.get_logger("audit")
+
+    class AuthAuditLogger:
+        async def log_auth_event(
+            self,
+            event_type: str,
+            user_id: str | None,
+            result: str,  # "success" | "failure"
+            request: Request,
+            reason: str = "",
+            resource: str = "",
+        ):
+            audit_logger.info(
+                "auth_event",
+                event_type=event_type,
+                user_id=user_id,
+                result=result,
+                reason=reason,
+                resource=resource,
+                ip_address=request.client.host,
+                user_agent=request.headers.get("user-agent", ""),
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                request_id=request.state.request_id,
+            )
+            # Write to immutable audit store
+            await self.audit_store.append({
+                "event_type": event_type,
+                "user_id": user_id,
+                "result": result,
+                "reason": reason,
+                "ip": request.client.host,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
+
+    # Usage in auth flow
+    async def login(email: str, password: str, request: Request):
+        user = await get_user_by_email(email)
+        if not user:
+            await audit.log_auth_event("login", None, "failure", request, reason="user_not_found")
+            raise HTTPException(401, "Invalid credentials")
+        if not verify_password(password, user.password_hash):
+            await audit.log_auth_event("login", user.id, "failure", request, reason="wrong_password")
+            raise HTTPException(401, "Invalid credentials")
+        await audit.log_auth_event("login", user.id, "success", request)
+        return create_session(user)
+  example_bad: |
+    # BAD: No audit logging
+    async def login(email, password):
+        user = await get_user(email)
+        if verify_password(password, user.password_hash):
+            return create_token(user)
+        raise HTTPException(401)
+        # No record of who tried to login, from where, or why it failed
+  when_applies: All authentication and authorization systems, especially in financial and regulated environments
+  sources: ["https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html"]
+
+- id: SEC-AUTH-ADV-015
+  text: "Auth testing must cover both happy paths and attack vectors. Test: credential stuffing resistance, token expiry enforcement, privilege escalation (horizontal and vertical), and session fixation."
+  why: >
+    A team had 100% test coverage on auth code but only tested happy paths: valid login, valid token,
+    authorized access. In production, an attacker discovered that changing user_id in the JWT payload
+    (without re-signing) still passed validation because the signature check had a bug — the test
+    never verified that tampered tokens were rejected. Attack-vector testing would have caught this
+    in development.
+  how_to_do_right: |
+    1. Test valid authentication: correct credentials -> access granted
+    2. Test invalid credentials: wrong password, expired token, malformed token -> 401
+    3. Test token tampering: modify payload without re-signing -> 401
+    4. Test horizontal privilege escalation: User A tries to access User B's resources -> 403
+    5. Test vertical privilege escalation: regular user tries admin endpoints -> 403
+    6. Test credential stuffing: 10 failed logins -> account locked for 15 minutes
+    7. Test session fixation: pre-login session ID must change after login
+    8. Test token expiry: token used 1 second after expiry -> 401
+    9. Test CSRF: state-changing request without CSRF token -> 403
+    10. Run tests in CI on every PR
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [clerk, jose, passlib]
+  domains:
+    domain: [security, testing]
+    concern: [web]
+  example_good: |
+    import pytest
+    from jose import jwt
+
+    class TestAuthSecurity:
+        @pytest.mark.asyncio
+        async def test_tampered_token_rejected(self, client):
+            """Modifying JWT payload without re-signing must be rejected."""
+            token = create_valid_token(user_id="user-1")
+            # Tamper: change user_id without re-signing
+            parts = token.split(".")
+            payload = json.loads(base64.b64decode(parts[1] + "=="))
+            payload["sub"] = "admin-user"
+            tampered_payload = base64.urlsafe_b64encode(
+                json.dumps(payload).encode()
+            ).rstrip(b"=").decode()
+            tampered_token = f"{parts[0]}.{tampered_payload}.{parts[2]}"
+            response = await client.get("/api/me", headers={"Authorization": f"Bearer {tampered_token}"})
+            assert response.status_code == 401
+
+        @pytest.mark.asyncio
+        async def test_horizontal_privilege_escalation(self, client):
+            """User A must not access User B's resources."""
+            token_a = create_valid_token(user_id="user-a")
+            response = await client.get(
+                "/api/users/user-b/portfolio",
+                headers={"Authorization": f"Bearer {token_a}"},
+            )
+            assert response.status_code == 403
+
+        @pytest.mark.asyncio
+        async def test_credential_stuffing_lockout(self, client):
+            """10 failed logins must lock account for 15 minutes."""
+            for i in range(10):
+                resp = await client.post("/auth/login", json={"email": "user@test.com", "password": f"wrong{i}"})
+                assert resp.status_code == 401
+            # 11th attempt should be locked
+            resp = await client.post("/auth/login", json={"email": "user@test.com", "password": "correct"})
+            assert resp.status_code == 429
+            assert "locked" in resp.json()["error"].lower()
+
+        @pytest.mark.asyncio
+        async def test_expired_token_rejected(self, client):
+            """Token used 1 second after expiry must be rejected."""
+            token = jwt.encode(
+                {"sub": "user-1", "exp": datetime.utcnow() - timedelta(seconds=1)},
+                SECRET_KEY, algorithm="HS256",
+            )
+            response = await client.get("/api/me", headers={"Authorization": f"Bearer {token}"})
+            assert response.status_code == 401
+  example_bad: |
+    # BAD: Only happy-path tests — misses all attack vectors
+    async def test_login():
+        resp = await client.post("/auth/login", json={"email": "a@b.com", "password": "correct"})
+        assert resp.status_code == 200
+
+    async def test_get_profile():
+        resp = await client.get("/api/me", headers={"Authorization": f"Bearer {valid_token}"})
+        assert resp.status_code == 200
+        # Never tests: tampered tokens, expired tokens, wrong user's data, lockout...
+  when_applies: All authentication and authorization implementations before going to production
+  sources: ["https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/04-Authentication_Testing/"]

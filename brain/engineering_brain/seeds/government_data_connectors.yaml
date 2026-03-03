@@ -1,0 +1,1150 @@
+layer: rules
+domain: data_engineering
+knowledge:
+- id: GOVDATA-001
+  text: >
+    When consuming CKAN API v3 (dados.gov.br, data.gov, portais estaduais), always
+    paginate package_search using rows + start parameters with a page size of 100.
+    Never request all packages in a single call — most CKAN instances cap at 1000
+    rows and return truncated results silently rather than raising an error.
+  why: >
+    dados.gov.br has over 10,000 datasets. A single call with rows=10000 returns
+    HTTP 200 with count=10000 in the metadata but only delivers the server-side cap
+    (often 1000). The caller has no indication of truncation unless they compare
+    result count vs the total count field. A data pipeline at a federal agency
+    discovered it had been missing 85% of available datasets for 6 months because
+    the initial developer did not paginate.
+  how_to_do_right: |
+    1. Make an initial call with rows=1, start=0 to get total count
+    2. Compute pages: math.ceil(total / PAGE_SIZE) where PAGE_SIZE=100
+    3. Fetch pages in sequence (or parallel with semaphore):
+       for start in range(0, total, PAGE_SIZE):
+           resp = requests.get(BASE_URL, params={"action": "package_search",
+               "rows": PAGE_SIZE, "start": start})
+           data = resp.json()["result"]["results"]
+    4. Verify: len(all_results) == total (warn if mismatch)
+    5. On dados.gov.br: use Authorization header with API key for higher rate limits
+       headers = {"Authorization": os.getenv("DADOS_GOV_BR_API_KEY", "")}
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [requests, httpx]
+  domains:
+    domain: [data_engineering, government_data, open_data]
+    concern: [pagination, completeness]
+  example_good: |
+    import math, os
+    import requests
+
+    BASE = "https://dados.gov.br/api/3/action"
+    PAGE_SIZE = 100
+
+    def fetch_all_packages(query: str = "*:*") -> list[dict]:
+        headers = {"Authorization": os.getenv("DADOS_GOV_API_KEY", "")}
+        # First call: get total count
+        r = requests.get(f"{BASE}/package_search",
+                        params={"q": query, "rows": 1, "start": 0},
+                        headers=headers, timeout=30)
+        r.raise_for_status()
+        total = r.json()["result"]["count"]
+
+        all_packages = []
+        for start in range(0, total, PAGE_SIZE):
+            r = requests.get(f"{BASE}/package_search",
+                            params={"q": query, "rows": PAGE_SIZE, "start": start},
+                            headers=headers, timeout=30)
+            r.raise_for_status()
+            results = r.json()["result"]["results"]
+            all_packages.extend(results)
+
+        assert len(all_packages) == total, f"Expected {total}, got {len(all_packages)}"
+        return all_packages
+  example_bad: |
+    # WRONG: single call without pagination — silently truncated
+    def fetch_all_bad() -> list[dict]:
+        r = requests.get("https://dados.gov.br/api/3/action/package_search",
+                        params={"rows": 10000})
+        return r.json()["result"]["results"]  # max 1000 returned, no error raised
+  when_applies: >
+    Any data pipeline that harvests datasets from CKAN-based portals: dados.gov.br,
+    data.gov, portais de dados abertos estaduais (SP, RJ, MG), data.europa.eu.
+  sources:
+    - "CKAN API Guide v3: https://docs.ckan.org/en/2.10/api/"
+    - "dados.gov.br portal: https://dados.gov.br"
+
+- id: GOVDATA-002
+  text: >
+    For CKAN datastore_search (tabular resource data), use the offset + limit
+    pagination pattern and always check the total field in the first response.
+    Use filters parameter for server-side filtering instead of fetching all rows
+    and filtering client-side — the difference can be 100x in data transferred.
+  why: >
+    A CKAN resource with 2M rows served via datastore_search defaults to 100 rows
+    per request. Fetching all rows at 100/page = 20,000 HTTP requests.
+    With server-side filters (e.g., {"UF": "SP"}) you may only need 200K rows =
+    2,000 requests. A government data pipeline that fetched all of SINAN's dengue
+    notifications (8M rows) and filtered in Python spent 4 hours per run; after
+    adding server-side filters it completed in 22 minutes.
+  how_to_do_right: |
+    1. Structure call: POST /api/3/action/datastore_search with JSON body
+       {"resource_id": "...", "limit": 1000, "offset": 0,
+        "filters": {"ano": "2024"}}
+    2. First call: capture result["total"] for progress tracking
+    3. Paginate: while offset < total, increment offset by limit
+    4. Use fields parameter to select only needed columns — reduces payload size
+    5. For large resources (>500K rows), consider the datastore_search_sql action
+       with SQL WHERE clauses for more efficient server-side filtering
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [requests, httpx]
+  domains:
+    domain: [data_engineering, government_data]
+    concern: [pagination, performance, filtering]
+  example_good: |
+    import requests
+
+    def datastore_search_all(
+        resource_id: str,
+        filters: dict | None = None,
+        fields: list[str] | None = None,
+        limit: int = 1000,
+        base_url: str = "https://dados.gov.br",
+    ) -> list[dict]:
+        endpoint = f"{base_url}/api/3/action/datastore_search"
+        offset = 0
+        all_records = []
+
+        while True:
+            payload = {"resource_id": resource_id, "limit": limit, "offset": offset}
+            if filters:
+                payload["filters"] = filters
+            if fields:
+                payload["fields"] = ",".join(fields)
+
+            r = requests.post(endpoint, json=payload, timeout=60)
+            r.raise_for_status()
+            result = r.json()["result"]
+            records = result["records"]
+            all_records.extend(records)
+
+            if len(records) < limit:
+                break  # last page
+            offset += limit
+
+        return all_records
+  example_bad: |
+    # WRONG: fetch everything, filter in Python
+    def bad_fetch(resource_id: str, uf: str) -> list[dict]:
+        all_rows = fetch_all_rows(resource_id)  # 8M rows transferred
+        return [r for r in all_rows if r.get("UF") == uf]  # 4h wasted
+  when_applies: >
+    Consuming tabular resources from CKAN datastores. Applies to dados.gov.br,
+    dados.mg.gov.br, dados.sp.gov.br, and any CKAN instance with the datastore extension.
+  sources:
+    - "CKAN DataStore API: https://docs.ckan.org/en/2.10/maintaining/datastore.html#ckan.logic.action.datastore_search"
+    - "CKAN API Guide: https://docs.ckan.org/en/2.10/api/"
+
+- id: GOVDATA-003
+  text: >
+    When consuming OGC WFS 2.0 services (geoportals, IBGE, ANA, INPE), paginate
+    using startIndex + count parameters and set sortBy to a stable unique key.
+    Without sortBy, results across pages may overlap or skip features when the
+    underlying dataset is modified between page requests.
+  why: >
+    WFS pagination without sortBy is non-deterministic: if the server re-orders
+    results between page 1 and page 2 (due to cache invalidation or concurrent
+    writes), you can receive duplicate features on page 2 or miss features entirely.
+    IBGE's WFS for municipal boundaries serves 5,570 municipalities; a harvest
+    without sortBy produced 5,612 features (42 duplicates) due to index reconstruction
+    mid-harvest. The OGC WFS 2.0 specification explicitly requires sortBy for
+    reliable paging.
+  how_to_do_right: |
+    1. Discover capabilities: GET ?SERVICE=WFS&REQUEST=GetCapabilities
+    2. Identify the feature type's primary key from DescribeFeatureType response
+    3. Paginate with:
+       params = {
+           "SERVICE": "WFS", "VERSION": "2.0.0", "REQUEST": "GetFeature",
+           "TYPENAMES": "ms:municipios",
+           "COUNT": 500,
+           "STARTINDEX": offset,
+           "SORTBY": "cod_municipio ASC",  # stable unique key
+           "OUTPUTFORMAT": "application/json",
+       }
+    4. Stop when len(features) < COUNT (last page)
+    5. Deduplicate on primary key after full harvest as a safety check
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [requests, owslib]
+  domains:
+    domain: [data_engineering, geospatial, government_data]
+    concern: [pagination, data_integrity]
+  example_good: |
+    import requests
+
+    def harvest_wfs(
+        base_url: str,
+        typename: str,
+        sort_by: str,
+        page_size: int = 500,
+    ) -> list[dict]:
+        features = []
+        offset = 0
+
+        while True:
+            params = {
+                "SERVICE": "WFS", "VERSION": "2.0.0", "REQUEST": "GetFeature",
+                "TYPENAMES": typename,
+                "COUNT": page_size,
+                "STARTINDEX": offset,
+                "SORTBY": f"{sort_by} ASC",
+                "OUTPUTFORMAT": "application/json",
+            }
+            r = requests.get(base_url, params=params, timeout=120)
+            r.raise_for_status()
+            data = r.json()
+            page_features = data.get("features", [])
+            features.extend(page_features)
+            if len(page_features) < page_size:
+                break
+            offset += page_size
+
+        return features
+  example_bad: |
+    # WRONG: no SORTBY — pagination is non-deterministic
+    def bad_wfs_harvest(url: str, typename: str) -> list[dict]:
+        all_features = []
+        for offset in range(0, 10000, 500):
+            r = requests.get(url, params={"REQUEST": "GetFeature", "TYPENAMES": typename,
+                                          "COUNT": 500, "STARTINDEX": offset})
+            features = r.json().get("features", [])
+            if not features:
+                break
+            all_features.extend(features)
+        return all_features
+        # May produce duplicates or missing features if dataset changes mid-harvest
+  when_applies: >
+    Any WFS harvest: IBGE municipal boundaries, ANA hydrological data, INPE
+    deforestation polygons, ANTT transport networks, state geoportals.
+  sources:
+    - "OGC WFS 2.0.0 Specification §7.7.4.4 — Paging: https://portal.ogc.org/files/?artifact_id=39967"
+    - "GeoServer WFS docs: https://docs.geoserver.org/main/en/user/services/wfs/basics.html"
+
+- id: GOVDATA-004
+  text: >
+    For ArcGIS REST API query endpoints, use resultOffset + resultRecordCount for
+    pagination and always request exceededTransferLimit in the first response to
+    detect when results were silently capped. ArcGIS services default to 1000-2000
+    records per request and return partial results without an error.
+  why: >
+    ArcGIS REST services have a maxRecordCount property (often 1000 or 2000) set
+    by the server administrator. A query returning more than maxRecordCount silently
+    truncates results and sets exceededTransferLimit: true in the response. Many
+    developers check only HTTP status (200 OK) and miss this flag. A traffic
+    analysis pipeline processing DNIT road network data (120K features) was silently
+    receiving only 2000 features per run because exceededTransferLimit was not checked.
+  how_to_do_right: |
+    1. Query service metadata first: GET /MapServer/0?f=json
+       → extract maxRecordCount
+    2. Use outStatistics to get total count before paginating:
+       GET /MapServer/0/query?where=1=1&returnCountOnly=true&f=json
+    3. Paginate with resultOffset:
+       params = {"where": "1=1", "outFields": "*", "f": "geojson",
+                 "resultRecordCount": maxRecordCount,
+                 "resultOffset": offset,
+                 "orderByFields": "OBJECTID"}  # stable sort
+    4. Check response["exceededTransferLimit"] on every page
+    5. Stop when len(features) < resultRecordCount
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [requests, arcgis]
+  domains:
+    domain: [data_engineering, geospatial, government_data]
+    concern: [pagination, completeness]
+  example_good: |
+    import requests
+
+    def harvest_arcgis_layer(service_url: str, layer_id: int = 0) -> list[dict]:
+        """Harvest all features from ArcGIS REST layer with proper pagination."""
+        meta = requests.get(f"{service_url}/{layer_id}", params={"f": "json"}, timeout=30)
+        meta.raise_for_status()
+        max_records = meta.json().get("maxRecordCount", 1000)
+
+        count_r = requests.get(f"{service_url}/{layer_id}/query",
+                               params={"where": "1=1", "returnCountOnly": "true", "f": "json"},
+                               timeout=30)
+        total = count_r.json()["count"]
+
+        all_features = []
+        for offset in range(0, total, max_records):
+            r = requests.get(f"{service_url}/{layer_id}/query", params={
+                "where": "1=1", "outFields": "*", "f": "geojson",
+                "resultRecordCount": max_records, "resultOffset": offset,
+                "orderByFields": "OBJECTID",
+            }, timeout=120)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("exceededTransferLimit"):
+                raise RuntimeError(f"Unexpected exceededTransferLimit at offset {offset}")
+            all_features.extend(data.get("features", []))
+
+        return all_features
+  example_bad: |
+    # WRONG: no pagination, no exceededTransferLimit check
+    def bad_arcgis(url: str) -> list[dict]:
+        r = requests.get(f"{url}/0/query", params={"where": "1=1", "outFields": "*", "f": "geojson"})
+        return r.json()["features"]   # Silently capped at maxRecordCount (e.g., 2000)
+  when_applies: >
+    DNIT road network, ANAC airport data, ANVISA facility registrations,
+    state/municipal ArcGIS portals, any Esri ArcGIS Server endpoint.
+  sources:
+    - "ArcGIS REST API — Query (Feature Service): https://developers.arcgis.com/rest/services-reference/enterprise/query-feature-service-layer/"
+    - "ArcGIS — Paging support: https://developers.arcgis.com/rest/services-reference/enterprise/query-feature-service-layer/#resultoffset"
+
+- id: GOVDATA-005
+  text: >
+    For FTP/SFTP data sources (many government agencies still publish via FTP),
+    implement download with resume capability using checkpointing. Store the last
+    successfully downloaded byte offset per file; on resume, use REST/partial
+    content download or SFTP seek to skip already-downloaded bytes.
+  why: >
+    IBGE releases census microdata files as 2-10GB CSV/TXT archives via FTP.
+    A single interrupted download restarts from zero without resume capability,
+    wasting 30-120 minutes per interruption. The IBGE FTP server also has a
+    2-hour connection timeout, making resume essential for large files. A census
+    data pipeline that implemented resume cut average download time from 4.2h to
+    47 minutes by avoiding full restarts.
+  how_to_do_right: |
+    1. Use a checkpoint file: {download_dir}/{filename}.checkpoint with last byte offset
+    2. For HTTP: set Range header: "bytes={checkpoint_offset}-"
+    3. For FTP: use ftplib with retrbinary callback, seek to offset:
+       ftp.retrbinary(f"RETR {path}", callback, rest=checkpoint_offset)
+    4. Compute MD5/SHA256 of the complete file after download; compare with server checksum
+    5. Store checkpoint as {filename: str, offset: int, total_size: int, started_at: str}
+    6. On completion: verify checksum, delete checkpoint file
+    7. Implement exponential backoff for FTP reconnections: base=5s, max=300s
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [ftplib, paramiko, httpx]
+  domains:
+    domain: [data_engineering, government_data]
+    concern: [reliability, large_file_download, resumability]
+  example_good: |
+    import ftplib, hashlib, json, os
+    from pathlib import Path
+
+    def download_ftp_with_resume(
+        host: str, path: str, dest: Path, expected_md5: str | None = None
+    ) -> Path:
+        checkpoint_file = dest.with_suffix(".checkpoint")
+        offset = 0
+        if checkpoint_file.exists():
+            cp = json.loads(checkpoint_file.read_text())
+            offset = cp["offset"]
+
+        mode = "ab" if offset > 0 else "wb"
+        with ftplib.FTP(host, timeout=120) as ftp:
+            ftp.login()
+            with open(dest, mode) as f:
+                def callback(data):
+                    f.write(data)
+                    checkpoint_file.write_text(json.dumps({"offset": f.tell(), "path": str(path)}))
+                ftp.retrbinary(f"RETR {path}", callback, rest=offset if offset > 0 else None)
+
+        if expected_md5:
+            md5 = hashlib.md5(dest.read_bytes()).hexdigest()
+            if md5 != expected_md5:
+                raise ValueError(f"MD5 mismatch: got {md5}, expected {expected_md5}")
+        checkpoint_file.unlink(missing_ok=True)
+        return dest
+  example_bad: |
+    # WRONG: no resume — restarts from zero on any interruption
+    import ftplib
+    def bad_download(host: str, path: str, dest: str):
+        with ftplib.FTP(host) as ftp:
+            ftp.login()
+            with open(dest, "wb") as f:
+                ftp.retrbinary(f"RETR {path}", f.write)
+        # Interrupted at 80% → restart from 0%, wasting 4 hours
+  when_applies: >
+    IBGE FTP (ftp.ibge.gov.br), INPE PRODES/DETER data, DATASUS archives, CAPES
+    theses database, any government source that publishes multi-GB files via FTP/SFTP.
+  sources:
+    - "IBGE FTP server: ftp://ftp.ibge.gov.br"
+    - "Python ftplib — retrbinary rest parameter: https://docs.python.org/3/library/ftplib.html#ftplib.FTP.retrbinary"
+    - "RFC 7233 — HTTP Range Requests: https://datatracker.ietf.org/doc/html/rfc7233"
+
+- id: GOVDATA-006
+  text: >
+    When extracting tables from government PDFs, use pdfplumber as the primary
+    extractor (it uses pdfminer under the hood and preserves table structure),
+    tabula-py as a fallback for complex multi-column layouts, and pytesseract
+    OCR as the last resort for scanned PDFs. Never apply a single tool universally.
+  why: >
+    Government PDFs are notoriously heterogeneous: some are native-digital (directly
+    parseable), some are scanned images, some mix both. pdfplumber succeeds on ~70%
+    of BACEN regulatory documents. tabula-py handles complex multi-column tables
+    better but fails on scanned pages. pytesseract is accurate but 20x slower.
+    A pipeline that used only tabula-py on Diário Oficial PDFs failed silently on
+    30% of pages, producing empty DataFrames that were loaded as "no data" records.
+  how_to_do_right: |
+    1. Detect PDF type: check if page.extract_text() returns non-empty → native-digital
+    2. Attempt pdfplumber table extraction:
+       with pdfplumber.open(pdf_path) as pdf:
+           tables = pdf.pages[i].extract_tables()
+    3. If tables empty or confidence low, fallback to tabula-py:
+       tables = tabula.read_pdf(pdf_path, pages=page_num, multiple_tables=True)
+    4. If still empty and PDF is scanned: convert to image (pdf2image) and apply
+       pytesseract with lang="por" for Portuguese government documents
+    5. Validate extracted tables: check column count, non-null row %, expected headers
+    6. Log extraction method used per page for debugging
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pdfplumber, tabula-py, pytesseract, pdf2image]
+  domains:
+    domain: [data_engineering, document_processing, government_data]
+    concern: [robustness, extraction_quality]
+  example_good: |
+    import pdfplumber
+    import tabula
+    from pathlib import Path
+    import logging
+
+    def extract_pdf_tables(pdf_path: Path, page_num: int) -> list[list]:
+        """Try pdfplumber first, then tabula, then signal for OCR fallback."""
+        # Attempt 1: pdfplumber
+        with pdfplumber.open(pdf_path) as pdf:
+            page = pdf.pages[page_num - 1]
+            tables = page.extract_tables()
+            if tables and any(len(t) > 1 for t in tables):
+                logging.info(f"pdfplumber succeeded on page {page_num}")
+                return tables
+
+        # Attempt 2: tabula-py
+        try:
+            dfs = tabula.read_pdf(str(pdf_path), pages=page_num, multiple_tables=True)
+            if dfs and any(not df.empty for df in dfs):
+                logging.info(f"tabula-py succeeded on page {page_num}")
+                return [df.values.tolist() for df in dfs if not df.empty]
+        except Exception as e:
+            logging.warning(f"tabula-py failed on page {page_num}: {e}")
+
+        # Signal that OCR is needed
+        logging.warning(f"Both extractors failed on page {page_num} — OCR required")
+        return []
+  example_bad: |
+    # WRONG: single tool, no fallback, no validation
+    import tabula
+    def bad_extract(pdf_path: str) -> list:
+        dfs = tabula.read_pdf(pdf_path, pages="all")
+        return [df.to_dict() for df in dfs]
+        # Returns empty dicts for scanned pages, silently losing data
+  when_applies: >
+    Diários Oficiais (federal and state), BACEN normative circulars, CVM regulatory
+    acts, ANATEL/ANVISA publications, TCU/TCE audit reports, BNDES operational reports.
+  sources:
+    - "pdfplumber: https://github.com/jsvine/pdfplumber"
+    - "tabula-py: https://github.com/chezou/tabula-py"
+    - "pytesseract: https://github.com/madmaze/pytesseract"
+
+- id: GOVDATA-007
+  text: >
+    When consuming Querido Diário (official gazette XML/TXT data), use the project's
+    open API for structured search rather than raw text scraping. The Querido Diário
+    API provides entity extraction, date filtering, and territory filtering that
+    would take months to replicate. For bulk historical data, use the project's
+    S3-compatible bulk download endpoint.
+  why: >
+    Querido Diário aggregates Official Gazettes from 4,700+ Brazilian municipalities.
+    Raw scraping each municipality's portal requires handling 4,700 different HTML
+    structures. The Querido Diário API abstracts this entirely. A civic tech project
+    that scraped raw gazette HTML spent 4 months building parsers that the Querido
+    Diário project had already built in 3 years with community contributions.
+  how_to_do_right: |
+    1. Use the public API for queries:
+       GET https://queridodiario.ok.org.br/api/gazettes
+       ?territory_id=3550308  # IBGE code for São Paulo municipality
+       &published_since=2024-01-01
+       &querystring=licitação+contrato
+       &size=10&offset=0
+    2. For bulk historical: use the MinIO S3 endpoint at
+       https://queridodiario.ok.org.br/data/  (public bucket)
+    3. Use territory_id from IBGE 7-digit code (e.g., 3550308 = São Paulo)
+    4. Results include txt_url and raw_txt fields for full gazette text
+    5. Respect the API: use If-None-Match / ETag for incremental updates
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [requests, httpx]
+  domains:
+    domain: [data_engineering, government_data, brazil]
+    concern: [api_usage, data_discovery]
+  example_good: |
+    import requests
+
+    QUERIDO_DIARIO_API = "https://queridodiario.ok.org.br/api"
+
+    def search_gazette(
+        ibge_code: str,
+        query: str,
+        since: str,
+        page_size: int = 20,
+    ) -> list[dict]:
+        """Search Querido Diário for gazette excerpts by territory and query."""
+        offset = 0
+        all_results = []
+
+        while True:
+            r = requests.get(f"{QUERIDO_DIARIO_API}/gazettes", params={
+                "territory_id": ibge_code,
+                "querystring": query,
+                "published_since": since,
+                "size": page_size,
+                "offset": offset,
+            }, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            gazettes = data.get("gazettes", [])
+            all_results.extend(gazettes)
+            if len(gazettes) < page_size:
+                break
+            offset += page_size
+
+        return all_results
+  example_bad: |
+    # WRONG: scraping municipal gazette portals directly
+    import requests
+    from bs4 import BeautifulSoup
+    # Each municipality has different HTML structure — unscalable
+    def bad_scrape(municipio_url: str) -> list[str]:
+        r = requests.get(municipio_url)
+        soup = BeautifulSoup(r.text, "html.parser")
+        return [a["href"] for a in soup.find_all("a", class_="gazette-link")]
+        # Breaks when municipality redesigns portal; scales to 0 of 4700
+  when_applies: >
+    Any project that needs to monitor or analyze Brazilian Official Gazettes
+    (Diários Oficiais) at municipal, state, or federal level.
+  sources:
+    - "Querido Diário project: https://queridodiario.ok.org.br"
+    - "Querido Diário API docs: https://queridodiario.ok.org.br/api/docs"
+    - "Open Knowledge Brasil: https://ok.org.br/projetos/querido-diario/"
+
+- id: GOVDATA-008
+  text: >
+    Implement per-source rate limiting and circuit breaking for government data
+    connectors. Government portals have unpredictable rate limits (often undocumented),
+    and a single burst of requests can trigger IP bans lasting hours to days. Use
+    a token bucket limiter with conservative defaults: 1 req/sec for most government
+    portals, 0.5 req/sec for DATASUS/CNES.
+  why: >
+    dados.gov.br's Nginx proxy blocks IPs that exceed ~10 req/s with 429 responses
+    that persist for up to 24 hours (not standard 429 with Retry-After). DATASUS
+    blocks IPs for 48-72 hours after 50+ rapid requests. A data pipeline team was
+    IP-blocked for 3 days after running a test with 200 concurrent requests against
+    CNES, halting production ETL for their entire health data product.
+  how_to_do_right: |
+    1. Use a per-source rate limiter (token bucket):
+       from ratelimit import limits, sleep_and_retry
+       CALLS_PER_SECOND = {"dados.gov.br": 1, "datasus.gov.br": 0.5, "ibge.gov.br": 2}
+    2. Respect robots.txt — parse Crawl-delay directive before first request
+    3. Implement circuit breaker: after 3 consecutive 429/503 responses, open circuit
+       and wait exponential(base=60s, factor=2, max=1800s) before retrying
+    4. Set User-Agent to identify your pipeline: "MyPipeline/1.0 (contact@org.br)"
+    5. Check for Retry-After header on 429 — honor it exactly
+    6. Log all rate limit events with source URL and timestamp
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [requests, httpx, ratelimit]
+  domains:
+    domain: [data_engineering, government_data, reliability]
+    concern: [rate_limiting, ip_protection, circuit_breaker]
+  example_good: |
+    import time, logging
+    from collections import defaultdict
+    from datetime import datetime, UTC
+
+    class SourceRateLimiter:
+        """Token bucket rate limiter per source domain."""
+        RATES = {  # requests per second
+            "dados.gov.br": 1.0,
+            "datasus.gov.br": 0.5,
+            "ibge.gov.br": 2.0,
+            "default": 1.0,
+        }
+
+        def __init__(self):
+            self._last_call: dict[str, float] = defaultdict(float)
+
+        def wait(self, source: str) -> None:
+            rate = self.RATES.get(source, self.RATES["default"])
+            min_interval = 1.0 / rate
+            elapsed = time.time() - self._last_call[source]
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+            self._last_call[source] = time.time()
+
+    _limiter = SourceRateLimiter()
+
+    def safe_get(url: str, **kwargs) -> "requests.Response":
+        from urllib.parse import urlparse
+        import requests
+        source = urlparse(url).netloc
+        _limiter.wait(source)
+        resp = requests.get(url, **kwargs)
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", 60))
+            logging.warning(f"Rate limited by {source}. Waiting {retry_after}s.")
+            time.sleep(retry_after)
+            resp = requests.get(url, **kwargs)
+        resp.raise_for_status()
+        return resp
+  example_bad: |
+    # WRONG: no rate limiting — concurrent requests trigger IP ban
+    from concurrent.futures import ThreadPoolExecutor
+    import requests
+    def bad_bulk_fetch(urls: list[str]) -> list:
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            return list(ex.map(requests.get, urls))
+        # 20 concurrent requests to datasus.gov.br → IP banned for 48h
+  when_applies: >
+    All government data source connectors. Apply before the first production run,
+    not after receiving your first IP ban.
+  sources:
+    - "CKAN docs — API limits: https://docs.ckan.org/en/2.10/api/"
+    - "RFC 6585 — 429 Too Many Requests: https://datatracker.ietf.org/doc/html/rfc6585"
+    - "Robots Exclusion Protocol: https://www.rfc-editor.org/rfc/rfc9309"
+
+- id: GOVDATA-009
+  text: >
+    Implement schema change detection for government data sources. Government portals
+    silently change column names, data types, and value encoding without versioning
+    or announcements. Run a schema fingerprint check on every sync and alert on
+    any structural change before loading data to your warehouse.
+  why: >
+    SINAN (Sistema de Informação de Agravos de Notificação) renamed its primary
+    disease code column from "ID_AGRAVO" to "SG_AGRAVO" in 2022 with no release
+    notes. Pipelines that ran for months after this change silently loaded NULL
+    for all disease codes. The CNES (Cadastro Nacional de Estabelecimentos de Saúde)
+    changed its encoding from ISO-8859-1 to UTF-8 in a mid-year release, breaking
+    all text columns until the connector was updated.
+  how_to_do_right: |
+    1. On first load, store schema fingerprint:
+       fingerprint = {
+           "columns": sorted(list(df.columns)),
+           "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
+           "sample_values": {col: str(df[col].iloc[0]) for col in df.columns[:5]},
+           "captured_at": datetime.now(UTC).isoformat(),
+       }
+    2. On every subsequent load, compute new fingerprint and compare
+    3. On change: raise SchemaChangedError with diff; do NOT silently load
+    4. After manual review: update stored fingerprint with migration notes
+    5. For encoding: always explicitly specify encoding='latin1' or 'utf-8'
+       — never rely on auto-detection for government files
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pandas, sqlalchemy]
+  domains:
+    domain: [data_engineering, government_data, data_quality]
+    concern: [schema_drift, data_quality, monitoring]
+  example_good: |
+    import json, hashlib
+    from pathlib import Path
+    import pandas as pd
+
+    class SchemaGuard:
+        def __init__(self, schema_store: Path):
+            self.store = schema_store
+            self.store.mkdir(exist_ok=True)
+
+        def _fingerprint(self, df: pd.DataFrame) -> dict:
+            return {"columns": sorted(df.columns.tolist()),
+                    "dtypes": {c: str(t) for c, t in df.dtypes.items()}}
+
+        def check_or_register(self, source_id: str, df: pd.DataFrame) -> None:
+            fp_file = self.store / f"{source_id}.json"
+            current = self._fingerprint(df)
+            if not fp_file.exists():
+                fp_file.write_text(json.dumps(current, indent=2))
+                return
+            stored = json.loads(fp_file.read_text())
+            added = set(current["columns"]) - set(stored["columns"])
+            removed = set(stored["columns"]) - set(current["columns"])
+            if added or removed:
+                raise ValueError(
+                    f"Schema changed for {source_id}: added={added}, removed={removed}"
+                )
+  example_bad: |
+    # WRONG: no schema validation — silent column name changes load as NULLs
+    def load_sinan(filepath: str, engine) -> None:
+        df = pd.read_csv(filepath)  # auto-detect encoding (may be wrong)
+        df.to_sql("sinan_notifications", engine, if_exists="append")
+        # If "ID_AGRAVO" → "SG_AGRAVO" change: loads months of NULL disease codes
+  when_applies: >
+    DATASUS (SINAN, SIH, SIA, CNES), IBGE (PNAD, CENSO), INEP (ENEM, IDEB),
+    MEC, ANTT, ANATEL — any government source with annual or irregular releases.
+  sources:
+    - "DATASUS — SINAN documentation: https://datasus.saude.gov.br/transferencia-de-arquivos/"
+    - "pandas — read_csv encoding: https://pandas.pydata.org/docs/reference/api/pandas.read_csv.html"
+
+- id: GOVDATA-010
+  text: >
+    For incremental synchronization of government datasets that support it, use
+    ETag + If-None-Match headers for HTTP resources and last-modified timestamps
+    for CKAN datasets. For sources without native change detection, implement
+    content fingerprinting (SHA256 of the resource) to avoid reprocessing unchanged files.
+  why: >
+    IBGE publishes monthly updates to CNPJ data (a 30GB file). A pipeline that
+    re-downloads the full file monthly wastes 30GB of bandwidth and 2 hours of
+    processing per run. With ETag-based incremental sync (the IBGE server does
+    support ETag), the pipeline downloads nothing in months without changes and
+    only the diff in months with updates — reducing monthly download from 30GB to
+    ~500MB on average.
+  how_to_do_right: |
+    1. Store the ETag or Last-Modified value after each successful download
+    2. On next run, send If-None-Match: {etag} or If-Modified-Since: {datetime}
+    3. HTTP 304 Not Modified → skip download, use cached version
+    4. HTTP 200 → new content, download and update stored ETag
+    5. For CKAN: use metadata_modified field from package_show API
+    6. For sources without ETag: compute SHA256 of first 1MB as a fast change indicator;
+       if changed, download full file and verify full SHA256
+    7. Store sync state in a JSON file or lightweight DB (SQLite) per source
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [requests, httpx]
+  domains:
+    domain: [data_engineering, government_data]
+    concern: [performance, incremental_sync, bandwidth]
+  example_good: |
+    import json, hashlib, requests
+    from pathlib import Path
+    from datetime import datetime, UTC
+
+    def incremental_download(
+        url: str, dest: Path, state_file: Path
+    ) -> tuple[bool, Path]:
+        """Returns (changed, dest). Uses ETag for incremental sync."""
+        state = json.loads(state_file.read_text()) if state_file.exists() else {}
+        headers = {}
+        if "etag" in state:
+            headers["If-None-Match"] = state["etag"]
+
+        r = requests.get(url, headers=headers, stream=True, timeout=30)
+        if r.status_code == 304:
+            return False, dest  # not modified
+
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=65536):
+                f.write(chunk)
+
+        state["etag"] = r.headers.get("ETag", "")
+        state["last_downloaded"] = datetime.now(UTC).isoformat()
+        state_file.write_text(json.dumps(state))
+        return True, dest
+  example_bad: |
+    # WRONG: always re-download regardless of changes
+    def bad_download(url: str, dest: str):
+        r = requests.get(url)   # 30GB downloaded every run, even if unchanged
+        Path(dest).write_bytes(r.content)
+  when_applies: >
+    IBGE CNPJ data, CNES monthly updates, RAIS annual releases, SINAN weekly reports,
+    any source that publishes regular updated snapshots of stable datasets.
+  sources:
+    - "RFC 7232 — Conditional Requests (ETag, If-None-Match): https://datatracker.ietf.org/doc/html/rfc7232"
+    - "CKAN package_show metadata_modified: https://docs.ckan.org/en/2.10/api/"
+
+- id: GOVDATA-011
+  text: >
+    Implement a source health monitor that tracks availability, response time,
+    and content freshness for each government data source. Alert when a source
+    has been down for >24h or has not updated data within its expected refresh
+    schedule. Government portals have ~96% uptime (not 99.9%) — plan for outages.
+  why: >
+    Portal de Transparência Federal has scheduled maintenance windows on Sundays
+    02:00-06:00 BRT (undocumented until 2023). dados.gov.br experiences multi-hour
+    outages roughly once per month. A health analytics platform that relied on
+    CNES for hospital capacity data had a 3-day silent data gap during a DATASUS
+    migration, causing their dashboard to show stale data without any alert.
+  how_to_do_right: |
+    1. Probe each source every 15 minutes with a lightweight HEAD or metadata request
+    2. Track: last_successful_response, consecutive_failures, last_data_date
+    3. Alert if: consecutive_failures > 3 (45 min down) OR last_data_date > expected_age
+    4. Store health state in Redis with TTL=1h; write to time-series DB for trends
+    5. Implement fallback: if primary source unavailable, serve cached last-known-good
+    6. Document expected refresh schedule per source in connector metadata:
+       SOURCES["cnes"]["expected_refresh_days"] = 30  # monthly
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [fastapi, redis, prometheus_client]
+  domains:
+    domain: [data_engineering, government_data, observability]
+    concern: [monitoring, availability, freshness]
+  example_good: |
+    import time, requests
+    from dataclasses import dataclass, field
+    from datetime import datetime, UTC
+
+    @dataclass
+    class SourceHealth:
+        source_id: str
+        probe_url: str
+        expected_refresh_days: int
+        consecutive_failures: int = 0
+        last_success: datetime | None = None
+        last_data_date: datetime | None = None
+
+        def probe(self) -> bool:
+            try:
+                r = requests.head(self.probe_url, timeout=10)
+                if r.status_code < 400:
+                    self.consecutive_failures = 0
+                    self.last_success = datetime.now(UTC)
+                    return True
+            except Exception:
+                pass
+            self.consecutive_failures += 1
+            return False
+
+        @property
+        def is_stale(self) -> bool:
+            if not self.last_data_date:
+                return True
+            age = (datetime.now(UTC) - self.last_data_date).days
+            return age > self.expected_refresh_days * 1.5  # 50% grace period
+
+        @property
+        def needs_alert(self) -> bool:
+            return self.consecutive_failures >= 3 or self.is_stale
+  example_bad: |
+    # WRONG: no health monitoring — silent data gaps for days
+    def fetch_cnes(url: str) -> pd.DataFrame:
+        return pd.read_csv(url)  # no health check, no freshness validation
+  when_applies: >
+    Any pipeline with SLA requirements that depends on external government sources.
+    Implement before production launch, not after the first silent outage.
+  sources:
+    - "DATASUS maintenance page: https://datasus.saude.gov.br"
+    - "dados.gov.br status: https://status.dados.gov.br"
+    - "Google SRE Book — Monitoring Distributed Systems: https://sre.google/sre-book/monitoring-distributed-systems/"
+
+- id: GOVDATA-012
+  text: >
+    Harvest Dublin Core and DCAT metadata from CKAN portals alongside the data.
+    Store dataset title, publisher, license, temporal coverage, update frequency,
+    and geographic scope in your metadata catalog. This metadata is essential for
+    data discovery, lineage tracking, and LGPD compliance documentation.
+  why: >
+    Government open data licenses vary significantly: some datasets allow commercial
+    reuse (CC-BY), others are restricted to non-commercial research (CC-NC). Using
+    a restricted-license dataset in a commercial product without checking its CKAN
+    license field creates legal liability. The LGPD (Lei Geral de Proteção de Dados)
+    also requires documentation of data provenance for personal data processing —
+    CKAN metadata provides this automatically if harvested.
+  how_to_do_right: |
+    1. For each CKAN package, harvest:
+       metadata = {
+           "id": pkg["id"],
+           "title": pkg["title"],
+           "license": pkg.get("license_title", "unknown"),
+           "organization": pkg.get("organization", {}).get("title"),
+           "temporal_start": pkg.get("temporal_coverage_start"),
+           "temporal_end": pkg.get("temporal_coverage_end"),
+           "update_frequency": pkg.get("frequency"),
+           "geographic_scope": pkg.get("spatial"),
+           "resources": [{"id": r["id"], "format": r["format"], "url": r["url"]}
+                         for r in pkg.get("resources", [])],
+       }
+    2. Reject or flag datasets with license=None or license="proprietary"
+    3. Store in a metadata catalog with full-text search (Elasticsearch or Qdrant)
+    4. Link every data load event to its source metadata record for lineage
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [requests]
+  domains:
+    domain: [data_engineering, government_data, data_governance]
+    concern: [metadata, licensing, lgpd_compliance, data_lineage]
+  example_good: |
+    import requests
+    from typing import TypedDict
+
+    class DatasetMetadata(TypedDict):
+        id: str
+        title: str
+        license: str
+        organization: str
+        update_frequency: str
+        temporal_coverage: str
+
+    def harvest_dataset_metadata(package_id: str, ckan_base: str) -> DatasetMetadata:
+        r = requests.get(f"{ckan_base}/api/3/action/package_show",
+                        params={"id": package_id}, timeout=30)
+        r.raise_for_status()
+        pkg = r.json()["result"]
+        return {
+            "id": pkg["id"],
+            "title": pkg.get("title", ""),
+            "license": pkg.get("license_title", "UNKNOWN — verify before use"),
+            "organization": pkg.get("organization", {}).get("title", ""),
+            "update_frequency": pkg.get("frequency", ""),
+            "temporal_coverage": f"{pkg.get('temporal_coverage_start','')} / {pkg.get('temporal_coverage_end','')}",
+        }
+  example_bad: |
+    # WRONG: harvest data without metadata — unknown license, no lineage
+    def load_dataset(resource_url: str, db_table: str):
+        df = pd.read_csv(resource_url)  # no license check, no metadata stored
+        df.to_sql(db_table, engine)     # cannot answer "where did this data come from?"
+  when_applies: >
+    All data pipelines that load government datasets into a warehouse or data lake.
+    Required before production for LGPD Article 37 documentation requirements.
+  sources:
+    - "CKAN DCAT support: https://docs.ckan.org/en/2.10/maintaining/linked-data-and-rdf.html"
+    - "W3C DCAT 2: https://www.w3.org/TR/vocab-dcat-2/"
+    - "LGPD Art. 37 — registro de operações de tratamento: https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2018/lei/l13709.htm"
+
+- id: GOVDATA-013
+  text: >
+    Implement connector-level retry with exponential backoff and jitter for all
+    government data source HTTP requests. Use a per-connector circuit breaker that
+    opens after 5 consecutive failures and remains open for 5 minutes before
+    attempting a half-open probe. This prevents cascade failures when a source is
+    undergoing maintenance.
+  why: >
+    Portal de Transparência Federal returns 503 during maintenance windows, which
+    can last up to 4 hours. Without circuit breaking, a pipeline retrying every 30
+    seconds sends 480 blocked requests during the window, wasting resources and
+    potentially extending the IP block. With a circuit breaker, the pipeline sends
+    ~5 probes during the window, detects recovery automatically, and resumes with
+    full throughput. A fiscal transparency platform reduced wasted API calls by 98%
+    after implementing circuit breaking on government connectors.
+  how_to_do_right: |
+    1. Use tenacity for retries with exponential backoff:
+       @retry(
+           stop=stop_after_attempt(5),
+           wait=wait_exponential(multiplier=1, min=2, max=120) + wait_random(0, 5),
+           retry=retry_if_exception_type(requests.RequestException),
+           reraise=True,
+       )
+    2. Implement circuit breaker state: CLOSED → OPEN → HALF_OPEN
+    3. CLOSED: normal operation
+    4. OPEN: after 5 failures, reject calls immediately, return cached data or raise
+    5. HALF_OPEN: after 5 min, allow 1 probe request through
+    6. On probe success: HALF_OPEN → CLOSED
+    7. On probe failure: HALF_OPEN → OPEN (reset 5-min timer)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [tenacity, requests]
+  domains:
+    domain: [data_engineering, government_data, reliability]
+    concern: [retry_strategy, circuit_breaker, resilience]
+  example_good: |
+    from tenacity import retry, stop_after_attempt, wait_exponential, wait_random
+    from enum import Enum
+    import time, requests
+
+    class CircuitState(Enum):
+        CLOSED = "closed"
+        OPEN = "open"
+        HALF_OPEN = "half_open"
+
+    class GovernmentConnector:
+        def __init__(self, base_url: str):
+            self.base_url = base_url
+            self._state = CircuitState.CLOSED
+            self._failures = 0
+            self._opened_at: float = 0.0
+
+        @retry(stop=stop_after_attempt(3),
+               wait=wait_exponential(multiplier=2, min=2, max=60) + wait_random(0, 3))
+        def _request(self, path: str) -> dict:
+            if self._state == CircuitState.OPEN:
+                if time.time() - self._opened_at > 300:
+                    self._state = CircuitState.HALF_OPEN
+                else:
+                    raise RuntimeError(f"Circuit open for {self.base_url}")
+            try:
+                r = requests.get(f"{self.base_url}{path}", timeout=30)
+                r.raise_for_status()
+                self._failures = 0
+                self._state = CircuitState.CLOSED
+                return r.json()
+            except Exception:
+                self._failures += 1
+                if self._failures >= 5:
+                    self._state = CircuitState.OPEN
+                    self._opened_at = time.time()
+                raise
+  example_bad: |
+    # WRONG: no retry, no circuit breaker
+    def bad_request(url: str) -> dict:
+        return requests.get(url, timeout=5).json()
+        # On maintenance: 480 failed requests in 4h, possible IP block
+  when_applies: >
+    All government connector classes: CKAN connectors, DATASUS, IBGE, ANATEL,
+    ANVISA, Portal da Transparência, TCU, any source with documented maintenance windows.
+  sources:
+    - "tenacity docs: https://tenacity.readthedocs.io/en/latest/"
+    - "Martin Fowler — Circuit Breaker: https://martinfowler.com/bliki/CircuitBreaker.html"
+    - "Microsoft — Retry pattern: https://learn.microsoft.com/en-us/azure/architecture/patterns/retry"
+
+- id: GOVDATA-014
+  text: >
+    When consuming RSS/Atom feeds from government news sources and regulatory bodies
+    (BACEN, CVM, ANATEL, Receita Federal), always process the published date and
+    guid/id fields for idempotent incremental consumption. Store processed guids in
+    a set and skip re-processing on each poll cycle to avoid duplicate event handling.
+  why: >
+    BACEN's RSS feed for normative circulars occasionally re-publishes old items
+    with updated links but the same publication date when they fix a typo in the
+    original document. A regulatory compliance alert system that did not deduplicate
+    by guid sent 47 duplicate notifications to compliance officers over 3 months,
+    causing alert fatigue and missed real regulatory changes because officers began
+    ignoring "duplicate-looking" notifications.
+  how_to_do_right: |
+    1. Parse feed with feedparser library
+    2. For each entry, use entry.id (guid) as the unique key, not the title or URL
+    3. Store processed guids in Redis SET with TTL=90 days (covers update windows)
+    4. Before processing: if redis.sismember("feed:processed", entry.id) → skip
+    5. After processing: redis.sadd("feed:processed", entry.id)
+    6. Sort entries by published_parsed timestamp before processing (feeds may be unordered)
+    7. For feeds without guid: compute SHA256 of (title + published + link) as synthetic id
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [feedparser, redis]
+  domains:
+    domain: [data_engineering, government_data, event_processing]
+    concern: [idempotency, deduplication]
+  example_good: |
+    import feedparser, hashlib
+    import redis
+
+    REDIS = redis.Redis()
+    PROCESSED_KEY = "feed:processed"
+
+    def consume_bacen_feed(feed_url: str) -> list[dict]:
+        feed = feedparser.parse(feed_url)
+        new_entries = []
+
+        # Sort by publication date (oldest first for ordered processing)
+        entries = sorted(feed.entries, key=lambda e: e.get("published_parsed", 0))
+
+        for entry in entries:
+            # Use guid if available; synthesize otherwise
+            guid = entry.get("id") or hashlib.sha256(
+                f"{entry.get('title','')}{entry.get('published','')}{entry.get('link','')}".encode()
+            ).hexdigest()
+
+            if REDIS.sismember(PROCESSED_KEY, guid):
+                continue  # already processed
+
+            new_entries.append({
+                "guid": guid,
+                "title": entry.get("title", ""),
+                "link": entry.get("link", ""),
+                "published": entry.get("published", ""),
+                "summary": entry.get("summary", ""),
+            })
+            REDIS.sadd(PROCESSED_KEY, guid)
+            REDIS.expire(PROCESSED_KEY, 7776000)  # 90 days
+
+        return new_entries
+  example_bad: |
+    # WRONG: no deduplication, no ordering
+    def bad_feed(url: str) -> list[dict]:
+        feed = feedparser.parse(url)
+        return [{"title": e.title, "link": e.link} for e in feed.entries]
+        # Re-processes same entries on every poll; sends duplicate alerts
+  when_applies: >
+    BACEN normative circulars feed, CVM regulatory acts, DOU (Diário Oficial da União)
+    RSS, ANVISA product alerts, ANATEL spectrum updates, any regulatory notification feed.
+  sources:
+    - "feedparser docs: https://feedparser.readthedocs.io/en/latest/"
+    - "Atom Syndication Format RFC 4287 — id element: https://datatracker.ietf.org/doc/html/rfc4287#section-4.2.6"
+    - "Redis SADD: https://redis.io/commands/sadd/"
+
+- id: GOVDATA-015
+  text: >
+    Validate data quality per-source on every load using a minimum set of checks:
+    null rate per column, row count within expected range, value format consistency
+    (e.g., CNPJ format, CPF format, CEP), and referential integrity for known
+    code lists (CID-10 codes, IBGE municipality codes). Reject loads that fail
+    quality thresholds rather than loading corrupt data.
+  why: >
+    SINAN dengue notifications have a documented null rate of ~15% for the
+    "Evolucao" (patient outcome) field — this is expected. A null rate of >50%
+    indicates a broken export. A health analytics platform loaded 3 months of
+    corrupt SINAN data (null rate 92% for key columns due to a DATASUS export
+    bug) without quality checks, generating erroneous epidemiological dashboards
+    that were cited in two news articles before the error was discovered.
+  how_to_do_right: |
+    1. Define per-source quality profiles:
+       QUALITY_PROFILES["sinan_dengue"] = {
+           "min_rows": 5000, "max_rows": 500000,
+           "max_null_rate": {"ID_AGRAVO": 0.0, "DT_NOTIFIC": 0.01, "CS_EVOLUCAO": 0.30},
+           "cnpj_columns": [],
+           "ibge_columns": ["ID_MUNICIP"],
+       }
+    2. After loading each batch: compute actual null rates and compare to profile
+    3. If actual_null_rate > max_null_rate * 1.5: raise DataQualityError
+    4. Validate CNPJ with algorithm (check digit validation)
+    5. Validate IBGE codes against the official 7-digit municipality code list
+    6. On failure: quarantine the batch, alert data team, serve last-known-good
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pandas, great_expectations]
+  domains:
+    domain: [data_engineering, government_data, data_quality]
+    concern: [data_validation, quality_gates]
+  example_good: |
+    import pandas as pd
+    from dataclasses import dataclass
+
+    @dataclass
+    class QualityProfile:
+        min_rows: int
+        max_rows: int
+        max_null_rate: dict[str, float]  # column → max acceptable null rate
+
+    PROFILES: dict[str, QualityProfile] = {
+        "sinan_dengue": QualityProfile(
+            min_rows=5_000, max_rows=500_000,
+            max_null_rate={"ID_AGRAVO": 0.0, "DT_NOTIFIC": 0.01, "CS_EVOLUCAO": 0.30}
+        )
+    }
+
+    def validate_quality(df: pd.DataFrame, source_id: str) -> None:
+        profile = PROFILES.get(source_id)
+        if not profile:
+            return  # no profile registered — warn, don't block
+        if not (profile.min_rows <= len(df) <= profile.max_rows):
+            raise ValueError(f"{source_id}: row count {len(df)} outside [{profile.min_rows}, {profile.max_rows}]")
+        for col, max_null in profile.max_null_rate.items():
+            if col not in df.columns:
+                raise ValueError(f"{source_id}: expected column '{col}' missing — schema changed?")
+            actual = df[col].isnull().mean()
+            if actual > max_null * 1.5:  # 50% grace
+                raise ValueError(f"{source_id}: column '{col}' null rate {actual:.1%} > threshold {max_null:.1%}")
+  example_bad: |
+    # WRONG: no quality validation — corrupt data loaded silently
+    def load_sinan(filepath: str, engine) -> None:
+        df = pd.read_csv(filepath, encoding="latin1")
+        df.to_sql("sinan", engine, if_exists="append", index=False)
+        # 92% null rate in key columns loaded without any alert
+  when_applies: >
+    All government data loads: DATASUS (SINAN, SIH, SIA, CNES), IBGE, INEP,
+    Portal da Transparência. Define quality profiles before the first production load.
+  sources:
+    - "DATASUS — SINAN data dictionary: https://datasus.saude.gov.br/transferencia-de-arquivos/"
+    - "Great Expectations: https://greatexpectations.io/expectations/"
+    - "IBGE — Código de Municípios: https://www.ibge.gov.br/explica/codigos-dos-municipios.php"

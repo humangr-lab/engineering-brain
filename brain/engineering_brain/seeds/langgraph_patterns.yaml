@@ -1,0 +1,1839 @@
+layer: rules
+domain: agent_orchestration
+knowledge:
+- id: LG-001
+  text: >
+    Define StateGraph state with TypedDict + Annotated reducers for every field that
+    accumulates data across nodes. Default behavior (no Annotated) is overwrite — two
+    parallel nodes returning the same key silently drop one value. Message history
+    requires add_messages reducer; counter fields need operator.add.
+  why: >
+    LangGraph supersteps run parallel nodes simultaneously. When two nodes both return
+    {"messages": [new_message]}, only the last-writer-wins without a reducer. The
+    add_messages reducer merges by message ID: new messages append, updated messages
+    replace by ID. This is the #1 source of lost data in parallel LangGraph workflows.
+    In our own pipeline, parallel QA and writer nodes both updating "output" resulted
+    in writer output being silently overwritten by QA output 50% of the time — a
+    non-deterministic bug that took 3 runs to reproduce.
+  how_to_do_right: |
+    1. Use TypedDict for state definition — it is the most explicit and IDE-friendly.
+    2. Annotate EVERY field that accumulates: Annotated[list, operator.add] for lists,
+       Annotated[int, operator.add] for counters, Annotated[list, add_messages] for message history.
+    3. Leave fields as plain types ONLY when last-write-wins is intentional.
+    4. Never put transient/ephemeral data in state — use function scope instead.
+    5. Use MessagesState as base class for chat agents (saves boilerplate).
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [langgraph]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [state_management, parallel_execution]
+  example_good: |
+    from typing import TypedDict, Annotated, Optional
+    import operator
+    from langgraph.graph import add_messages
+    from langchain_core.messages import BaseMessage
+
+    class PipelineState(TypedDict):
+        # Accumulates — add_messages merges by ID, never overwrites
+        messages: Annotated[list[BaseMessage], add_messages]
+
+        # Accumulates — operator.add concatenates lists from parallel nodes
+        findings: Annotated[list[str], operator.add]
+
+        # Accumulates — operator.add sums token counts
+        total_tokens_used: Annotated[int, operator.add]
+
+        # Last-write-wins — OK for scalar config set once
+        company_name: str
+
+        # Optional — explicitly None until set
+        final_report: Optional[str]
+
+    # Parallel nodes can safely both write to findings and messages
+    def researcher_node(state: PipelineState) -> dict:
+        return {
+            "findings": ["finding from researcher"],
+            "total_tokens_used": 500,
+        }
+
+    def analyst_node(state: PipelineState) -> dict:
+        return {
+            "findings": ["finding from analyst"],
+            "total_tokens_used": 300,
+        }
+    # Result: state.findings = ["finding from researcher", "finding from analyst"]
+    # Result: state.total_tokens_used = 800
+  example_bad: |
+    from typing import TypedDict
+
+    class PipelineState(TypedDict):
+        findings: list[str]  # No reducer — last-write-wins in parallel execution
+        messages: list       # No add_messages — message history gets overwritten
+
+    # Parallel nodes:
+    def researcher_node(state: PipelineState) -> dict:
+        return {"findings": ["finding from researcher"]}
+
+    def analyst_node(state: PipelineState) -> dict:
+        return {"findings": ["finding from analyst"]}
+
+    # RACE CONDITION: only one finding survives — non-deterministic, no error raised
+    # findings = ["finding from analyst"]  OR  findings = ["finding from researcher"]
+    # Drops 50% of data silently
+  when_applies: When defining any LangGraph StateGraph state schema. Every state field must be a deliberate choice between overwrite and accumulate.
+  sources:
+    - "https://docs.langchain.com/oss/python/langgraph/graph-api"
+    - "https://medium.com/@omeryalcin48/langgraph-notes-state-management-62ea5b5a5cdd"
+
+- id: LG-002
+  text: >
+    Node functions must be pure with respect to state: receive state, return a dict
+    of state updates — never mutate the input state object. LangGraph's checkpointing
+    serializes the state after each node; in-place mutation bypasses the checkpoint
+    and makes state recovery unreliable after failures.
+  why: >
+    LangGraph checkpoints state AFTER a node returns, by applying the returned dict
+    to the current state via reducers. If a node mutates state in-place (state["key"] = value),
+    the mutation occurs before the checkpoint, but the returned {} empty dict causes
+    LangGraph to think nothing changed. On resume from checkpoint, the mutation is
+    lost. This produces silent data loss during fault recovery. Treat each node as a
+    pure function: old_state + returned_dict = new_state.
+  how_to_do_right: |
+    1. Node signature: def node(state: MyState, config: RunnableConfig) -> dict
+    2. Read from state freely: data = state["key"]
+    3. NEVER write to state: state["key"] = value is forbidden
+    4. Return ONLY the keys that changed: {"output": result}
+    5. For testing: call the node function directly with a test state dict and assert on the returned dict.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langgraph]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [node_design, checkpointing]
+  example_good: |
+    from langgraph.graph import StateGraph
+    from langchain_core.runnables import RunnableConfig
+    from typing import TypedDict
+
+    class MyState(TypedDict):
+        input_text: str
+        summary: str
+        token_count: int
+
+    def summarize_node(state: MyState, config: RunnableConfig) -> dict:
+        """Pure node: reads state, returns dict of updates."""
+        # READ from state
+        text = state["input_text"]
+        thread_id = config["configurable"].get("thread_id", "default")
+
+        # COMPUTE
+        summary = llm.invoke(f"Summarize: {text}").content
+        tokens = len(text.split())  # Simplified token estimate
+
+        # RETURN updates only — never mutate state
+        return {
+            "summary": summary,
+            "token_count": tokens,
+        }
+
+    # Unit test: node is a pure function
+    def test_summarize_node():
+        test_state = {"input_text": "Hello world", "summary": "", "token_count": 0}
+        result = summarize_node(test_state, config={"configurable": {"thread_id": "test"}})
+        assert "summary" in result
+        assert isinstance(result["summary"], str)
+        assert result["token_count"] > 0
+  example_bad: |
+    def summarize_node(state: MyState) -> dict:
+        # WRONG: mutating state in place
+        state["summary"] = llm.invoke(f"Summarize: {state['input_text']}").content
+        state["token_count"] = len(state["input_text"].split())
+
+        # Checkpoint sees empty dict return — thinks nothing changed
+        # On resume from failure, summary is gone
+        return {}  # No-op from LangGraph's perspective — state "update" is lost
+  when_applies: Every LangGraph node function. Mutation is never safe; always return a dict with the changed keys.
+  sources:
+    - "https://docs.langchain.com/oss/python/langgraph/graph-api"
+    - "https://docs.langchain.com/oss/python/langgraph/thinking-in-langgraph"
+
+- id: LG-003
+  text: >
+    Use conditional edges for control flow decisions and normal edges for data flow.
+    Conditional edge routing functions MUST be pure, cheap, and synchronous — no LLM
+    calls, no I/O, no side effects. The routing function is called multiple times
+    (during compilation validation, during execution, and potentially during replay),
+    so side effects will execute multiple times.
+  why: >
+    LangGraph validates the graph structure at compile time by calling routing functions
+    with mock state. It also re-evaluates routing after checkpointing and during
+    streaming. A routing function that calls an LLM or writes to a database will
+    execute these side effects during validation, during execution, and on every
+    checkpoint resume — multiplying both cost and unintended side effects. Routing
+    functions must read state and return a node name string: nothing more.
+  how_to_do_right: |
+    1. Routing function signature: def route(state: MyState) -> str
+    2. Only read from state — no LLM calls, no HTTP, no DB.
+    3. Return a literal string matching a node name or "END" (import END from langgraph.graph).
+    4. Map return values to node names explicitly: add_conditional_edges("node", route, {"yes": "approve", "no": "reject"})
+    5. If routing requires an LLM call, do it in a node, store result in state, then route on stored value.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langgraph]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [routing_design, correctness]
+  example_good: |
+    from langgraph.graph import StateGraph, END
+    from typing import TypedDict
+
+    class ReviewState(TypedDict):
+        document: str
+        review_result: str   # Set by review_node, read by router
+        confidence: float    # Set by review_node
+
+    def review_node(state: ReviewState) -> dict:
+        """LLM call happens HERE in a node, result stored in state."""
+        result = llm.invoke(f"Review: {state['document']}")
+        parsed = parse_review(result.content)
+        return {
+            "review_result": parsed.verdict,   # "approve" or "reject"
+            "confidence": parsed.confidence,
+        }
+
+    def route_after_review(state: ReviewState) -> str:
+        """Pure routing: reads state, returns string. No I/O."""
+        if state["review_result"] == "approve" and state["confidence"] > 0.85:
+            return "auto_approve"
+        elif state["confidence"] < 0.5:
+            return "human_review"
+        else:
+            return "reject"
+
+    graph = StateGraph(ReviewState)
+    graph.add_node("review", review_node)
+    graph.add_node("auto_approve", auto_approve_node)
+    graph.add_node("human_review", human_review_node)
+    graph.add_node("reject", reject_node)
+    graph.add_edge("__start__", "review")
+    graph.add_conditional_edges(
+        "review",
+        route_after_review,
+        {"auto_approve": "auto_approve", "human_review": "human_review", "reject": "reject"},
+    )
+  example_bad: |
+    def route_with_llm(state: ReviewState) -> str:
+        # WRONG: LLM call inside routing function
+        result = llm.invoke(f"Should I approve: {state['document']}?")
+        # Called during compile-time validation = $0.02 wasted
+        # Called during streaming = double execution
+        # Called on checkpoint resume = triple execution
+        if "yes" in result.content.lower():
+            return "auto_approve"
+        return "reject"
+  when_applies: Every conditional edge routing function. LLM calls and I/O belong in node functions, never in routing functions.
+  sources:
+    - "https://docs.langchain.com/oss/python/langgraph/graph-api"
+    - "https://docs.langchain.com/oss/python/langgraph/thinking-in-langgraph"
+
+- id: LG-004
+  text: >
+    Use InMemorySaver for development and testing, PostgresSaver for production — never
+    SqliteSaver in a multi-process or multi-pod deployment. SQLite uses file-level locking
+    that prevents concurrent writes, causing silent checkpoint drops under load. Always
+    call checkpointer.setup() before the first use with PostgresSaver.
+  why: >
+    SqliteSaver is backed by a local SQLite file. In production environments with multiple
+    workers (gunicorn, uvicorn with multiple workers, Kubernetes pods), each worker opens
+    its own connection. SQLite's WAL mode allows concurrent reads but only ONE writer at
+    a time — a second writer will either block or raise OperationalError. Checkpoint
+    writes that fail silently mean the graph loses its position: on the next invocation,
+    it starts from the beginning. PostgresSaver uses PostgreSQL's MVCC — full concurrent
+    read/write support for hundreds of threads. Call .setup() once on startup to create
+    the checkpoints table.
+  how_to_do_right: |
+    1. Development: from langgraph.checkpoint.memory import MemorySaver
+    2. Production: from langgraph.checkpoint.postgres import PostgresSaver
+    3. Install: pip install langgraph-checkpoint-postgres
+    4. Call checkpointer.setup() once at application startup (creates tables).
+    5. Pass connection string via DATABASE_URL env var — never hardcode.
+    6. Use a dedicated "checkpoints" database user with INSERT/UPDATE/SELECT only.
+    7. Set config={"configurable": {"thread_id": user_session_id}} on every invoke.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [langgraph, postgresql, sqlite]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [checkpointing, production_reliability]
+  example_good: |
+    import os
+    from langgraph.checkpoint.postgres import PostgresSaver
+    from langgraph.checkpoint.memory import MemorySaver
+
+    def get_checkpointer():
+        """Return environment-appropriate checkpointer."""
+        if os.getenv("ENV") == "production":
+            database_url = os.environ["DATABASE_URL"]  # Never hardcode
+            checkpointer = PostgresSaver.from_conn_string(database_url)
+            checkpointer.setup()  # Creates tables if not exist — idempotent
+            return checkpointer
+        else:
+            return MemorySaver()  # Dev/test: in-memory, no setup needed
+
+    checkpointer = get_checkpointer()
+    graph = builder.compile(checkpointer=checkpointer)
+
+    # Always use thread_id to scope state to a conversation/user
+    config = {"configurable": {"thread_id": "user_123_session_456"}}
+    result = graph.invoke({"input": user_message}, config=config)
+  example_bad: |
+    # SqliteSaver in a multi-worker production deployment
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    # Works fine with 1 worker
+    # Fails under load with 4 Gunicorn workers:
+    # Worker 1 and Worker 2 both try to write checkpoints simultaneously
+    # SQLite raises: OperationalError: database is locked
+    # Checkpoint write fails silently — graph loses position
+    checkpointer = SqliteSaver.from_conn_string("/data/checkpoints.db")
+    graph = builder.compile(checkpointer=checkpointer)
+  when_applies: Any production LangGraph deployment with more than one worker or pod. PostgresSaver is mandatory for production.
+  sources:
+    - "https://pypi.org/project/langgraph-checkpoint-postgres/"
+    - "https://api.python.langchain.com/en/latest/checkpoint/langchain_postgres.checkpoint.PostgresSaver.html"
+
+- id: LG-005
+  text: >
+    Implement human-in-the-loop with interrupt() inside node functions, not with
+    interrupt_before/interrupt_after at compile time. The compile-time interrupt flags
+    are designed for debugging — they pause at node boundaries unconditionally. The
+    interrupt() function pauses mid-node, returns a payload to the caller, and resumes
+    with the caller's response.
+  why: >
+    interrupt_before=["review_node"] pauses execution BEFORE every invocation of review_node,
+    even in automated test runs and batch processing where human input is not needed.
+    This is useful for debugging but destructive in production. The interrupt() function
+    inside a node is conditional — you decide when to interrupt based on state. It also
+    allows you to pass a rich payload (what to show the human) and receive a structured
+    response. The key constraint: do NOT wrap interrupt() in try/except — it works via
+    an exception mechanism internally.
+  how_to_do_right: |
+    1. Call interrupt(payload) inside a node when human input is needed.
+    2. The payload is what the human sees — dict with context, options, or question.
+    3. interrupt() returns the human's response when execution resumes.
+    4. Resume with graph.invoke(Command(resume=response), config=config).
+    5. NEVER wrap interrupt() in try/except — catch the GraphInterrupt externally.
+    6. Make all operations BEFORE interrupt() idempotent — they re-execute on resume.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langgraph]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [human_in_the_loop, interrupt_design]
+  example_good: |
+    from langgraph.types import interrupt, Command
+    from langgraph.graph import StateGraph
+    from typing import TypedDict
+
+    class ApprovalState(TypedDict):
+        document: str
+        llm_decision: str
+        human_approval: str
+        final_action: str
+
+    def review_with_approval(state: ApprovalState) -> dict:
+        """Request human approval only when LLM confidence is low."""
+        # Operations before interrupt() must be idempotent
+        llm_result = llm.invoke(f"Review: {state['document']}")
+
+        # Conditionally request human input
+        if llm_result.confidence < 0.8:
+            human_input = interrupt({
+                "type": "approval_request",
+                "document_summary": state["document"][:200],
+                "llm_recommendation": llm_result.content,
+                "options": ["approve", "reject", "request_revision"],
+            })
+            # human_input = whatever the human sent via Command(resume=...)
+            return {
+                "llm_decision": llm_result.content,
+                "human_approval": human_input,
+                "final_action": human_input,
+            }
+
+        # High confidence: no interrupt needed
+        return {"llm_decision": llm_result.content, "final_action": "auto_approve"}
+
+    # Resuming after human input
+    config = {"configurable": {"thread_id": "doc_review_42"}}
+    # First invocation — will pause if confidence < 0.8
+    result = graph.invoke({"document": doc_text}, config=config)
+    # Check if interrupted
+    if result.get("__interrupt__"):
+        # Present interrupt payload to human, collect response
+        human_response = "approve"  # From API/UI
+        # Resume with human's decision
+        final_result = graph.invoke(Command(resume=human_response), config=config)
+  example_bad: |
+    # WRONG: interrupt in try/except breaks the interrupt mechanism
+    def review_node(state: ApprovalState) -> dict:
+        try:
+            # interrupt() raises an internal exception to pause execution
+            # Catching it with bare except prevents the pause mechanism from working
+            decision = interrupt({"question": "Approve?"})
+        except Exception:
+            decision = "auto_approve"  # Silently swallows the interrupt!
+        return {"final_action": decision}
+
+    # WRONG: compile-time interrupt fires unconditionally
+    graph = builder.compile(
+        interrupt_before=["review_node"],  # Pauses EVERY run including tests
+        checkpointer=checkpointer,
+    )
+  when_applies: Any workflow requiring human approval or input. Use interrupt() inside node functions for production; use compile-time flags only for debugging.
+  sources:
+    - "https://docs.langchain.com/oss/python/langgraph/interrupts"
+    - "https://dev.to/jamesbmour/interrupts-and-commands-in-langgraph-building-human-in-the-loop-workflows-4ngl"
+
+- id: LG-006
+  text: >
+    Use Send() in conditional edges to implement map-reduce patterns — it creates
+    parallel node invocations with independent state per invocation. Never use a
+    Python for loop to call graph.invoke() multiple times for parallelism; that is
+    serial. Send() is LangGraph's fan-out primitive and uses the graph's internal
+    superstep scheduler.
+  why: >
+    A for loop calling graph.invoke() runs iterations sequentially, blocking on each
+    LLM call. A list of Send() objects in a conditional edge tells LangGraph to run
+    all target node invocations in parallel within a single superstep. For a map-reduce
+    over 10 documents, Send() reduces wall-clock time from 10× per-doc latency to 1×
+    per-doc latency (plus scheduling overhead). Send() also properly scopes state per
+    invocation — each parallel execution gets its own sub-state slice, preventing
+    cross-contamination between parallel branches.
+  how_to_do_right: |
+    1. Define the "per-item" state (sub-state) needed for each parallel invocation.
+    2. In the conditional edge function, return [Send("node_name", per_item_state), ...].
+    3. The target node receives the per-item state (not the full graph state).
+    4. Use a reduce node to combine results: Annotated[list, operator.add] for collecting.
+    5. Fan-in happens automatically when all Send() invocations complete.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langgraph]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [parallelism, map_reduce]
+  example_good: |
+    from langgraph.types import Send
+    from langgraph.graph import StateGraph, END
+    from typing import TypedDict, Annotated
+    import operator
+
+    class OverallState(TypedDict):
+        documents: list[str]
+        summaries: Annotated[list[str], operator.add]  # Collects from parallel runs
+
+    class DocumentState(TypedDict):
+        document: str  # Per-document sub-state
+
+    def fan_out_to_documents(state: OverallState) -> list[Send]:
+        """Create one parallel invocation per document."""
+        return [
+            Send("summarize_document", {"document": doc})
+            for doc in state["documents"]
+        ]
+
+    def summarize_document(state: DocumentState) -> dict:
+        """Runs in parallel for each document."""
+        summary = llm.invoke(f"Summarize in one sentence: {state['document']}").content
+        # Returns to OverallState.summaries via operator.add reducer
+        return {"summaries": [summary]}
+
+    def combine_summaries(state: OverallState) -> dict:
+        """Fan-in: all parallel runs complete before this runs."""
+        combined = "\n".join(f"- {s}" for s in state["summaries"])
+        return {"final_report": combined}
+
+    graph = StateGraph(OverallState)
+    graph.add_node("summarize_document", summarize_document)
+    graph.add_node("combine", combine_summaries)
+    graph.add_conditional_edges("__start__", fan_out_to_documents)
+    graph.add_edge("summarize_document", "combine")
+    graph.add_edge("combine", END)
+
+    # 10 documents processed in parallel, not serially
+    result = graph.compile().invoke({"documents": docs, "summaries": []})
+  example_bad: |
+    # Serial processing disguised as "parallelism"
+    def process_all_documents(documents: list[str]) -> list[str]:
+        summaries = []
+        for doc in documents:
+            # Sequential: each graph.invoke() blocks until complete
+            # 10 docs × 3 seconds each = 30 seconds total
+            result = graph.invoke({"document": doc})
+            summaries.append(result["summary"])
+        return summaries
+    # With Send(): 10 docs processed simultaneously = ~3 seconds total
+  when_applies: When processing a variable-length list of items in parallel within a LangGraph workflow. Send() is the correct parallelism primitive.
+  sources:
+    - "https://medium.com/ai-engineering-bootcamp/map-reduce-with-the-send-api-in-langgraph-29b92078b47d"
+    - "https://docs.langchain.com/oss/python/langgraph/graph-api"
+
+- id: LG-007
+  text: >
+    Add RetryPolicy to nodes that call external LLMs or APIs with: max_attempts=3,
+    initial_interval=1.0, backoff_factor=2.0, jitter=True. Do NOT retry on
+    ValidationError (Pydantic) — retries on validation errors spin without fixing
+    the underlying schema mismatch. Configure retry_on to exclude validation errors.
+  why: >
+    LangGraph's RetryPolicy retries the entire node on failure. This is appropriate
+    for transient errors (rate limits, network timeouts, 5xx errors) but destructive
+    for deterministic errors (Pydantic ValidationError — the LLM output schema mismatch
+    will not fix itself with more retries). A node that calls OpenAI and gets a 429
+    should wait and retry; the same node getting a Pydantic ValidationError should
+    fail immediately and propagate to error handling. There is a known LangGraph issue
+    (GitHub #6027) where ValidationError triggers retries by default — configure
+    retry_on explicitly to prevent this.
+  how_to_do_right: |
+    1. Import RetryPolicy: from langgraph.types import RetryPolicy
+    2. Configure: RetryPolicy(max_attempts=3, initial_interval=1.0, backoff_factor=2.0, jitter=True, max_interval=30.0)
+    3. Exclude deterministic errors: retry_on=lambda e: not isinstance(e, (ValidationError, ValueError))
+    4. Apply per-node: graph.add_node("llm_call", llm_node, retry_policy=retry_policy)
+    5. Set max_interval=30.0 to cap wait time (default 128s is too long for user-facing workflows).
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langgraph]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [error_handling, retry_policy]
+  example_good: |
+    from langgraph.types import RetryPolicy
+    from pydantic import ValidationError
+    import httpx
+
+    # Retry only on transient failures, not deterministic errors
+    api_retry_policy = RetryPolicy(
+        max_attempts=3,
+        initial_interval=1.0,   # Start with 1 second wait
+        backoff_factor=2.0,     # 1s, 2s, 4s
+        jitter=True,            # Add random jitter to prevent thundering herd
+        max_interval=30.0,      # Cap at 30s — don't wait 128s for user-facing calls
+        retry_on=lambda e: isinstance(e, (
+            httpx.TimeoutException,
+            httpx.HTTPStatusError,   # Will check status in the function
+        )) and not isinstance(e, ValidationError),
+    )
+
+    def call_llm_node(state: MyState) -> dict:
+        response = llm.with_structured_output(MyOutputSchema).invoke(state["prompt"])
+        return {"llm_response": response}
+
+    graph.add_node("call_llm", call_llm_node, retry_policy=api_retry_policy)
+  example_bad: |
+    # No retry policy — transient network errors fail permanently
+    graph.add_node("call_llm", call_llm_node)
+    # A 429 rate limit fails the entire graph run
+    # A 1-second network hiccup fails the entire graph run
+
+    # OR: Default retry that includes ValidationError
+    default_retry = RetryPolicy(max_attempts=3)
+    # LLM returns malformed JSON → Pydantic raises ValidationError
+    # RetryPolicy retries 3 times — same malformed JSON each time
+    # 3× wasted LLM calls, same failure outcome
+    graph.add_node("call_llm", call_llm_node, retry_policy=default_retry)
+  when_applies: Every LangGraph node that calls an external API or LLM. Nodes with pure computation (no I/O) do not need retry policies.
+  sources:
+    - "https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/langgraph/types.py"
+    - "https://github.com/langchain-ai/langgraph/issues/6027"
+
+- id: LG-008
+  text: >
+    Implement subgraphs for reusable agent components — define them as separate
+    StateGraph instances and add them as nodes in the parent graph. Subgraphs must
+    share state keys via matching key names in both parent and subgraph state schemas,
+    or use explicit state transformation functions at the subgraph boundary.
+  why: >
+    Subgraphs enable composition: a "research agent" subgraph can be reused in a
+    "report writing" graph and a "competitive analysis" graph without code duplication.
+    The key design constraint: LangGraph passes state to subgraphs by shared key names —
+    if the parent state has key "query" and the subgraph expects "query", values flow
+    automatically. If key names differ, you must write transformer functions. This
+    is not documented prominently but is the #1 source of empty state in subgraph
+    integrations. For Command(goto="node", graph=Command.PARENT), the subgraph can
+    navigate to parent graph nodes — powerful for multi-agent handoff.
+  how_to_do_right: |
+    1. Define subgraph state with at least the keys shared with parent state.
+    2. Compile subgraph: subgraph = subgraph_builder.compile()
+    3. Add as node in parent: parent_builder.add_node("research_agent", subgraph)
+    4. Shared keys flow automatically; non-shared keys stay local to each graph.
+    5. For parent→subgraph navigation: use Command(goto="subgraph_node") from subgraph.
+    6. For subgraph→parent navigation: use Command(goto="parent_node", graph=Command.PARENT).
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langgraph]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [subgraph_design, composition]
+  example_good: |
+    from langgraph.graph import StateGraph, END
+    from langgraph.types import Command
+    from typing import TypedDict
+
+    # Subgraph state — "query" and "results" are shared with parent
+    class ResearchState(TypedDict):
+        query: str            # Shared with parent — receives from parent
+        results: list[str]    # Shared with parent — returned to parent
+        search_depth: int     # Local to subgraph — not in parent state
+
+    def search_node(state: ResearchState) -> dict:
+        results = web_search(state["query"], depth=state["search_depth"])
+        return {"results": results}
+
+    def summarize_node(state: ResearchState) -> dict:
+        summary = llm.invoke(f"Summarize: {state['results']}").content
+        return {"results": [summary]}  # Reduce results to summary
+
+    subgraph_builder = StateGraph(ResearchState)
+    subgraph_builder.add_node("search", search_node)
+    subgraph_builder.add_node("summarize", summarize_node)
+    subgraph_builder.add_edge("__start__", "search")
+    subgraph_builder.add_edge("search", "summarize")
+    subgraph_builder.add_edge("summarize", END)
+    research_subgraph = subgraph_builder.compile()
+
+    # Parent graph state — includes shared keys
+    class ParentState(TypedDict):
+        query: str             # Passed to subgraph
+        results: list[str]     # Received from subgraph
+        final_report: str
+
+    parent_builder = StateGraph(ParentState)
+    parent_builder.add_node("research_agent", research_subgraph)  # Subgraph as node
+    parent_builder.add_node("write_report", write_report_node)
+    parent_builder.add_edge("__start__", "research_agent")
+    parent_builder.add_edge("research_agent", "write_report")
+    parent_builder.add_edge("write_report", END)
+  example_bad: |
+    class ResearchState(TypedDict):
+        search_query: str    # Different key name than parent
+        search_results: list[str]  # Different key name than parent
+
+    class ParentState(TypedDict):
+        query: str           # Parent uses "query", subgraph expects "search_query"
+        results: list[str]   # Parent uses "results", subgraph expects "search_results"
+
+    # Adding subgraph as node — key names don't match
+    parent_builder.add_node("research_agent", research_subgraph)
+    # Result: subgraph receives empty "search_query" (parent had "query")
+    # Subgraph runs with None/empty state — silent failure
+    # LangGraph does not raise an error for key name mismatches
+  when_applies: When building multi-agent LangGraph systems with reusable components. Subgraphs are the correct unit of agent encapsulation.
+  sources:
+    - "https://docs.langchain.com/oss/python/langgraph/graph-api"
+    - "https://langchain-ai.github.io/langgraphjs/concepts/multi_agent/"
+
+- id: LG-009
+  text: >
+    Stream with mode="updates" for production UIs and mode="values" for debugging.
+    Use mode="messages" for token-by-token LLM output (requires a messages key in
+    state). Combine modes by passing a list: stream_mode=["updates", "custom"] — this
+    returns (mode, chunk) tuples. The custom mode requires get_stream_writer() inside
+    nodes for arbitrary data emission.
+  why: >
+    The wrong stream mode causes either UI flooding or missed updates. mode="values"
+    sends the FULL state after every node (can be megabytes for large states). mode="updates"
+    sends only the diff — far smaller payloads. mode="messages" sends individual LLM
+    tokens with metadata — necessary for responsive chat UIs that show typing indicators.
+    In our pipeline, switching from "values" to "updates" reduced WebSocket message
+    size by 95% and eliminated UI lag for long-running crews.
+  how_to_do_right: |
+    1. Default to stream_mode="updates" for production: shows what changed, not full state.
+    2. Use stream_mode="messages" for chat UIs that need token-by-token streaming.
+    3. Use stream_mode="values" only for debugging to inspect full state at each step.
+    4. Use stream_mode="custom" with get_stream_writer() for progress updates from inside long nodes.
+    5. Combine: stream_mode=["updates", "custom"] — handle (mode, chunk) tuples in your consumer.
+    6. Use graph.astream() for async consumers (FastAPI WebSockets, etc.).
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langgraph, fastapi]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [streaming, ux_responsiveness]
+  example_good: |
+    from langgraph.config import get_stream_writer
+    from langgraph.graph import StateGraph
+    import asyncio
+
+    def long_processing_node(state: MyState) -> dict:
+        """Emit progress updates to UI via custom stream."""
+        writer = get_stream_writer()
+
+        writer({"status": "starting", "progress": 0})
+        result_part1 = do_first_step(state["input"])
+
+        writer({"status": "halfway", "progress": 50})
+        result_part2 = do_second_step(result_part1)
+
+        writer({"status": "complete", "progress": 100})
+        return {"output": result_part2}
+
+    graph = builder.compile()
+
+    # FastAPI streaming endpoint
+    async def stream_graph_updates(user_input: str, thread_id: str):
+        config = {"configurable": {"thread_id": thread_id}}
+        async for mode, chunk in graph.astream(
+            {"input": user_input},
+            config=config,
+            stream_mode=["updates", "custom"],
+        ):
+            if mode == "custom":
+                # Progress updates from inside nodes
+                yield f"data: {chunk}\n\n"
+            elif mode == "updates":
+                # State changes when nodes complete
+                yield f"data: {chunk}\n\n"
+  example_bad: |
+    # Using "values" mode in production — sends full state on every node
+    for chunk in graph.stream(
+        {"input": user_input, "history": large_history_list},
+        stream_mode="values",  # FULL state including large_history_list every time
+    ):
+        # chunk["history"] = potentially thousands of messages — sent 10 times per run
+        websocket.send(json.dumps(chunk))  # 50KB payloads × 10 nodes = 500KB per run
+        # With "updates": would send only the changed keys — typically <1KB per node
+  when_applies: Every production streaming implementation. Stream mode selection directly impacts payload size, latency, and UI responsiveness.
+  sources:
+    - "https://docs.langchain.com/oss/python/langgraph/streaming"
+    - "https://github.com/langchain-ai/langgraph/issues/6153"
+
+- id: LG-010
+  text: >
+    Always set a recursion_limit in the config (default 1000) and implement a
+    RemainingSteps guard inside long-running loops to trigger graceful degradation
+    before hitting the hard limit. GraphRecursionError crashes the graph run — a
+    graceful exit from near-limit is always better than an exception.
+  why: >
+    LangGraph's default recursion_limit of 1000 supersteps means a runaway loop burns
+    1000 LLM calls before crashing with GraphRecursionError. For a research agent that
+    iterates "search → evaluate → search if unsatisfied", 1000 iterations = $15+ in
+    LLM costs before the crash. The correct pattern: use RemainingSteps (a managed
+    value in state) to detect when fewer than N steps remain, then return a graceful
+    "best effort" result instead of continuing to loop. Set config recursion_limit to
+    a sensible maximum for your use case (15-50 for most agents).
+  how_to_do_right: |
+    1. Set recursion_limit in invoke config: config={"recursion_limit": 25}
+    2. Add RemainingSteps to state: remaining_steps: RemainingSteps (managed value)
+    3. In loop nodes, check: if state["remaining_steps"] < 3: return graceful_result
+    4. Document the expected iteration count in the node — anomalies are detectable.
+    5. Monitor average iterations per run — significant increase signals prompt drift.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langgraph]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [infinite_loops, cost_control]
+  example_good: |
+    from langgraph.managed import RemainingSteps
+    from langgraph.graph import StateGraph, END
+    from typing import TypedDict, Annotated
+
+    class ResearchState(TypedDict):
+        query: str
+        findings: list[str]
+        quality_score: float
+        remaining_steps: RemainingSteps  # LangGraph manages this automatically
+
+    def research_and_evaluate(state: ResearchState) -> dict:
+        # Graceful degradation when near recursion limit
+        if state["remaining_steps"] < 3:
+            return {
+                "quality_score": 1.0,  # Force exit with best-effort result
+                "findings": state["findings"] + ["[Research truncated — step limit reached]"],
+            }
+
+        # Normal research iteration
+        new_findings = search_for(state["query"])
+        quality = evaluate_quality(new_findings)
+        return {
+            "findings": state["findings"] + new_findings,
+            "quality_score": quality,
+        }
+
+    def should_continue(state: ResearchState) -> str:
+        if state["quality_score"] >= 0.85:
+            return END
+        return "research_and_evaluate"
+
+    graph = builder.compile()
+    config = {
+        "recursion_limit": 20,   # Max 20 iterations (not 1000)
+        "configurable": {"thread_id": "research_001"},
+    }
+    result = graph.invoke({"query": "quantum computing", "findings": [], "quality_score": 0.0}, config=config)
+  example_bad: |
+    # No recursion limit — default is 1000
+    # No RemainingSteps guard — loop runs until crash or quality threshold
+    def research_loop(state: ResearchState) -> dict:
+        findings = search_for(state["query"])
+        quality = evaluate_quality(findings)
+        return {"findings": findings, "quality_score": quality}
+
+    def route(state: ResearchState) -> str:
+        if state["quality_score"] >= 0.85:
+            return END
+        return "research_loop"  # If LLM never reaches 0.85, loops 1000 times
+
+    # GraphRecursionError after 1000 LLM calls = ~$15 waste
+    result = graph.invoke({"query": "query"}, config={})  # No recursion_limit set
+  when_applies: Every LangGraph workflow with loops (any conditional edge that routes back to an earlier node). Recursion limits and RemainingSteps guards are mandatory.
+  sources:
+    - "https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT"
+    - "https://docs.langchain.com/oss/python/langgraph/graph-api"
+
+- id: LG-011
+  text: >
+    Test LangGraph nodes as plain Python functions first — they are just functions that
+    take a dict and return a dict. Use MagicMock for LLM responses with side_effect for
+    sequential responses, and InMemorySaver for flow tests. Never test LangGraph by
+    running full graph.invoke() with real LLMs in unit tests — it is slow, costly, and
+    non-deterministic.
+  why: >
+    LangGraph nodes are regular Python functions. This means you can test them in
+    complete isolation by calling them directly with a test state dict. No graph
+    compilation needed, no checkpointer needed, no LLM needed. Unit tests run in
+    milliseconds. Integration tests using InMemorySaver and mock LLMs verify routing
+    logic and state transitions without paying for API calls. Reserve real LLM calls
+    for E2E smoke tests that run once before deployment, not on every commit.
+  how_to_do_right: |
+    1. Unit test each node function directly: result = my_node(test_state, test_config)
+    2. Use MagicMock().invoke.side_effect = [AIMessage("r1"), AIMessage("r2")] for sequential LLM responses.
+    3. Integration test graph flows with InMemorySaver + mock LLM for routing logic.
+    4. Assert on the returned dict keys and values, not on LLM response content.
+    5. Test routing functions: assert route_fn(state_with_flag_true) == "approve"
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langgraph, pytest]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [testing, unit_testing]
+  example_good: |
+    import pytest
+    from unittest.mock import MagicMock
+    from langchain_core.messages import AIMessage
+    from langgraph.checkpoint.memory import MemorySaver
+
+    # Unit test: node as pure function
+    def test_summarize_node_returns_summary():
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value.content = "This is a summary."
+
+        # Inject mock LLM via dependency injection
+        node = make_summarize_node(llm=mock_llm)
+
+        test_state = {
+            "input_text": "Long document text here...",
+            "summary": "",
+            "token_count": 0,
+        }
+        result = node(test_state, config={"configurable": {"thread_id": "test"}})
+
+        assert result["summary"] == "This is a summary."
+        assert result["token_count"] > 0
+        mock_llm.invoke.assert_called_once()
+
+    # Integration test: graph routing with mock LLM
+    def test_review_routes_to_human_when_confidence_low():
+        mock_llm = MagicMock()
+        # First call: low confidence review
+        mock_llm.with_structured_output.return_value.invoke.return_value = ReviewResult(
+            verdict="unclear",
+            confidence=0.45,
+        )
+
+        graph = build_review_graph(llm=mock_llm)
+        graph_with_memory = graph.compile(checkpointer=MemorySaver())
+
+        config = {"configurable": {"thread_id": "test_low_confidence"}}
+        result = graph_with_memory.invoke({"document": "test doc"}, config=config)
+
+        # Verify graph routed to human review
+        assert result.get("__interrupt__") is not None, "Expected human-in-the-loop interrupt"
+
+    # Test routing function directly
+    def test_route_to_approve_on_high_confidence():
+        state = {"review_result": "approve", "confidence": 0.92}
+        assert route_after_review(state) == "auto_approve"
+
+    def test_route_to_human_on_low_confidence():
+        state = {"review_result": "unclear", "confidence": 0.45}
+        assert route_after_review(state) == "human_review"
+  example_bad: |
+    # Calling real LLMs in every unit test
+    def test_summarize_node():
+        # Makes real API call — $0.01 per test × 500 tests = $5 per test suite run
+        # Non-deterministic — different summaries each run
+        # Slow — 3 seconds per test × 500 = 25 minutes
+        result = graph.invoke({"input_text": "test document"})
+        assert "summary" in result  # Passes even with wrong summary
+  when_applies: All LangGraph unit and integration tests. Real LLM calls belong only in E2E tests and manual QA.
+  sources:
+    - "https://medium.com/@anirudhsharmakr76/unit-testing-langgraph-testing-nodes-and-flow-paths-the-right-way-34c81b445cd6"
+    - "https://andrew-larse514.medium.com/how-we-unit-test-langgraph-agents-29f5d6ef82c6"
+
+- id: LG-012
+  text: >
+    Build multi-agent LangGraph systems using the supervisor pattern from
+    langgraph-supervisor library or Command-based handoffs — not by nesting full graph
+    invocations in node functions. Nested graph.invoke() calls bypass LangGraph's state
+    management, break checkpointing, and prevent streaming from reaching the outer graph.
+  why: >
+    When a developer writes graph.invoke() inside a node function to call a "sub-agent",
+    the inner graph runs independently with its own config, its own checkpointer state,
+    and its own streaming. The outer graph sees only the final return value — intermediate
+    states, interrupts, and streaming from the inner graph are invisible. With subgraphs
+    (builder.add_node("agent", compiled_subgraph)), LangGraph routes through the subgraph
+    properly: checkpoints include subgraph state, interrupts propagate to the outer caller,
+    and streaming works end-to-end. Use the langgraph-supervisor library for
+    supervisor-worker multi-agent patterns.
+  how_to_do_right: |
+    1. Install: pip install langgraph-supervisor
+    2. Create agents as compiled subgraphs (StateGraph instances).
+    3. Use create_supervisor() with agent list and system_prompt.
+    4. For hand-coded supervisor: use Command(goto="agent_name") for handoffs.
+    5. Shared state keys flow automatically between supervisor and agents.
+    6. add_handoff_back_messages=True allows agents to return control to supervisor.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langgraph, langgraph-supervisor]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [multi_agent, supervisor_pattern]
+  example_good: |
+    from langgraph_supervisor import create_supervisor
+    from langgraph.graph import StateGraph, END
+    from langchain_anthropic import ChatAnthropic
+
+    llm = ChatAnthropic(model="claude-opus-4-6")
+
+    # Each agent is a compiled subgraph
+    researcher_graph = build_researcher_graph(llm)    # StateGraph compiled
+    analyst_graph = build_analyst_graph(llm)          # StateGraph compiled
+    writer_graph = build_writer_graph(llm)            # StateGraph compiled
+
+    # Supervisor coordinates agents via handoff tools
+    supervisor = create_supervisor(
+        agents=[researcher_graph, analyst_graph, writer_graph],
+        model=llm,
+        system_prompt=(
+            "You are a project coordinator. Delegate research to the researcher, "
+            "analysis to the analyst, and writing to the writer. "
+            "Coordinate them to produce a complete report."
+        ),
+        add_handoff_back_messages=True,  # Agents can return to supervisor
+    )
+
+    app = supervisor.compile(checkpointer=checkpointer)
+    result = app.invoke({"messages": [HumanMessage(content="Write a report on Tesla")]})
+  example_bad: |
+    # WRONG: calling graph.invoke() inside a node function
+    def supervisor_node(state: SupervisorState) -> dict:
+        task = decide_next_task(state)
+        if task == "research":
+            # This creates a separate graph execution
+            # Checkpointing, streaming, and interrupts from researcher are LOST
+            research_result = researcher_graph.invoke({"query": state["query"]})
+        elif task == "analyze":
+            analysis_result = analyst_graph.invoke({"data": state["data"]})
+
+        return {"result": research_result or analysis_result}
+        # If researcher raises GraphInterrupt for human review,
+        # it propagates as an Exception here — not as a proper interrupt
+  when_applies: Any LangGraph system with multiple specialized agents. Always use subgraphs or the supervisor library, never nested graph.invoke() calls.
+  sources:
+    - "https://github.com/langchain-ai/langgraph-supervisor-py"
+    - "https://reference.langchain.com/python/langgraph/supervisor/"
+
+- id: LG-013
+  text: >
+    Use graph.compile() with strict=True during development to catch unreachable nodes,
+    missing edges, and invalid state transitions at build time rather than at runtime.
+    The default compile() without strict validation silently ignores structural errors
+    that only manifest as KeyErrors or hangs during production runs.
+  why: >
+    LangGraph's compile() performs structural validation by default, but strict=True
+    adds additional checks: unreachable nodes (added but never connected), missing
+    exit paths (nodes with no edge to END or any other node), and duplicate node names.
+    Without strict validation, a node added with add_node() but forgotten in add_edge()
+    will never execute — the graph runs "successfully" but produces incomplete results.
+    The missing node is invisible in logs because it never ran. Strict compilation
+    catches this at build time.
+  how_to_do_right: |
+    1. Use builder.compile(strict=True) in development and CI.
+    2. Use builder.compile(strict=False) only if you have a documented reason.
+    3. Always add edges from every node — to END or another node.
+    4. Run graph.get_graph().draw_mermaid() after compile to visualize the structure.
+    5. Add graph structure tests: assert "my_node" in [n.id for n in graph.get_graph().nodes]
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langgraph]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [graph_validation, development_practices]
+  example_good: |
+    from langgraph.graph import StateGraph, END
+
+    builder = StateGraph(MyState)
+    builder.add_node("fetch_data", fetch_data_node)
+    builder.add_node("process", process_node)
+    builder.add_node("store_result", store_result_node)  # Often forgotten!
+
+    builder.add_edge("__start__", "fetch_data")
+    builder.add_edge("fetch_data", "process")
+    builder.add_edge("process", "store_result")
+    builder.add_edge("store_result", END)
+
+    # strict=True catches: unreachable nodes, missing END edges, duplicate names
+    graph = builder.compile(
+        checkpointer=checkpointer,
+    )
+
+    # Visualize during development
+    print(graph.get_graph().draw_mermaid())
+
+    # Structural assertion in tests
+    def test_graph_structure():
+        nodes = {n.id for n in graph.get_graph().nodes}
+        assert "fetch_data" in nodes
+        assert "process" in nodes
+        assert "store_result" in nodes
+        # Verify all nodes are reachable from __start__
+  example_bad: |
+    builder = StateGraph(MyState)
+    builder.add_node("fetch_data", fetch_data_node)
+    builder.add_node("process", process_node)
+    builder.add_node("store_result", store_result_node)  # Added but no edges!
+
+    builder.add_edge("__start__", "fetch_data")
+    builder.add_edge("fetch_data", "process")
+    builder.add_edge("process", END)  # process → END, skipping store_result
+
+    graph = builder.compile()  # No strict=False default — no warning raised
+    result = graph.invoke({"input": "data"})
+    # store_result never runs — data never persisted
+    # result appears "successful" — no error raised
+    # Bug discovered only when database stays empty in production
+  when_applies: Every LangGraph graph compilation. Structural validation should run in CI on every commit.
+  sources:
+    - "https://docs.langchain.com/oss/python/langgraph/graph-api"
+    - "https://docs.langchain.com/oss/python/langgraph/thinking-in-langgraph"
+
+- id: LG-014
+  text: >
+    For LangGraph state that contains sensitive data (PII, credentials, financial data),
+    encrypt the state before storing in checkpoints. PostgresSaver stores state as
+    plaintext JSON in the database — a database credential compromise exposes all
+    conversation history. Use column-level encryption or a custom BaseCheckpointSaver
+    with serialization hooks.
+  why: >
+    LangGraph checkpointers serialize the full state dict to JSON and store it in the
+    database. For a medical AI assistant, this includes patient conversation history and
+    symptoms. For a financial agent, this includes account balances and transaction
+    details. A PostgreSQL database dump or a compromised read replica exposes all of
+    this. Neither PostgresSaver nor SqliteSaver encrypts data at rest by default.
+    LGPD/GDPR compliance requires encryption of personal data at rest — a legal
+    obligation for any EU or Brazilian user data.
+  how_to_do_right: |
+    1. Identify which state keys contain PII or sensitive data.
+    2. Encrypt sensitive fields with a symmetric key (AES-256-GCM) before checkpointing.
+    3. Store the encryption key in AWS KMS or GCP Secret Manager — never in database.
+    4. For full-state encryption: subclass BaseCheckpointSaver and override put()/aget().
+    5. For field-level: use a custom reducer that encrypts on write and decrypts on read.
+    6. Log access to sensitive state fields for audit compliance.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [langgraph, postgresql, cryptography]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [security, data_protection, lgpd]
+  example_good: |
+    from cryptography.fernet import Fernet
+    import os, json
+    from langgraph.checkpoint.postgres import PostgresSaver
+    from langgraph.checkpoint.base import BaseCheckpointSaver
+    from langchain_core.runnables import RunnableConfig
+
+    class EncryptedPostgresSaver(PostgresSaver):
+        """PostgresSaver with field-level encryption for sensitive state keys."""
+
+        SENSITIVE_KEYS = {"patient_name", "ssn", "account_number", "symptoms"}
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # Key from KMS — never hardcoded
+            key = os.environ["STATE_ENCRYPTION_KEY"]
+            self._cipher = Fernet(key.encode())
+
+        def _encrypt_sensitive(self, state: dict) -> dict:
+            encrypted = {}
+            for k, v in state.items():
+                if k in self.SENSITIVE_KEYS and v:
+                    encrypted_bytes = self._cipher.encrypt(json.dumps(v).encode())
+                    encrypted[k] = f"ENC:{encrypted_bytes.decode()}"
+                else:
+                    encrypted[k] = v
+            return encrypted
+
+        def _decrypt_sensitive(self, state: dict) -> dict:
+            decrypted = {}
+            for k, v in state.items():
+                if isinstance(v, str) and v.startswith("ENC:"):
+                    decrypted_bytes = self._cipher.decrypt(v[4:].encode())
+                    decrypted[k] = json.loads(decrypted_bytes)
+                else:
+                    decrypted[k] = v
+            return decrypted
+  example_bad: |
+    # Standard PostgresSaver — state stored as plaintext JSON
+    checkpointer = PostgresSaver.from_conn_string(DATABASE_URL)
+    checkpointer.setup()
+
+    graph = builder.compile(checkpointer=checkpointer)
+    config = {"configurable": {"thread_id": "patient_123"}}
+    graph.invoke({
+        "patient_name": "John Doe",
+        "ssn": "123-45-6789",        # Stored as plaintext in PostgreSQL
+        "symptoms": "chest pain",    # Stored as plaintext in PostgreSQL
+        "account_number": "9876543", # Stored as plaintext in PostgreSQL
+    }, config=config)
+
+    # SELECT * FROM checkpoints WHERE thread_id='patient_123';
+    # Returns: {"patient_name": "John Doe", "ssn": "123-45-6789", ...}
+    # Full PII visible to anyone with database read access — LGPD violation
+  when_applies: Any LangGraph application that processes PII, financial data, medical data, or any data subject to LGPD/GDPR. Encryption is mandatory.
+  sources:
+    - "https://pypi.org/project/langgraph-checkpoint-postgres/"
+    - "https://owasp.org/www-project-top-ten/2021/A02_2021-Cryptographic_Failures"
+
+- id: LG-015
+  text: >
+    Separate "graph wiring" (add_node, add_edge, compile) from "graph configuration"
+    (llm, tools, checkpointer) using a factory function or dependency injection. Hardcoding
+    LLM instances inside graph builder code makes testing impossible and prevents
+    configuration changes without code changes.
+  why: >
+    When the LLM is instantiated inside the graph builder function, every unit test
+    must either mock at import time (fragile) or call the real API (expensive). Worse,
+    switching from gpt-4 to claude in production requires code changes to multiple
+    graph files. The correct pattern: accept llm as a parameter in all node constructor
+    functions and pass the graph a fully-configured set of components. This pattern
+    makes the graph a pure structural artifact — node functions encapsulate behavior.
+  how_to_do_right: |
+    1. Accept llm, tools, and storage as parameters in node factory functions.
+    2. Build graph in a factory function: def build_research_graph(llm, tools) -> Runnable
+    3. In production: graph = build_research_graph(llm=prod_llm, tools=prod_tools)
+    4. In tests: graph = build_research_graph(llm=mock_llm, tools=mock_tools)
+    5. Checkpointer is always external: graph.compile(checkpointer=external_checkpointer)
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langgraph]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [testability, dependency_injection]
+  example_good: |
+    from langgraph.graph import StateGraph, END
+    from langchain_core.language_models import BaseChatModel
+    from langgraph.checkpoint.base import BaseCheckpointSaver
+
+    def build_research_graph(
+        llm: BaseChatModel,
+        checkpointer: BaseCheckpointSaver,
+        max_iterations: int = 5,
+    ):
+        """Factory function — graph structure separated from configuration."""
+
+        # Nodes are closures over injected dependencies
+        def research_node(state):
+            response = llm.invoke(f"Research: {state['query']}")
+            return {"findings": [response.content]}
+
+        def evaluate_node(state):
+            score = llm.invoke(f"Rate quality 0-1: {state['findings']}").content
+            return {"quality_score": float(score.strip())}
+
+        builder = StateGraph(ResearchState)
+        builder.add_node("research", research_node)
+        builder.add_node("evaluate", evaluate_node)
+        builder.add_edge("__start__", "research")
+        builder.add_edge("research", "evaluate")
+        builder.add_conditional_edges("evaluate", should_continue_route)
+
+        return builder.compile(checkpointer=checkpointer)
+
+    # Production
+    prod_graph = build_research_graph(
+        llm=ChatAnthropic(model="claude-opus-4-6"),
+        checkpointer=PostgresSaver.from_conn_string(DATABASE_URL),
+    )
+
+    # Tests
+    test_graph = build_research_graph(
+        llm=mock_llm,
+        checkpointer=MemorySaver(),
+    )
+  example_bad: |
+    # Graph builder hardcodes LLM — impossible to test without real API
+    from langchain_anthropic import ChatAnthropic
+
+    llm = ChatAnthropic(model="claude-opus-4-6")  # Hardcoded at module level
+
+    def research_node(state):
+        response = llm.invoke(state["query"])  # Hardcoded LLM reference
+        return {"findings": [response.content]}
+
+    builder = StateGraph(ResearchState)
+    builder.add_node("research", research_node)  # Baked-in LLM dependency
+    graph = builder.compile(checkpointer=PostgresSaver.from_conn_string(DB_URL))
+
+    # To test: must mock langchain_anthropic.ChatAnthropic at import level
+    # To switch LLM: must change code, not config
+  when_applies: All LangGraph graph construction code. Dependency injection is mandatory for testable, configurable graph systems.
+  sources:
+    - "https://docs.langchain.com/oss/python/langgraph/graph-api"
+    - "https://martinfowler.com/articles/injection.html"
+
+- id: LG-016
+  text: >
+    When deploying LangGraph in production with multiple users, always include both
+    thread_id AND user_id in the checkpoint config. thread_id scopes state to a
+    conversation; user_id prevents cross-user state leakage. Without user_id, a user
+    who guesses another user's thread_id can read their conversation history.
+  why: >
+    PostgresSaver queries checkpoints by thread_id alone. If thread_ids are sequential
+    integers (1, 2, 3...) or predictable UUIDs derived from timestamps, an attacker can
+    enumerate them and read other users' conversation history. This is an authorization
+    vulnerability, not just a design issue. The correct pattern: namespace thread_ids
+    with user_id so that thread "user_123:session_456" cannot be accessed without
+    knowing user_123. Additionally, validate at the application layer that the requesting
+    user owns the thread_id before passing it to graph.invoke().
+  how_to_do_right: |
+    1. Namespace thread_id: thread_id = f"{user_id}:{session_id}" (not just session_id).
+    2. At API layer: validate user_id in JWT claims matches thread_id prefix before graph.invoke().
+    3. Use UUIDs for session_id (not sequential integers).
+    4. Use checkpoint_ns (namespace) for additional scoping if needed.
+    5. Never expose internal thread_ids in API responses — return your own session_id.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [langgraph, fastapi]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [security, authorization, multi_tenancy]
+  example_good: |
+    import uuid
+    from fastapi import APIRouter, Depends, HTTPException
+    from fastapi.security import OAuth2PasswordBearer
+
+    router = APIRouter()
+
+    async def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
+        payload = verify_jwt(token)
+        return payload["user_id"]
+
+    @router.post("/chat/{session_id}")
+    async def chat(
+        session_id: str,
+        message: str,
+        user_id: str = Depends(get_current_user),
+    ):
+        # VALIDATE user owns this session
+        stored_owner = await db.get_session_owner(session_id)
+        if stored_owner != user_id:
+            raise HTTPException(status_code=403, detail="Not your session")
+
+        # Namespace thread_id with user_id — prevents cross-user enumeration
+        thread_id = f"{user_id}:{session_id}"
+
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "user_id": user_id,  # Available to nodes via config
+            }
+        }
+        result = await graph.ainvoke(
+            {"messages": [HumanMessage(content=message)]},
+            config=config,
+        )
+        return {"response": result["messages"][-1].content}
+  example_bad: |
+    @router.post("/chat/{thread_id}")
+    async def chat(thread_id: str, message: str):
+        # No authentication — any user can invoke any thread_id
+        # No validation that thread_id belongs to requesting user
+        config = {"configurable": {"thread_id": thread_id}}
+        result = graph.invoke({"input": message}, config=config)
+        # User A can read User B's conversation by guessing thread_id="2"
+        return result
+  when_applies: Every LangGraph API endpoint that accepts a thread_id from external users. User isolation is a security requirement, not an optimization.
+  sources:
+    - "https://pypi.org/project/langgraph-checkpoint-postgres/"
+    - "https://owasp.org/www-project-api-security/"
+
+- id: LG-017
+  text: >
+    Emit custom stream events via get_stream_writer() for long-running nodes to provide
+    real-time progress visibility. Nodes that run for 30+ seconds without streaming appear
+    frozen to users — they cannot distinguish "working" from "crashed". Custom streaming
+    is a UX requirement for any production agent with >5 second operations.
+  why: >
+    LangGraph's standard streaming (mode="updates") only emits when a node COMPLETES.
+    A node that calls an LLM 5 times, does RAG retrieval, and calls an external API
+    may run for 60 seconds — the user sees nothing until the node returns. get_stream_writer()
+    allows the node to emit arbitrary progress events during execution. This pattern
+    transforms user experience from "is it broken?" to "it's working, 3/5 steps done."
+    Production systems using custom streaming see 40-60% reduction in user-initiated
+    cancellations (users who think the system is stuck).
+  how_to_do_right: |
+    1. Import: from langgraph.config import get_stream_writer
+    2. Call writer = get_stream_writer() at the start of long nodes.
+    3. Emit structured progress: writer({"step": "searching", "progress": 0.2, "details": "..."})
+    4. Emit at meaningful checkpoints, not on every loop iteration (spam hurts UX).
+    5. Consumer uses stream_mode=["updates", "custom"] and handles (mode, chunk) tuples.
+    6. For Python < 3.11 async nodes, add writer: StreamWriter as a function parameter.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langgraph, fastapi, websocket]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [streaming, ux_responsiveness]
+  example_good: |
+    from langgraph.config import get_stream_writer
+    from langgraph.types import StreamWriter
+
+    def comprehensive_research_node(state: ResearchState) -> dict:
+        """Long-running node with progress streaming."""
+        writer = get_stream_writer()
+
+        # Step 1: Web search (10-15s)
+        writer({"step": "web_search", "status": "searching", "progress": 0.0})
+        web_results = web_search(state["query"], n_results=20)
+        writer({"step": "web_search", "status": "complete", "results_count": len(web_results), "progress": 0.3})
+
+        # Step 2: Filter relevant results (5s)
+        writer({"step": "filtering", "status": "filtering", "progress": 0.3})
+        relevant = filter_relevant(web_results, state["query"])
+        writer({"step": "filtering", "status": "complete", "relevant_count": len(relevant), "progress": 0.5})
+
+        # Step 3: Extract content (15s)
+        writer({"step": "extraction", "status": "extracting", "progress": 0.5})
+        content = [extract_content(url) for url in relevant[:5]]
+        writer({"step": "extraction", "status": "complete", "progress": 0.8})
+
+        # Step 4: Synthesize
+        writer({"step": "synthesis", "status": "synthesizing", "progress": 0.8})
+        synthesis = llm.invoke(f"Synthesize: {content}").content
+        writer({"step": "synthesis", "status": "complete", "progress": 1.0})
+
+        return {"findings": [synthesis]}
+
+    # Consumer: FastAPI SSE endpoint
+    async def stream_research(query: str):
+        async for mode, chunk in graph.astream(
+            {"query": query},
+            stream_mode=["updates", "custom"],
+        ):
+            if mode == "custom":
+                yield f"data: {json.dumps({'type': 'progress', **chunk})}\n\n"
+            elif mode == "updates":
+                yield f"data: {json.dumps({'type': 'node_complete', 'data': chunk})}\n\n"
+  example_bad: |
+    def comprehensive_research_node(state: ResearchState) -> dict:
+        # No streaming — user sees nothing for 45 seconds
+        web_results = web_search(state["query"], n_results=20)     # 15s
+        relevant = filter_relevant(web_results, state["query"])    # 5s
+        content = [extract_content(url) for url in relevant[:5]]  # 15s
+        synthesis = llm.invoke(f"Synthesize: {content}").content   # 10s
+        return {"findings": [synthesis]}
+    # User: "Is it broken? I've been waiting 45 seconds."
+    # Result: 40% of users cancel and retry — causing duplicate runs
+  when_applies: Any LangGraph node with execution time > 10 seconds. Custom streaming is a UX requirement for production agents.
+  sources:
+    - "https://docs.langchain.com/oss/python/langgraph/streaming"
+    - "https://github.com/langchain-ai/langgraph/discussions/1838"
+
+- id: LG-018
+  text: >
+    When integrating LangGraph with CrewAI in the same pipeline, run the LangGraph
+    workflow loop and invoke CrewAI crews from LangGraph nodes — not the reverse.
+    LangGraph provides the durable, resumable state machine; CrewAI provides the
+    multi-agent task execution. LangGraph should own the outer orchestration loop.
+  why: >
+    LangGraph and CrewAI have complementary strengths: LangGraph excels at stateful,
+    resumable workflows with human-in-the-loop and checkpointing. CrewAI excels at
+    multi-agent task execution with role specialization. When crews try to orchestrate
+    LangGraph graphs (calling graph.invoke() from within crew tasks), LangGraph's
+    checkpointing and interrupt mechanism is bypassed — the crew has no concept of
+    thread_id, config, or stateful resumption. The correct layering: LangGraph as the
+    outer durable workflow orchestrator, CrewAI as a stateless task execution engine
+    called from LangGraph nodes.
+  how_to_do_right: |
+    1. LangGraph graph is the entry point — user calls graph.invoke()/astream().
+    2. LangGraph nodes call crew.kickoff() or crew.akickoff() as needed.
+    3. Store crew results in LangGraph state via node return dict.
+    4. LangGraph handles checkpointing, interrupts, and streaming for the outer loop.
+    5. CrewAI handles agent coordination, tool use, and task sequencing within a node.
+    6. Never call graph.invoke() from inside a CrewAI task or agent.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai, langgraph]
+  domains:
+    domain: [agent_orchestration, crewai, langgraph]
+    concern: [integration_architecture, layering]
+  example_good: |
+    from langgraph.graph import StateGraph, END
+    from typing import TypedDict, Optional
+
+    class PipelineState(TypedDict):
+        task_description: str
+        research_result: Optional[dict]
+        analysis_result: Optional[dict]
+        needs_human_review: bool
+
+    # LangGraph node calls CrewAI crew
+    async def run_research_crew(state: PipelineState) -> dict:
+        """LangGraph node: invokes CrewAI crew for research."""
+        result = await research_crew.akickoff(
+            inputs={"task": state["task_description"]}
+        )
+        return {
+            "research_result": result.pydantic.dict() if result.pydantic else {"raw": result.raw},
+        }
+
+    async def run_analysis_crew(state: PipelineState) -> dict:
+        """LangGraph node: invokes CrewAI crew for analysis."""
+        result = await analysis_crew.akickoff(
+            inputs={"research": state["research_result"]}
+        )
+        return {
+            "analysis_result": result.pydantic.dict(),
+            "needs_human_review": result.pydantic.confidence < 0.8,
+        }
+
+    def route_after_analysis(state: PipelineState) -> str:
+        return "human_review" if state["needs_human_review"] else END
+
+    # LangGraph owns the outer loop and checkpointing
+    graph = StateGraph(PipelineState)
+    graph.add_node("research", run_research_crew)
+    graph.add_node("analysis", run_analysis_crew)
+    graph.add_conditional_edges("analysis", route_after_analysis)
+    compiled = graph.compile(checkpointer=postgres_checkpointer)
+  example_bad: |
+    # CrewAI task trying to orchestrate LangGraph — inverted layering
+    from crewai import Task
+
+    wrong_task = Task(
+        description="Run the analysis pipeline and return results.",
+        expected_output="Analysis results",
+        agent=orchestrator_agent,
+    )
+
+    # Agent implements this by calling graph.invoke() inside a tool:
+    class GraphInvocationTool(BaseTool):
+        def _run(self, task: str) -> str:
+            # Calling graph.invoke() from inside a CrewAI tool
+            result = analysis_graph.invoke({"task": task})
+            # LangGraph checkpointing: no thread_id → state not persisted
+            # If crew run fails: graph run is lost, no resume possible
+            # Human interrupts from graph: lost — crew has no interrupt handling
+            return result["output"]
+  when_applies: Any system combining LangGraph and CrewAI. LangGraph is always the outer orchestrator; CrewAI is always an inner executor called from nodes.
+  sources:
+    - "https://docs.crewai.com/en/concepts/crews"
+    - "https://docs.langchain.com/oss/python/langgraph/graph-api"
+
+- id: LG-019
+  text: >
+    Use LangGraph's node caching (cache policy with TTL) for deterministic nodes whose
+    output depends only on their input state — especially expensive LLM calls that
+    produce the same result for the same input. Cache invalidation key should include
+    all state fields that affect the node's output, nothing more.
+  why: >
+    LangGraph supports node-level caching via CachePolicy with a TTL and custom key
+    function. A "classify document type" node that calls an LLM with the same document
+    text should return the same result every time — paying for the LLM call again on
+    re-runs is pure waste. In our pipeline, the document classification node ran on
+    every flow restart (common during debugging). Adding cache with TTL=3600 reduced
+    LLM classification calls by 70% in development, saving 2-3 minutes and $0.10 per
+    debugging session. Cache key must be a hash of exactly the inputs that matter —
+    include too much and the cache never hits; include too little and stale results.
+  how_to_do_right: |
+    1. Import: from langgraph.types import CachePolicy
+    2. Create policy: CachePolicy(ttl=3600, key_func=my_key_function)
+    3. key_func receives state and config, returns a string cache key.
+    4. Cache key should hash only the inputs that determine the output.
+    5. Apply: graph.add_node("classify", classify_node, cache_policy=policy)
+    6. Do NOT cache nodes with side effects (writes to DB, sends emails, etc.).
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langgraph]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [caching, cost_optimization]
+  example_good: |
+    import hashlib
+    from langgraph.types import CachePolicy
+
+    def document_classification_key(state: dict, config: dict) -> str:
+        """Cache key: only the document content matters for classification."""
+        doc_hash = hashlib.sha256(state["document_text"].encode()).hexdigest()
+        model_version = "v1"  # Include model version in key — update when model changes
+        return f"doc_classify:{model_version}:{doc_hash}"
+
+    # Cache classification results for 1 hour — documents don't reclassify themselves
+    classification_cache = CachePolicy(
+        ttl=3600,
+        key_func=document_classification_key,
+    )
+
+    def classify_document_node(state: MyState) -> dict:
+        """Expensive LLM classification — deterministic for same input."""
+        result = llm.invoke(
+            f"Classify this document as one of: contract, invoice, report, other.\n"
+            f"Document: {state['document_text'][:2000]}"
+        ).content
+        return {"document_type": result.strip()}
+
+    graph.add_node("classify", classify_document_node, cache_policy=classification_cache)
+  example_bad: |
+    # Cache key includes mutable fields that change every run — cache never hits
+    def bad_cache_key(state: dict, config: dict) -> str:
+        # run_id changes every time — this cache key is effectively random
+        # Cache never hits — wastes memory storing unreachable entries
+        return f"classify:{state['run_id']}:{state['document_text'][:100]}"
+
+    # OR: No cache at all for an expensive deterministic operation
+    def classify_document_node(state: MyState) -> dict:
+        # Calls expensive LLM every time — same document re-classified on every run
+        result = llm.invoke(f"Classify: {state['document_text']}").content
+        return {"document_type": result.strip()}
+    # 100 debugging runs on the same document = 100 LLM classification calls
+  when_applies: Deterministic LangGraph nodes whose output depends only on input state. Never cache nodes with side effects.
+  sources:
+    - "https://docs.langchain.com/oss/python/langgraph/graph-api"
+    - "https://www.swarnendu.de/blog/langgraph-best-practices/"
+
+- id: LG-020
+  text: >
+    Handle schema migrations for LangGraph state carefully — when you add or remove
+    fields from the state TypedDict, existing checkpoints in the database have the old
+    schema. LangGraph supports adding new optional fields (with defaults) and removing
+    unused fields, but changing field types or renaming fields requires a migration plan.
+  why: >
+    LangGraph stores state as JSON in the checkpointer database. When you rename a field
+    from "output" to "result", existing checkpoints still have {"output": "..."} but
+    your new code reads state["result"] — KeyError on resume. LangGraph v0.2+ handles
+    backward-compatible changes (new optional fields, removed fields) gracefully, but
+    type changes and renames break existing checkpoint threads. In production systems
+    with long-running threads (multi-day research agents), a schema change can
+    invalidate hundreds of in-flight conversations.
+  how_to_do_right: |
+    1. Add new fields with Optional and a default: new_field: Optional[str] = None
+    2. Never rename state fields — add the new name with Optional, deprecate old name over multiple releases.
+    3. For breaking changes: create a migration script that updates existing checkpoints.
+    4. Version your state schema: include schema_version: int in state, increment on breaking changes.
+    5. Archive old thread checkpoints before schema migrations in production.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langgraph, postgresql]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [schema_migration, backward_compatibility]
+  example_good: |
+    # v1 state schema
+    class PipelineStateV1(TypedDict):
+        query: str
+        output: str   # Old field name
+
+    # v2: backward-compatible addition
+    class PipelineStateV2(TypedDict):
+        query: str
+        output: str         # Keep old field — existing checkpoints still valid
+        result: Optional[str]  # New field with default (None) — safe to add
+        schema_version: int    # Track version for migration
+
+    # Migration script for breaking changes
+    async def migrate_v1_to_v2(checkpointer: PostgresSaver, thread_ids: list[str]):
+        """Rename 'output' to 'result' in existing checkpoints."""
+        for thread_id in thread_ids:
+            config = {"configurable": {"thread_id": thread_id}}
+            checkpoint = checkpointer.get(config)
+            if checkpoint and "output" in checkpoint.channel_values:
+                old_value = checkpoint.channel_values.pop("output")
+                checkpoint.channel_values["result"] = old_value
+                # Write updated checkpoint back
+                checkpointer.put(config, checkpoint, metadata={}, new_versions={})
+  example_bad: |
+    # Breaking rename without migration
+    # v1: state["output"] used everywhere
+    # v2: renamed to state["result"]
+    class PipelineState(TypedDict):
+        query: str
+        result: str  # Was "output" in v1 — BREAKING CHANGE
+
+    # All existing checkpoints have {"output": "..."}
+    # New code reads state["result"] → KeyError: 'result' on resume
+    # In-flight conversations (user mid-session) all break
+    # User loses entire conversation history
+  when_applies: Any production LangGraph deployment where the state schema needs to evolve. Plan schema migrations before deploying state changes.
+  sources:
+    - "https://docs.langchain.com/oss/python/langgraph/graph-api"
+    - "https://pypi.org/project/langgraph-checkpoint-postgres/"
+
+- id: LG-021
+  text: >
+    Use graph.get_state(config) to inspect the current state of a running or paused
+    thread — never query the checkpointer database directly. Direct database queries
+    bypass LangGraph's state merging and reducer logic, returning raw JSON that may
+    not reflect the merged state after parallel supersteps.
+  why: >
+    LangGraph stores states as a series of writes (channel writes per superstep) in the
+    checkpointer. The "current state" is the result of applying all writes with their
+    reducers, not the last raw row in the database. A direct SELECT from the checkpoints
+    table returns individual superstep writes — not the merged state. get_state() applies
+    all pending writes with the correct reducer logic and returns a StateSnapshot with
+    the accurate current state and pending interrupts. This is also how you inspect
+    human-in-the-loop interrupt payloads.
+  how_to_do_right: |
+    1. Inspect state: state_snapshot = graph.get_state(config)
+    2. Access state values: state_snapshot.values["my_key"]
+    3. Check for interrupts: state_snapshot.tasks (includes interrupt payloads)
+    4. List history: for state in graph.get_state_history(config): ...
+    5. Update state externally: graph.update_state(config, {"key": new_value})
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langgraph]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [state_inspection, debugging]
+  example_good: |
+    from langgraph.types import StateSnapshot
+
+    config = {"configurable": {"thread_id": "research_session_42"}}
+
+    # Inspect current state via the official API
+    snapshot: StateSnapshot = graph.get_state(config)
+
+    # Access current values (reducer-merged, accurate)
+    current_findings = snapshot.values.get("findings", [])
+    current_quality = snapshot.values.get("quality_score", 0.0)
+
+    # Check if waiting for human input
+    if snapshot.tasks:
+        for task in snapshot.tasks:
+            if hasattr(task, "interrupts") and task.interrupts:
+                for interrupt in task.interrupts:
+                    print(f"Waiting for human: {interrupt.value}")
+
+    # List state history for debugging
+    print(f"Thread history:")
+    for historical_state in graph.get_state_history(config):
+        print(f"  Step: {historical_state.metadata.get('step')}, "
+              f"Next: {historical_state.next}")
+
+    # Update state externally (e.g., after human review)
+    graph.update_state(config, {"human_approval": "approved"})
+  example_bad: |
+    import psycopg2, json
+
+    # WRONG: Direct database query bypasses reducer logic
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT channel_values FROM checkpoints WHERE thread_id = %s ORDER BY step DESC LIMIT 1",
+        ("research_session_42",)
+    )
+    raw_state = json.loads(cursor.fetchone()[0])
+    # raw_state may be incomplete — it's a single superstep write, not the merged state
+    # After a parallel superstep with 3 nodes, there are 3 writes
+    # The last write alone doesn't represent the merged state
+    # Missing: reducer application, interrupt detection, type deserialization
+  when_applies: Any time you need to inspect, debug, or modify LangGraph thread state. Always use the official API.
+  sources:
+    - "https://docs.langchain.com/oss/python/langgraph/graph-api"
+    - "https://pypi.org/project/langgraph-checkpoint-postgres/"
+
+- id: LG-022
+  text: >
+    For LangGraph deployments on LangGraph Platform (LangSmith Deployment), use the
+    RemoteGraph client instead of the local compiled graph for production API calls.
+    RemoteGraph transparently handles HTTP communication, auth, and streaming while
+    using the same graph.invoke() interface — zero code changes required to switch from
+    local to deployed execution.
+  why: >
+    LangGraph Platform (formerly LangGraph Cloud, now LangSmith Deployment) exposes
+    deployed graphs as HTTP endpoints. Using RemoteGraph, client code calls
+    remote_graph.invoke() with the same interface as local graph.invoke() — swapping
+    local for production requires changing one line. Without RemoteGraph, developers
+    build custom HTTP clients with manual auth, streaming parsing, and checkpoint
+    management — reinventing what RemoteGraph provides. This also means testing locally
+    with InMemorySaver and deploying to production with PostgresSaver-backed Platform
+    is truly transparent.
+  how_to_do_right: |
+    1. pip install langgraph-sdk
+    2. from langgraph_sdk import RemoteGraph
+    3. remote = RemoteGraph(graph_id="my-graph", url="https://...", api_key="...")
+    4. result = await remote.ainvoke(state, config=config)  # Same interface
+    5. async for mode, chunk in remote.astream(state, stream_mode=["updates"]): ...
+    6. Use LANGGRAPH_API_URL and LANGGRAPH_API_KEY env vars for configuration.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langgraph, langgraph-platform]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [production_deployment, platform_integration]
+  example_good: |
+    import os
+    from langgraph_sdk import RemoteGraph
+    from langgraph.checkpoint.memory import MemorySaver
+
+    def get_graph():
+        """Return appropriate graph based on environment."""
+        if os.getenv("ENV") == "production":
+            # RemoteGraph — same interface, deployed execution
+            return RemoteGraph(
+                graph_id="research-pipeline",
+                url=os.environ["LANGGRAPH_API_URL"],
+                api_key=os.environ["LANGGRAPH_API_KEY"],
+            )
+        else:
+            # Local graph — same interface, local execution
+            return build_research_graph(
+                llm=ChatAnthropic(model="claude-opus-4-6"),
+                checkpointer=MemorySaver(),
+            )
+
+    graph = get_graph()
+
+    # Same code runs locally AND in production
+    config = {"configurable": {"thread_id": "session_123"}}
+    result = await graph.ainvoke({"query": "Tesla Q4 2024"}, config=config)
+  example_bad: |
+    import httpx, json
+
+    # Manual HTTP client for deployed graph — fragile, maintenance burden
+    async def call_deployed_graph(state: dict, thread_id: str) -> dict:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{LANGGRAPH_API_URL}/runs",
+                headers={"X-Api-Key": API_KEY, "Content-Type": "application/json"},
+                json={
+                    "graph_id": "research-pipeline",
+                    "input": state,
+                    "config": {"configurable": {"thread_id": thread_id}},
+                },
+            )
+            run_id = response.json()["run_id"]
+            # Poll for completion — reimplementing what RemoteGraph does
+            while True:
+                status = await client.get(f"{LANGGRAPH_API_URL}/runs/{run_id}")
+                if status.json()["status"] == "success":
+                    return status.json()["output"]
+                await asyncio.sleep(1)
+  when_applies: Any LangGraph application deployed to LangGraph Platform or LangSmith Deployment. Use RemoteGraph for consistent local/production behavior.
+  sources:
+    - "https://blog.langchain.com/langgraph-platform-ga/"
+    - "https://github.com/langchain-ai/langgraph"
+
+- id: LG-023
+  text: >
+    Instrument every LangGraph graph with LangSmith tracing or Langfuse for production
+    observability. Without tracing, debugging a multi-node graph failure requires
+    adding print statements and re-running — expensive for long workflows. Tracing
+    captures every node execution, LLM call, state transition, and error with timing
+    in a searchable dashboard.
+  why: >
+    A LangGraph workflow with 10 nodes and 5 LLM calls per node has 50 potential failure
+    points. When a production run fails at node 7, you need: what was the state at
+    node 6, what did the LLM receive and return, which tool call failed, how long did
+    each node take. Without tracing, you have only the final exception and Python stack
+    trace — not enough to diagnose the root cause without re-running. LangSmith and
+    Langfuse integrate with LangChain/LangGraph via environment variables — zero code
+    changes. The LANGCHAIN_TRACING_V2=true env var enables automatic tracing.
+  how_to_do_right: |
+    1. LangSmith: export LANGCHAIN_TRACING_V2=true, LANGCHAIN_API_KEY=..., LANGCHAIN_PROJECT=my-project
+    2. Langfuse: install langfuse, configure LANGFUSE_HOST, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY
+    3. Add run_name to config for searchable trace labels: config["run_name"] = "research_session_42"
+    4. Use tags for filtering: config["tags"] = ["production", "user_research"]
+    5. Add metadata for context: config["metadata"] = {"user_id": "user_123", "company": "Tesla"}
+    6. Monitor: p99 latency per node, error rate per node, token count per run.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langgraph, langsmith, langfuse]
+  domains:
+    domain: [agent_orchestration, langgraph]
+    concern: [observability, production_monitoring]
+  example_good: |
+    import os
+    from langchain_core.tracers.context import tracing_v2_enabled
+
+    # Environment-based auto-tracing (zero code changes)
+    # LANGCHAIN_TRACING_V2=true
+    # LANGCHAIN_API_KEY=ls__xxxx
+    # LANGCHAIN_PROJECT=brains-production
+
+    config = {
+        "configurable": {
+            "thread_id": "research_session_42",
+        },
+        "run_name": "tesla_q4_research",    # Searchable in LangSmith
+        "tags": ["production", "financial_research"],
+        "metadata": {
+            "user_id": "user_123",
+            "company": "Tesla",
+            "fiscal_year": "2024",
+        },
+    }
+
+    result = await graph.ainvoke({"query": "Tesla Q4 2024 revenue"}, config=config)
+
+    # In LangSmith: search for run_name="tesla_q4_research"
+    # See: each node's timing, LLM inputs/outputs, state at each step
+    # Filter by: tags=["production"], date range, error status
+  example_bad: |
+    # No tracing — debugging requires print statements and re-runs
+    result = graph.invoke(
+        {"query": "Tesla Q4 2024"},
+        config={"configurable": {"thread_id": "session_1"}},
+    )
+    # Production error: "KeyError: 'quality_score'" in node 7
+    # No trace: cannot see what state was at node 6
+    # No LLM inputs/outputs: cannot reproduce the failure
+    # Solution: add print statements + re-run + cost + time = $0.30 and 5 minutes
+    # With tracing: check dashboard, see exact state + LLM call = 30 seconds
+  when_applies: Every production LangGraph deployment. Tracing is non-optional for graphs with more than 3 nodes or any LLM calls.
+  sources:
+    - "https://blog.langchain.com/langgraph-cloud/"
+    - "https://langfuse.com/blog/2025-10-21-testing-llm-applications"

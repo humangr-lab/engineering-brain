@@ -1,0 +1,1037 @@
+layer: rules
+domain: fact_checking
+knowledge:
+- id: FC-NLP-001
+  text: "Use Named Entity Recognition (NER) to extract verifiable entities (people, organizations, dates, locations, statistics) from claims before verification. Claims without extractable entities are likely opinions, not verifiable facts."
+  why: >
+    NER extraction identifies the concrete, checkable components of a claim. 'The president
+    signed the bill on Tuesday' contains 3 verifiable entities: president (who), bill (what),
+    Tuesday (when). Without NER, the system treats claims as opaque text blobs and cannot
+    target evidence search effectively. NER also enables claim classification: claims with
+    zero entities are often opinions (unverifiable), while entity-rich claims are fact-checkable.
+  how_to_do_right: |
+    1. Run SpaCy NER pipeline with model 'en_core_web_trf' (transformer-based, highest accuracy)
+    2. Extract entities: PERSON, ORG, DATE, GPE, MONEY, PERCENT, CARDINAL, EVENT
+    3. Link entities to Wikidata IDs when possible (entity disambiguation)
+    4. Classify claim as VERIFIABLE if >= 1 concrete entity, OPINION if 0 entities
+    5. Use extracted entities to construct targeted search queries
+    6. For PT-BR: use 'pt_core_news_lg' model
+    7. Cache NER results — same claim text always produces same entities
+  severity: high
+  technologies:
+    lang: [python]
+    library: [spacy, transformers]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    import spacy
+
+    nlp = spacy.load("en_core_web_trf")
+
+    def extract_entities(claim_text: str) -> list[ClaimEntity]:
+        doc = nlp(claim_text)
+        entities = []
+        for ent in doc.ents:
+            entities.append(ClaimEntity(
+                text=ent.text,
+                label=ent.label_,
+                start=ent.start_char,
+                end=ent.end_char,
+                wikidata_id=link_to_wikidata(ent.text, ent.label_),
+            ))
+        return entities
+
+    def is_verifiable(claim_text: str) -> bool:
+        entities = extract_entities(claim_text)
+        concrete = [e for e in entities if e.label in ("PERSON", "ORG", "DATE", "GPE", "MONEY", "PERCENT")]
+        return len(concrete) >= 1
+  example_bad: |
+    def extract_keywords(text: str) -> list[str]:
+        return text.split()  # Naive tokenization — no entity recognition
+  when_applies: Claim intake and decomposition stages
+  sources:
+    - "SpaCy entity recognition documentation"
+    - "Named Entity Recognition for fact-checking (Thorne et al., 2018)"
+
+- id: FC-NLP-002
+  text: "Implement stance detection to classify each evidence passage as SUPPORTS, REFUTES, or NEUTRAL relative to the claim. Use a fine-tuned NLI model, not keyword matching."
+  why: >
+    Keyword matching produces false positives: an article mentioning the same entities as a claim
+    is not necessarily supporting it — it could be refuting it. Stance detection is the critical
+    bridge between evidence retrieval and verdict. Without it, the system cannot determine
+    whether found evidence actually corroborates or contradicts the claim. FEVER dataset shows
+    that keyword-based evidence selection alone achieves only 55% accuracy vs 78% with NLI.
+  how_to_do_right: |
+    1. Use a model fine-tuned on stance detection datasets (FEVER, MultiFC, SNLI)
+    2. Input format: [CLS] claim [SEP] evidence_passage [SEP]
+    3. Output: probability distribution over [SUPPORTS, REFUTES, NEUTRAL]
+    4. Threshold: SUPPORTS/REFUTES if p > 0.7, else NEUTRAL
+    5. For long evidence (>512 tokens): chunk into passages, classify each, aggregate
+    6. Aggregate: if any chunk REFUTES with p > 0.8, overall stance = REFUTES
+    7. Batch inference for efficiency: max 32 pairs per batch
+  severity: high
+  technologies:
+    lang: [python]
+    library: [transformers, torch]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    class StanceDetector:
+        def __init__(self, model_name: str = "roberta-large-mnli"):
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
+
+        def detect_stance(self, claim: str, evidence: str) -> StanceResult:
+            inputs = self.tokenizer(claim, evidence, return_tensors="pt", truncation=True, max_length=512)
+            logits = self.model(**inputs).logits
+            probs = torch.softmax(logits, dim=-1)[0]
+            labels = ["REFUTES", "NEUTRAL", "SUPPORTS"]
+            idx = probs.argmax().item()
+            return StanceResult(
+                label=labels[idx],
+                confidence=probs[idx].item(),
+                distribution={l: p.item() for l, p in zip(labels, probs)},
+            )
+  example_bad: |
+    def check_stance(claim: str, evidence: str) -> str:
+        claim_words = set(claim.lower().split())
+        evidence_words = set(evidence.lower().split())
+        overlap = len(claim_words & evidence_words)
+        return "SUPPORTS" if overlap > 3 else "NEUTRAL"  # Keyword overlap != stance
+  when_applies: Evidence evaluation stage — after retrieval, before verdict
+  sources:
+    - "FEVER: Fact Extraction and VERification (Thorne et al., 2018)"
+
+- id: FC-NLP-003
+  text: "Match claims to existing fact-checks using embedding-based semantic search. Encode claims with a sentence transformer model, store in Qdrant, and retrieve by cosine similarity. Threshold 0.85 for strong match, 0.75 for candidate match."
+  why: >
+    The same misinformation circulates in many phrasings. Without semantic matching, each
+    phrasing triggers a full verification pipeline, wasting resources and risking inconsistent
+    verdicts. Embedding-based search catches paraphrases that keyword search misses:
+    'vaccines cause autism' matches 'immunizations lead to autism spectrum disorder' at 0.92
+    similarity despite sharing only one word.
+  how_to_do_right: |
+    1. Encode claims with sentence-transformers (all-mpnet-base-v2 or Voyage AI voyage-large-2)
+    2. Store in Qdrant collection 'fact_checks' with payload: {claim_id, verdict, published_date}
+    3. On new claim: embed and search with score_threshold=0.75
+    4. score >= 0.85: strong match — return existing fact-check, log as dedup
+    5. 0.75 <= score < 0.85: candidate — present to human reviewer for confirmation
+    6. score < 0.75: new claim — enter full verification pipeline
+    7. Re-index collection weekly as new fact-checks are published
+  severity: high
+  technologies:
+    lang: [python]
+    library: [sentence-transformers, qdrant-client, voyage]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    from sentence_transformers import SentenceTransformer
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import PointStruct, Distance, VectorParams
+
+    class ClaimMatcher:
+        def __init__(self):
+            self.encoder = SentenceTransformer("all-mpnet-base-v2")
+            self.qdrant = QdrantClient(host="localhost", port=6333)
+
+        async def find_match(self, claim_text: str) -> MatchResult | None:
+            embedding = self.encoder.encode(claim_text).tolist()
+            results = self.qdrant.search(
+                collection_name="fact_checks",
+                query_vector=embedding,
+                limit=5,
+                score_threshold=0.75,
+            )
+            if not results:
+                return None
+            best = results[0]
+            return MatchResult(
+                claim_id=best.payload["claim_id"],
+                similarity=best.score,
+                match_type="STRONG" if best.score >= 0.85 else "CANDIDATE",
+                existing_verdict=best.payload.get("verdict"),
+            )
+  example_bad: |
+    def find_existing(claim: str, db_claims: list[str]) -> str | None:
+        for c in db_claims:
+            if claim.lower() == c.lower():  # Exact match only — misses all paraphrases
+                return c
+        return None
+  when_applies: Claim intake stage, before entering full verification pipeline
+  sources:
+    - "Sentence-BERT for claim matching (Reimers & Gurevych, 2019)"
+
+- id: FC-NLP-004
+  text: "Use Natural Language Inference (NLI) models to determine textual entailment between claim and evidence. NLI provides the logical backbone for verdict generation: if evidence entails the claim, it supports it; if it contradicts, it refutes."
+  why: >
+    NLI is the gold standard for determining logical relationships between text pairs.
+    Unlike simple similarity (which says texts are about the same topic), NLI determines
+    whether one text logically follows from another. 'All dogs are mammals' entails
+    'My poodle is a mammal' even though word overlap is low. Without NLI, the system
+    conflates topical relevance with logical support, producing verdicts based on vibes not logic.
+  how_to_do_right: |
+    1. Use a model trained on MNLI/SNLI: roberta-large-mnli or DeBERTa-v3-large-mnli
+    2. Input: (premise=evidence_text, hypothesis=claim_text)
+    3. Output: ENTAILMENT (supports), CONTRADICTION (refutes), NEUTRAL
+    4. For multi-evidence: run NLI pairwise (each evidence vs claim), aggregate
+    5. Aggregation: max-entailment and max-contradiction — strong signal either way wins
+    6. If both ENTAILMENT and CONTRADICTION scores are high → claim is PARTIALLY_TRUE
+    7. Use NLI confidence to weight evidence in final verdict scoring
+  severity: high
+  technologies:
+    lang: [python]
+    library: [transformers, torch]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    class NLIChecker:
+        def __init__(self, model_name: str = "microsoft/deberta-v3-large-mnli-fever-anli-ling-wanli"):
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
+            self.labels = ["ENTAILMENT", "NEUTRAL", "CONTRADICTION"]
+
+        def check_entailment(self, evidence: str, claim: str) -> NLIResult:
+            inputs = self.tokenizer(evidence, claim, return_tensors="pt", truncation=True, max_length=512)
+            with torch.no_grad():
+                logits = self.model(**inputs).logits
+            probs = torch.softmax(logits, dim=-1)[0]
+            return NLIResult(
+                label=self.labels[probs.argmax().item()],
+                confidence=probs.max().item(),
+                entailment_prob=probs[0].item(),
+                contradiction_prob=probs[2].item(),
+            )
+  example_bad: |
+    def does_evidence_support(evidence: str, claim: str) -> bool:
+        # Cosine similarity != entailment — 'dogs are big' is similar to 'dogs are small'
+        return cosine_similarity(embed(evidence), embed(claim)) > 0.7
+  when_applies: Evidence evaluation step — mapping evidence to verdict
+  sources:
+    - "MNLI: Multi-Genre NLI (Williams et al., 2018)"
+    - "FEVER shared task (Thorne et al., 2018)"
+
+- id: FC-NLP-005
+  text: "Serve transformer models with production-grade batching, GPU memory management, and model versioning. Use dynamic batching with max_batch_size=32 and timeout=50ms to balance throughput and latency."
+  why: >
+    Naive single-request inference wastes 90% of GPU compute on overhead. Without batching,
+    inference throughput drops from 1000 req/s to 30 req/s on the same hardware. Without
+    GPU memory management, OOM errors crash the service under load. Without model versioning,
+    model updates cause downtime or inconsistent results during rollout.
+  how_to_do_right: |
+    1. Use dynamic batching: accumulate requests for up to 50ms, then batch-infer
+    2. Max batch size = 32 (larger batches hit diminishing returns on GPU)
+    3. Set CUDA memory fraction to 0.8 to leave headroom for spikes
+    4. Implement model versioning: /v1/predict and /v2/predict endpoints
+    5. Canary deployment: route 10% traffic to new model, compare metrics for 24h
+    6. Health check: model warmup on startup with synthetic input, fail fast if OOM
+    7. Serve with ONNX Runtime or TorchServe for production reliability
+    8. Monitor: p50/p99 latency, throughput, GPU utilization, memory usage
+  severity: high
+  technologies:
+    lang: [python]
+    library: [torch, onnxruntime, fastapi]
+  domains:
+    domain: [fact_checking, performance, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    import asyncio
+    from collections import deque
+
+    class DynamicBatcher:
+        def __init__(self, model, max_batch: int = 32, max_wait_ms: int = 50):
+            self.model = model
+            self.max_batch = max_batch
+            self.max_wait = max_wait_ms / 1000
+            self.queue: deque = deque()
+
+        async def predict(self, input_text: str) -> dict:
+            future = asyncio.get_event_loop().create_future()
+            self.queue.append((input_text, future))
+            if len(self.queue) >= self.max_batch:
+                await self._flush()
+            else:
+                await asyncio.sleep(self.max_wait)
+                if self.queue:
+                    await self._flush()
+            return await future
+
+        async def _flush(self):
+            batch = []
+            futures = []
+            while self.queue and len(batch) < self.max_batch:
+                text, future = self.queue.popleft()
+                batch.append(text)
+                futures.append(future)
+            results = self.model.batch_predict(batch)
+            for future, result in zip(futures, results):
+                future.set_result(result)
+  example_bad: |
+    @app.post("/predict")
+    async def predict(text: str):
+        result = model(text)  # Single inference — wastes 90% GPU capacity
+        return result
+  when_applies: Any production deployment of NLP models for fact-checking
+  sources:
+    - "TorchServe dynamic batching documentation"
+
+- id: FC-NLP-006
+  text: "Support multi-lingual NLP for at least PT-BR and EN. Use language detection at intake, language-specific models for NER and stance detection, and cross-lingual embeddings for claim matching across languages."
+  why: >
+    Veritas targets Brazilian and English-speaking markets. Misinformation often crosses language
+    barriers — a false claim in English gets translated and spread in Portuguese. Without
+    multi-lingual support, claims in PT-BR are either ignored or processed with English models
+    that have 30-40% lower accuracy on Portuguese text. Cross-lingual matching catches
+    translated misinformation that monolingual systems miss entirely.
+  how_to_do_right: |
+    1. Detect language at intake using langdetect or fasttext (>99% accuracy for PT/EN)
+    2. Route to language-specific NER: en_core_web_trf (EN), pt_core_news_lg (PT-BR)
+    3. For stance detection: use multilingual model (XLM-RoBERTa fine-tuned on XNLI)
+    4. For claim matching: use multilingual embeddings (paraphrase-multilingual-mpnet-base-v2)
+    5. Store claims with language tag for filtered search
+    6. Cross-lingual matching: embed PT-BR and EN in same vector space, match across languages
+    7. Evidence search: query both PT-BR and EN sources for better coverage
+  severity: high
+  technologies:
+    lang: [python]
+    library: [spacy, transformers, langdetect, sentence-transformers]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    from langdetect import detect
+
+    LANGUAGE_MODELS = {
+        "en": {"ner": "en_core_web_trf", "stance": "roberta-large-mnli"},
+        "pt": {"ner": "pt_core_news_lg", "stance": "xlm-roberta-large-xnli"},
+    }
+
+    class MultilingualPipeline:
+        def __init__(self):
+            self.cross_lingual_encoder = SentenceTransformer("paraphrase-multilingual-mpnet-base-v2")
+
+        def process_claim(self, text: str) -> ProcessedClaim:
+            lang = detect(text)
+            if lang not in LANGUAGE_MODELS:
+                lang = "en"  # Fallback
+            ner_model = load_ner(LANGUAGE_MODELS[lang]["ner"])
+            entities = extract_entities(text, ner_model)
+            embedding = self.cross_lingual_encoder.encode(text)
+            return ProcessedClaim(text=text, language=lang, entities=entities, embedding=embedding)
+  example_bad: |
+    def process(text: str):
+        # English-only — PT-BR claims get wrong entities, bad stance detection
+        doc = en_nlp(text)
+        return [ent.text for ent in doc.ents]
+  when_applies: All NLP processing in the Veritas platform
+  sources:
+    - "XNLI: Cross-lingual NLI (Conneau et al., 2018)"
+
+- id: FC-NLP-007
+  text: "Use embedding-based semantic search over evidence databases instead of keyword search. Combine dense retrieval (embeddings) with sparse retrieval (BM25) in a hybrid approach for best recall and precision."
+  why: >
+    Keyword search (BM25) misses semantically relevant evidence that uses different words.
+    'Economic downturn' does not match 'recession' via keywords. Pure embedding search can miss
+    exact term matches that are critical for fact-checking (specific numbers, names). Hybrid
+    search combining both achieves 15-20% higher recall than either alone on the FEVER benchmark.
+  how_to_do_right: |
+    1. Index evidence in Elasticsearch (BM25) AND Qdrant (dense vectors) simultaneously
+    2. For each query: run BM25 search (top 20) and embedding search (top 20) in parallel
+    3. Merge results using Reciprocal Rank Fusion (RRF): score = sum(1/(k+rank)) across retrievers
+    4. k=60 is standard for RRF
+    5. Re-rank top 10 merged results with a cross-encoder for final ordering
+    6. For claims with specific numbers/dates: boost BM25 weight (exact match matters more)
+    7. Monitor retrieval quality: track recall@10 and precision@10 weekly
+  severity: high
+  technologies:
+    lang: [python]
+    library: [elasticsearch, qdrant-client, sentence-transformers]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    class HybridRetriever:
+        def __init__(self, es_client, qdrant_client, encoder):
+            self.es = es_client
+            self.qdrant = qdrant_client
+            self.encoder = encoder
+
+        async def search(self, query: str, top_k: int = 10) -> list[Evidence]:
+            embedding = self.encoder.encode(query)
+            bm25_results, dense_results = await asyncio.gather(
+                self.es_search(query, limit=20),
+                self.qdrant_search(embedding, limit=20),
+            )
+            merged = reciprocal_rank_fusion(bm25_results, dense_results, k=60)
+            return merged[:top_k]
+
+    def reciprocal_rank_fusion(
+        *result_lists: list[SearchResult], k: int = 60
+    ) -> list[SearchResult]:
+        scores: dict[str, float] = {}
+        for results in result_lists:
+            for rank, result in enumerate(results):
+                scores[result.id] = scores.get(result.id, 0) + 1.0 / (k + rank + 1)
+        return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+  example_bad: |
+    def search_evidence(claim: str) -> list[str]:
+        return es.search(index="evidence", query={"match": {"text": claim}})
+        # BM25 only — misses semantically related evidence
+  when_applies: Evidence retrieval stage of the verification pipeline
+  sources:
+    - "Reciprocal Rank Fusion (Cormack et al., 2009)"
+    - "Dense Passage Retrieval (Karpukhin et al., 2020)"
+
+- id: FC-NLP-008
+  text: "Generate concise evidence summaries using extractive-then-abstractive summarization. Extract the 3 most relevant sentences first, then generate a fluent summary. Never generate summaries without grounding in extracted sentences."
+  why: >
+    Pure abstractive summarization hallucinate facts that are not in the source material.
+    For fact-checking, hallucinated summaries are catastrophic — they could introduce false
+    information into the evidence chain. Extractive-first ensures every claim in the summary
+    traces back to a specific source sentence. Abstractive-second makes the summary readable.
+  how_to_do_right: |
+    1. Extractive: score each sentence by relevance to claim (BM25 or embedding similarity)
+    2. Select top 3 sentences, preserving order
+    3. Abstractive: generate fluent summary constrained to extracted sentences only
+    4. Validate: every fact in abstractive summary must appear in extracted sentences
+    5. If validation fails, fall back to extracted sentences as-is
+    6. Max summary length: 150 words (social media compatible)
+    7. Include source sentence indices for traceability
+  severity: high
+  technologies:
+    lang: [python]
+    library: [transformers, spacy]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    class EvidenceSummarizer:
+        def __init__(self, extractor, abstractor):
+            self.extractor = extractor
+            self.abstractor = abstractor
+
+        def summarize(self, evidence_text: str, claim: str, max_sentences: int = 3) -> Summary:
+            sentences = split_sentences(evidence_text)
+            scores = [(s, self.extractor.relevance(s, claim)) for s in sentences]
+            top_k = sorted(scores, key=lambda x: x[1], reverse=True)[:max_sentences]
+            extracted = [s for s, _ in sorted(top_k, key=lambda x: sentences.index(x[0]))]
+            abstract = self.abstractor.generate(" ".join(extracted), max_length=150)
+            if not self.validate_grounding(abstract, extracted):
+                return Summary(text=" ".join(extracted), method="EXTRACTIVE", source_sentences=extracted)
+            return Summary(text=abstract, method="ABSTRACTIVE", source_sentences=extracted)
+  example_bad: |
+    def summarize(text: str) -> str:
+        return llm.complete(f"Summarize: {text}")  # May hallucinate facts
+  when_applies: Evidence presentation and verdict explanation generation
+  sources:
+    - "Faithful summarization research (Maynez et al., 2020)"
+
+- id: FC-NLP-009
+  text: "Apply sentiment analysis to evidence sources as a bias signal, not as a truth signal. A strongly negative sentiment toward the claim subject may indicate bias, not that the claim is false."
+  why: >
+    Sentiment is correlated with bias but not with truth. A heavily negative article about
+    a politician may be factually accurate or may be biased. Systems that confuse negative
+    sentiment with refutation produce biased verdicts. Sentiment should feed into source
+    credibility scoring (bias dimension) not into evidence evaluation (support/refute).
+  how_to_do_right: |
+    1. Run sentiment analysis on each evidence passage: POSITIVE, NEGATIVE, NEUTRAL + score
+    2. Feed sentiment into source bias dimension, NOT into stance detection
+    3. Flag evidence with extreme sentiment (|score| > 0.8) for additional bias review
+    4. Compare sentiment across sources: if all sources are strongly negative, check for pile-on bias
+    5. Use sentiment to detect emotional framing vs factual reporting
+    6. NEVER use sentiment polarity as proxy for supports/refutes
+    7. Track correlation between sentiment extremity and source accuracy over time
+  severity: high
+  technologies:
+    lang: [python]
+    library: [transformers, textblob]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    def analyze_evidence_sentiment(evidence: Evidence) -> SentimentAnalysis:
+        result = sentiment_model(evidence.text)
+        return SentimentAnalysis(
+            polarity=result.polarity,  # -1 to +1
+            subjectivity=result.subjectivity,  # 0 to 1
+            is_extreme=abs(result.polarity) > 0.8,
+        )
+
+    def update_source_bias(source: SourceProfile, sentiment: SentimentAnalysis):
+        # Sentiment feeds BIAS dimension, not truth evaluation
+        if sentiment.is_extreme:
+            source.bias_indicators.append("extreme_sentiment")
+        source.recent_sentiments.append(sentiment.polarity)
+  example_bad: |
+    def evaluate_claim(claim: str, evidence: str) -> str:
+        sentiment = analyze_sentiment(evidence)
+        if sentiment > 0.5:
+            return "TRUE"  # Positive sentiment != claim is true
+        return "FALSE"
+  when_applies: Source credibility analysis, NOT verdict generation
+  sources:
+    - "Sentiment analysis and media bias (Hamborg et al., 2019)"
+
+- id: FC-NLP-010
+  text: "Implement quote verification to check whether a person actually said the attributed quote. Extract the alleged quote, identify the attributed speaker, and search for the original source with exact or near-exact match."
+  why: >
+    Misattributed quotes are among the most common forms of misinformation. 'Einstein said X'
+    circulates widely when Einstein never said it. Without quote verification, the system
+    cannot catch fabricated attributions. Quote verification requires specific techniques:
+    exact string matching in known speech databases, near-match for paraphrased quotes,
+    and provenance tracking to the original utterance.
+  how_to_do_right: |
+    1. Extract quoted text and attributed speaker using pattern matching + NER
+    2. Search known quote databases (Wikiquote, official transcripts, press releases)
+    3. Exact match: character-level comparison after normalization
+    4. Near match: embedding similarity > 0.90 to catch minor paraphrasing
+    5. If no match in known databases: search news archives for original reporting of the quote
+    6. Verify: if original source found, check date precedes claim date
+    7. Output: VERIFIED_QUOTE, MISATTRIBUTED, PARAPHRASED, UNVERIFIED_QUOTE
+  severity: high
+  technologies:
+    lang: [python]
+    library: [spacy, httpx, qdrant-client]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    class QuoteVerifier:
+        async def verify(self, quote: str, speaker: str) -> QuoteVerification:
+            # Step 1: Search official sources
+            official = await self.search_official_transcripts(speaker, quote)
+            if official and self.exact_match(official.text, quote):
+                return QuoteVerification(status="VERIFIED_QUOTE", source=official)
+
+            # Step 2: Near match for paraphrases
+            near = await self.semantic_search(speaker, quote, threshold=0.90)
+            if near:
+                return QuoteVerification(status="PARAPHRASED", source=near, original_text=near.text)
+
+            # Step 3: Check misattribution databases
+            real_author = await self.check_misattribution(quote)
+            if real_author and real_author != speaker:
+                return QuoteVerification(status="MISATTRIBUTED", actual_speaker=real_author)
+
+            return QuoteVerification(status="UNVERIFIED_QUOTE")
+  example_bad: |
+    def check_quote(speaker: str, quote: str) -> bool:
+        results = google_search(f'{speaker} "{quote}"')
+        return len(results) > 0  # Google results != verification
+  when_applies: Claims that attribute statements to specific people
+  sources:
+    - "Quote verification in journalism (Silverman, 2014)"
+
+- id: FC-NLP-011
+  text: "Detect paraphrases between claim variants using a dedicated paraphrase detection model (not just embedding similarity). Two texts can be similar without being paraphrases, and paraphrases can have low surface similarity."
+  why: >
+    Embedding similarity conflates topic similarity with semantic equivalence. 'Dogs are larger
+    than cats' and 'Cats are larger than dogs' have high embedding similarity (0.93) but are
+    opposite claims. A paraphrase detection model trained on MRPC/QQP datasets correctly
+    identifies true paraphrases while rejecting contradictory or merely related texts.
+  how_to_do_right: |
+    1. Use a model fine-tuned on MRPC + QQP datasets (e.g., deberta-v3-base-paraphrase)
+    2. Input: (text_a, text_b) → output: paraphrase probability
+    3. Threshold: > 0.80 for paraphrase, < 0.40 for non-paraphrase, between = uncertain
+    4. Use BEFORE embedding similarity to catch adversarial cases (same topic, opposite meaning)
+    5. For claim dedup: require paraphrase_score > 0.80 AND embedding_similarity > 0.75
+    6. For contradiction detection: paraphrase_score < 0.30 AND embedding_similarity > 0.70 = likely contradiction
+    7. Cache paraphrase scores between claim pairs for efficiency
+  severity: high
+  technologies:
+    lang: [python]
+    library: [transformers, torch]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    class ParaphraseDetector:
+        def __init__(self):
+            self.model = AutoModelForSequenceClassification.from_pretrained("microsoft/deberta-v3-base-paraphrase-detection")
+            self.tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v3-base-paraphrase-detection")
+
+        def is_paraphrase(self, text_a: str, text_b: str) -> ParaphraseResult:
+            inputs = self.tokenizer(text_a, text_b, return_tensors="pt", truncation=True)
+            logits = self.model(**inputs).logits
+            prob = torch.softmax(logits, dim=-1)[0][1].item()
+            return ParaphraseResult(
+                probability=prob,
+                is_paraphrase=prob > 0.80,
+                is_contradiction=prob < 0.30,
+            )
+  example_bad: |
+    def are_same_claim(a: str, b: str) -> bool:
+        sim = cosine_similarity(embed(a), embed(b))
+        return sim > 0.85  # 'Dogs > cats' and 'cats > dogs' both match!
+  when_applies: Claim deduplication and contradiction detection
+  sources:
+    - "MRPC: Microsoft Research Paraphrase Corpus"
+
+- id: FC-NLP-012
+  text: "Detect contradictions between evidence sources explicitly. When Source A says X and Source B says not-X, flag the contradiction, identify which source is more credible, and surface the conflict in the verdict explanation."
+  why: >
+    Contradictions between sources are the most informative signal for fact-checking. They
+    indicate either one source is wrong, the topic is genuinely uncertain, or sources are
+    reporting different aspects. Silently ignoring contradictions produces verdicts that
+    paper over genuine disagreements. Surfacing contradictions builds trust and enables
+    informed user judgment.
+  how_to_do_right: |
+    1. Run pairwise NLI between all evidence pairs for each claim
+    2. If NLI reports CONTRADICTION with p > 0.7 between two evidence passages, flag
+    3. Extract the specific contradicting statements (not just flag at document level)
+    4. Score both sides using source credibility, recency, and evidence tier
+    5. Present contradiction in explanation: 'Source A says X, but Source B says Y'
+    6. If contradictions are unresolvable by credibility: set verdict to DISPUTED
+    7. Track contradiction frequency per source pair — persistent contradictions suggest systematic bias
+  severity: high
+  technologies:
+    lang: [python]
+    library: [transformers, torch]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    class ContradictionDetector:
+        def __init__(self, nli_model: NLIChecker):
+            self.nli = nli_model
+
+        def detect_contradictions(self, evidence: list[Evidence]) -> list[Contradiction]:
+            contradictions = []
+            for i, a in enumerate(evidence):
+                for b in evidence[i+1:]:
+                    result = self.nli.check_entailment(a.text, b.text)
+                    if result.contradiction_prob > 0.7:
+                        contradictions.append(Contradiction(
+                            source_a=a.source_id, source_b=b.source_id,
+                            text_a=a.key_passage, text_b=b.key_passage,
+                            confidence=result.contradiction_prob,
+                        ))
+            return contradictions
+  example_bad: |
+    def aggregate_evidence(evidence: list[Evidence]) -> str:
+        # Ignores contradictions — averages conflicting sources
+        avg_support = sum(e.support_score for e in evidence) / len(evidence)
+        return "TRUE" if avg_support > 0.5 else "FALSE"
+  when_applies: Evidence evaluation when multiple sources are available
+  sources:
+    - "Contradiction detection in NLI (De Marneffe et al., 2008)"
+
+- id: FC-NLP-013
+  text: "Extract temporal expressions from claims and evidence to enable time-aware verification. Parse dates, relative time references ('last year', 'recently'), and durations using a temporal expression parser."
+  why: >
+    Temporal context is critical for fact-checking. 'Unemployment is at 5%' is meaningless without
+    a date. 'Last year' in a 2020 article means 2019, not the current year. Without temporal
+    extraction, the system cannot match claims to time-appropriate evidence, leading to
+    anachronistic verdicts that use 2024 data to verify a 2020 claim.
+  how_to_do_right: |
+    1. Use SUTime or HeidelTime for temporal expression extraction
+    2. Resolve relative expressions to absolute dates using document date as anchor
+    3. Extract: point-in-time ('January 2024'), duration ('for 3 years'), recurrence ('every month')
+    4. Tag claim with temporal_scope: the time period the claim refers to
+    5. Filter evidence search to temporal_scope +/- tolerance (default: +/- 30 days)
+    6. Flag claims with no temporal expressions as 'temporally_ambiguous'
+    7. For 'always'/'never' claims: require evidence spanning the full implied period
+  severity: high
+  technologies:
+    lang: [python]
+    library: [sutime, dateparser, spacy]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    from dateparser import parse as parse_date
+    import re
+
+    class TemporalExtractor:
+        RELATIVE_PATTERNS = {
+            r"last year": lambda ref: ref.replace(year=ref.year - 1),
+            r"this month": lambda ref: ref.replace(day=1),
+            r"recently": lambda ref: ref - timedelta(days=30),
+        }
+
+        def extract(self, text: str, reference_date: datetime) -> list[TemporalExpression]:
+            expressions = []
+            for pattern, resolver in self.RELATIVE_PATTERNS.items():
+                if re.search(pattern, text, re.IGNORECASE):
+                    resolved = resolver(reference_date)
+                    expressions.append(TemporalExpression(
+                        raw=pattern, resolved_date=resolved, type="RELATIVE",
+                    ))
+            # Also extract absolute dates
+            for date_match in find_dates_in_text(text):
+                expressions.append(TemporalExpression(
+                    raw=date_match.text, resolved_date=date_match.date, type="ABSOLUTE",
+                ))
+            return expressions
+  example_bad: |
+    def search_evidence(claim: str) -> list[Evidence]:
+        return search(claim)  # No temporal awareness — 2020 data mixed with 2024
+  when_applies: Claim decomposition and evidence search stages
+  sources:
+    - "SUTime: temporal expression recognition (Chang & Manning, 2012)"
+
+- id: FC-NLP-014
+  text: "Score claim complexity to determine verification difficulty and resource allocation. Complex claims (multiple entities, conditional logic, statistical comparisons) require more evidence, more time, and possibly human review."
+  why: >
+    A simple binary claim ('Person X is the CEO of Company Y') requires different resources
+    than a complex conditional claim ('If inflation exceeds 5%, interest rates will rise,
+    which will cause housing prices to fall'). Without complexity scoring, simple and complex
+    claims get the same pipeline, either over-resourcing simple claims or under-resourcing
+    complex ones.
+  how_to_do_right: |
+    1. Count complexity indicators: entity count, conditional clauses, statistical references, temporal scopes
+    2. Score formula: complexity = 0.3 * entities + 0.25 * conditionals + 0.25 * statistics + 0.2 * temporal
+    3. Normalize to 0-1 scale
+    4. LOW (< 0.3): simple claim, automated pipeline, 3 evidence pieces sufficient
+    5. MEDIUM (0.3-0.7): standard pipeline, 5+ evidence pieces
+    6. HIGH (> 0.7): enhanced pipeline, 10+ evidence pieces, human review recommended
+    7. Use complexity to estimate and communicate verification time to users
+  severity: high
+  technologies:
+    lang: [python]
+    library: [spacy, pydantic]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    def score_complexity(claim_text: str) -> ClaimComplexity:
+        doc = nlp(claim_text)
+        entity_count = len(doc.ents) / 10  # Normalize: 10 entities = max
+        conditional_count = sum(1 for t in doc if t.dep_ == "mark" and t.text in ("if", "when", "unless")) / 3
+        stat_count = sum(1 for ent in doc.ents if ent.label_ in ("PERCENT", "MONEY", "CARDINAL")) / 5
+        temporal_count = sum(1 for ent in doc.ents if ent.label_ == "DATE") / 3
+        raw = 0.3 * entity_count + 0.25 * conditional_count + 0.25 * stat_count + 0.2 * temporal_count
+        score = min(1.0, raw)
+        level = "LOW" if score < 0.3 else ("MEDIUM" if score < 0.7 else "HIGH")
+        return ClaimComplexity(score=score, level=level, entity_count=len(doc.ents))
+  example_bad: |
+    def estimate_difficulty(claim: str) -> str:
+        return "MEDIUM"  # Constant — all claims treated the same
+  when_applies: Claim intake and resource allocation
+  sources:
+    - "https://spacy.io/usage/linguistic-features#named-entities"
+
+- id: FC-NLP-015
+  text: "Score verdict explanation readability using Flesch-Kincaid Grade Level. Target grade 8 or lower (Flesch score >= 60) to ensure fact-check explanations are accessible to the general public."
+  why: >
+    A technically correct explanation that requires a college education to understand fails its
+    primary mission: informing the public. Average US reading level is 7th-8th grade. If
+    explanations are written at college level, 50% of the audience cannot understand them.
+    Health fact-checks with high readability are shared 2x more than low-readability ones.
+  how_to_do_right: |
+    1. Compute Flesch-Kincaid Grade Level for every explanation before publication
+    2. Target: grade <= 8 (Flesch Reading Ease >= 60)
+    3. If grade > 10: automatically simplify using shorter sentences and simpler words
+    4. Avoid jargon: maintain a domain-specific glossary for technical term replacement
+    5. Test with readability tools: textstat library for Python
+    6. A/B test: compare engagement metrics for different readability levels
+    7. Generate two versions: simplified (public) and detailed (expert/journalist)
+  severity: high
+  technologies:
+    lang: [python]
+    library: [textstat]
+  domains:
+    domain: [fact_checking, ui]
+    concern: [domain_specific]
+  example_good: |
+    import textstat
+
+    def check_readability(text: str) -> ReadabilityScore:
+        fk_grade = textstat.flesch_kincaid_grade(text)
+        flesch_ease = textstat.flesch_reading_ease(text)
+        return ReadabilityScore(
+            grade_level=fk_grade,
+            flesch_ease=flesch_ease,
+            is_accessible=fk_grade <= 8,
+            needs_simplification=fk_grade > 10,
+        )
+
+    def ensure_readable(explanation: str, max_grade: float = 8.0) -> str:
+        score = check_readability(explanation)
+        if score.is_accessible:
+            return explanation
+        # Simplify: split long sentences, replace jargon
+        simplified = simplify_text(explanation, target_grade=max_grade)
+        return simplified
+  example_bad: |
+    def explain(verdict: Verdict) -> str:
+        return verdict.technical_explanation  # No readability check — could be PhD-level text
+  when_applies: All user-facing verdict explanations
+  sources:
+    - "Flesch Reading Ease formula"
+    - "Health literacy and fact-checking accessibility research"
+
+- id: FC-NLP-016
+  text: "Detect LLM hallucinations in generated fact-check explanations using entailment verification. Every factual claim in the generated text must be entailed by the source evidence. Flag unsupported claims as potential hallucinations."
+  why: >
+    LLMs generate fluent, confident text that may contain fabricated facts. In a fact-checking
+    context, hallucinated facts in explanations are catastrophic — the system designed to fight
+    misinformation becomes a source of it. Entailment verification catches generated claims
+    that have no evidence support, preventing hallucinations from reaching users.
+  how_to_do_right: |
+    1. Decompose generated explanation into individual factual claims
+    2. For each claim, check NLI entailment against ALL source evidence
+    3. If no evidence entails the claim (all NEUTRAL or CONTRADICTION): flag as UNSUPPORTED
+    4. If flagged claims > 0: regenerate explanation with stricter grounding prompt
+    5. If still failing after 2 regenerations: fall back to extractive summary only
+    6. Log hallucination rate per model version — track regression
+    7. Target: 0% hallucination in published explanations (zero tolerance)
+  severity: critical
+  technologies:
+    lang: [python]
+    library: [transformers, torch]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    class HallucinationDetector:
+        def __init__(self, nli_model: NLIChecker):
+            self.nli = nli_model
+
+        def check_explanation(
+            self, explanation: str, evidence: list[Evidence]
+        ) -> HallucinationReport:
+            claims = decompose_into_claims(explanation)
+            unsupported = []
+            for claim in claims:
+                supported = False
+                for e in evidence:
+                    result = self.nli.check_entailment(e.text, claim)
+                    if result.entailment_prob > 0.7:
+                        supported = True
+                        break
+                if not supported:
+                    unsupported.append(claim)
+            return HallucinationReport(
+                total_claims=len(claims),
+                unsupported_claims=unsupported,
+                hallucination_rate=len(unsupported) / max(len(claims), 1),
+                is_clean=len(unsupported) == 0,
+            )
+  example_bad: |
+    def generate_explanation(claim: str, verdict: str) -> str:
+        return llm.complete(f"Explain why {claim} is {verdict}")
+        # No grounding check — LLM may invent supporting facts
+  when_applies: All LLM-generated content in the fact-checking pipeline
+  sources:
+    - "Hallucination detection survey (Ji et al., 2023)"
+
+- id: FC-NLP-017
+  text: "Engineer prompts for LLM-assisted fact-checking with explicit grounding constraints. Every prompt must include the evidence texts, instruct the model to cite specific passages, and prohibit introducing external knowledge."
+  why: >
+    Without grounding constraints, LLMs use their training data to answer fact-checking questions,
+    which may be outdated, biased, or wrong. The LLM's role is to REASON over provided evidence,
+    not to provide evidence itself. Grounded prompts reduce hallucination by 60% compared to
+    open-ended prompts according to recent benchmarks.
+  how_to_do_right: |
+    1. Include ALL relevant evidence in the prompt with clear citation markers [E1], [E2], etc.
+    2. Instruction: 'Based ONLY on the evidence provided, determine if the claim is supported'
+    3. Require citations: 'For each statement, cite the evidence [E1-EN] that supports it'
+    4. Prohibit external knowledge: 'Do NOT use information not present in the evidence'
+    5. Use structured output: force JSON with fields {verdict, confidence, citations, reasoning}
+    6. Temperature = 0.0 for deterministic outputs
+    7. Validate: every citation in output must reference a provided evidence piece
+  severity: high
+  technologies:
+    lang: [python]
+    library: [anthropic, openai, pydantic]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    FACT_CHECK_PROMPT = """You are a fact-checker. Evaluate the claim using ONLY the evidence provided.
+    Do NOT use any knowledge not in the evidence.
+
+    CLAIM: {claim}
+
+    EVIDENCE:
+    {evidence_block}
+
+    Based ONLY on the above evidence, provide:
+    1. VERDICT: TRUE, FALSE, PARTIALLY_TRUE, UNVERIFIABLE, MISLEADING, or OUT_OF_CONTEXT
+    2. CONFIDENCE: 0.0-1.0
+    3. REASONING: Explain your verdict, citing evidence as [E1], [E2], etc.
+    4. UNSUPPORTED: List any parts of the claim that no evidence addresses.
+
+    Respond in JSON format."""
+
+    def build_prompt(claim: str, evidence: list[Evidence]) -> str:
+        evidence_block = "\n".join(
+            f"[E{i+1}] ({e.source_name}, {e.date}): {e.text}"
+            for i, e in enumerate(evidence)
+        )
+        return FACT_CHECK_PROMPT.format(claim=claim, evidence_block=evidence_block)
+  example_bad: |
+    prompt = f"Is this claim true? {claim}"  # No evidence, no grounding, no structure
+    response = llm.complete(prompt)
+  when_applies: All LLM-assisted reasoning steps in the verification pipeline
+  sources:
+    - "Grounding and attribution in LLMs (Rashkin et al., 2023)"
+
+- id: FC-NLP-018
+  text: "Implement Retrieval-Augmented Generation (RAG) for fact-checking by retrieving relevant evidence first, then generating verdict explanations grounded in the retrieved context. Use chunk sizes of 512 tokens with 50-token overlap."
+  why: >
+    RAG combines the best of retrieval (factual grounding) and generation (fluent explanations).
+    Without RAG, the system either retrieves evidence without explanation or generates
+    explanations without evidence. RAG ensures every generated statement traces back to
+    retrieved evidence, reducing hallucination while maintaining readability.
+  how_to_do_right: |
+    1. Chunk evidence documents into 512-token passages with 50-token overlap
+    2. Embed chunks and store in Qdrant with metadata (source, date, page)
+    3. At query time: retrieve top 5 chunks most relevant to claim
+    4. Construct prompt: claim + retrieved chunks + grounding instructions (see FC-NLP-017)
+    5. Generate explanation using LLM with temperature=0.0
+    6. Validate: run hallucination detection on output (see FC-NLP-016)
+    7. If hallucination detected: remove unsupported sentences, regenerate
+    8. Track RAG metrics: retrieval precision, answer faithfulness, answer relevancy
+  severity: high
+  technologies:
+    lang: [python]
+    library: [qdrant-client, langchain, anthropic]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    class FactCheckRAG:
+        def __init__(self, retriever: HybridRetriever, llm_client, hallucination_detector):
+            self.retriever = retriever
+            self.llm = llm_client
+            self.detector = hallucination_detector
+
+        async def generate_explanation(self, claim: str) -> RAGExplanation:
+            # Retrieve
+            evidence_chunks = await self.retriever.search(claim, top_k=5)
+
+            # Generate
+            prompt = build_grounded_prompt(claim, evidence_chunks)
+            response = await self.llm.complete(prompt, temperature=0.0)
+
+            # Validate
+            report = self.detector.check_explanation(response.text, evidence_chunks)
+            if not report.is_clean:
+                response = await self.regenerate_without_hallucinations(
+                    claim, evidence_chunks, report.unsupported_claims,
+                )
+
+            return RAGExplanation(
+                text=response.text,
+                sources=[c.source_url for c in evidence_chunks],
+                hallucination_free=report.is_clean,
+            )
+  example_bad: |
+    async def explain(claim: str) -> str:
+        return await llm.complete(f"Explain whether this is true: {claim}")
+        # No retrieval — LLM hallucinates evidence
+  when_applies: Verdict explanation generation in the Veritas platform
+  sources:
+    - "Retrieval-Augmented Generation (Lewis et al., 2020)"
+
+- id: FC-NLP-019
+  text: "Use few-shot learning with curated examples for claim classification tasks (domain, verifiability, complexity). Provide 3-5 labeled examples per category in the prompt to achieve 80%+ accuracy without fine-tuning."
+  why: >
+    Fine-tuning requires labeled datasets of 1,000+ examples, which are expensive to create for
+    niche fact-checking tasks. Few-shot learning achieves competitive accuracy with just 3-5
+    examples, enabling rapid iteration on new claim categories. For Veritas, this means new
+    domain classifiers can be deployed in hours, not weeks.
+  how_to_do_right: |
+    1. Curate 3-5 high-quality examples per classification category
+    2. Select diverse examples: different lengths, complexities, edge cases
+    3. Format: {input: claim_text, output: {category, confidence, reasoning}}
+    4. Place examples before the actual query in the prompt
+    5. Use consistent formatting between examples and query
+    6. Evaluate accuracy on a held-out set of 50+ claims before deploying
+    7. Monitor accuracy weekly — if drops below 80%, add more examples or fine-tune
+    8. Maintain example bank in version-controlled YAML, not hardcoded in prompts
+  severity: high
+  technologies:
+    lang: [python]
+    library: [anthropic, openai, pydantic]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    FEW_SHOT_EXAMPLES = [
+        {"claim": "COVID vaccines contain microchips", "domain": "health", "verifiable": True},
+        {"claim": "Democracy is the best system", "domain": "politics", "verifiable": False},
+        {"claim": "Bitcoin hit $100K in 2024", "domain": "finance", "verifiable": True},
+        {"claim": "AI will replace all jobs", "domain": "technology", "verifiable": False},
+        {"claim": "Brazil's GDP grew 3% in 2024", "domain": "finance", "verifiable": True},
+    ]
+
+    def build_classification_prompt(claim: str) -> str:
+        examples = "\n".join(
+            f"Claim: {e['claim']}\nDomain: {e['domain']}\nVerifiable: {e['verifiable']}\n"
+            for e in FEW_SHOT_EXAMPLES
+        )
+        return f"Classify the following claim based on these examples:\n\n{examples}\nClaim: {claim}\n"
+  example_bad: |
+    def classify(claim: str) -> str:
+        return llm.complete(f"What domain is this claim? {claim}")
+        # Zero-shot, no examples — inconsistent outputs, no structured format
+  when_applies: Claim classification tasks where fine-tuned models are not yet available
+  sources:
+    - "Language Models are Few-Shot Learners (Brown et al., 2020)"
+
+- id: FC-NLP-020
+  text: "Track NLP model performance with evaluation metrics specific to fact-checking: claim detection precision/recall/F1, stance detection accuracy, verdict accuracy, and explanation faithfulness. Run evaluations on a gold-standard test set of 200+ labeled examples."
+  why: >
+    Without systematic evaluation, model changes can degrade quality undetected. A model update
+    that improves stance detection by 2% but degrades NER by 10% is a net negative. Fact-checking-
+    specific metrics capture the full pipeline quality, not just individual model performance.
+    The gold-standard test set enables regression testing before any model deployment.
+  how_to_do_right: |
+    1. Maintain gold-standard dataset: 200+ claims with labeled entities, stances, verdicts
+    2. Split: 70% development, 30% held-out test (never train on test set)
+    3. Metrics per stage:
+       - Claim detection: precision, recall, F1 (is the claim correctly identified?)
+       - NER: entity-level F1 (are the right entities extracted?)
+       - Stance: accuracy, macro-F1 across SUPPORTS/REFUTES/NEUTRAL
+       - Verdict: accuracy, weighted F1 across all 6 verdict labels
+       - Explanation: faithfulness score (% of claims supported by cited evidence)
+    4. Run evaluation suite before every model update (CI/CD gate)
+    5. Alert if any metric drops > 2% from baseline
+    6. Track metrics over time in dashboard (Langfuse or custom)
+    7. Update gold-standard quarterly with new claim types
+  severity: high
+  technologies:
+    lang: [python]
+    library: [scikit-learn, pytest, langfuse]
+  domains:
+    domain: [fact_checking, ai_ml, testing]
+    concern: [domain_specific]
+  example_good: |
+    from sklearn.metrics import classification_report, f1_score
+
+    class FactCheckEvaluator:
+        def __init__(self, gold_dataset: list[GoldExample]):
+            self.gold = gold_dataset
+
+        def evaluate_stance(self, model: StanceDetector) -> dict:
+            predictions = [model.detect_stance(g.claim, g.evidence).label for g in self.gold]
+            labels = [g.stance_label for g in self.gold]
+            return {
+                "accuracy": sum(p == l for p, l in zip(predictions, labels)) / len(labels),
+                "macro_f1": f1_score(labels, predictions, average="macro"),
+                "report": classification_report(labels, predictions, output_dict=True),
+            }
+
+        def evaluate_full_pipeline(self, pipeline: VerificationPipeline) -> PipelineMetrics:
+            results = [pipeline.verify(g.claim) for g in self.gold]
+            verdict_acc = sum(r.label == g.verdict for r, g in zip(results, self.gold)) / len(self.gold)
+            faithfulness = np.mean([score_faithfulness(r.explanation, r.evidence) for r in results])
+            return PipelineMetrics(
+                verdict_accuracy=verdict_acc,
+                explanation_faithfulness=faithfulness,
+            )
+  example_bad: |
+    def test_model():
+        assert model.predict("test claim") is not None  # Existence check only — no quality metrics
+  when_applies: Model development, CI/CD pipeline, production monitoring
+  sources:
+    - "FEVER shared task evaluation (Thorne et al., 2018)"
+    - "RAGAS evaluation framework documentation"

@@ -1,0 +1,959 @@
+layer: rules
+technology: Redis
+domain: database
+knowledge:
+- id: CR-RED-DS-001
+  text: Use Sorted Sets for leaderboards, rate limiters, and priority queues — they provide O(log N) insertion and O(log N
+    + M) range queries with automatic score-based ordering.
+  why: Implementing leaderboards or priority queues with plain keys or hashes requires reading all entries, sorting in application
+    code, and writing back — O(N log N) per operation and not atomic. Sorted Sets maintain elements ordered by score in a
+    skip list, enabling ZADD (insert/update), ZRANGEBYSCORE (range query), ZRANK (position lookup), and ZINCRBY (atomic score
+    increment) all in O(log N). For a leaderboard with 1M players, getting the top 100 is O(log N + 100) instead of O(N log
+    N). Rate limiters using sliding windows with ZADD/ZRANGEBYSCORE are both atomic and efficient.
+  how_to_do_right: 'For leaderboards: ZADD key score member, ZREVRANGE key 0 99 WITHSCORES (top 100), ZRANK key member (player
+    position). For rate limiting: ZADD key timestamp member, ZRANGEBYSCORE key (now-window) now (count requests in window),
+    ZREMRANGEBYSCORE key 0 (now-window) (clean old entries). For priority queues: ZADD key priority task, ZPOPMIN key (get
+    highest priority). Use ZRANGEBYLEX for lexicographic ordering.'
+  severity: high
+  technologies:
+    platform: [redis]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, caching, real_time]
+  example_good: "# Leaderboard — O(log N) per operation\nZADD leaderboard 1500 \"player:alice\"\nZADD leaderboard 2300 \"\
+    player:bob\"\nZADD leaderboard 1800 \"player:charlie\"\nZINCRBY leaderboard 100 \"player:alice\"  # Alice scores 100 more\n\
+    \n# Top 3 players with scores\nZREVRANGE leaderboard 0 2 WITHSCORES\n# 1) \"player:bob\"    2300\n# 2) \"player:charlie\"\
+    \ 1800\n# 3) \"player:alice\"  1600\n\n# Player's rank (0-based, from top)\nZREVRANK leaderboard \"player:charlie\"  #\
+    \ Returns 1 (2nd place)\n\n# Sliding window rate limiter (10 requests per 60 seconds)\nimport time, redis\nr = redis.Redis()\n\
+    \ndef is_rate_limited(user_id: str, limit: int = 10, window: int = 60) -> bool:\n    key = f\"rate:{user_id}\"\n    now\
+    \ = time.time()\n    pipe = r.pipeline()\n    pipe.zremrangebyscore(key, 0, now - window)  # Remove old entries\n    pipe.zadd(key,\
+    \ {f\"{now}:{id(object())}\": now})  # Add current request\n    pipe.zcard(key)  # Count requests in window\n    pipe.expire(key,\
+    \ window)  # TTL for cleanup\n    _, _, count, _ = pipe.execute()\n    return count > limit\n"
+  example_bad: '# Using a LIST for leaderboard — O(N) to find rank
+
+    RPUSH leaderboard ''{"player":"alice","score":1500}''
+
+    # To get top 10: must LRANGE all, parse JSON, sort in app code
+
+    # O(N) read + O(N log N) sort vs O(log N + 10) with Sorted Set
+
+
+    # Rate limiting with a simple counter — no sliding window
+
+    INCR rate:user123
+
+    EXPIRE rate:user123 60
+
+    # Problem: counter resets at the exact TTL boundary
+
+    # User can do 10 requests at 0:59 and 10 more at 1:01 = 20 in 2 seconds
+
+    '
+  when_applies: Projects using Redis cache/pub-sub systems
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Redis
+  sources: ["https://redis.io/docs/latest/develop/data-types/sorted-sets/"]
+- id: CR-RED-DS-002
+  text: Use Redis Streams for reliable message queues with consumer groups — they provide exactly-once delivery semantics,
+    message acknowledgment, and dead letter handling.
+  why: 'Using Redis Lists (RPUSH/BLPOP) for message queues loses messages on consumer crashes — once a message is popped,
+    it is gone. Pub/Sub has no persistence — if no subscriber is listening, messages are lost. Redis Streams combine the durability
+    of an append-only log with consumer group semantics: messages are stored persistently, each consumer group tracks its
+    own offset, unacknowledged messages can be reclaimed (XCLAIM), and messages survive consumer restarts. This makes Streams
+    a lightweight alternative to Kafka for applications already using Redis.'
+  how_to_do_right: Create streams with XADD, consumer groups with XGROUP CREATE. Consumers read with XREADGROUP (blocks until
+    new messages). After processing, acknowledge with XACK. Use XPENDING to find unacknowledged messages and XCLAIM to reassign
+    them after a timeout. Set MAXLEN or MINID on XADD to bound stream size. For exactly-once processing, use the message ID
+    as an idempotency key.
+  severity: high
+  technologies:
+    platform: [redis]
+  domains:
+    domain: [architecture, messaging]
+    concern: [data, database, event-driven]
+  example_good: "# Create stream and consumer group\nXGROUP CREATE orders:stream orders-group $ MKSTREAM\n\n# Producer: add\
+    \ events to stream\nXADD orders:stream MAXLEN ~10000 * \\\n  order_id \"ORD-123\" action \"created\" amount \"99.50\"\n\
+    \n# Consumer: read new messages (blocks up to 5 seconds)\nXREADGROUP GROUP orders-group consumer-1 COUNT 10 BLOCK 5000\
+    \ \\\n  STREAMS orders:stream >\n\n# Acknowledge successful processing\nXACK orders:stream orders-group \"1677123456789-0\"\
+    \n\n# Check for unacknowledged messages (consumer crashed)\nXPENDING orders:stream orders-group - + 10\n\n# Reclaim messages\
+    \ idle for 30+ seconds\nXAUTOCLAIM orders:stream orders-group consumer-2 30000 0-0\n\n# Python consumer with proper error\
+    \ handling\nimport redis\nr = redis.Redis()\n\nwhile True:\n    messages = r.xreadgroup(\n        \"orders-group\", \"\
+    consumer-1\",\n        {\"orders:stream\": \">\"},\n        count=10, block=5000\n    )\n    for stream, entries in messages:\n\
+    \        for msg_id, fields in entries:\n            try:\n                process_order(fields)\n                r.xack(\"\
+    orders:stream\", \"orders-group\", msg_id)\n            except Exception:\n                pass  # Message stays pending\
+    \ for XAUTOCLAIM\n"
+  example_bad: '# Using LIST as message queue — messages lost on crash
+
+    RPUSH queue ''{"order_id": "ORD-123"}''
+
+    BLPOP queue 0
+
+    # If consumer crashes after BLPOP but before processing: message LOST
+
+    # No consumer groups — only one consumer can read each message
+
+    # No replay — once popped, message is gone
+
+
+    # Using PUB/SUB — messages lost if no subscriber
+
+    PUBLISH orders ''{"order_id": "ORD-123"}''
+
+    # If no subscriber is connected: message LOST
+
+    # No persistence — cannot replay historical messages
+
+    # No acknowledgment — publisher doesn''t know if message was processed
+
+    '
+  when_applies: Projects using Redis cache/pub-sub systems
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Redis
+  sources: ["https://redis.io/docs/latest/develop/data-types/streams/"]
+- id: CR-RED-DS-003
+  text: Use HyperLogLog for probabilistic cardinality estimation — it counts unique elements using only 12KB of memory regardless
+    of the actual count.
+  why: Counting unique visitors, unique IP addresses, or unique search queries exactly requires storing every unique element
+    in a Set — consuming O(N) memory. For 100M unique visitors, that is ~3.2GB of memory per counter. HyperLogLog uses a fixed
+    12KB per counter regardless of cardinality and provides cardinality estimates with a standard error of 0.81%. For most
+    analytics use cases (unique visitors, unique events, unique users per feature), the 0.81% error is negligible compared
+    to the 250,000x memory reduction. Multiple HyperLogLogs can be merged (PFMERGE) for aggregate counts.
+  how_to_do_right: Use PFADD to add elements, PFCOUNT to get the estimated cardinality, PFMERGE to combine counters. Create
+    separate HyperLogLogs per time period (day, hour) and PFMERGE for aggregate periods. Do NOT use HyperLogLog when you need
+    exact counts (financial transactions, inventory) or when you need to check membership (use Bloom filter instead). HyperLogLog
+    answers 'how many unique?' but cannot answer 'was this element seen?'
+  severity: medium
+  technologies:
+    platform: [redis]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, analytics]
+  example_good: "# Count unique visitors per day — 12KB per day\nPFADD visitors:2026-02-15 \"user:alice\" \"user:bob\" \"\
+    user:charlie\"\nPFADD visitors:2026-02-15 \"user:alice\"  # Duplicate — not counted\nPFCOUNT visitors:2026-02-15  # Returns\
+    \ ~3 (with 0.81% error)\n\n# Merge weekly unique visitors\nPFMERGE visitors:week-7 \\\n  visitors:2026-02-10 visitors:2026-02-11\
+    \ visitors:2026-02-12 \\\n  visitors:2026-02-13 visitors:2026-02-14 visitors:2026-02-15 visitors:2026-02-16\nPFCOUNT visitors:week-7\
+    \  # Weekly unique visitors\n\n# Memory comparison:\n# HyperLogLog: 7 keys × 12KB = 84KB for weekly tracking\n# SET: 10M\
+    \ unique visitors × 32 bytes avg = 320MB per day = 2.24GB weekly\n\n# Python usage\nimport redis\nr = redis.Redis()\n\n\
+    def track_unique_visitor(page: str, user_id: str):\n    date = datetime.now().strftime(\"%Y-%m-%d\")\n    r.pfadd(f\"\
+    uv:{page}:{date}\", user_id)\n\ndef get_unique_visitors(page: str, date: str) -> int:\n    return r.pfcount(f\"uv:{page}:{date}\"\
+    )\n"
+  example_bad: '# Using SET for unique counting — O(N) memory
+
+    SADD visitors:2026-02-15 "user:alice" "user:bob" "user:charlie"
+
+    SCARD visitors:2026-02-15  # Exact count: 3
+
+    # With 10M visitors: SET uses 320MB vs HyperLogLog''s 12KB
+
+    # 26,000x more memory for 0.81% more accuracy
+
+
+    # Using HyperLogLog for exact-count requirements
+
+    PFADD inventory:warehouse-1 "SKU-001" "SKU-002"
+
+    PFCOUNT inventory:warehouse-1  # Might return 2 or 3 — unacceptable for inventory
+
+    # HyperLogLog error is ±0.81% — for 100 SKUs that is ±1 SKU
+
+    '
+  when_applies: Projects using Redis cache/pub-sub systems
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Redis
+  sources: ["https://redis.io/docs/latest/develop/data-types/probabilistic/hyperloglogs/"]
+- id: CR-RED-DS-004
+  text: Use Lua scripting for atomic multi-step operations — Lua scripts execute as a single atomic command, preventing race
+    conditions between read and write steps.
+  why: 'Redis executes commands sequentially but individual commands are not composable atomically. A pattern like GET key,
+    check value, SET key has a race condition — another client can modify the key between GET and SET. MULTI/EXEC transactions
+    prevent interleaving but cannot use intermediate results (you cannot branch based on GET result inside MULTI). Lua scripts
+    solve this: they execute atomically on the server, can read values, compute, branch, and write — all without any other
+    client intervening. This is the correct way to implement compare-and-swap, conditional updates, and complex atomic operations.'
+  how_to_do_right: Write Lua scripts using EVAL or EVALSHA (preloaded). Pass keys as KEYS[] and arguments as ARGV[] for cluster
+    compatibility. Keep scripts short (< 5ms execution time) — long-running scripts block all other Redis commands. Use redis.call()
+    for commands that should propagate errors, redis.pcall() for error handling. Cache scripts with SCRIPT LOAD + EVALSHA
+    to avoid resending script text.
+  severity: high
+  technologies:
+    platform: [redis]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, concurrency]
+  example_good: "-- Atomic rate limiter with sliding window (Lua script)\n-- KEYS[1] = rate limit key\n-- ARGV[1] = current\
+    \ timestamp, ARGV[2] = window size, ARGV[3] = max requests\nlocal key = KEYS[1]\nlocal now = tonumber(ARGV[1])\nlocal\
+    \ window = tonumber(ARGV[2])\nlocal max_requests = tonumber(ARGV[3])\n\n-- Remove expired entries\nredis.call('ZREMRANGEBYSCORE',\
+    \ key, 0, now - window)\n\n-- Count current requests\nlocal count = redis.call('ZCARD', key)\n\nif count < max_requests\
+    \ then\n    -- Add new request\n    redis.call('ZADD', key, now, now .. ':' .. math.random(1000000))\n    redis.call('EXPIRE',\
+    \ key, window)\n    return 1  -- Allowed\nelse\n    return 0  -- Rate limited\nend\n\n# Python usage\nrate_limit_script\
+    \ = r.register_script(LUA_SCRIPT)\nallowed = rate_limit_script(\n    keys=[\"rate:user:123\"],\n    args=[time.time(),\
+    \ 60, 10]\n)\n"
+  example_bad: "# Non-atomic rate limiter — race condition\nimport redis, time\nr = redis.Redis()\n\ndef check_rate_limit(user_id):\n\
+    \    key = f\"rate:{user_id}\"\n    now = time.time()\n    r.zremrangebyscore(key, 0, now - 60)  # Step 1: Remove old\n\
+    \    # RACE CONDITION: another request can arrive here\n    count = r.zcard(key)                    # Step 2: Count\n\
+    \    # RACE CONDITION: count is stale\n    if count < 10:\n        r.zadd(key, {str(now): now})         # Step 3: Add\n\
+    \        return True\n    return False\n# 20 concurrent requests can all pass the count < 10 check\n# Result: 20 requests\
+    \ allowed when limit is 10\n"
+  when_applies: Projects using Redis cache/pub-sub systems
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Redis
+  sources: ["https://redis.io/docs/latest/develop/interact/programmability/eval-intro/"]
+- id: CR-RED-DS-005
+  text: Use hybrid persistence (RDB + AOF) for production Redis — RDB for fast restart and AOF for durability, with appendfsync
+    everysec as the balanced default.
+  why: RDB snapshots are point-in-time copies saved every N minutes. If Redis crashes between snapshots, you lose up to N
+    minutes of data. AOF logs every write command and can be replayed for full recovery, but AOF files are larger and restart
+    is slower (replaying millions of commands). Hybrid mode uses AOF for durability (fsync every second = max 1 second of
+    data loss) and rewrites the AOF in RDB format during compaction for fast restart. appendfsync=always writes to disk on
+    every command (zero data loss but 100x slower). appendfsync=no delegates to the OS (fastest but up to 30 seconds of data
+    loss).
+  how_to_do_right: 'Enable both RDB and AOF: save ''900 1'' (RDB snapshot every 15min if 1+ key changed), appendonly yes,
+    appendfsync everysec. The AOF rewrite uses RDB format for the base (aof-use-rdb-preamble yes). Monitor with INFO persistence
+    — check rdb_last_bgsave_status and aof_last_bgrewrite_status. Test recovery regularly: stop Redis, restart, verify data.'
+  severity: critical
+  technologies:
+    platform: [redis]
+  domains:
+    domain: [architecture, reliability, operations]
+    concern: [data, database]
+  example_good: '# redis.conf — hybrid persistence (recommended for production)
+
+
+    # RDB snapshots — fast point-in-time recovery
+
+    save 900 1       # Snapshot every 15min if 1+ key changed
+
+    save 300 10      # Snapshot every 5min if 10+ keys changed
+
+    save 60 10000    # Snapshot every 1min if 10000+ keys changed
+
+
+    # AOF — durability (max 1 second data loss)
+
+    appendonly yes
+
+    appendfsync everysec             # Fsync every second (balanced)
+
+    aof-use-rdb-preamble yes         # Hybrid: RDB format in AOF rewrite
+
+    auto-aof-rewrite-percentage 100  # Rewrite when AOF doubles in size
+
+    auto-aof-rewrite-min-size 64mb   # Minimum size before rewrite
+
+
+    # Recovery order: Redis loads AOF if exists (more complete), else RDB
+
+
+    # Monitoring
+
+    # redis-cli INFO persistence
+
+    # rdb_last_bgsave_status: ok
+
+    # aof_last_bgrewrite_status: ok
+
+    # aof_current_size: 125829120
+
+    '
+  example_bad: '# No persistence — all data lost on restart
+
+    save ""
+
+    appendonly no
+
+    # Redis restart = empty database
+
+    # Server crash = all session data, cache, queues LOST
+
+
+    # RDB only with infrequent saves — up to 15 min data loss
+
+    save 900 1
+
+    appendonly no
+
+    # Server crashes 14 minutes after last snapshot
+
+    # Result: 14 minutes of writes are LOST
+
+
+    # appendfsync always — correct but too slow for most workloads
+
+    appendfsync always
+
+    # Every write waits for fsync to disk
+
+    # Throughput drops from 100K ops/s to 1K ops/s
+
+    # Only justified for financial transaction logging
+
+    '
+  when_applies: Any project using Redis cache/pub-sub systems
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Redis
+  sources: ["https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/"]
+- id: CR-RED-DS-006
+  text: Understand Redis Cluster's hash slot model — all keys in a multi-key operation must map to the same hash slot, enforced
+    by using hash tags {tag}.
+  why: 'Redis Cluster distributes data across nodes using 16,384 hash slots. Each key is assigned to a slot via CRC16(key)
+    % 16384. Multi-key commands (MGET, MSET, SUNION, Lua scripts with multiple KEYS) require all keys to be on the same node
+    — otherwise Redis returns CROSSSLOT error. This is the most common Redis Cluster migration pitfall: code that works on
+    standalone Redis breaks in cluster mode because related keys land on different nodes. Hash tags ({prefix}) force keys
+    to the same slot by only hashing the content between {}.'
+  how_to_do_right: 'Use hash tags for related keys: user:{12345}:profile, user:{12345}:session, user:{12345}:cart — all hash
+    to the same slot because of {12345}. Design your key naming scheme to group co-accessed keys under the same hash tag.
+    For Lua scripts, all KEYS[] must share a hash tag. Avoid too many keys under one hash tag (hot slot). Test with CLUSTER
+    KEYSLOT to verify slot assignment.'
+  severity: critical
+  technologies:
+    platform: [redis]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, scalability]
+  example_good: "# Hash tags group related keys on the same slot\nSET user:{12345}:profile '{\"name\": \"Alice\"}'\nSET user:{12345}:session\
+    \ '{\"token\": \"abc\"}'\nSET user:{12345}:cart '{\"items\": [1, 2, 3]}'\n\n# All three keys hash to the same slot (CRC16\
+    \ of \"12345\")\nCLUSTER KEYSLOT user:{12345}:profile   # → 1234\nCLUSTER KEYSLOT user:{12345}:session   # → 1234\nCLUSTER\
+    \ KEYSLOT user:{12345}:cart      # → 1234\n\n# Multi-key operations work because same slot\nMGET user:{12345}:profile\
+    \ user:{12345}:session user:{12345}:cart\n\n# Lua script with multiple keys — all must be same slot\nEVAL \"return {redis.call('GET',\
+    \ KEYS[1]), redis.call('GET', KEYS[2])}\" \\\n  2 user:{12345}:profile user:{12345}:session\n"
+  example_bad: '# No hash tags — related keys scatter across slots
+
+    SET user:12345:profile ''{"name": "Alice"}''
+
+    SET user:12345:session ''{"token": "abc"}''
+
+
+    CLUSTER KEYSLOT user:12345:profile   # → 8901
+
+    CLUSTER KEYSLOT user:12345:session   # → 4567 (different slot!)
+
+
+    # Multi-key operation fails
+
+    MGET user:12345:profile user:12345:session
+
+    # (error) CROSSSLOT Keys in request don''t hash to the same slot
+
+
+    # Hot slot — too many keys under one hash tag
+
+    SET orders:{global}:1 "..."
+
+    SET orders:{global}:2 "..."
+
+    # ... millions of keys with {global} tag
+
+    # ALL land on one node — that node becomes the bottleneck
+
+    '
+  when_applies: Any project using Redis cache/pub-sub systems
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Redis
+  sources: ["https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/"]
+- id: CR-RED-DS-007
+  text: Implement distributed locking with the Redlock algorithm or single-instance SET NX EX — never use SETNX + EXPIRE as
+    two separate commands.
+  why: 'SETNX and EXPIRE as separate commands have a race condition: if the process crashes after SETNX but before EXPIRE,
+    the lock is held forever (no TTL). SET key value NX EX seconds is atomic — it either sets with TTL or fails in a single
+    command. For single-instance Redis, this is sufficient. For Redis Cluster or high-availability scenarios, the Redlock
+    algorithm acquires locks on N/2+1 independent Redis instances with clock drift compensation. Without proper distributed
+    locking, two processes can hold the ''same'' lock, leading to data corruption in critical sections.'
+  how_to_do_right: 'For single instance: SET lock:resource unique_value NX EX 30. The unique_value (UUID) prevents releasing
+    another client''s lock. Release with Lua script that checks value before DELeting. For production: use a well-tested library
+    (Redisson for Java, redis-py with Lock, etc.). Set TTL conservatively longer than maximum expected operation time. Implement
+    lock extension (watchdog) for long-running operations.'
+  severity: critical
+  technologies:
+    platform: [redis]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, concurrency, distributed-systems]
+  example_good: "import redis\nimport uuid\nimport time\n\nr = redis.Redis()\n\ndef acquire_lock(resource: str, ttl: int =\
+    \ 30) -> str | None:\n    \"\"\"Acquire distributed lock with unique token.\"\"\"\n    token = str(uuid.uuid4())\n   \
+    \ if r.set(f\"lock:{resource}\", token, nx=True, ex=ttl):\n        return token\n    return None\n\ndef release_lock(resource:\
+    \ str, token: str) -> bool:\n    \"\"\"Release lock only if we own it (atomic via Lua).\"\"\"\n    script = \"\"\"\n \
+    \   if redis.call('GET', KEYS[1]) == ARGV[1] then\n        return redis.call('DEL', KEYS[1])\n    else\n        return\
+    \ 0\n    end\n    \"\"\"\n    return bool(r.eval(script, 1, f\"lock:{resource}\", token))\n\n# Usage\ntoken = acquire_lock(\"\
+    order:123\")\nif token:\n    try:\n        process_order(\"123\")\n    finally:\n        release_lock(\"order:123\", token)\n\
+    else:\n    raise Exception(\"Could not acquire lock\")\n\n# Or use redis-py's built-in Lock (recommended)\nwith r.lock(\"\
+    lock:order:123\", timeout=30, blocking_timeout=5):\n    process_order(\"123\")\n"
+  example_bad: "# SETNX + EXPIRE — race condition (lock held forever if crash between)\nif r.setnx(\"lock:order:123\", \"\
+    locked\"):\n    # Process crashes HERE → no TTL → lock held forever\n    r.expire(\"lock:order:123\", 30)\n    process_order(\"\
+    123\")\n    r.delete(\"lock:order:123\")\n\n# DEL without checking ownership — releases another client's lock\ntoken =\
+    \ acquire_lock(\"order:123\")\nif token:\n    process_order(\"123\")\n    r.delete(\"lock:order:123\")  # Might delete\
+    \ ANOTHER client's lock!\n    # If our lock expired and client B acquired it,\n    # we just released client B's lock\n"
+  when_applies: Any project using Redis cache/pub-sub systems
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Redis
+  sources: ["https://redis.io/docs/latest/develop/use/patterns/distributed-locks/"]
+- id: CR-RED-DS-008
+  text: Use cache-aside pattern with appropriate TTLs — never cache without expiration, and handle cache stampede with probabilistic
+    early expiration or locking.
+  why: A cache without TTL grows until Redis runs out of memory, then evicts keys unpredictably. When a popular cached key
+    expires, hundreds of concurrent requests simultaneously hit the database to regenerate it — the thundering herd (cache
+    stampede) problem. This can take down your database if the regeneration query is expensive. Cache-aside with TTL ensures
+    freshness while the application controls what is cached. Probabilistic early expiration (XFetch) or mutex locking for
+    regeneration prevents stampedes.
+  how_to_do_right: 'Cache-aside pattern: (1) read cache, (2) on miss, read DB, (3) write to cache with TTL. Set TTL based
+    on data freshness requirements: 5min for user profiles, 1hour for product catalogs, 24h for static content. For stampede
+    prevention: use SET NX to acquire a regeneration lock — only one process regenerates while others serve stale data or
+    wait. Add jitter to TTLs (TTL + random(0, TTL*0.1)) to prevent synchronized expiration.'
+  severity: high
+  technologies:
+    platform: [redis]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, caching]
+  example_good: "import redis\nimport json\nimport random\n\nr = redis.Redis()\nBASE_TTL = 3600  # 1 hour\n\ndef get_product(product_id:\
+    \ str) -> dict:\n    cache_key = f\"product:{product_id}\"\n\n    # Step 1: Try cache\n    cached = r.get(cache_key)\n\
+    \    if cached:\n        return json.loads(cached)\n\n    # Step 2: Cache miss — acquire regeneration lock\n    lock_key\
+    \ = f\"lock:regen:{cache_key}\"\n    if r.set(lock_key, \"1\", nx=True, ex=10):\n        try:\n            # Step 3: Read\
+    \ from DB (only one process does this)\n            product = db.query(\"SELECT * FROM products WHERE id = %s\", product_id)\n\
+    \            # Step 4: Write to cache with jittered TTL\n            ttl = BASE_TTL + random.randint(0, 360)  # 1h ± 6min\n\
+    \            r.setex(cache_key, ttl, json.dumps(product))\n            return product\n        finally:\n            r.delete(lock_key)\n\
+    \    else:\n        # Another process is regenerating — wait briefly and retry\n        import time\n        time.sleep(0.1)\n\
+    \        cached = r.get(cache_key)\n        return json.loads(cached) if cached else get_product_from_db(product_id)\n"
+  example_bad: "# No TTL — cache grows forever\ndef get_product(product_id):\n    cached = r.get(f\"product:{product_id}\"\
+    )\n    if cached:\n        return json.loads(cached)\n    product = db.query(...)\n    r.set(f\"product:{product_id}\"\
+    , json.dumps(product))  # No TTL!\n    return product\n# After 6 months: 10M product keys consuming 8GB\n# Product data\
+    \ is stale — price changes not reflected for cached items\n\n# No stampede protection — thundering herd\ndef get_popular_item(item_id):\n\
+    \    cached = r.get(f\"item:{item_id}\")\n    if not cached:\n        # 500 concurrent requests all miss cache simultaneously\n\
+    \        # 500 identical DB queries execute in parallel\n        data = expensive_db_query(item_id)  # Takes 2 seconds\n\
+    \        r.setex(f\"item:{item_id}\", 300, json.dumps(data))\n        return data\n    return json.loads(cached)\n"
+  when_applies: Projects using Redis cache/pub-sub systems
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Redis
+  sources: ["https://redis.io/docs/latest/develop/use/patterns/caching/"]
+- id: CR-RED-DS-009
+  text: Never use KEYS command in production — it scans the entire keyspace, blocking Redis for seconds to minutes, causing
+    timeouts for all clients.
+  why: Redis is single-threaded for command execution. The KEYS pattern command scans every key in the database — O(N) where
+    N is the total number of keys. With 10M keys, KEYS * takes 2-5 seconds, during which Redis cannot process ANY other command.
+    All other clients experience timeouts. In production with 100M keys, KEYS can block Redis for 30+ seconds, triggering
+    cascading failures as applications timeout and retry. This single command has caused more production outages than almost
+    any other Redis misuse.
+  how_to_do_right: 'Use SCAN cursor COUNT 100 for iterating over keys — it processes in small batches without blocking. SCAN
+    is cursor-based: it returns a cursor and a batch of keys; call again with the returned cursor until cursor is 0. Use SCAN
+    with MATCH pattern for filtered iteration. For counting keys matching a pattern, use SCAN + client-side counting. For
+    monitoring, use INFO keyspace for total key counts.'
+  severity: critical
+  technologies:
+    platform: [redis]
+  domains:
+    domain: [architecture, operations]
+    concern: [data, database, anti-pattern]
+  example_good: "# SCAN — non-blocking iteration in batches\nimport redis\n\nr = redis.Redis()\n\ndef find_keys_by_pattern(pattern:\
+    \ str) -> list[str]:\n    \"\"\"Iterate keys without blocking Redis.\"\"\"\n    keys = []\n    cursor = 0\n    while True:\n\
+    \        cursor, batch = r.scan(cursor, match=pattern, count=100)\n        keys.extend(batch)\n        if cursor == 0:\n\
+    \            break\n    return keys\n\n# Find all user session keys\nsessions = find_keys_by_pattern(\"session:user:*\"\
+    )\n\n# Delete keys by pattern safely\ndef delete_by_pattern(pattern: str) -> int:\n    deleted = 0\n    cursor = 0\n \
+    \   while True:\n        cursor, batch = r.scan(cursor, match=pattern, count=100)\n        if batch:\n            deleted\
+    \ += r.delete(*batch)\n        if cursor == 0:\n            break\n    return deleted\n\n# Redis CLI equivalent\n# redis-cli\
+    \ --scan --pattern \"session:*\" | head -10\n"
+  example_bad: "# KEYS in production — blocks Redis entirely\nkeys = r.keys(\"session:*\")  # 10M keys → blocks for 3-5 seconds\n\
+    # ALL other clients timeout during this scan\n# Health checks fail → load balancer removes Redis from pool\n# Application\
+    \ cascade failure\n\n# KEYS in a loop — amplified disaster\nfor pattern in [\"user:*\", \"session:*\", \"cache:*\", \"\
+    rate:*\"]:\n    keys = r.keys(pattern)  # 4 full scans = 12-20 seconds blocked\n    for key in keys:\n        r.delete(key)\n\
+    \n# Using KEYS in monitoring scripts (runs every minute)\n# redis-cli KEYS \"*\" | wc -l  # Blocks Redis every minute\n"
+  when_applies: Any project using Redis cache/pub-sub systems
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Redis
+  sources: ["https://redis.io/docs/latest/commands/scan/"]
+- id: CR-RED-DS-010
+  text: Use Redis pipelining to batch multiple commands into a single round trip — reducing network latency from N round trips
+    to 1.
+  why: 'Each Redis command requires a network round trip: send command, wait for response. For 1000 commands at 0.5ms per
+    round trip, that is 500ms of network latency alone — even though Redis processes each command in microseconds. Pipelining
+    sends all commands in a single write and reads all responses in a single read. For 1000 commands, latency drops from 500ms
+    to ~1ms. This is the single most impactful Redis optimization for batch operations. Without pipelining, Redis throughput
+    is limited by network latency, not server performance.'
+  how_to_do_right: Use pipeline() context manager in Redis clients. Batch related operations (e.g., all cache reads for a
+    page). Keep pipeline batches under ~1000 commands (very large pipelines consume server memory for buffering responses).
+    For operations that depend on intermediate results, use Lua scripts instead. Pipeline operations are NOT atomic — use
+    MULTI/EXEC within a pipeline if you need atomicity.
+  severity: high
+  technologies:
+    platform: [redis]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database]
+  example_good: "import redis\n\nr = redis.Redis()\n\n# Pipelining — 1000 commands in 1 round trip\npipe = r.pipeline(transaction=False)\
+    \  # No MULTI/EXEC\nfor user_id in range(1000):\n    pipe.get(f\"user:{user_id}:score\")\nresults = pipe.execute()  #\
+    \ Single round trip\n\n# Time: ~1ms (1 round trip)\n# vs non-pipelined: ~500ms (1000 round trips)\n\n# Mixed operations\
+    \ in pipeline\npipe = r.pipeline()\npipe.set(\"key1\", \"value1\")\npipe.expire(\"key1\", 3600)\npipe.get(\"key2\")\n\
+    pipe.incr(\"counter\")\nset_result, expire_result, value, count = pipe.execute()\n\n# Atomic pipeline with MULTI/EXEC\n\
+    pipe = r.pipeline(transaction=True)  # MULTI/EXEC wrapper\npipe.decrby(\"balance:alice\", 100)\npipe.incrby(\"balance:bob\"\
+    , 100)\npipe.execute()  # Atomic transfer\n"
+  example_bad: "# No pipelining — 1000 network round trips\nresults = []\nfor user_id in range(1000):\n    results.append(r.get(f\"\
+    user:{user_id}:score\"))\n# Time: ~500ms (1000 × 0.5ms round trip)\n\n# Loading a page that needs 20 cache reads\nuser\
+    \ = r.get(f\"user:{user_id}\")           # Round trip 1\nprofile = r.get(f\"profile:{user_id}\")      # Round trip 2\n\
+    settings = r.get(f\"settings:{user_id}\")    # Round trip 3\n# ... 17 more ...\n# Total: 20 × 0.5ms = 10ms just in Redis\
+    \ latency\n# With pipeline: 20 commands in 1 round trip = 0.5ms\n"
+  when_applies: Projects using Redis cache/pub-sub systems
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Redis
+  sources: ["https://redis.io/docs/latest/develop/interact/pipelining/"]
+- id: CR-RED-DS-011
+  text: Use Redis pub/sub for real-time notifications and Streams for durable message processing — pub/sub is fire-and-forget,
+    Streams persist messages.
+  why: 'Pub/sub delivers messages to all connected subscribers in real-time with near-zero latency. However, messages are
+    not persisted: if no subscriber is listening, the message is lost. If a subscriber disconnects and reconnects, it misses
+    all messages published during the gap. This makes pub/sub suitable for ephemeral notifications (cache invalidation, live
+    updates) but dangerous for anything requiring guaranteed delivery. Streams provide durability, replay, and consumer groups.
+    Choosing pub/sub when you need durability causes silent data loss; choosing Streams when you need broadcast adds unnecessary
+    complexity.'
+  how_to_do_right: 'Use pub/sub for: real-time UI updates, cache invalidation, live notifications where missing a message
+    is acceptable. Use Streams for: task queues, event sourcing, order processing, anything requiring guaranteed delivery.
+    For a hybrid: use pub/sub for instant notification + Streams for durable processing. In Redis Cluster, pub/sub messages
+    are broadcast to ALL nodes — use sharded pub/sub (SSUBSCRIBE, Redis 7.0+) for scalable pub/sub.'
+  severity: high
+  technologies:
+    platform: [redis]
+  domains:
+    domain: [architecture, messaging]
+    concern: [data, database, real_time]
+  example_good: "# Pub/Sub for cache invalidation (ephemeral, broadcast)\nimport redis, threading\n\nr = redis.Redis()\n\n\
+    # Publisher: notify all app instances to invalidate cache\ndef invalidate_cache(entity_type: str, entity_id: str):\n \
+    \   r.publish(f\"cache:invalidate:{entity_type}\", entity_id)\n\n# Subscriber: listen for invalidation events\ndef cache_invalidation_listener():\n\
+    \    pubsub = r.pubsub()\n    pubsub.psubscribe(\"cache:invalidate:*\")\n    for message in pubsub.listen():\n       \
+    \ if message[\"type\"] == \"pmessage\":\n            entity_type = message[\"channel\"].decode().split(\":\")[-1]\n  \
+    \          entity_id = message[\"data\"].decode()\n            local_cache.delete(f\"{entity_type}:{entity_id}\")\n\n\
+    # Run listener in background thread\nthreading.Thread(target=cache_invalidation_listener, daemon=True).start()\n\n# Streams\
+    \ for durable order processing (see CR-RED-DS-002)\n# Use Streams when message loss is unacceptable\n"
+  example_bad: '# Pub/sub for order processing — messages lost on disconnect
+
+    r.publish("orders", ''{"id": "ORD-123", "action": "process"}'')
+
+    # If order processor is restarting: message LOST
+
+    # No replay, no acknowledgment, no recovery
+
+
+    # Pub/sub in Redis Cluster without sharded pub/sub
+
+    r.publish("notifications", "message")
+
+    # Message broadcast to ALL cluster nodes (O(N) nodes)
+
+    # 100 nodes × 10K messages/sec = 1M cross-node broadcasts/sec
+
+    '
+  when_applies: Projects using Redis cache/pub-sub systems
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Redis
+  sources: ["https://redis.io/docs/latest/develop/interact/pubsub/", "https://redis.io/docs/latest/develop/data-types/streams/"]
+- id: CR-RED-DS-012
+  text: Use Bloom filters (RedisBloom module) for probabilistic set membership checks — they answer 'is this element in the
+    set?' using a fraction of the memory of a Set with zero false negatives.
+  why: 'Checking if a username is taken, if a URL has been crawled, or if an IP is in a blocklist requires a set membership
+    check. A Redis Set storing 100M elements consumes ~6.4GB. A Bloom filter storing 100M elements with 1% false positive
+    rate uses ~114MB — 56x less memory. Bloom filters guarantee zero false negatives: if it says ''not in set'', the element
+    is definitely not in the set. False positives (says ''in set'' when it is not) occur at a configurable rate. For username
+    availability checks, a 0.1% false positive rate means 1 in 1000 available usernames are incorrectly reported as taken
+    — an acceptable trade-off for 560x memory savings.'
+  how_to_do_right: Use BF.RESERVE to create a Bloom filter with specified error rate and capacity. Use BF.ADD to add elements
+    and BF.EXISTS to check membership. Set error_rate based on your tolerance (0.01 = 1%, 0.001 = 0.1%). Over-provision capacity
+    by 20% to avoid degradation as the filter fills. Use BF.MADD/BF.MEXISTS for batch operations. Bloom filters cannot remove
+    elements — use Cuckoo filters (CF.*) if you need deletion.
+  severity: medium
+  technologies:
+    library: [redisbloom]
+    platform: [redis]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, probabilistic]
+  example_good: "# Create Bloom filter: 100M capacity, 0.1% false positive rate\nBF.RESERVE crawled_urls 0.001 100000000\n\
+    \n# Add URLs as they are crawled\nBF.ADD crawled_urls \"https://example.com/page1\"\nBF.MADD crawled_urls \"https://example.com/page2\"\
+    \ \"https://example.com/page3\"\n\n# Check before crawling — avoid duplicate work\nBF.EXISTS crawled_urls \"https://example.com/page1\"\
+    \  # Returns 1 (exists)\nBF.EXISTS crawled_urls \"https://example.com/new\"    # Returns 0 (definitely not crawled)\n\n\
+    # Python usage\nimport redis\nr = redis.Redis()\n\ndef should_crawl(url: str) -> bool:\n    \"\"\"Returns True if URL\
+    \ has NOT been crawled (zero false negatives).\"\"\"\n    return not r.bf().exists(\"crawled_urls\", url)\n\n# Memory\
+    \ comparison:\n# SET with 100M URLs (avg 50 bytes): ~6.4GB\n# Bloom filter (100M, 0.1% FPR): ~180MB — 35x smaller\n"
+  example_bad: '# Using SET for 100M membership checks
+
+    SADD crawled_urls "https://example.com/page1"
+
+    SISMEMBER crawled_urls "https://example.com/page1"
+
+    # 100M URLs × 64 bytes avg = 6.4GB memory
+
+    # Bloom filter: 180MB for same functionality with 0.1% false positives
+
+
+    # Bloom filter without reserving capacity
+
+    BF.ADD crawled_urls "url1"  # Auto-creates with default settings
+
+    # Default: 100 capacity, 0.01 error rate
+
+    # After 100 elements: error rate degrades dramatically
+
+    # Must BF.RESERVE with correct capacity upfront
+
+    '
+  when_applies: Projects using Redis cache/pub-sub systems or RedisBloom
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Redis or
+    RedisBloom
+  sources: ["https://redis.io/docs/latest/develop/data-types/probabilistic/bloom-filter/"]
+- id: CR-RED-DS-013
+  text: Use Redis as a session store with proper TTL and serialization — it provides sub-millisecond access across all application
+    instances with automatic expiration.
+  why: Server-side sessions stored in application memory are lost on restart and cannot be shared across instances. Database-backed
+    sessions add 5-50ms latency per request. Redis provides sub-millisecond session access with automatic TTL expiration,
+    horizontal scalability, and atomic operations. Session data (user ID, permissions, cart) is serialized to a string or
+    hash and stored with an appropriate TTL. When the session expires, Redis automatically removes it — no cleanup cron needed.
+    For stateless application servers behind a load balancer, Redis sessions are the standard pattern.
+  how_to_do_right: Use a Hash for session data (HSET/HGET for individual fields without deserializing the entire session).
+    Set TTL on the session key matching your session duration. Refresh TTL on every request (sliding expiration). Use JSON
+    serialization for complex session data. Prefix session keys with a namespace. For sensitive sessions, encrypt the session
+    data before storing.
+  severity: high
+  technologies:
+    platform: [redis]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, caching, web]
+  example_good: "import redis\nimport json\nimport uuid\nimport time\n\nr = redis.Redis()\nSESSION_TTL = 3600  # 1 hour\n\n\
+    def create_session(user_id: int, metadata: dict) -> str:\n    session_id = str(uuid.uuid4())\n    session_data = {\n \
+    \       \"user_id\": str(user_id),\n        \"created\": str(time.time()),\n        \"ip\": metadata.get(\"ip\", \"\"\
+    ),\n        \"user_agent\": metadata.get(\"user_agent\", \"\"),\n    }\n    key = f\"session:{session_id}\"\n    r.hset(key,\
+    \ mapping=session_data)\n    r.expire(key, SESSION_TTL)\n    return session_id\n\ndef get_session(session_id: str) ->\
+    \ dict | None:\n    key = f\"session:{session_id}\"\n    data = r.hgetall(key)\n    if not data:\n        return None\n\
+    \    r.expire(key, SESSION_TTL)  # Sliding expiration\n    return {k.decode(): v.decode() for k, v in data.items()}\n\n\
+    def destroy_session(session_id: str):\n    r.delete(f\"session:{session_id}\")\n"
+  example_bad: '# Session in application memory — not shared, lost on restart
+
+    sessions = {}  # In-memory dict
+
+    sessions[session_id] = {"user_id": 123}
+
+    # Server restart = all sessions lost (users logged out)
+
+    # Load balancer sends request to different instance = session not found
+
+
+    # Session in database — high latency
+
+    cursor.execute("SELECT data FROM sessions WHERE id = %s", (session_id,))
+
+    # 5-50ms per request × 20 requests/page = 100-1000ms overhead
+
+    # Redis: 0.1ms per request × 20 = 2ms overhead
+
+
+    # No TTL on session — sessions accumulate forever
+
+    r.set(f"session:{session_id}", json.dumps(data))  # No TTL!
+
+    # After 6 months: 50M expired session keys consuming 10GB
+
+    '
+  when_applies: Projects using Redis cache/pub-sub systems
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Redis
+  sources: ["https://redis.io/docs/latest/develop/data-types/hashes/"]
+- id: CR-RED-DS-014
+  text: Configure maxmemory and eviction policy for production Redis — without a memory limit, Redis grows until the OS kills
+    it with OOM, causing cascading failures.
+  why: 'Redis stores all data in memory. Without maxmemory configured, Redis consumes memory without bound until the OS out-of-memory
+    killer terminates the process — taking down all cached sessions, rate limiters, and queues simultaneously with no graceful
+    degradation. With maxmemory + an eviction policy, Redis refuses writes or evicts old data when approaching the limit,
+    maintaining service availability. The eviction policy determines which keys to remove: allkeys-lru (remove least recently
+    used — best for caching), volatile-lru (only evict keys with TTL), noeviction (reject writes when full — best for data
+    stores). Choosing the wrong eviction policy means either data loss (cache evicts session keys) or service outage (data
+    store rejects writes).'
+  how_to_do_right: 'Set maxmemory to 75% of available RAM (leave room for fork during RDB/AOF rewrite). Choose eviction policy
+    based on use case: allkeys-lru for pure caching, volatile-lru when mixing cache + persistent data, volatile-ttl to evict
+    keys closest to expiration, noeviction for session stores and queues (reject writes, do not lose data). Monitor with INFO
+    memory — track used_memory vs maxmemory. Set up alerts at 80% and 90% memory usage.'
+  severity: critical
+  technologies:
+    platform: [redis]
+  domains:
+    domain: [architecture, operations, reliability]
+    concern: [data, database]
+  example_good: '# redis.conf — production memory configuration
+
+    maxmemory 12gb                  # 75% of 16GB server
+
+    maxmemory-policy allkeys-lru    # Evict least recently used (caching)
+
+
+    # Alternative policies by use case:
+
+    # Pure cache: allkeys-lru (evict any key, LRU order)
+
+    # Cache + sessions: volatile-lru (only evict keys with TTL)
+
+    # Session store: noeviction (reject writes, never lose data)
+
+    # TTL-based expiry: volatile-ttl (evict closest-to-expiry first)
+
+
+    # Monitor memory usage
+
+    # redis-cli INFO memory
+
+    # used_memory_human: 8.2G
+
+    # maxmemory_human: 12.0G
+
+    # mem_fragmentation_ratio: 1.08  (good: 1.0-1.5)
+
+
+    # Set alerts
+
+    # Alert at 80%: used_memory > 9.6GB
+
+    # Alert at 90%: used_memory > 10.8GB (investigate immediately)
+
+    # Alert at 95%: used_memory > 11.4GB (evictions increasing rapidly)
+
+    '
+  example_bad: '# No maxmemory — Redis grows until OOM kill
+
+    # maxmemory 0  (default — unlimited)
+
+    # After months: Redis uses 14.8GB on a 16GB server
+
+    # OS OOM killer sends SIGKILL — instant death
+
+    # All sessions, caches, rate limiters, queues: GONE
+
+    # No graceful degradation, no warning
+
+
+    # Wrong eviction policy — loses session data
+
+    maxmemory-policy allkeys-lru
+
+    # Session keys (no TTL) are evicted alongside cache keys
+
+    # Users randomly logged out when memory is tight
+
+    # Should use volatile-lru (only evict keys WITH TTL) for mixed workloads
+
+    '
+  when_applies: Any project using Redis cache/pub-sub systems
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Redis
+  sources: ["https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/memory-optimization/"]
+- id: CR-REDIS-FIN-001
+  text: Use Redis Streams for event sourcing in financial systems — every state change is an immutable event appended to a stream,
+    enabling full audit trail, temporal queries, and state reconstruction.
+  why: 'Financial systems require complete audit trails and the ability to reconstruct state at any point in time. Redis Streams
+    provide an append-only log with automatic timestamps, consumer groups for parallel processing, and message acknowledgment
+    for reliable delivery. Unlike pub/sub (fire-and-forget), Streams persist events and support replay. For a prediction market,
+    every order, trade, settlement, and balance change is an event in the stream. If a dispute arises, you can replay events
+    to reconstruct the exact state at any timestamp. Redis Streams handle 100K+ events/second with sub-millisecond latency
+    — suitable for real-time financial event sourcing.'
+  how_to_do_right: '1. Use one stream per aggregate (e.g., orders:market:{id}, trades:market:{id}).
+
+    2. Include all event metadata: event_type, timestamp, actor, correlation_id, version.
+
+    3. Use consumer groups for different processing pipelines (settlement, analytics, audit).
+
+    4. Set MAXLEN or MINID to bound stream size — archive old events to PostgreSQL for long-term storage.
+
+    5. Implement idempotent consumers using message ID as idempotency key.
+
+    6. Use XRANGE with timestamp bounds for temporal queries (reconstruct state at time T).
+
+    '
+  severity: high
+  technologies:
+    platform: [redis]
+    lang: [python]
+  domains:
+    domain: [architecture, fintech]
+    concern: [data, database, event_sourcing, financial]
+  example_good: "import redis\nimport json\nimport time\n\nr = redis.Redis()\n\ndef publish_event(stream: str, event_type: str,\
+    \ data: dict, actor: str) -> str:\n    \"\"\"Append immutable event to stream.\"\"\"\n    event = {\n        'event_type':\
+    \ event_type,\n        'data': json.dumps(data),\n        'actor': actor,\n        'correlation_id': str(uuid4()),\n    \
+    \    'version': '1',\n    }\n    msg_id = r.xadd(\n        stream,\n        event,\n        maxlen=1000000,  # Bound stream\
+    \ size\n    )\n    return msg_id\n\n# Publish order events\npublish_event(\n    'orders:market:mkt-001',\n    'ORDER_PLACED',\n\
+    \    {'order_id': 'ord-123', 'side': 'buy', 'price': '0.65', 'quantity': '100'},\n    actor='user:u-456',\n)\n\n# Reconstruct\
+    \ state at specific time\ndef reconstruct_orderbook(market_id: str, at_time: int) -> dict:\n    events = r.xrange(f'orders:market:{market_id}',\
+    \ '-', at_time)\n    orderbook = {'bids': [], 'asks': []}\n    for msg_id, fields in events:\n        event = json.loads(fields[b'data'])\n\
+    \        # Replay events to build orderbook state\n        apply_event(orderbook, fields[b'event_type'].decode(), event)\n\
+    \    return orderbook\n"
+  example_bad: "# Mutable state without event history\ndef place_order(order):\n    db.execute('INSERT INTO orders VALUES ...',\
+    \ order)\n    db.execute('UPDATE orderbook SET ... WHERE market_id = ...', ...)\n    # What happened to this order? When?\
+    \ By whom?\n    # Cannot reconstruct orderbook at past time\n    # No audit trail for dispute resolution\n"
+  when_applies: Financial systems using Redis, prediction markets, trading platforms
+  when_not_applies: non-financial applications, systems where event history is not needed
+  sources: ["https://redis.io/docs/latest/develop/data-types/streams/"]
+- id: CR-REDIS-FIN-002
+  text: Use Redis Sorted Sets for real-time leaderboards and ranking in prediction markets — they provide O(log N) rank lookups
+    and range queries for portfolio rankings, trader performance, and market activity.
+  why: Prediction markets and financial platforms need real-time rankings — top traders by P&L, most active markets by volume,
+    best-performing portfolios by return rate. Redis Sorted Sets maintain elements ordered by score with O(log N) insertion,
+    O(log N) rank lookup, and O(log N + M) range queries. For 1M traders, getting the top 100 by P&L is O(log N + 100) — microseconds,
+    not seconds. Unlike database ORDER BY queries that require full table scans or index rebuilds, Sorted Sets maintain order
+    incrementally on every score update. ZINCRBY atomically updates scores, making concurrent P&L updates safe without locks.
+  how_to_do_right: '1. Use ZADD for initial placement, ZINCRBY for atomic score updates.
+
+    2. Use ZREVRANGE for top-N (descending), ZRANGE for bottom-N (ascending).
+
+    3. Use ZREVRANK for a specific user''s rank (0-based from top).
+
+    4. Separate leaderboards per time period (daily, weekly, all-time) with TTL on daily/weekly keys.
+
+    5. Use ZUNIONSTORE to merge period-specific leaderboards into aggregate rankings.
+
+    6. Store detailed data in a hash (HSET trader:{id} ...), use the sorted set only for ranking.
+
+    '
+  severity: medium
+  technologies:
+    platform: [redis]
+    lang: [python]
+  domains:
+    domain: [architecture, fintech]
+    concern: [data, database, real_time, financial]
+  example_good: "import redis\nfrom decimal import Decimal\n\nr = redis.Redis()\n\ndef update_trader_pnl(trader_id: str, pnl_delta:\
+    \ float):\n    \"\"\"Atomically update trader P&L and ranking.\"\"\"\n    # Update all-time leaderboard\n    r.zincrby('leaderboard:pnl:alltime',\
+    \ pnl_delta, trader_id)\n    # Update daily leaderboard (expires at midnight)\n    daily_key = f'leaderboard:pnl:{date.today().isoformat()}'\n\
+    \    r.zincrby(daily_key, pnl_delta, trader_id)\n    r.expireat(daily_key, midnight_timestamp())\n\ndef get_top_traders(period:\
+    \ str = 'alltime', limit: int = 100) -> list:\n    key = f'leaderboard:pnl:{period}'\n    return r.zrevrange(key, 0, limit\
+    \ - 1, withscores=True)\n\ndef get_trader_rank(trader_id: str, period: str = 'alltime') -> int:\n    rank = r.zrevrank(f'leaderboard:pnl:{period}',\
+    \ trader_id)\n    return rank + 1 if rank is not None else None  # 1-based rank\n\n# Usage\nupdate_trader_pnl('trader:alice',\
+    \ 150.50)  # O(log N) atomic update\nupdate_trader_pnl('trader:bob', -30.00)\ntop_10 = get_top_traders(limit=10)  # O(log\
+    \ N + 10)\nalice_rank = get_trader_rank('trader:alice')  # O(log N)\n"
+  example_bad: "# SQL-based leaderboard — slow under concurrent updates\nSELECT trader_id, pnl, RANK() OVER (ORDER BY pnl DESC)\n\
+    FROM trader_stats ORDER BY pnl DESC LIMIT 100;\n-- Full table scan or index rebuild on every query\n-- 1M traders: 500ms-5s\
+    \ per query\n-- Concurrent PNL updates cause lock contention\n-- Redis Sorted Set: <1ms for same query\n"
+  when_applies: Real-time ranking systems, prediction markets, trading platforms using Redis
+  when_not_applies: batch-only analytics, systems where rankings update infrequently
+  sources: ["https://redis.io/docs/latest/develop/data-types/sorted-sets/"]
+- id: CR-REDIS-FIN-003
+  text: Use Redlock (distributed locks across multiple Redis instances) for critical financial operations — single-instance locks
+    fail when the Redis node crashes, potentially allowing double-execution.
+  why: A single Redis instance lock (SET NX EX) is sufficient for most operations but has a failure mode — if the Redis node
+    crashes while a client holds the lock, the lock is lost and another client can acquire it, leading to double-execution.
+    For financial operations (order execution, settlement, fund transfers), double-execution means double-charging a customer
+    or double-settling a trade. Redlock acquires locks on N/2+1 independent Redis instances with clock drift compensation.
+    If the majority of instances grant the lock, it is considered acquired. Even if one Redis node crashes, the lock is still
+    held on the remaining majority. The Redlock algorithm has been formally analyzed and is the recommended approach for distributed
+    locking in Redis.
+  how_to_do_right: '1. Deploy at least 3 independent Redis instances (not replicas — independent masters).
+
+    2. Use a well-tested Redlock implementation (python-redis-lock, pottery, or redis-py Lock with multiple instances).
+
+    3. Set TTL conservatively longer than maximum expected operation time (e.g., 30s for a 5s operation).
+
+    4. Implement lock extension (watchdog) for operations that may exceed TTL.
+
+    5. Always use unique lock tokens (UUID) and verify ownership before releasing.
+
+    6. For the highest criticality operations, combine Redlock with database-level constraints as defense-in-depth.
+
+    '
+  severity: critical
+  technologies:
+    platform: [redis]
+    lang: [python]
+    library: [pottery, redis-py]
+  domains:
+    domain: [architecture, fintech, reliability]
+    concern: [data, database, distributed_systems, financial]
+  example_good: "from pottery import Redlock\nfrom redis import Redis\n\n# 3 independent Redis instances (not replicas)\nredis_instances\
+    \ = [\n    Redis(host='redis-1', port=6379),\n    Redis(host='redis-2', port=6379),\n    Redis(host='redis-3', port=6379),\n\
+    ]\n\ndef execute_settlement(trade_id: str):\n    \"\"\"Settle trade with distributed lock — prevents double-settlement.\"\"\
+    \"\n    lock = Redlock(\n        key=f'lock:settlement:{trade_id}',\n        masters=redis_instances,\n        auto_release_time=30,\
+    \  # TTL: 30 seconds\n    )\n\n    if lock.acquire(timeout=10):  # Wait up to 10s to acquire\n        try:\n            #\
+    \ Check if already settled (defense-in-depth)\n            trade = db.get_trade(trade_id)\n            if trade.status ==\
+    \ 'settled':\n                return  # Already settled — idempotent\n\n            # Execute settlement\n            settle_trade(trade)\n\
+    \            db.update_trade_status(trade_id, 'settled')\n        finally:\n            lock.release()\n    else:\n      \
+    \  raise LockTimeout(f'Could not acquire lock for trade {trade_id}')\n"
+  example_bad: "# Single-instance lock — double-settlement on Redis crash\ndef execute_settlement(trade_id):\n    lock_key =\
+    \ f'lock:settlement:{trade_id}'\n    if r.set(lock_key, 'locked', nx=True, ex=30):\n        settle_trade(trade_id)  # Redis\
+    \ crashes HERE\n        r.delete(lock_key)\n    # Redis restarts — lock is gone\n    # Another process acquires the lock\n\
+    \    # Trade is settled TWICE — double payment to the winner\n"
+  when_applies: Financial operations requiring distributed mutual exclusion, prediction market settlement
+  when_not_applies: non-critical operations, single-process applications
+  sources: ["https://redis.io/docs/latest/develop/use/patterns/distributed-locks/"]
+- id: CR-REDIS-FIN-004
+  text: Use Redis pub/sub for real-time price feed distribution — it broadcasts price updates to all connected clients with
+    microsecond latency, ideal for live market data.
+  why: Prediction market platforms need to push price updates to all connected users in real-time. Polling the API (every client
+    requesting prices every second) creates N*frequency requests — 10,000 users polling every second is 10,000 req/s on the
+    API server. Redis pub/sub broadcasts each price update to all subscribers with a single publish operation. The publish latency
+    is microseconds, and Redis handles millions of messages per second. Combined with WebSocket connections on the application
+    server, pub/sub enables real-time price feeds with minimal server load. Since price feed messages are ephemeral (a missed
+    update is replaced by the next one), pub/sub's fire-and-forget semantics are perfectly suited.
+  how_to_do_right: '1. Publish price updates to market-specific channels: prices:market:{id}.
+
+    2. Use pattern subscriptions (PSUBSCRIBE prices:market:*) for clients watching multiple markets.
+
+    3. Include sequence numbers in messages so clients can detect missed updates.
+
+    4. Combine with WebSocket on the application layer: Redis pub/sub → app server → WebSocket → browser.
+
+    5. Use Redis Streams (not pub/sub) if you need durable price history or replay.
+
+    6. In Redis Cluster, use sharded pub/sub (SSUBSCRIBE, Redis 7.0+) for scalable distribution.
+
+    '
+  severity: medium
+  technologies:
+    platform: [redis]
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [architecture, fintech]
+    concern: [data, database, real_time, financial]
+  example_good: "import redis\nimport json\nimport asyncio\nfrom fastapi import FastAPI, WebSocket\n\nr = redis.Redis()\napp\
+    \ = FastAPI()\n\n# Publisher: called when orderbook changes\ndef publish_price_update(market_id: str, bid: float, ask: float,\
+    \ last: float, seq: int):\n    r.publish(f'prices:market:{market_id}', json.dumps({\n        'market_id': market_id,\n  \
+    \      'bid': bid, 'ask': ask, 'last': last,\n        'seq': seq,  # Sequence number for gap detection\n        'ts': time.time(),\n\
+    \    }))\n\n# WebSocket endpoint: subscribes to Redis pub/sub, forwards to browser\n@app.websocket('/ws/prices/{market_id}')\n\
+    async def price_feed(websocket: WebSocket, market_id: str):\n    await websocket.accept()\n    pubsub = r.pubsub()\n   \
+    \ pubsub.subscribe(f'prices:market:{market_id}')\n    try:\n        for message in pubsub.listen():\n            if message['type']\
+    \ == 'message':\n                await websocket.send_text(message['data'].decode())\n    finally:\n        pubsub.unsubscribe()\n\
+    \        await websocket.close()\n\n# 10,000 connected users get real-time prices\n# Server load: 1 publish per price change\
+    \ (not 10,000 API calls)\n"
+  example_bad: "# Polling API — 10,000 users × 1 req/s = 10,000 req/s\n@app.get('/api/prices/{market_id}')\ndef get_prices(market_id:\
+    \ str):\n    return db.query('SELECT bid, ask, last FROM prices WHERE market_id = %s', market_id)\n# Client: setInterval(fetch('/api/prices/mkt-001'),\
+    \ 1000)\n# 10K users: 10K queries/second to the database\n# Price updates delayed by up to 1 second (polling interval)\n\
+    # Database CPU at 100% from identical queries\n"
+  when_applies: Real-time market data systems, prediction market platforms, trading interfaces
+  when_not_applies: batch analytics, systems where real-time pricing is not needed
+  sources: ["https://redis.io/docs/latest/develop/interact/pubsub/"]
+- id: CR-REDIS-FIN-005
+  text: Use Redis rate limiting for API protection in financial platforms — implement sliding window rate limits with atomic
+    Lua scripts to prevent abuse, ensure fair access, and comply with regulatory requirements.
+  why: Financial APIs are high-value targets for abuse — automated trading bots hammering the order API, scrapers extracting
+    market data, and DDoS attacks targeting settlement endpoints. Rate limiting protects system stability and ensures fair access
+    for all users. For prediction markets, regulators may require rate limits to prevent market manipulation through rapid-fire
+    order placement. Redis-based rate limiting with Lua scripts provides atomic, sub-millisecond rate checks that scale to millions
+    of requests per second. The sliding window algorithm (using Sorted Sets) provides smoother rate limiting than fixed windows,
+    preventing burst-at-boundary exploits.
+  how_to_do_right: '1. Implement sliding window rate limiting using Redis Sorted Sets + Lua script (atomic).
+
+    2. Apply different rate limits by tier: free users (10 req/min), paid (100 req/min), market makers (1000 req/min).
+
+    3. Rate limit by user ID (authenticated) and IP address (unauthenticated) as separate keys.
+
+    4. Return rate limit headers: X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset.
+
+    5. Use a separate Redis instance for rate limiting so it does not compete with cache/session workloads.
+
+    6. Monitor rate limit hits — frequent hitting may indicate abuse or undersized limits.
+
+    '
+  severity: high
+  technologies:
+    platform: [redis]
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [architecture, security, fintech]
+    concern: [data, database, rate_limiting, financial]
+  example_good: "import redis\nimport time\n\nr = redis.Redis()\n\n# Atomic sliding window rate limiter (Lua script)\nRATE_LIMIT_SCRIPT\
+    \ = \"\"\"\nlocal key = KEYS[1]\nlocal now = tonumber(ARGV[1])\nlocal window = tonumber(ARGV[2])\nlocal limit = tonumber(ARGV[3])\n\
+    \nredis.call('ZREMRANGEBYSCORE', key, 0, now - window)\nlocal count = redis.call('ZCARD', key)\n\nif count < limit then\n\
+    \    redis.call('ZADD', key, now, now .. ':' .. math.random(1000000))\n    redis.call('EXPIRE', key, window)\n    return\
+    \ {1, limit - count - 1, 0}  -- allowed, remaining, retry_after\nelse\n    local oldest = redis.call('ZRANGE', key, 0, 0,\
+    \ 'WITHSCORES')\n    local retry_after = window - (now - tonumber(oldest[2]))\n    return {0, 0, retry_after}  -- denied,\
+    \ 0 remaining, retry_after\nend\n\"\"\"\n\nrate_limiter = r.register_script(RATE_LIMIT_SCRIPT)\n\nRATE_LIMITS = {\n    'free':\
+    \ (60, 10),       # 10 requests per 60 seconds\n    'paid': (60, 100),      # 100 requests per 60 seconds\n    'maker':\
+    \ (60, 1000),    # 1000 requests per 60 seconds\n}\n\ndef check_rate_limit(user_id: str, tier: str) -> tuple[bool, dict]:\n\
+    \    window, limit = RATE_LIMITS[tier]\n    result = rate_limiter(\n        keys=[f'rate:{user_id}'],\n        args=[time.time(),\
+    \ window, limit],\n    )\n    allowed, remaining, retry_after = result\n    headers = {\n        'X-RateLimit-Limit': str(limit),\n\
+    \        'X-RateLimit-Remaining': str(remaining),\n        'X-RateLimit-Reset': str(int(time.time()) + int(retry_after)),\n\
+    \    }\n    return bool(allowed), headers\n"
+  example_bad: "# No rate limiting — API is unprotected\n@app.post('/api/orders')\nasync def place_order(order: Order):\n   \
+    \ return await execute_order(order)\n    # Bot places 10,000 orders per second\n    # Database overwhelmed, legitimate users\
+    \ cannot trade\n    # Regulators: \"Where is your market manipulation prevention?\"\n\n# Fixed window rate limiting — burst\
+    \ at boundary\nif r.incr(f'rate:{user_id}') > 100:\n    raise RateLimited()\nr.expire(f'rate:{user_id}', 60)\n# User sends\
+    \ 100 requests at 0:59 and 100 at 1:01 = 200 in 2 seconds\n"
+  when_applies: Financial APIs, prediction market platforms, trading endpoints
+  when_not_applies: internal batch processing, non-financial APIs with low abuse risk
+  sources: ["https://redis.io/docs/latest/develop/use/patterns/rate-limiting/"]

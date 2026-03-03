@@ -1,0 +1,846 @@
+layer: rules
+technology: eBPF
+domain: security
+knowledge:
+- id: EBPF-001
+  text: >
+    eBPF (extended Berkeley Packet Filter) enables kernel-level programmability with verifier-enforced safety
+    and JIT compilation -- programs run at near-native speed inside the kernel without requiring kernel modules
+    or reboots.
+  why: >
+    Traditional kernel extensions (kernel modules, kprobes with C) are dangerous -- a bug crashes the entire
+    kernel. eBPF solves this with a verifier that guarantees termination, memory safety, and bounded complexity.
+    The JIT compiler translates verified bytecode to native code at 95-99% of native performance. As of Linux 6.x
+    (2024-2025), eBPF supports 30+ program types including XDP, tracepoints, kprobes/uprobes, cgroup, and LSM.
+  how_to_do_right: |
+    1. Use CO-RE (Compile Once, Run Everywhere) with libbpf for portable programs.
+    2. Write eBPF programs in restricted C (compiled with Clang to BPF bytecode).
+    3. Use BPF maps for kernel-userspace data sharing (hash maps, ring buffers, per-CPU arrays).
+    4. Leverage BTF for type-safe field access across kernel versions.
+    5. Start with high-level frameworks: Cilium/Tetragon for networking/security.
+    6. Test programs in dev VMs before production.
+    7. Monitor overhead with bpftool prog.
+  severity: high
+  technologies:
+    library: [libbpf, bcc, bpftrace, cilium, tetragon]
+    platform: [linux]
+  domains:
+    domain: [security, observability, networking]
+    concern: [kernel_programmability, performance]
+  example_good: |
+    // eBPF program with CO-RE -- trace every execve syscall
+    #include "vmlinux.h"
+    #include <bpf/bpf_helpers.h>
+    #include <bpf/bpf_core_read.h>
+
+    struct event {
+        u32 pid;
+        u32 uid;
+        char comm[16];
+        char filename[256];
+    };
+
+    struct {
+        __uint(type, BPF_MAP_TYPE_RINGBUF);
+        __uint(max_entries, 256 * 1024);
+    } events SEC(".maps");
+
+    SEC("tracepoint/syscalls/sys_enter_execve")
+    int trace_execve(struct trace_event_raw_sys_enter *ctx) {
+        struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+        if (!e) return 0;
+        e->pid = bpf_get_current_pid_tgid() >> 32;
+        e->uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+        bpf_get_current_comm(&e->comm, sizeof(e->comm));
+        bpf_probe_read_user_str(&e->filename, sizeof(e->filename),
+                                (const char *)ctx->args[0]);
+        bpf_ringbuf_submit(e, 0);
+        return 0;
+    }
+    char LICENSE[] SEC("license") = "GPL";
+  example_bad: |
+    // Kernel module approach (dangerous, not portable)
+    #include <linux/module.h>
+    // No verifier -- any bug = kernel panic
+    // Must recompile for each kernel version
+    // Requires root + CAP_SYS_MODULE
+    // Cannot be loaded in containers
+
+    // Or: shell scripts parsing /proc
+    // while true; do ps aux | grep suspicious; sleep 1; done
+    // 5-10% CPU overhead, race conditions, easily evaded
+  when_applies: Linux infrastructure requiring kernel-level visibility or enforcement
+  when_not_applies: Windows-only or macOS-only environments
+  sources:
+    - "https://ebpf.io/what-is-ebpf/"
+    - "https://docs.ebpf.io/concepts/core/"
+    - "https://nakryiko.com/posts/bpf-portability-and-co-re/"
+
+- id: EBPF-002
+  text: >
+    Deploy Cilium as the CNI for Kubernetes to replace iptables with eBPF-based networking -- achieving
+    identity-based network policy, transparent encryption, and 2-5x better performance at scale.
+  why: >
+    Traditional Kubernetes networking relies on iptables which degrades linearly at 10K+ services. Cilium replaces
+    iptables with eBPF programs providing O(1) service lookup, identity-based policies, transparent WireGuard
+    encryption, and L7 visibility. Cilium is CNCF graduated (2024), used by GKE, EKS, and AKS in production.
+  how_to_do_right: |
+    1. Install Cilium as CNI during cluster creation (replacing kube-proxy).
+    2. Enable Hubble for observability (flow logs, service map, DNS visibility).
+    3. Define CiliumNetworkPolicy resources (L3/L4/L7, identity-based).
+    4. Enable transparent encryption (WireGuard) for node-to-node traffic.
+    5. Use Cilium service mesh mode to replace sidecar proxies.
+    6. Monitor with cilium status, hubble observe.
+  severity: high
+  technologies:
+    library: [cilium, hubble, kubernetes]
+    platform: [kubernetes, linux]
+  domains:
+    domain: [security, networking]
+    concern: [container_networking, network_policy]
+  example_good: |
+    # CiliumNetworkPolicy -- identity-based, L7-aware
+    apiVersion: cilium.io/v2
+    kind: CiliumNetworkPolicy
+    metadata:
+      name: payment-api-policy
+      namespace: production
+    spec:
+      endpointSelector:
+        matchLabels:
+          app: payment-api
+      ingress:
+        - fromEndpoints:
+            - matchLabels:
+                app: api-gateway
+          toPorts:
+            - ports:
+                - port: "8080"
+                  protocol: TCP
+              rules:
+                http:
+                  - method: POST
+                    path: "/v1/payments"
+                  - method: GET
+                    path: "/v1/payments/[0-9]+"
+      egress:
+        - toEndpoints:
+            - matchLabels:
+                app: postgres
+          toPorts:
+            - ports:
+                - port: "5432"
+        - toFQDNs:
+            - matchName: "api.stripe.com"
+          toPorts:
+            - ports:
+                - port: "443"
+  example_bad: |
+    # Standard Kubernetes NetworkPolicy
+    # IP-based (no FQDN support), L3/L4 only (no HTTP methods/paths)
+    # No flow visibility, O(n) iptables rule evaluation at scale
+  when_applies: Kubernetes clusters requiring fine-grained network security
+  when_not_applies: Non-Kubernetes environments or tiny clusters
+  sources:
+    - "https://docs.cilium.io/en/stable/overview/intro/"
+    - "https://cilium.io/blog/2024/02/28/cilium-cncf-graduation/"
+    - "https://docs.cilium.io/en/stable/security/policy/"
+
+- id: EBPF-003
+  text: >
+    Deploy Falco for runtime threat detection using eBPF-based syscall monitoring -- detect container escapes,
+    privilege escalation, cryptominers, and anomalous behavior in real time with rules mapped to MITRE ATT&CK.
+  why: >
+    Static security catches known vulnerabilities before deployment, but runtime threats can only be detected
+    during execution. Falco (CNCF graduated 2024) monitors syscalls via eBPF with < 1% CPU overhead. Default
+    rules cover MITRE ATT&CK techniques including T1611 (Container Escape), T1068 (Privilege Escalation),
+    T1059 (Command Execution).
+  how_to_do_right: |
+    1. Deploy Falco as DaemonSet (one per node, eBPF driver).
+    2. Start with default rules, add custom rules for your application.
+    3. Route alerts to SIEM/Slack/PagerDuty by severity.
+    4. Map rules to MITRE ATT&CK techniques.
+    5. Tune to reduce false positives.
+    6. Test detection with attack simulations in staging.
+    7. Integrate with response automation (alert -> kill pod -> ticket).
+  severity: high
+  technologies:
+    library: [falco, falcosidekick, kubernetes]
+    platform: [kubernetes, linux]
+  domains:
+    domain: [security]
+    concern: [runtime_security, threat_detection]
+  example_good: |
+    # Custom Falco rules
+    - rule: Container Escape via Mount Namespace
+      desc: Detect nsenter or mount namespace manipulation
+      condition: >
+        spawned_process and container
+        and (proc.name in (nsenter, unshare)
+             or (proc.name = mount and proc.args contains "/proc"))
+      output: >
+        Container escape attempt (pod=%k8s.pod.name command=%proc.cmdline)
+      priority: CRITICAL
+      tags: [container, escape, mitre_T1611]
+
+    - rule: Cryptominer Process Detected
+      condition: >
+        spawned_process and container
+        and (proc.name in (xmrig, minerd, cpuminer)
+             or proc.cmdline contains "stratum+tcp://")
+      output: >
+        Cryptominer detected (pod=%k8s.pod.name command=%proc.cmdline)
+      priority: CRITICAL
+      tags: [cryptominer, mitre_T1496]
+
+    - rule: Reverse Shell in Container
+      condition: >
+        spawned_process and container
+        and ((proc.name in (bash, sh) and proc.args contains "/dev/tcp")
+             or (proc.name = nc and proc.args contains "-e"))
+      output: >
+        Reverse shell detected (pod=%k8s.pod.name command=%proc.cmdline)
+      priority: CRITICAL
+      tags: [shell, mitre_T1059]
+  example_bad: |
+    # No runtime monitoring
+    # "We scan images before deployment, we're secure"
+    # Cryptominer runs 3 weeks before billing alert ($12K cost)
+    # Container escape via kernel vuln: undetected lateral movement
+  when_applies: Kubernetes clusters or Linux servers running untrusted workloads
+  when_not_applies: Development-only environments with no sensitive data
+  sources:
+    - "https://falco.org/docs/"
+    - "https://falco.org/docs/reference/rules/default-rules/"
+    - "https://github.com/falcosecurity/falco"
+
+- id: EBPF-004
+  text: >
+    Deploy Cilium Tetragon for kernel-level security enforcement -- go beyond detection (Falco) to prevention
+    by blocking malicious actions at the kernel level before they complete, with sub-millisecond response.
+  why: >
+    Detection tools alert after a syscall completes -- the malicious action already happened. Tetragon (CNCF,
+    Cilium sub-project) attaches eBPF to LSM hooks and kprobes to enforce policies at the kernel level, blocking
+    actions before completion. Kernel-level enforcement has sub-ms latency and cannot be bypassed. Tetragon 1.1-1.2
+    (2024) added improved policy language and namespace-aware enforcement.
+  how_to_do_right: |
+    1. Deploy Tetragon as DaemonSet alongside Cilium.
+    2. Start with monitoring mode to understand baseline.
+    3. Define TracingPolicy CRDs for enforcement.
+    4. Transition to enforcement after baseline period (1-2 weeks).
+    5. Use sigkill action for critical violations.
+    6. Integrate events with Falco/SIEM.
+    7. Test enforcement policies in staging first.
+  severity: high
+  technologies:
+    library: [tetragon, cilium, kubernetes]
+    platform: [kubernetes, linux]
+  domains:
+    domain: [security]
+    concern: [runtime_enforcement, process_restriction]
+  example_good: |
+    # Tetragon TracingPolicy -- block sensitive file access
+    apiVersion: cilium.io/v1alpha1
+    kind: TracingPolicy
+    metadata:
+      name: block-sensitive-file-access
+    spec:
+      kprobes:
+        - call: "fd_install"
+          syscall: false
+          args:
+            - index: 0
+              type: int
+            - index: 1
+              type: "file"
+          selectors:
+            - matchArgs:
+                - index: 1
+                  operator: "Prefix"
+                  values:
+                    - "/etc/shadow"
+                    - "/root/.ssh/id_rsa"
+              matchActions:
+                - action: Sigkill
+
+    ---
+    # Block dangerous binaries in containers
+    apiVersion: cilium.io/v1alpha1
+    kind: TracingPolicy
+    metadata:
+      name: block-dangerous-binaries
+    spec:
+      kprobes:
+        - call: "security_bprm_check"
+          args:
+            - index: 0
+              type: "linux_binprm"
+          selectors:
+            - matchArgs:
+                - index: 0
+                  operator: "Postfix"
+                  values: ["nsenter", "kubectl", "xmrig", "nmap"]
+              matchNamespaces:
+                - namespace: Pid
+                  operator: NotIn
+                  values: ["host_ns"]
+              matchActions:
+                - action: Sigkill
+  example_bad: |
+    # Detection-only (Falco alone):
+    # 1. Attacker runs: cat /etc/shadow
+    # 2. Syscall completes -- file contents returned
+    # 3. Alert 50-100ms later, SOC reviews minutes/hours later
+    # With Tetragon: process killed <1ms, file never read
+  when_applies: Kubernetes clusters requiring runtime enforcement
+  when_not_applies: Environments where detection and alerting is sufficient
+  sources:
+    - "https://tetragon.io/"
+    - "https://github.com/cilium/tetragon"
+    - "https://cilium.io/blog/2024/12/31/tetragon-2024-year-in-review/"
+
+- id: EBPF-005
+  text: >
+    Implement zero-instrumentation observability with eBPF -- gain network flow, DNS, HTTP, and gRPC visibility
+    without sidecars, agents, or code changes, reducing overhead by 15-30% versus sidecar-based service mesh.
+  why: >
+    Traditional observability requires application instrumentation or sidecar proxies (Istio adds 100-200MB per pod).
+    eBPF-based observability hooks into the kernel network stack providing visibility without modifications. Cilium +
+    Hubble provides L3/L4 flow logs, DNS visibility, HTTP metrics, and gRPC visibility. For 500 pods, eliminating
+    sidecars saves 50-100GB RAM and removes 2-5ms proxy latency per request.
+  how_to_do_right: |
+    1. Enable Hubble in Cilium for automatic flow logs, DNS, and HTTP metrics.
+    2. Use hubble observe for real-time debugging.
+    3. Export metrics to Prometheus for dashboards.
+    4. Use Hubble UI for auto-generated service dependency map.
+    5. Add OpenTelemetry where deeper application tracing is needed.
+    6. Monitor eBPF overhead (typically < 2% CPU).
+  severity: medium
+  technologies:
+    library: [cilium, hubble, prometheus]
+    platform: [kubernetes, linux]
+  domains:
+    domain: [observability, security]
+    concern: [service_mesh, monitoring]
+  example_good: |
+    # Enable Hubble
+    # helm upgrade cilium cilium/cilium \
+    #   --set hubble.enabled=true \
+    #   --set hubble.relay.enabled=true \
+    #   --set hubble.metrics.enabled="{dns,drop,tcp,flow,http}"
+
+    # Real-time flow observation (no app changes):
+    # $ hubble observe --namespace production --pod payment-api --protocol http
+    # TIMESTAMP          SOURCE                 DESTINATION            VERDICT  HTTP
+    # 10:23:45.123       api-gateway            payment-api            FORWARDED POST /v1/payments 200 45ms
+    # 10:23:46.789       api-gateway            payment-api            DROPPED   POST /admin 403
+
+    # DNS exfiltration detection:
+    # $ hubble observe --type l7 --protocol dns
+    # payment-api -> kube-dns  DNS Query evil.c2server.com TXT  <- suspicious!
+
+    # Auto-exported Prometheus metrics (no instrumentation):
+    # hubble_http_requests_total{method="POST", status="200"}
+    # hubble_dns_queries_total{query="api.stripe.com"}
+    # hubble_drop_total{reason="POLICY_DENIED"}
+  example_bad: |
+    # 500 pods x 200MB sidecar = 100GB extra RAM
+    # +2-5ms latency per hop, sidecar maintenance overhead
+    # Or: "instrument all 47 services in 5 languages" -- 12 done, 35 dark
+  when_applies: Kubernetes clusters with multiple services
+  when_not_applies: Single-service deployments or non-Linux environments
+  sources:
+    - "https://github.com/cilium/hubble"
+    - "https://docs.cilium.io/en/stable/observability/"
+
+- id: EBPF-006
+  text: >
+    Use eBPF-based XDP (eXpress Data Path) for DDoS mitigation and high-performance load balancing -- process
+    packets at the NIC driver level achieving 10-100 million packets per second per core.
+  why: >
+    Traditional DDoS mitigation processes packets in the kernel stack or userspace, adding latency. XDP attaches
+    eBPF programs directly to the NIC driver, processing packets before the kernel stack. This enables line-rate
+    processing, sub-microsecond decisions, and efficient DDoS filtering. Cilium uses XDP for load balancing,
+    Cloudflare uses XDP for Tbps-scale DDoS mitigation, and Meta's Katran handles all facebook.com traffic.
+  how_to_do_right: |
+    1. Use Cilium's built-in XDP acceleration for Kubernetes.
+    2. For custom XDP: start with XDP_DROP for DDoS filtering.
+    3. Implement per-source-IP rate limiting in BPF maps.
+    4. Use XDP_TX for fast packet redirection (load balancing).
+    5. XDP_PASS for legitimate traffic (continue normal processing).
+    6. Test with xdp-loader and xdp-filter before custom development.
+    7. Monitor performance with bpftool.
+  severity: medium
+  technologies:
+    library: [cilium, xdp, katran]
+    platform: [linux]
+  domains:
+    domain: [security, networking]
+    concern: [ddos_mitigation, load_balancing]
+  example_good: |
+    // XDP SYN flood mitigation with rate limiting
+    #include "vmlinux.h"
+    #include <bpf/bpf_helpers.h>
+    #include <bpf/bpf_endian.h>
+
+    #define MAX_SYN_PER_SEC 100
+
+    struct rate_info { __u64 first_seen; __u32 count; };
+
+    struct {
+        __uint(type, BPF_MAP_TYPE_LRU_HASH);
+        __uint(max_entries, 1000000);
+        __type(key, __u32);
+        __type(value, struct rate_info);
+    } syn_rate SEC(".maps");
+
+    SEC("xdp")
+    int syn_flood_filter(struct xdp_md *ctx) {
+        void *data = (void *)(long)ctx->data;
+        void *data_end = (void *)(long)ctx->data_end;
+
+        struct ethhdr *eth = data;
+        if ((void *)(eth + 1) > data_end) return XDP_PASS;
+        if (eth->h_proto != bpf_htons(ETH_P_IP)) return XDP_PASS;
+
+        struct iphdr *ip = (void *)(eth + 1);
+        if ((void *)(ip + 1) > data_end) return XDP_PASS;
+        if (ip->protocol != IPPROTO_TCP) return XDP_PASS;
+
+        struct tcphdr *tcp = (void *)ip + (ip->ihl * 4);
+        if ((void *)(tcp + 1) > data_end) return XDP_PASS;
+        if (!(tcp->syn && !tcp->ack)) return XDP_PASS;
+
+        __u32 src_ip = ip->saddr;
+        struct rate_info *info = bpf_map_lookup_elem(&syn_rate, &src_ip);
+        if (info && info->count >= MAX_SYN_PER_SEC)
+            return XDP_DROP;  // Drop at NIC driver level
+
+        // ... update rate counter ...
+        return XDP_PASS;
+    }
+    char LICENSE[] SEC("license") = "GPL";
+  example_bad: |
+    # iptables DDoS mitigation:
+    # Under 10M pps, kernel exhausts CPU before iptables evaluates
+    # Cannot do per-IP rate limiting efficiently
+    # O(n) rule evaluation degrades with many rules
+  when_applies: Internet-facing infrastructure requiring DDoS protection
+  when_not_applies: Internal-only services with low traffic
+  sources:
+    - "https://docs.cilium.io/en/stable/network/kubernetes/kubeproxy-free/"
+    - "https://github.com/facebookincubator/katran"
+    - "https://blog.cloudflare.com/l4drop-xdp-ebpf-based-ddos-mitigations/"
+
+- id: EBPF-007
+  text: >
+    Define CiliumNetworkPolicy with L3/L4/L7 rules and DNS-aware FQDN policies -- standard Kubernetes
+    NetworkPolicy only supports L3/L4 and cannot restrict by HTTP method, path, or external domain name.
+  why: >
+    Standard Kubernetes NetworkPolicy is limited to IP-based L3/L4 rules. It cannot restrict HTTP methods/paths,
+    gRPC services, or DNS names. CiliumNetworkPolicy adds L7 awareness and FQDN policies that resolve DNS names
+    dynamically, critical for preventing data exfiltration to arbitrary external hosts. Identity-based policies
+    are more stable than IP-based rules.
+  how_to_do_right: |
+    1. Use CiliumNetworkPolicy for all policies.
+    2. Default deny all ingress and egress at namespace level.
+    3. Allow specific L7 traffic: HTTP methods + paths, gRPC services.
+    4. Use toFQDNs for external access: list allowed domains explicitly.
+    5. Test with hubble observe --verdict DROPPED.
+    6. Store policies in Git, deploy with Helm/ArgoCD.
+  severity: high
+  technologies:
+    library: [cilium, kubernetes]
+    platform: [kubernetes, linux]
+  domains:
+    domain: [security, networking]
+    concern: [network_policy, zero_trust]
+  example_good: |
+    # Default deny (zero trust baseline)
+    apiVersion: cilium.io/v2
+    kind: CiliumNetworkPolicy
+    metadata:
+      name: default-deny
+      namespace: production
+    spec:
+      endpointSelector: {}
+      ingress:
+        - fromEndpoints: [{}]
+      egress:
+        - toEndpoints: [{}]
+
+    ---
+    # Fine-grained L7 + FQDN policy
+    apiVersion: cilium.io/v2
+    kind: CiliumNetworkPolicy
+    metadata:
+      name: order-api-policy
+    spec:
+      endpointSelector:
+        matchLabels: { app: order-api }
+      ingress:
+        - fromEndpoints:
+            - matchLabels: { app: frontend }
+          toPorts:
+            - ports: [{ port: "8080", protocol: TCP }]
+              rules:
+                http:
+                  - method: GET
+                    path: "/api/v1/orders"
+                  - method: POST
+                    path: "/api/v1/orders"
+      egress:
+        - toEndpoints:
+            - matchLabels: { app: postgres }
+          toPorts:
+            - ports: [{ port: "5432" }]
+        - toFQDNs:
+            - matchName: "api.stripe.com"
+          toPorts:
+            - ports: [{ port: "443" }]
+  example_bad: |
+    # Standard NetworkPolicy:
+    # IP-based (Stripe IPs change without notice)
+    # No L7 (cannot restrict HTTP methods/paths)
+    # No DNS (cannot say "allow api.stripe.com")
+    # Attacker can exfiltrate to ANY IP on port 443
+  when_applies: Kubernetes clusters using Cilium
+  when_not_applies: Clusters not using Cilium
+  sources:
+    - "https://docs.cilium.io/en/stable/security/policy/"
+    - "https://docs.cilium.io/en/stable/security/policy/language/"
+
+- id: EBPF-008
+  text: >
+    Combine runtime security (Falco/Tetragon) with static security (SAST/SCA) as complementary layers --
+    static catches known patterns in code, runtime catches exploitation of unknown vulnerabilities.
+  why: >
+    Static and runtime security operate at different points and catch different threats. SAST catches code
+    vulnerabilities before deployment. Runtime security detects zero-day exploits, misconfigurations, insider
+    threats, and lateral movement. NIST CSF 2.0 (Feb 2024) requires both preventive and detective controls.
+    Neither replaces the other -- both are needed for defense in depth.
+  how_to_do_right: |
+    1. Pre-deployment: SAST + SCA + image scanning in CI/CD.
+    2. Runtime: Falco (detection) + Tetragon (enforcement) as DaemonSets.
+    3. Correlate: runtime exploit -> check if CVE was flagged by SCA.
+    4. Feedback loop: new runtime attack pattern -> new SAST rule.
+    5. Map both to MITRE ATT&CK matrix for coverage analysis.
+    6. Neither replaces the other -- both required.
+  severity: high
+  technologies:
+    library: [falco, tetragon, semgrep, codeql, trivy]
+    platform: [kubernetes, linux]
+  domains:
+    domain: [security]
+    concern: [defense_in_depth, devsecops]
+  example_good: |
+    # Integrated security pipeline
+    pre_commit:
+      - gitleaks  # Secrets
+
+    ci_cd:
+      - semgrep: "p/owasp-top-ten"
+      - codeql: "security-extended"
+      - trivy: "filesystem + container scan"
+      mitre: ["T1190 (Exploit Public App)", "T1195 (Supply Chain)"]
+
+    admission:
+      - kyverno: "Block privileged containers"
+
+    runtime_detection:
+      - falco: "Syscall monitoring, behavioral detection"
+      mitre: ["T1059 (Command Exec)", "T1611 (Container Escape)"]
+
+    runtime_enforcement:
+      - tetragon: "Kernel-level blocking"
+      mitre: ["T1068 (Priv Escalation)", "T1005 (Data Collection)"]
+
+    # Feedback: Falco detects curl to external IP
+    # -> New Semgrep rule: detect unchecked subprocess with URLs
+    # -> Prevents same pattern in new code
+  example_bad: |
+    # Static only: "Code passes SAST, we're secure"
+    # Zero-day in OpenSSL: no runtime detection
+    # Runtime only: known SQLi CVE deployed to production
+    # Could have been caught by SCA for $0
+  when_applies: Production systems handling sensitive data
+  when_not_applies: Development environments with no production traffic
+  sources:
+    - "https://www.nist.gov/cyberframework"
+    - "https://falco.org/docs/"
+    - "https://tetragon.io/"
+
+- id: EBPF-009
+  text: >
+    Deploy eBPF-based continuous profiling (Parca or Pyroscope) for always-on CPU and memory profiling --
+    identify regressions, memory leaks, and optimization opportunities with less than 1% overhead.
+  why: >
+    Traditional profiling is ad-hoc -- run when investigating a known issue. Continuous profiling samples stack
+    traces at 19-100 Hz and aggregates into flame graphs over time. eBPF-based profilers capture system-wide
+    stacks with <1% CPU overhead. Parca Agent is merging with OpenTelemetry eBPF Profiler (2024). Enables
+    diff flame graphs, language-agnostic profiling, and correlation with traces and metrics.
+  how_to_do_right: |
+    1. Deploy Parca Agent as DaemonSet (auto-discovers all processes).
+    2. Configure Parca Server for storage and query.
+    3. Enable symbol resolution for your languages.
+    4. Sampling rate: 19 Hz (default) to 100 Hz (more detail).
+    5. Use diff flame graphs to compare before/after deployments.
+    6. Alert on CPU regression after deploys.
+    7. Integrate with Grafana for unified observability.
+  severity: medium
+  technologies:
+    library: [parca, pyroscope, grafana]
+    platform: [kubernetes, linux]
+  domains:
+    domain: [observability, performance]
+    concern: [profiling, performance_engineering]
+  example_good: |
+    # Parca Agent DaemonSet
+    apiVersion: apps/v1
+    kind: DaemonSet
+    metadata:
+      name: parca-agent
+      namespace: parca-system
+    spec:
+      template:
+        spec:
+          hostPID: true
+          containers:
+            - name: parca-agent
+              image: ghcr.io/parca-dev/parca-agent:v0.32.0
+              args:
+                - /bin/parca-agent
+                - --node=$(NODE_NAME)
+                - --store-address=parca-server:7070
+                - --sampling-ratio=19
+              securityContext:
+                privileged: true
+              volumeMounts:
+                - name: sys
+                  mountPath: /sys
+                  readOnly: true
+          volumes:
+            - name: sys
+              hostPath:
+                path: /sys
+
+    # Diff flame graph: compare before/after deployment
+    # Red = new hot paths (regression)
+    # Blue = improved paths
+  example_bad: |
+    # Ad-hoc profiling:
+    # 1. SSH into production pod (security violation)
+    # 2. Install py-spy (modifies production image)
+    # 3. "I don't see the issue... probably transient"
+    # Intermittent issues missed, no historical comparison
+  when_applies: Production systems where performance matters
+  when_not_applies: Development environments or batch workloads
+  sources:
+    - "https://github.com/parca-dev/parca"
+    - "https://www.polarsignals.com/blog/posts/2024/08/13/parca-opentelemetry-bright-future"
+    - "https://grafana.com/oss/pyroscope/"
+
+- id: EBPF-010
+  text: >
+    Use Hubble (Cilium's observability layer) for network flow visibility, service dependency mapping, DNS
+    monitoring, and security audit logging -- real-time and historical visibility without application changes.
+  why: >
+    Debugging Kubernetes networking without visibility is guesswork. Hubble provides real-time flow observation
+    with Kubernetes identity context, automatic service maps, DNS monitoring, dropped packet analysis with
+    reasons, and HTTP/gRPC-level visibility. Hubble Relay aggregates cluster-wide for centralized visibility.
+  how_to_do_right: |
+    1. Enable Hubble in Cilium (hubble.enabled=true, hubble.relay.enabled=true).
+    2. Deploy Hubble UI for visual service map.
+    3. Use hubble observe CLI for real-time debugging.
+    4. Export metrics to Prometheus.
+    5. Alert on: high drop rate, DNS failures, unexpected external traffic.
+    6. Use flow logs for security audit.
+    7. Integrate with Grafana dashboards.
+  severity: medium
+  technologies:
+    library: [hubble, cilium, grafana, prometheus]
+    platform: [kubernetes, linux]
+  domains:
+    domain: [observability, security]
+    concern: [network_observability, service_map]
+  example_good: |
+    # Debug: "Why can't order-api reach postgres?"
+    $ hubble observe --namespace production \
+        --from-pod order-api --to-pod postgres --verdict DROPPED
+
+    # Output: DROPPED Policy denied (no matching rule)
+    # Fix: add CiliumNetworkPolicy
+
+    # DNS exfiltration detection:
+    $ hubble observe --type l7 --protocol dns | grep -v known-domains
+    # compromised-pod -> kube-dns  DNS Query data.evil-c2.com TXT
+
+    # Prometheus alerting:
+    - alert: HighDropRate
+      expr: rate(hubble_drop_total{reason="POLICY_DENIED"}[5m]) > 10
+      labels: { severity: warning }
+
+    - alert: UnexpectedExternalDNS
+      expr: increase(hubble_dns_queries_total{destination_pod!~"kube-dns.*"}[5m]) > 0
+      labels: { severity: critical }
+  example_bad: |
+    # Debugging without Hubble:
+    # kubectl exec order-api -- curl postgres:5432  (curl not installed)
+    # kubectl debug, tcpdump... which node? which interface?
+    # 45 minutes. With Hubble: 30 seconds.
+  when_applies: Kubernetes clusters using Cilium
+  when_not_applies: Clusters not using Cilium or single-node dev environments
+  sources:
+    - "https://github.com/cilium/hubble"
+    - "https://docs.cilium.io/en/stable/observability/hubble/"
+
+- id: EBPF-011
+  text: >
+    Follow eBPF program lifecycle best practices -- use CO-RE with BTF for portability, BPF maps for
+    kernel-userspace communication, pinning for persistence, and structured error handling.
+  why: >
+    eBPF programs are compiled to bytecode, verified, JIT-compiled, attached to hooks, and communicate via maps.
+    Without CO-RE, programs must be recompiled per kernel version. BTF enables CO-RE by allowing libbpf to
+    relocate field accesses at load time. Choosing the right map type (hash, array, ring buffer, per-CPU)
+    significantly affects performance. Map pinning allows persistence beyond process lifetime.
+  how_to_do_right: |
+    1. Use CO-RE with libbpf (C) or cilium/ebpf (Go).
+    2. Generate vmlinux.h from BTF.
+    3. Use BPF_CORE_READ() for safe field access.
+    4. Choose map types: HASH for lookups, RINGBUF for events, PERCPU_ARRAY for counters.
+    5. Pin maps to /sys/fs/bpf/ for persistence.
+    6. Handle verifier errors: small functions, no unbounded loops.
+    7. Monitor with bpftool prog show.
+  severity: medium
+  technologies:
+    library: [libbpf, cilium_ebpf, bpftool]
+    platform: [linux]
+  domains:
+    domain: [security, observability]
+    concern: [ebpf_development, kernel_programming]
+  example_good: |
+    // Go loader with proper lifecycle (cilium/ebpf)
+    package main
+
+    import (
+        "github.com/cilium/ebpf"
+        "github.com/cilium/ebpf/link"
+        "github.com/cilium/ebpf/ringbuf"
+        "github.com/cilium/ebpf/rlimit"
+    )
+
+    //go:generate go run github.com/cilium/ebpf/cmd/bpf2go tracer tracer.bpf.c
+
+    func main() {
+        rlimit.RemoveMemlock()  // Required for maps
+
+        objs := tracerObjects{}
+        loadTracerObjects(&objs, nil)  // CO-RE: works across kernels
+        defer objs.Close()
+
+        tp, _ := link.Tracepoint("syscalls", "sys_enter_execve",
+            objs.TraceExecve, nil)
+        defer tp.Close()
+
+        // Pin map for persistence
+        objs.Events.Pin("/sys/fs/bpf/my_events")
+        defer os.Remove("/sys/fs/bpf/my_events")
+
+        reader, _ := ringbuf.NewReader(objs.Events)
+        defer reader.Close()
+
+        // Graceful shutdown on SIGTERM
+        sig := make(chan os.Signal, 1)
+        signal.Notify(sig, syscall.SIGTERM)
+        go func() { <-sig; reader.Close() }()
+
+        for {
+            record, err := reader.Read()
+            if err != nil { break }
+            processEvent(record.RawSample)
+        }
+    }
+  example_bad: |
+    # BCC approach (avoid for production):
+    # from bcc import BPF
+    # b = BPF(text="""...""")  # Compiles at runtime (slow, needs LLVM)
+    # Requires kernel headers on production nodes
+    # 10-30 second startup, fails if headers missing
+    # No CO-RE: different binary per kernel version
+  when_applies: Teams developing custom eBPF programs
+  when_not_applies: Teams using only Cilium/Falco/Tetragon without custom programs
+  sources:
+    - "https://docs.ebpf.io/concepts/core/"
+    - "https://github.com/cilium/ebpf"
+    - "https://nakryiko.com/posts/bpf-portability-and-co-re/"
+
+- id: EBPF-012
+  text: >
+    Use eBPF-based monitoring to enforce CIS Kubernetes Benchmark compliance, audit logging, and RBAC validation
+    continuously -- shift compliance from periodic audits to continuous enforcement.
+  why: >
+    CIS compliance is traditionally verified quarterly. Between audits, drift occurs -- privileged pods,
+    excessive RBAC, disabled audit logging. eBPF enables continuous verification. Tetragon enforces CIS controls
+    at kernel level (block privilege escalation). Falco detects violations in real time (pod as root). Hubble
+    verifies network segmentation. This shifts compliance from point-in-time to continuous.
+  how_to_do_right: |
+    1. Run kube-bench for initial CIS assessment.
+    2. Map CIS controls to eBPF rules: API Server (Falco), Worker Nodes (Tetragon),
+       Policies (Cilium), Network (Hubble).
+    3. Deploy Falco rules for CIS violation detection.
+    4. Deploy Tetragon policies for critical CIS enforcement.
+    5. Export compliance metrics to Prometheus.
+    6. Generate reports from continuous data (replaces manual audit).
+    7. Integrate with GRC tools for automated evidence.
+  severity: high
+  technologies:
+    library: [falco, tetragon, cilium, hubble, kube_bench]
+    platform: [kubernetes, linux]
+  domains:
+    domain: [security, compliance]
+    concern: [cis_benchmark, continuous_compliance]
+  example_good: |
+    # Falco: CIS 5.2.2 - Detect privileged containers
+    - rule: CIS 5.2.2 - Privileged Container
+      condition: kevt and kcreate and ka.req.pod.containers.privileged = true
+      output: >
+        CIS VIOLATION 5.2.2: Privileged container
+        (user=%ka.user.name pod=%ka.req.pod.name namespace=%ka.target.namespace)
+      priority: CRITICAL
+      tags: [cis, cis_5_2_2]
+
+    # Falco: CIS 5.2.6 - Container as root
+    - rule: CIS 5.2.6 - Container Running as Root
+      condition: spawned_process and container and user.uid = 0
+      output: >
+        CIS VIOLATION 5.2.6: root container
+        (pod=%k8s.pod.name command=%proc.cmdline)
+      priority: WARNING
+      tags: [cis, cis_5_2_6]
+
+    # Compliance dashboard metrics:
+    # cis_violations_total{control="5.2.2", severity="critical"} 3
+    # cis_enforced_blocks_total{control="4.2.1"} 47
+    # cis_controls_monitored 24
+
+    # Report:
+    compliance_report:
+      period: "2025-12-01 to 2025-12-15"
+      monitored: 24
+      passing: 21
+      violations: 3
+      auto_blocked: 2
+  example_bad: |
+    # Quarterly audit with kube-bench:
+    # Q1: 12 failures, create tickets
+    # Q2: 8 still open, 5 new ones
+    # Privileged container undetected for 90 days
+    # Audit logging disabled after debugging, never re-enabled
+    # $150K remediation sprint before each SOC 2 audit
+  when_applies: Kubernetes clusters subject to CIS, SOC 2, ISO 27001, or PCI DSS
+  when_not_applies: Development clusters with no compliance requirements
+  sources:
+    - "https://www.cisecurity.org/benchmark/kubernetes"
+    - "https://tetragon.io/"
+    - "https://falco.org/docs/"
+    - "https://github.com/aquasecurity/kube-bench"

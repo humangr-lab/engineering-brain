@@ -1,0 +1,1185 @@
+layer: rules
+domain: validation
+knowledge:
+
+- id: PYDV2-001
+  text: "Use model_validator(mode='wrap') when you need to intercept the entire validation pipeline and decide whether to run Pydantic's default validation, return a pre-existing instance, or transform input before validation. Use mode='before' for pre-processing raw input (dict/JSON), mode='after' for cross-field validation on an already-constructed model."
+  why: >
+    The three model_validator modes serve fundamentally different purposes and choosing the wrong one
+    leads to subtle bugs. mode='before' receives raw input (dict or whatever was passed) before any
+    field validation — use it to reshape external data. mode='after' receives a fully validated model
+    instance — use it for cross-field constraints (e.g., end_date > start_date). mode='wrap' is the
+    most powerful: it receives the raw input AND a handler function that runs the rest of validation.
+    You can call handler(value) to run default validation, skip it entirely to return a cached instance,
+    or transform input before calling handler. A common mistake is using mode='before' when you need
+    wrap — before cannot return the model instance directly or skip validation. Another mistake is using
+    mode='after' when you need before — after cannot reshape input because fields are already validated.
+  how_to_do_right: |
+    1. mode='before': Transform raw input before field validation. Receives dict/raw input.
+       Use for: normalizing external API formats, converting legacy field names, flattening nested dicts.
+    2. mode='after': Validate cross-field constraints on a fully constructed instance. Receives self.
+       Use for: end_date > start_date, password_confirm == password, at least one contact method.
+    3. mode='wrap': Full control. Receives raw input + handler. Call handler(value) for default validation.
+       Use for: caching (return existing instance), conditional validation, input routing.
+    4. In wrap validators, ALWAYS call handler at least in the default path — forgetting it skips all validation.
+    5. before validators must return a dict (or the same type passed in). Returning the model class raises TypeError.
+    6. after validators must return self. Returning a different instance silently replaces the model.
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [validation, architecture]
+    concern: [data_integrity, api_design]
+  example_good: |
+    from pydantic import BaseModel, model_validator
+    from datetime import date
+
+    class DateRange(BaseModel):
+        start: date
+        end: date
+
+        @model_validator(mode='after')
+        def end_after_start(self) -> 'DateRange':
+            if self.end <= self.start:
+                raise ValueError(f'end ({self.end}) must be after start ({self.start})')
+            return self
+
+    class LegacyImport(BaseModel):
+        full_name: str
+        email: str
+
+        @model_validator(mode='before')
+        @classmethod
+        def normalize_legacy(cls, data: dict) -> dict:
+            # Legacy API sends first_name + last_name, we need full_name
+            if 'first_name' in data and 'last_name' in data:
+                data['full_name'] = f"{data.pop('first_name')} {data.pop('last_name')}"
+            return data
+
+    _cache: dict[str, 'Config'] = {}
+
+    class Config(BaseModel):
+        name: str
+        value: int
+
+        @model_validator(mode='wrap')
+        @classmethod
+        def check_cache(cls, data, handler):
+            if isinstance(data, dict) and data.get('name') in _cache:
+                return _cache[data['name']]
+            instance = handler(data)
+            _cache[instance.name] = instance
+            return instance
+  example_bad: |
+    from pydantic import BaseModel, model_validator
+
+    class DateRange(BaseModel):
+        start: str
+        end: str
+
+        # BAD: Using mode='before' for cross-field validation — fields aren't parsed yet
+        @model_validator(mode='before')
+        @classmethod
+        def validate_dates(cls, data):
+            # data['start'] is still a string here, not a date object
+            # Comparing strings: "2024-12-01" > "2024-02-28" works by accident
+            # but "01/12/2024" > "28/02/2024" does NOT
+            if data.get('end', '') <= data.get('start', ''):
+                raise ValueError('end must be after start')
+            return data
+
+    class Config(BaseModel):
+        name: str
+
+        # BAD: Using mode='after' when you need wrap — cannot skip validation or return cached
+        @model_validator(mode='after')
+        def maybe_cache(self) -> 'Config':
+            # Too late — validation already ran, cannot skip it for cached instances
+            return self
+  when_applies: Any Pydantic v2 model that needs input transformation (before), cross-field validation (after), or caching/routing (wrap)
+  sources:
+    - url: https://docs.pydantic.dev/latest/concepts/validators/#model-validators
+      title: "Pydantic v2 Docs — Model Validators"
+    - url: https://docs.pydantic.dev/latest/api/functional_validators/#pydantic.functional_validators.model_validator
+      title: "Pydantic v2 API — model_validator"
+
+- id: PYDV2-002
+  text: "Use ConfigDict(strict=True) at API boundaries (FastAPI endpoints, CLI input, external integrations) to reject implicit type coercion. Use lax mode (default) for internal data flow where you control the types. Strict mode catches '123' being silently cast to int — a common source of bugs when external clients send wrong types."
+  why: >
+    Pydantic v2's default lax mode coerces types: string "123" becomes int 123, string "true" becomes
+    bool True. This is convenient for internal code where you know your ORM returns strings for numeric
+    columns, but dangerous at API boundaries where external clients may send "null" (string) instead of
+    null (JSON null), or "123abc" which fails silently after truncation in some parsers. A real-world bug:
+    a financial API accepted amount="100.50" (string), Pydantic coerced to float 100.5, but the client
+    meant to send 10050 cents as an integer. Strict mode would have rejected the string immediately,
+    surfacing the type mismatch at the API boundary instead of producing incorrect calculations downstream.
+    Google's API design guidelines and Stripe's API both enforce strict typing at boundaries.
+  how_to_do_right: |
+    1. API request/response models: ConfigDict(strict=True). Reject wrong types early.
+    2. Internal models (ORM, cache, internal services): lax mode (default). Coercion is convenient.
+    3. Per-field override: Field(strict=True) on sensitive fields (amounts, IDs) even in lax models.
+    4. For FastAPI: strict models as request bodies catch client errors at the endpoint level.
+    5. Use TypeAdapter(int, config=ConfigDict(strict=True)) for validating primitives strictly.
+    6. Document your API contract: if amount is int, reject "100" — don't silently coerce.
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic]
+    framework: [fastapi]
+  domains:
+    domain: [validation, api_design, security]
+    concern: [data_integrity, type_safety]
+  example_good: |
+    from pydantic import BaseModel, ConfigDict, Field
+
+    # API boundary — strict, reject implicit coercion
+    class CreatePaymentRequest(BaseModel):
+        model_config = ConfigDict(strict=True)
+
+        amount_cents: int          # Rejects "100" (string) — must be 100 (int)
+        currency: str              # Rejects 840 (int) — must be "USD" (str)
+        idempotency_key: str       # Rejects 12345 (int) — must be "12345" (str)
+
+    # Internal model — lax, coercion is fine (we control the data)
+    class PaymentRecord(BaseModel):
+        amount_cents: int          # Accepts "100" from DB column → 100
+        currency: str
+        created_at: str
+
+    # Mixed: lax model with one strict field
+    class UserProfile(BaseModel):
+        name: str
+        age: int = Field(strict=True)  # Only this field is strict
+        score: float                    # This field allows coercion
+  example_bad: |
+    from pydantic import BaseModel
+
+    # BAD: Lax mode at API boundary — silent coercion hides client bugs
+    class CreatePaymentRequest(BaseModel):
+        amount_cents: int   # Accepts "100" (string) → 100 — client meant 10000?
+        currency: str       # Accepts 840 (int) → "840" — valid ISO code or bug?
+
+    # Client sends: {"amount_cents": "100.50", "currency": 840}
+    # Pydantic coerces: amount_cents=100 (truncated!), currency="840"
+    # No error — but the data is wrong
+  when_applies: Any Pydantic model that receives data from external clients, APIs, CLI arguments, or untrusted sources
+  sources:
+    - url: https://docs.pydantic.dev/latest/concepts/strict_mode/
+      title: "Pydantic v2 Docs — Strict Mode"
+    - url: https://docs.pydantic.dev/latest/concepts/config/#strict-mode
+      title: "Pydantic v2 Docs — ConfigDict strict"
+
+- id: PYDV2-003
+  text: "Use discriminated unions with a Literal tag field instead of try-except chains for polymorphic models. Pydantic v2 uses the discriminator value to select the correct model in O(1) — a try-except chain over N models is O(N) and produces confusing error messages showing the last model's errors instead of the real problem."
+  why: >
+    When you have a union type like Event = OrderCreated | OrderShipped | OrderCancelled, Pydantic
+    must determine which model to use. Without a discriminator, it tries each model in order and uses
+    the first one that validates. This is O(N), produces misleading errors (error shows "OrderCancelled
+    missing field 'reason'" when the input was actually a malformed OrderCreated), and gets worse as
+    you add more models. With a discriminator field (e.g., type: Literal["created"]), Pydantic reads
+    the tag value first and jumps directly to the correct model — O(1) lookup, clear errors ("type
+    must be 'created', 'shipped', or 'cancelled'"), and 10x faster validation for unions with 5+ models.
+    Benchmarks show discriminated unions validate in ~2us regardless of union size, while try-except
+    chains scale linearly (~1us per model in the union).
+  how_to_do_right: |
+    1. Add a Literal type field to every model in the union (e.g., type: Literal["order_created"]).
+    2. Use Annotated[Union[...], Field(discriminator='type')] to declare the discriminator.
+    3. The discriminator field name must be identical across all models in the union.
+    4. Each model's Literal value must be unique within the union.
+    5. For nested discriminators: use Discriminator(custom_function) for complex routing logic.
+    6. Error messages will say "Input tag 'xyz' not found in ['created', 'shipped']" — much clearer.
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [validation, performance, architecture]
+    concern: [polymorphism, type_safety]
+  example_good: |
+    from typing import Annotated, Literal, Union
+    from pydantic import BaseModel, Field
+
+    class OrderCreated(BaseModel):
+        type: Literal["order_created"]
+        order_id: str
+        total: float
+
+    class OrderShipped(BaseModel):
+        type: Literal["order_shipped"]
+        order_id: str
+        tracking_number: str
+
+    class OrderCancelled(BaseModel):
+        type: Literal["order_cancelled"]
+        order_id: str
+        reason: str
+
+    # Discriminated union — O(1) lookup via 'type' field
+    OrderEvent = Annotated[
+        Union[OrderCreated, OrderShipped, OrderCancelled],
+        Field(discriminator='type'),
+    ]
+
+    class EventEnvelope(BaseModel):
+        event: OrderEvent
+
+    # Validates instantly — reads type="order_shipped", jumps to OrderShipped
+    envelope = EventEnvelope.model_validate({
+        "event": {"type": "order_shipped", "order_id": "123", "tracking_number": "TRK-456"}
+    })
+    print(type(envelope.event))  # <class 'OrderShipped'>
+  example_bad: |
+    from pydantic import BaseModel
+
+    class OrderCreated(BaseModel):
+        order_id: str
+        total: float
+
+    class OrderShipped(BaseModel):
+        order_id: str
+        tracking_number: str
+
+    class OrderCancelled(BaseModel):
+        order_id: str
+        reason: str
+
+    # BAD: No discriminator — Pydantic tries each model in order
+    def parse_event(data: dict):
+        for model in [OrderCreated, OrderShipped, OrderCancelled]:
+            try:
+                return model.model_validate(data)
+            except Exception:
+                continue
+        raise ValueError("No model matched")
+
+    # Problem 1: OrderCreated has fewer required fields, so it matches EVERYTHING
+    # {"order_id": "123", "tracking_number": "TRK"} → OrderCreated (wrong!)
+    # Problem 2: Error message shows OrderCancelled errors, not the real problem
+  when_applies: Any Pydantic model with Union types representing 3+ polymorphic variants (events, messages, commands, API responses)
+  sources:
+    - url: https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions
+      title: "Pydantic v2 Docs — Discriminated Unions"
+    - url: https://docs.pydantic.dev/latest/api/standard_types/#discriminated-unions-aka-tagged-unions
+      title: "Pydantic v2 Docs — Tagged Unions"
+
+- id: PYDV2-004
+  text: "Use @computed_field for derived properties that should appear in serialization (model_dump, JSON). For expensive computations, cache with @cached_property + @computed_field. Never use @property for fields that must appear in API responses — they are invisible to Pydantic's serializer."
+  why: >
+    In Pydantic v1, @property fields were invisible to .dict() and .json() — a constant source of
+    bugs where API responses were missing computed fields. Pydantic v2 introduced @computed_field to
+    make derived values part of the schema. The key insight: @computed_field values appear in
+    model_dump(), JSON schema, and OpenAPI docs. Plain @property values do NOT. For expensive
+    computations (e.g., aggregating child records), combining @cached_property with @computed_field
+    gives you serialization visibility AND single-computation caching. The trade-off: @cached_property
+    makes the model mutable (the cache is stored on the instance), so don't use it on frozen models.
+    For frozen models, accept the recomputation cost or pre-compute in a validator.
+  how_to_do_right: |
+    1. @computed_field on a @property: recomputes on every access and every serialization call.
+       Use for: cheap derivations (full_name from first + last, age from birth_date).
+    2. @computed_field on a @cached_property: computes once, caches on instance.
+       Use for: expensive derivations (aggregation, formatting).
+       Caveat: makes instance mutable — incompatible with frozen=True.
+    3. Never use bare @property for fields that should appear in API responses.
+    4. computed_field supports return_type annotation for accurate JSON schema.
+    5. For conditional inclusion: use @computed_field and model_dump(exclude={'field'}).
+  severity: medium
+  technologies:
+    lang: [python]
+    library: [pydantic]
+    framework: [fastapi]
+  domains:
+    domain: [validation, api_design]
+    concern: [serialization, schema]
+  example_good: |
+    from functools import cached_property
+    from pydantic import BaseModel, computed_field
+    from datetime import date
+
+    class Employee(BaseModel):
+        first_name: str
+        last_name: str
+        birth_date: date
+        salary_base: float
+        bonus_pct: float
+
+        @computed_field
+        @property
+        def full_name(self) -> str:
+            """Cheap — recomputes every time, no caching needed."""
+            return f"{self.first_name} {self.last_name}"
+
+        @computed_field
+        @cached_property
+        def total_compensation(self) -> float:
+            """Expensive — cached after first access."""
+            # Imagine this queries a benefits API or does complex math
+            return self.salary_base * (1 + self.bonus_pct / 100)
+
+    emp = Employee(
+        first_name="Ada", last_name="Lovelace",
+        birth_date=date(1815, 12, 10), salary_base=150000, bonus_pct=20
+    )
+    data = emp.model_dump()
+    # {'first_name': 'Ada', 'last_name': 'Lovelace', ...,
+    #  'full_name': 'Ada Lovelace', 'total_compensation': 180000.0}
+    # Both computed fields appear in the output!
+  example_bad: |
+    from pydantic import BaseModel
+
+    class Employee(BaseModel):
+        first_name: str
+        last_name: str
+        salary_base: float
+        bonus_pct: float
+
+        # BAD: @property is invisible to model_dump() and JSON schema
+        @property
+        def full_name(self) -> str:
+            return f"{self.first_name} {self.last_name}"
+
+        @property
+        def total_compensation(self) -> float:
+            return self.salary_base * (1 + self.bonus_pct / 100)
+
+    emp = Employee(first_name="Ada", last_name="Lovelace", salary_base=150000, bonus_pct=20)
+    print(emp.full_name)  # Works: "Ada Lovelace"
+    print(emp.model_dump())
+    # {'first_name': 'Ada', 'last_name': 'Lovelace', 'salary_base': 150000, 'bonus_pct': 20}
+    # full_name and total_compensation are MISSING from the output!
+  when_applies: Any Pydantic model with derived/computed values that must appear in API responses, JSON serialization, or OpenAPI schemas
+  sources:
+    - url: https://docs.pydantic.dev/latest/concepts/fields/#computed-fields
+      title: "Pydantic v2 Docs — Computed Fields"
+    - url: https://docs.pydantic.dev/latest/api/fields/#pydantic.fields.computed_field
+      title: "Pydantic v2 API — computed_field"
+
+- id: PYDV2-005
+  text: "Use @model_serializer for custom JSON encoding and @model_validator(mode='before') for custom JSON decoding. This replaces Pydantic v1's json_encoders Config. For individual fields, use PlainSerializer/PlainValidator via Annotated types for reusable custom serialization."
+  why: >
+    Pydantic v1 used Config.json_encoders = {datetime: lambda v: v.isoformat()} for custom
+    serialization. This was global, inflexible, and removed in v2. Pydantic v2 uses composable
+    serializers: @model_serializer for full model control, and Annotated[type, PlainSerializer(...)]
+    for per-field reusable serialization. The key advantage: Annotated serializers are type-level,
+    meaning you define them once and reuse across all models. A common mistake in v2 migration:
+    trying to set json_encoders in model_config — it doesn't exist. Another mistake: using
+    model_serializer when you only need to customize one field (use PlainSerializer instead).
+    model_serializer replaces the entire serialization output, which means you must serialize
+    ALL fields manually if you use it.
+  how_to_do_right: |
+    1. For one field: Annotated[datetime, PlainSerializer(lambda v: v.isoformat())].
+       Reusable across models. Attach to a TypeAlias for DRY.
+    2. For entire model: @model_serializer(mode='plain') returns a dict.
+       You must serialize ALL fields — Pydantic won't fill in what you miss.
+    3. mode='wrap' in model_serializer gives you the default serialization + your customization.
+    4. For deserialization: @model_validator(mode='before') or Annotated[type, BeforeValidator(...)].
+    5. For round-trip (serialize + deserialize): define BOTH the serializer and validator.
+    6. Never try to use Config.json_encoders — it was removed in v2.
+  severity: medium
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [validation, api_design]
+    concern: [serialization, json]
+  example_good: |
+    from typing import Annotated
+    from datetime import datetime, timezone
+    from decimal import Decimal
+    from pydantic import BaseModel, PlainSerializer, PlainValidator, model_serializer
+
+    # Reusable per-field serializer via Annotated type alias
+    ISODatetime = Annotated[
+        datetime,
+        PlainSerializer(lambda v: v.isoformat(), return_type=str),
+        PlainValidator(lambda v: datetime.fromisoformat(v) if isinstance(v, str) else v),
+    ]
+
+    CentsAmount = Annotated[
+        Decimal,
+        PlainSerializer(lambda v: int(v * 100), return_type=int),
+        PlainValidator(lambda v: Decimal(v) / 100 if isinstance(v, int) else Decimal(str(v))),
+    ]
+
+    class Payment(BaseModel):
+        created_at: ISODatetime
+        amount: CentsAmount
+        description: str
+
+    p = Payment(created_at=datetime(2024, 6, 15, tzinfo=timezone.utc), amount=Decimal("99.99"), description="Test")
+    print(p.model_dump(mode='json'))
+    # {'created_at': '2024-06-15T00:00:00+00:00', 'amount': 9999, 'description': 'Test'}
+
+    # Round-trip works:
+    p2 = Payment.model_validate({'created_at': '2024-06-15T00:00:00+00:00', 'amount': 9999, 'description': 'Test'})
+    assert p2.amount == Decimal("99.99")
+  example_bad: |
+    from pydantic import BaseModel
+    from datetime import datetime
+
+    class Payment(BaseModel):
+        # BAD: v1 pattern — json_encoders removed in v2
+        class Config:
+            json_encoders = {  # AttributeError or silently ignored in v2!
+                datetime: lambda v: v.isoformat(),
+            }
+
+        created_at: datetime
+        amount: float  # BAD: float for money — precision errors
+  when_applies: Any Pydantic v2 model that needs custom JSON serialization (datetime formats, Decimal precision, enum values, nested transformations)
+  sources:
+    - url: https://docs.pydantic.dev/latest/concepts/serialization/#custom-serializers
+      title: "Pydantic v2 Docs — Custom Serializers"
+    - url: https://docs.pydantic.dev/latest/concepts/validators/#annotated-validators
+      title: "Pydantic v2 Docs — Annotated Validators"
+
+- id: PYDV2-006
+  text: "Use Field(json_schema_extra={...}) to enrich OpenAPI documentation with examples, descriptions, and constraints that Pydantic cannot express in Python types. For model-level schema customization, use model_config = ConfigDict(json_schema_extra={...}) or the model_json_schema_extra classmethod."
+  why: >
+    Pydantic v2 auto-generates JSON Schema from type hints, but real-world OpenAPI docs need more:
+    example values for Swagger UI "Try it out", regex pattern descriptions, deprecated field markers,
+    and external documentation links. Without json_schema_extra, your auto-generated OpenAPI docs
+    show correct types but no examples — making API exploration painful for consumers. FastAPI renders
+    json_schema_extra directly into the OpenAPI spec, so Swagger UI shows example values in the
+    request body editor. This is the difference between "your API has documentation" and "your API
+    has USEFUL documentation." Stripe, Twilio, and GitHub APIs all include rich examples in their
+    OpenAPI specs.
+  how_to_do_right: |
+    1. Field(json_schema_extra={"examples": ["value1", "value2"]}) for example values.
+    2. Field(json_schema_extra={"deprecated": True}) to mark deprecated fields.
+    3. Field(json_schema_extra={"externalDocs": {"url": "..."}}) for linking external docs.
+    4. For model-level: ConfigDict(json_schema_extra={"examples": [{...full example...}]}).
+    5. For dynamic schema: define @classmethod __get_pydantic_json_schema__ (advanced).
+    6. Combine with Field(description="...") for complete documentation.
+  severity: medium
+  technologies:
+    lang: [python]
+    library: [pydantic]
+    framework: [fastapi]
+  domains:
+    domain: [api_design, validation]
+    concern: [documentation, openapi]
+  example_good: |
+    from pydantic import BaseModel, ConfigDict, Field
+
+    class CreateUserRequest(BaseModel):
+        model_config = ConfigDict(
+            json_schema_extra={
+                "examples": [
+                    {
+                        "username": "ada_lovelace",
+                        "email": "ada@example.com",
+                        "role": "admin",
+                    }
+                ]
+            }
+        )
+
+        username: str = Field(
+            min_length=3,
+            max_length=30,
+            pattern=r'^[a-z0-9_]+$',
+            description="Lowercase alphanumeric username",
+            json_schema_extra={"examples": ["ada_lovelace", "charles_babbage"]},
+        )
+        email: str = Field(
+            description="Valid email address",
+            json_schema_extra={"examples": ["ada@example.com"]},
+        )
+        role: str = Field(
+            default="viewer",
+            description="User role",
+            json_schema_extra={
+                "examples": ["admin", "editor", "viewer"],
+                "deprecated": False,
+            },
+        )
+        legacy_id: str | None = Field(
+            default=None,
+            description="Deprecated: use username instead",
+            json_schema_extra={"deprecated": True},
+        )
+  example_bad: |
+    from pydantic import BaseModel
+
+    # BAD: No examples, no descriptions — OpenAPI docs show only types
+    class CreateUserRequest(BaseModel):
+        username: str
+        email: str
+        role: str = "viewer"
+        legacy_id: str | None = None
+
+    # Swagger UI shows:
+    # { "username": "string", "email": "string", "role": "string" }
+    # Consumers have no idea what valid values look like
+  when_applies: Any Pydantic model used as a FastAPI request/response body that will appear in OpenAPI/Swagger documentation
+  sources:
+    - url: https://docs.pydantic.dev/latest/concepts/json_schema/#schema-customization
+      title: "Pydantic v2 Docs — JSON Schema Customization"
+    - url: https://fastapi.tiangolo.com/tutorial/schema-extra-example/
+      title: "FastAPI Docs — Schema Extra Examples"
+
+- id: PYDV2-007
+  text: "Use TypeAdapter for validating non-model types: lists, dicts, primitives, and Union types that don't warrant a full BaseModel. TypeAdapter provides model_validate, model_dump, and json_schema on any type — it is Pydantic v2's replacement for parse_obj_as."
+  why: >
+    Not everything is a BaseModel. You often need to validate a list[int], a dict[str, float], or a
+    Union[str, int] from untrusted input. In Pydantic v1 you used parse_obj_as(list[int], data) which
+    was poorly documented and slow. Pydantic v2's TypeAdapter is the official, performant replacement.
+    It wraps ANY type (including BaseModel, dataclass, TypedDict, list, dict, primitives) and gives
+    it the full Pydantic validation/serialization API. A common mistake: creating a wrapper BaseModel
+    with a single field just to validate a list — TypeAdapter eliminates this boilerplate. TypeAdapter
+    also generates JSON Schema for non-model types, which is essential for OpenAPI docs when your
+    endpoint returns list[Item] instead of a wrapper model.
+  how_to_do_right: |
+    1. TypeAdapter(list[int]).validate_python(["1", "2", "3"]) → [1, 2, 3]
+    2. TypeAdapter(dict[str, float]).validate_json('{"a": "1.5"}') → {"a": 1.5}
+    3. TypeAdapter(MyModel).validate_python({...}) — works on models too.
+    4. ta.json_schema() generates JSON Schema for the type.
+    5. Create TypeAdapter ONCE (module-level) — construction has overhead, validation is fast.
+    6. Use for FastAPI response_model validation of non-model return types.
+  severity: medium
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [validation, architecture]
+    concern: [type_safety, data_integrity]
+  example_good: |
+    from pydantic import TypeAdapter, BaseModel
+
+    # Validate a list of integers from untrusted input
+    int_list_adapter = TypeAdapter(list[int])  # Create ONCE at module level
+
+    data = int_list_adapter.validate_python(["1", "2", "3"])
+    print(data)  # [1, 2, 3] — strings coerced to int
+
+    data = int_list_adapter.validate_json(b'[1, 2, "3"]')
+    print(data)  # [1, 2, 3]
+
+    print(int_list_adapter.json_schema())
+    # {'items': {'type': 'integer'}, 'type': 'array'}
+
+    # Validate a dict with typed values
+    scores_adapter = TypeAdapter(dict[str, float])
+    scores = scores_adapter.validate_python({"math": "95.5", "science": 87})
+    print(scores)  # {'math': 95.5, 'science': 87.0}
+
+    # Validate a Union type
+    from typing import Union
+    flexible_adapter = TypeAdapter(Union[int, str, bool])
+    print(flexible_adapter.validate_python(42))      # 42
+    print(flexible_adapter.validate_python("hello"))  # 'hello'
+
+    # Use with BaseModel for external validation
+    class Item(BaseModel):
+        name: str
+        price: float
+
+    items_adapter = TypeAdapter(list[Item])
+    items = items_adapter.validate_python([
+        {"name": "Widget", "price": "9.99"},
+        {"name": "Gadget", "price": 19.99},
+    ])
+    print(items)  # [Item(name='Widget', price=9.99), Item(name='Gadget', price=19.99)]
+  example_bad: |
+    from pydantic import BaseModel
+
+    # BAD: Creating a wrapper model just to validate a list
+    class IntListWrapper(BaseModel):
+        items: list[int]
+
+    wrapper = IntListWrapper(items=["1", "2", "3"])
+    data = wrapper.items  # Extra wrapping for no reason
+
+    # BAD: Manual validation without Pydantic
+    def validate_scores(data: dict) -> dict[str, float]:
+        return {k: float(v) for k, v in data.items()}  # No error messages, no schema
+  when_applies: Whenever you need to validate, serialize, or generate JSON Schema for non-BaseModel types (lists, dicts, primitives, unions, TypedDicts)
+  sources:
+    - url: https://docs.pydantic.dev/latest/concepts/type_adapter/
+      title: "Pydantic v2 Docs — TypeAdapter"
+    - url: https://docs.pydantic.dev/latest/api/type_adapter/
+      title: "Pydantic v2 API — TypeAdapter"
+
+- id: PYDV2-008
+  text: "Use pydantic-settings with BaseSettings for configuration from .env files, environment variables, and secrets directories. Support nested models with env_nested_delimiter='__', use secrets_dir for Docker/Kubernetes secrets, and always define sensible defaults with validation."
+  why: >
+    Application configuration has multiple sources: environment variables (12-factor app), .env files
+    (local dev), secrets directories (Docker Swarm, Kubernetes), and defaults. pydantic-settings
+    unifies all sources with priority ordering (env > .env > secrets > defaults) and full Pydantic
+    validation. Without it, teams use os.getenv() scattered across the codebase with no validation,
+    no type safety, and no documentation of what environment variables exist. A production outage at
+    a fintech company was caused by POOL_SIZE=ten (string typo) — os.getenv returns strings, and
+    int("ten") crashed at runtime. With pydantic-settings, this would fail at startup with a clear
+    validation error. The env_nested_delimiter feature allows nested models like DATABASE__HOST=localhost
+    to populate settings.database.host, keeping configuration structured.
+  how_to_do_right: |
+    1. Install: pip install pydantic-settings (separate package in v2).
+    2. Inherit from BaseSettings, not BaseModel.
+    3. model_config = SettingsConfigDict(env_file='.env', env_nested_delimiter='__').
+    4. Use secrets_dir for Docker/K8s secrets: SettingsConfigDict(secrets_dir='/run/secrets').
+    5. Override priority: env vars > .env file > secrets_dir > field defaults.
+    6. Use @field_validator for custom validation (e.g., DATABASE_URL must start with postgresql://).
+    7. Instantiate settings ONCE at startup and inject via dependency injection.
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic, pydantic-settings]
+    framework: [fastapi]
+  domains:
+    domain: [architecture, operations]
+    concern: [configuration, security, deployment]
+  example_good: |
+    from pydantic import field_validator
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+
+    class DatabaseSettings(BaseSettings):
+        host: str = "localhost"
+        port: int = 5432
+        name: str = "mydb"
+        user: str = "postgres"
+        password: str = ""  # Loaded from env or secrets_dir
+
+        @property
+        def url(self) -> str:
+            return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
+
+    class RedisSettings(BaseSettings):
+        host: str = "localhost"
+        port: int = 6379
+        db: int = 0
+
+    class AppSettings(BaseSettings):
+        model_config = SettingsConfigDict(
+            env_file='.env',
+            env_file_encoding='utf-8',
+            env_nested_delimiter='__',    # DATABASE__HOST=x → database.host=x
+            secrets_dir='/run/secrets',    # Docker/K8s secrets
+            case_sensitive=False,
+        )
+
+        debug: bool = False
+        log_level: str = "INFO"
+        database: DatabaseSettings = DatabaseSettings()
+        redis: RedisSettings = RedisSettings()
+
+        @field_validator('log_level')
+        @classmethod
+        def validate_log_level(cls, v: str) -> str:
+            valid = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+            if v.upper() not in valid:
+                raise ValueError(f'log_level must be one of {valid}')
+            return v.upper()
+
+    # Instantiate once at startup
+    settings = AppSettings()
+    print(settings.database.url)  # postgresql://postgres:@localhost:5432/mydb
+
+    # .env file:
+    # DATABASE__HOST=prod-db.example.com
+    # DATABASE__PASSWORD=secret123
+    # LOG_LEVEL=WARNING
+  example_bad: |
+    import os
+
+    # BAD: Scattered os.getenv with no validation
+    DB_HOST = os.getenv("DB_HOST", "localhost")
+    DB_PORT = int(os.getenv("DB_PORT", "5432"))  # Crashes if DB_PORT="ten"
+    DB_NAME = os.getenv("DB_NAME")  # None if not set — crash later
+    DEBUG = os.getenv("DEBUG")  # "true" (string), not True (bool)
+
+    # No documentation of what env vars exist
+    # No type validation
+    # No centralized configuration
+    # DB_NAME=None discovered at runtime, not at startup
+  when_applies: Any Python application that reads configuration from environment variables, .env files, or secrets (i.e., every production application)
+  sources:
+    - url: https://docs.pydantic.dev/latest/concepts/pydantic_settings/
+      title: "Pydantic v2 Docs — Settings Management"
+    - url: https://github.com/pydantic/pydantic-settings
+      title: "pydantic-settings GitHub Repository"
+
+- id: PYDV2-009
+  text: "Use model_construct() to create model instances without validation when the data is trusted and already validated. This is 5-10x faster than model_validate() and is appropriate for internal data from your own ORM, cache, or serialized checkpoints. Never use it for external or untrusted input."
+  why: >
+    Pydantic validation has overhead: type checking, coercion, custom validators, and error formatting.
+    For API boundaries this is essential. But when loading 10,000 records from your own database (already
+    validated on insert), re-validating each record wastes CPU. model_construct() creates a model
+    instance by directly setting attributes — no validation, no coercion, no validators. Benchmarks
+    show model_construct() is 5-10x faster than model_validate() for models with 10+ fields. Use cases:
+    loading from ORM (SQLAlchemy rows you inserted with validation), deserializing from trusted cache
+    (Redis, pickle), building models in tight loops where data is computed internally. The danger:
+    model_construct() trusts your data completely — if you pass invalid data, you get a corrupt model
+    instance with no error. Only use for data you fully control.
+  how_to_do_right: |
+    1. model_construct() for trusted internal data: ORM rows, cache, internal pipelines.
+    2. model_validate() for untrusted external data: API input, user input, file uploads.
+    3. model_construct(_fields_set={'field1', 'field2'}) to track which fields were explicitly set.
+    4. Computed fields and validators DO NOT RUN with model_construct(). Ensure data is complete.
+    5. Default values DO apply with model_construct() — fields not passed get their defaults.
+    6. Profile first: only optimize with model_construct() in hot paths where validation is measurably slow.
+  severity: medium
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [performance, validation]
+    concern: [optimization, data_integrity]
+  example_good: |
+    from pydantic import BaseModel
+    import time
+
+    class UserRecord(BaseModel):
+        id: int
+        name: str
+        email: str
+        score: float
+        active: bool = True
+
+    # Trusted data from your own database — already validated on insert
+    db_rows = [
+        {"id": i, "name": f"User {i}", "email": f"user{i}@corp.com", "score": 95.5}
+        for i in range(10000)
+    ]
+
+    # Slow: re-validates every field on every record
+    start = time.perf_counter()
+    validated = [UserRecord.model_validate(row) for row in db_rows]
+    slow_time = time.perf_counter() - start
+
+    # Fast: skips validation — data is already trusted
+    start = time.perf_counter()
+    constructed = [UserRecord.model_construct(**row) for row in db_rows]
+    fast_time = time.perf_counter() - start
+
+    print(f"model_validate: {slow_time:.3f}s, model_construct: {fast_time:.3f}s")
+    # Typical output: model_validate: 0.150s, model_construct: 0.020s (7.5x faster)
+
+    # EXTERNAL input: ALWAYS validate
+    user_input = {"id": "abc", "name": "", "email": "invalid", "score": "high"}
+    user = UserRecord.model_validate(user_input)  # Raises ValidationError — correct!
+  example_bad: |
+    from pydantic import BaseModel
+
+    class UserRecord(BaseModel):
+        id: int
+        name: str
+        email: str
+
+    # BAD: Using model_construct() on untrusted external input
+    user_input = {"id": "not_an_int", "name": 123, "email": None}
+    user = UserRecord.model_construct(**user_input)
+    # No error! But user.id is "not_an_int" (str, not int) — corrupt instance
+    # This will crash downstream when code assumes user.id is int:
+    # next_id = user.id + 1  # TypeError: can only concatenate str to str
+
+    # BAD: Using model_validate() in a hot loop on trusted data
+    for row in million_db_rows:
+        record = UserRecord.model_validate(row)  # 10x slower than necessary
+  when_applies: Loading large batches of data from trusted internal sources (ORM, cache, checkpoints) where validation is measurably slow
+  sources:
+    - url: https://docs.pydantic.dev/latest/concepts/models/#creating-models-without-validation
+      title: "Pydantic v2 Docs — Creating Models Without Validation"
+    - url: https://docs.pydantic.dev/latest/api/base_model/#pydantic.BaseModel.model_construct
+      title: "Pydantic v2 API — model_construct"
+
+- id: PYDV2-010
+  text: "Use Generic models with TypeVar to create reusable paginated responses, API envelopes, and collection wrappers. Define the generic once and parameterize it with any item type — Pydantic v2 generates correct JSON Schema for each specialization."
+  why: >
+    Every API needs paginated responses: {items: [...], total: int, page: int}. Without generics,
+    you create PaginatedUsers, PaginatedOrders, PaginatedProducts — identical boilerplate for every
+    entity. Pydantic v2 generics let you define Paginated[User], Paginated[Order] — one definition,
+    infinite specializations. The JSON Schema is generated correctly for each: Paginated[User] shows
+    items as array of User objects in OpenAPI docs. This pattern extends to API envelopes
+    (ApiResponse[T]), collection wrappers (BatchResult[T]), and cache entries (CacheEntry[T]).
+    FastAPI fully supports Pydantic generics as response_model, so Swagger UI shows the correct
+    schema for each endpoint. A common mistake: using dict or Any instead of generics — you lose
+    type safety and OpenAPI docs show "object" instead of the actual schema.
+  how_to_do_right: |
+    1. Define T = TypeVar('T') and use Generic[T] in your BaseModel.
+    2. Parameterize at usage: Paginated[User], ApiResponse[Order].
+    3. FastAPI: use Paginated[User] as response_model — OpenAPI schema is correct.
+    4. Pydantic validates the items against the parameterized type.
+    5. Nest generics: ApiResponse[Paginated[User]] works correctly.
+    6. For multiple type parameters: T, E = TypeVar('T'), TypeVar('E') → Result[T, E].
+  severity: medium
+  technologies:
+    lang: [python]
+    library: [pydantic]
+    framework: [fastapi]
+  domains:
+    domain: [api_design, architecture]
+    concern: [code_reuse, type_safety]
+  example_good: |
+    from typing import Generic, TypeVar, Sequence
+    from pydantic import BaseModel, computed_field
+
+    T = TypeVar('T')
+
+    class Paginated(BaseModel, Generic[T]):
+        items: Sequence[T]
+        total: int
+        page: int = 1
+        page_size: int = 20
+
+        @computed_field
+        @property
+        def total_pages(self) -> int:
+            return (self.total + self.page_size - 1) // self.page_size
+
+        @computed_field
+        @property
+        def has_next(self) -> bool:
+            return self.page < self.total_pages
+
+    class ApiResponse(BaseModel, Generic[T]):
+        data: T
+        success: bool = True
+        message: str = "OK"
+
+    class User(BaseModel):
+        id: int
+        name: str
+
+    class Order(BaseModel):
+        id: str
+        total: float
+
+    # Reuse the same generic for different types
+    users_page = Paginated[User](items=[User(id=1, name="Ada")], total=50)
+    orders_page = Paginated[Order](items=[Order(id="O1", total=99.99)], total=10)
+
+    response = ApiResponse[Paginated[User]](data=users_page)
+    print(response.model_dump())
+    # Correct JSON Schema generated for each specialization
+
+    # FastAPI integration
+    # @app.get("/users", response_model=ApiResponse[Paginated[User]])
+    # async def list_users(): ...
+    # OpenAPI shows full nested schema with User fields
+  example_bad: |
+    from pydantic import BaseModel
+    from typing import Any
+
+    # BAD: Copy-paste pagination for each entity
+    class PaginatedUsers(BaseModel):
+        items: list[dict]   # No type safety — dict instead of User
+        total: int
+        page: int = 1
+
+    class PaginatedOrders(BaseModel):
+        items: list[dict]   # Same boilerplate, no type safety
+        total: int
+        page: int = 1
+
+    # BAD: Using Any — loses all type information in OpenAPI
+    class ApiResponse(BaseModel):
+        data: Any           # OpenAPI shows "object" — useless
+        success: bool = True
+  when_applies: Any API with paginated responses, standard envelopes, or collection wrappers that repeat the same structure for different entity types
+  sources:
+    - url: https://docs.pydantic.dev/latest/concepts/models/#generic-models
+      title: "Pydantic v2 Docs — Generic Models"
+    - url: https://fastapi.tiangolo.com/advanced/response-model/#response-model-with-generics
+      title: "FastAPI Docs — Response Model with Generics"
+
+- id: PYDV2-011
+  text: "Use ConfigDict(frozen=True) to create hashable, immutable value objects. Frozen models can be used as dict keys, added to sets, and safely shared across threads. Use them for configuration objects, enum-like value types, and cache keys."
+  why: >
+    Mutable models are dangerous when used as dict keys or in sets — mutating the model after insertion
+    corrupts the hash table. Frozen models prevent this by raising TypeError on attribute assignment.
+    They also enable hash-based operations: you can use a frozen model as a dict key for caching,
+    add it to a set for deduplication, or share it across threads without locks. Domain-Driven Design
+    calls these "Value Objects" — objects defined by their attributes, not their identity. Examples:
+    Money(amount=100, currency="USD"), Coordinates(lat=40.7, lng=-74.0), DateRange(start, end).
+    Without frozen=True, two Money(100, "USD") instances are equal (==) but not hashable — you can't
+    use them as dict keys. With frozen=True, they are both equal and hashable.
+  how_to_do_right: |
+    1. ConfigDict(frozen=True) makes all fields read-only and the model hashable.
+    2. Use for value objects: Money, Coordinates, DateRange, Color, Version.
+    3. Use for configuration: once loaded, config should never change.
+    4. Use as dict keys: cache[frozen_key] = value.
+    5. Use in sets: unique_items = {FrozenModel(...), FrozenModel(...)}.
+    6. Caveat: @cached_property does NOT work with frozen=True (it needs to write to the instance).
+    7. If you need one mutable field on an otherwise frozen model: don't. Redesign the model.
+  severity: medium
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [architecture, validation]
+    concern: [immutability, thread_safety, ddd]
+  example_good: |
+    from pydantic import BaseModel, ConfigDict
+
+    class Money(BaseModel):
+        model_config = ConfigDict(frozen=True)
+        amount: int       # cents, to avoid float precision issues
+        currency: str
+
+        def add(self, other: 'Money') -> 'Money':
+            if self.currency != other.currency:
+                raise ValueError(f"Cannot add {self.currency} and {other.currency}")
+            return Money(amount=self.amount + other.amount, currency=self.currency)
+
+    class Coordinates(BaseModel):
+        model_config = ConfigDict(frozen=True)
+        latitude: float
+        longitude: float
+
+    # Hashable — use as dict keys
+    prices: dict[Money, str] = {
+        Money(amount=999, currency="USD"): "Budget",
+        Money(amount=4999, currency="USD"): "Premium",
+    }
+
+    # Usable in sets — deduplication
+    locations = {
+        Coordinates(latitude=40.7128, longitude=-74.0060),
+        Coordinates(latitude=40.7128, longitude=-74.0060),  # Duplicate — removed
+    }
+    assert len(locations) == 1
+
+    # Immutable — assignment raises TypeError
+    price = Money(amount=999, currency="USD")
+    # price.amount = 0  # TypeError: "Money" is immutable and does not support item assignment
+  example_bad: |
+    from pydantic import BaseModel
+
+    class Money(BaseModel):
+        amount: int
+        currency: str
+
+    # BAD: Mutable model used as dict key — hash changes if mutated
+    price = Money(amount=999, currency="USD")
+    # cache = {price: "result"}  # TypeError: unhashable type: 'Money'
+
+    # BAD: Mutable model shared across threads
+    config = Money(amount=999, currency="USD")
+    config.amount = 0  # Silently mutated — other threads see corrupted data
+  when_applies: Value objects (Money, Coordinates, DateRange), configuration objects, cache keys, or any model that should be immutable after creation
+  sources:
+    - url: https://docs.pydantic.dev/latest/concepts/config/#frozen
+      title: "Pydantic v2 Docs — Frozen Config"
+    - url: https://docs.pydantic.dev/latest/concepts/models/#faux-immutability
+      title: "Pydantic v2 Docs — Faux Immutability"
+
+- id: PYDV2-012
+  text: "Define custom types with __get_pydantic_core_schema__ for Pydantic v2. This replaces v1's __get_validators__ which no longer works. Custom types allow you to validate domain-specific formats (phone numbers, slugs, hex colors) with reusable, composable type annotations."
+  why: >
+    Pydantic v1 used __get_validators__ for custom types — a generator that yielded validator functions.
+    This was removed in v2 because v2's core validation is written in Rust (pydantic-core) and needs
+    a schema object, not Python generators. The v2 replacement is __get_pydantic_core_schema__ which
+    returns a CoreSchema object describing validation, serialization, and JSON schema generation. A
+    common migration mistake: keeping __get_validators__ and wondering why custom types silently pass
+    without validation. The new system is more powerful: you can compose schemas (chain validations),
+    customize serialization separately from validation, and generate accurate JSON Schema. For simple
+    cases, use Annotated[str, AfterValidator(fn)] instead of a full custom type.
+  how_to_do_right: |
+    1. Simple cases: Annotated[str, AfterValidator(validate_fn)] — no custom class needed.
+    2. Reusable types: define a class with __get_pydantic_core_schema__(cls, source, handler).
+    3. Use core_schema.with_info_plain_validator_function for validation with field info.
+    4. Use core_schema.chain_schema to compose multiple validations.
+    5. Never use __get_validators__ — it is silently ignored in v2.
+    6. Test custom types with TypeAdapter(YourType).validate_python(input) in unit tests.
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [validation, architecture]
+    concern: [type_safety, code_reuse]
+  example_good: |
+    from typing import Annotated, Any
+    from pydantic import BaseModel, GetCoreSchemaHandler, TypeAdapter
+    from pydantic_core import CoreSchema, core_schema
+    import re
+
+    class Slug:
+        """URL-safe slug: lowercase, alphanumeric, hyphens only."""
+
+        PATTERN = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*$')
+
+        def __init__(self, value: str):
+            self._value = value
+
+        def __str__(self) -> str:
+            return self._value
+
+        def __repr__(self) -> str:
+            return f"Slug({self._value!r})"
+
+        @classmethod
+        def __get_pydantic_core_schema__(
+            cls, source_type: Any, handler: GetCoreSchemaHandler
+        ) -> CoreSchema:
+            return core_schema.no_info_plain_validator_function(
+                cls._validate,
+                serialization=core_schema.to_string_ser_schema(),
+            )
+
+        @classmethod
+        def _validate(cls, value: Any) -> 'Slug':
+            if isinstance(value, cls):
+                return value
+            if not isinstance(value, str):
+                raise ValueError(f'Expected string, got {type(value).__name__}')
+            value = value.lower().strip()
+            if not cls.PATTERN.match(value):
+                raise ValueError(
+                    f'Invalid slug: {value!r}. Must be lowercase alphanumeric with hyphens.'
+                )
+            return cls(value)
+
+    class Article(BaseModel):
+        title: str
+        slug: Slug
+
+    article = Article(title="My Post", slug="my-post")
+    print(article.model_dump())  # {'title': 'My Post', 'slug': 'my-post'}
+
+    # Simpler alternative for one-off cases: Annotated + AfterValidator
+    from pydantic import AfterValidator
+
+    def validate_hex_color(v: str) -> str:
+        if not re.match(r'^#[0-9a-fA-F]{6}$', v):
+            raise ValueError(f'Invalid hex color: {v}')
+        return v.upper()
+
+    HexColor = Annotated[str, AfterValidator(validate_hex_color)]
+
+    class Theme(BaseModel):
+        primary: HexColor
+        secondary: HexColor
+
+    theme = Theme(primary="#ff5733", secondary="#33ff57")
+    print(theme.primary)  # #FF5733
+  example_bad: |
+    from pydantic import BaseModel
+
+    class Slug:
+        # BAD: v1 pattern — __get_validators__ is ignored in Pydantic v2
+        @classmethod
+        def __get_validators__(cls):
+            yield cls.validate
+
+        @classmethod
+        def validate(cls, v):
+            # This NEVER runs in v2 — validation silently passes everything
+            if not isinstance(v, str) or ' ' in v:
+                raise ValueError('Invalid slug')
+            return cls(v)
+
+    class Article(BaseModel):
+        slug: Slug  # Slug validation never runs — any value accepted!
+  when_applies: Any domain-specific type that needs reusable validation (slugs, phone numbers, hex colors, ISBNs, currency codes, custom IDs)
+  sources:
+    - url: https://docs.pydantic.dev/latest/concepts/types/#custom-types
+      title: "Pydantic v2 Docs — Custom Types"
+    - url: https://docs.pydantic.dev/latest/migration/#custom-types
+      title: "Pydantic v2 Migration Guide — Custom Types"
+
+- id: PYDV2-013
+  text: "When migrating from Pydantic v1 to v2: use model_dump() not dict(), model_validate() not parse_obj(), model_validate_json() not parse_raw(), model_json_schema() not schema(). Enable the v1-to-v2 shim temporarily with ConfigDict(from_attributes=True) for ORM mode. Run the official bump-pydantic codemod for automated migration."
+  why: >
+    Pydantic v2 renamed almost every method to be more explicit and consistent. The old names are
+    REMOVED (not just deprecated) — code using .dict() raises AttributeError in v2. The most common
+    migration failures: .dict() → .model_dump(), .json() → .model_dump_json(), .parse_obj() →
+    .model_validate(), .parse_raw() → .model_validate_json(), .schema() → .model_json_schema(),
+    .copy() → .model_copy(), from_orm() → model_validate() with from_attributes=True. The official
+    bump-pydantic tool automates 90% of the migration. For the remaining 10%: Config inner class
+    becomes model_config = ConfigDict(...), orm_mode=True becomes from_attributes=True,
+    __get_validators__ becomes __get_pydantic_core_schema__, and validator/root_validator become
+    field_validator/model_validator. Running bump-pydantic first and fixing manually after is
+    10x faster than manual migration.
+  how_to_do_right: |
+    1. Run bump-pydantic: pip install bump-pydantic && bump-pydantic .
+    2. Method renames:
+       .dict() → .model_dump()
+       .json() → .model_dump_json()
+       .parse_obj(data) → .model_validate(data)
+       .parse_raw(json_str) → .model_validate_json(json_str)
+       .schema() → .model_json_schema()
+       .copy(update={...}) → .model_copy(update={...})
+       .construct() → .model_construct()
+    3. Config renames:
+       class Config: → model_config = ConfigDict(...)
+       orm_mode = True → from_attributes=True
+       json_encoders → use PlainSerializer (per-field)
+    4. Validator renames:
+       @validator → @field_validator (note: classmethod by default in v2)
+       @root_validator → @model_validator
+    5. Test thoroughly: some coercion behaviors changed (e.g., str to int strictness).
+    6. Use from_attributes=True for SQLAlchemy ORM objects.
+  severity: critical
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [validation, architecture]
+    concern: [migration, compatibility]
+  example_good: |
+    from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+
+    # Pydantic v2 — correct patterns
+    class User(BaseModel):
+        model_config = ConfigDict(from_attributes=True)  # Was orm_mode=True
+
+        id: int
+        name: str
+        email: str
+
+        @field_validator('email')  # Was @validator('email')
+        @classmethod
+        def validate_email(cls, v: str) -> str:
+            if '@' not in v:
+                raise ValueError('Invalid email')
+            return v.lower()
+
+    # Creating
+    user = User.model_validate({"id": 1, "name": "Ada", "email": "ADA@example.com"})
+
+    # Serializing
+    data = user.model_dump()               # Was .dict()
+    json_str = user.model_dump_json()      # Was .json()
+
+    # Deserializing
+    user2 = User.model_validate_json(json_str)  # Was .parse_raw()
+
+    # Schema
+    schema = User.model_json_schema()      # Was .schema()
+
+    # Copying
+    user3 = user.model_copy(update={"name": "Charles"})  # Was .copy(update={...})
+
+    # From ORM object (SQLAlchemy)
+    # user = User.model_validate(db_row)   # Was User.from_orm(db_row)
+
+    # Automated migration (run once):
+    # pip install bump-pydantic
+    # bump-pydantic .
+  example_bad: |
+    from pydantic import BaseModel
+
+    class User(BaseModel):
+        # BAD: v1 Config class — use model_config = ConfigDict(...) in v2
+        class Config:
+            orm_mode = True          # AttributeError in v2
+            json_encoders = {        # Removed in v2
+                datetime: lambda v: v.isoformat()
+            }
+
+        id: int
+        name: str
+
+    user = User(id=1, name="Ada")
+    user.dict()                   # AttributeError — use model_dump()
+    user.json()                   # AttributeError — use model_dump_json()
+    User.parse_obj({"id": 1})    # AttributeError — use model_validate()
+    User.schema()                 # AttributeError — use model_json_schema()
+  when_applies: Any codebase migrating from Pydantic v1 to v2, or any new project that should use v2 patterns from the start
+  sources:
+    - url: https://docs.pydantic.dev/latest/migration/
+      title: "Pydantic v2 Migration Guide"
+    - url: https://github.com/pydantic/bump-pydantic
+      title: "bump-pydantic — Automated Migration Tool"

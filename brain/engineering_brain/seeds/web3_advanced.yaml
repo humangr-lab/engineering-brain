@@ -1,0 +1,930 @@
+layer: rules
+domain: security
+knowledge:
+- id: W3ADV-001
+  text: >
+    Protect DeFi contracts against MEV sandwich attacks by implementing commit-reveal
+    schemes for price-sensitive operations, or by integrating Flashbots Protect RPC
+    for transaction submission. Never submit large swaps directly to the public
+    mempool — attackers monitor the mempool in real-time and front-run transactions
+    worth more than ~$50 in expected profit.
+  why: >
+    MEV (Maximal Extractable Value) sandwich attacks constituted $289.76 million
+    (51.56%) of the total $561.92 million MEV volume on Ethereum in 2024. A sandwich
+    attack: attacker sees your swap in mempool, buys the token before your tx (raising
+    price), your tx executes at a worse price, attacker sells immediately. Average
+    loss per sandwiched swap: 0.3-2% of swap value. For a $100K swap, this is
+    $300-$2,000 extracted per transaction invisibly.
+  how_to_do_right: |
+    1. Integrate Flashbots Protect RPC endpoint (https://rpc.flashbots.net) for
+       all user-facing swap transactions — this routes txs privately, bypassing
+       the public mempool.
+    2. Implement commit-reveal for auctions and Dutch auctions:
+         Phase 1 (Commit): keccak256(abi.encodePacked(bid, nonce, msg.sender)) stored on-chain.
+         Phase 2 (Reveal): submit actual bid + nonce after commit window closes.
+         Verify: require(keccak256(...) == commitment[msg.sender]);
+    3. Set tight slippage tolerance in contract: require(amountOut >= minAmountOut, "Slippage");
+       Use 0.5% max for stablecoins, 1-2% for liquid pairs. Reject anything else.
+    4. For DEX contracts, implement a minimum time lock between price-sensitive
+       operations (1 block minimum = 12 seconds on Ethereum mainnet).
+    5. For large orders ($50K+), consider CowSwap's batch auction mechanism which
+       provides MEV protection at the protocol level.
+  severity: critical
+  technologies:
+    lang: [solidity]
+    framework: [hardhat, foundry, ethers.js]
+  domains:
+    domain: [security, blockchain, defi]
+    concern: [mev_protection, frontrunning, smart_contracts]
+  example_good: |
+    // Commit-reveal scheme for auction bids
+    contract MEVResistantAuction {
+        mapping(address => bytes32) public commitments;
+        mapping(address => uint256) public commitBlock;
+        uint256 public constant REVEAL_DELAY = 5; // 5 blocks
+
+        function commit(bytes32 commitment) external {
+            commitments[msg.sender] = commitment;
+            commitBlock[msg.sender] = block.number;
+        }
+
+        function reveal(uint256 bid, bytes32 nonce) external {
+            require(block.number >= commitBlock[msg.sender] + REVEAL_DELAY, "Too early");
+            require(
+                keccak256(abi.encodePacked(bid, nonce, msg.sender)) == commitments[msg.sender],
+                "Invalid commitment"
+            );
+            _processBid(msg.sender, bid);
+        }
+    }
+  example_bad: |
+    // Direct bid submission — visible in mempool, trivially front-run
+    function placeBid(uint256 bid) external payable {
+        require(bid > highestBid, "Bid too low");
+        // Attacker sees this tx in mempool, places higher bid first with higher gas
+        // Your tx now fails (wasted gas) or sets new floor for attacker
+        highestBid = bid;
+        highestBidder = msg.sender;
+    }
+  when_applies: Any DeFi contract with price-sensitive operations, auctions, swaps, or liquidations.
+  sources:
+    - "https://medium.com/@ancilartech/implementing-effective-mev-protection-in-2025-c8a65570be3a"
+    - "https://docs.flashbots.net/flashbots-protect/overview"
+    - "https://medium.com/@swapspace-co/how-to-implement-mev-resistant-smart-contracts-f0cbc378584e"
+    - "https://eips.ethereum.org/EIPS/eip-4337"
+
+- id: W3ADV-002
+  text: >
+    Design zk-SNARK circuits in Circom or Noir with the minimal constraint set
+    required for the proof. Verify on-chain using a pre-deployed verifier contract —
+    never implement custom pairing logic in Solidity. Proof verification gas cost
+    on Ethereum mainnet is ~250K-500K gas for Groth16; batch verification reduces
+    this to ~50K per proof amortized.
+  why: >
+    zk-SNARKs allow proving knowledge of a secret (e.g., "I know a password that
+    hashes to X" or "my balance is >1000") without revealing the secret. The
+    most critical engineering mistake is under-constraining the circuit — an
+    under-constrained circuit allows a prover to generate valid proofs for false
+    statements, defeating the purpose entirely. In 2023, the Tornado Cash circuit
+    had an under-constraint vulnerability where an attacker could prove membership
+    in a Merkle tree for a leaf they did not own. Formal verification of constraints
+    before deployment is mandatory.
+  how_to_do_right: |
+    1. Use Circom 2.x for zkSNARK circuits; Noir for more ergonomic Rust-like syntax.
+    2. Enforce ALL signals that affect the output are constrained:
+         signal input a, b;
+         signal output c;
+         c <== a * b;  // <== is both assignment AND constraint
+         // NEVER use <-- alone (assignment without constraint)
+    3. Generate verifier contract with snarkjs: snarkjs zkey export solidityverifier circuit.zkey verifier.sol
+    4. Verify on-chain using the generated Verifier.verifyProof(pA, pB, pC, pubSignals).
+    5. Use Groth16 for minimal on-chain verification cost (~250K gas).
+       Use PLONK for trusted setup-free proofs (higher gas: ~500K).
+    6. For privacy-preserving balance proofs or KYC (without revealing identity),
+       use Semaphore or Aztec's Noir + Barretenberg backend.
+    7. Audit circuits with circom-audit or formal verification with ECNE tool
+       before mainnet deployment.
+  severity: critical
+  technologies:
+    lang: [solidity, circom, noir]
+    framework: [hardhat, snarkjs, foundry]
+  domains:
+    domain: [security, blockchain, cryptography]
+    concern: [zk_proofs, privacy, circuit_design]
+  example_good: |
+    // Circom: properly constrained range proof (proves 0 <= x < 2^n without revealing x)
+    pragma circom 2.0.0;
+    include "node_modules/circomlib/circuits/bitify.circom";
+
+    template RangeProof(n) {
+        signal input x;
+        signal output valid;
+
+        component bits = Num2Bits(n);
+        bits.in <== x;      // <== enforces constraint: x must decompose into n bits
+        valid <== 1;        // If circuit satisfies, x is in [0, 2^n)
+    }
+
+    component main {public []} = RangeProof(64);
+  example_bad: |
+    // DANGEROUS: <-- without constraint — x is assigned but not constrained
+    // Malicious prover can set x to any value and generate a valid proof
+    template UnconstainedExample() {
+        signal input secret;
+        signal output hash;
+        hash <-- poseidon(secret);  // <-- is assignment only, NOT constraint
+        // Missing: hash === poseidon(secret) constraint
+        // Attacker can claim hash = anything while proving knowledge of secret
+    }
+  when_applies: Any zk-SNARK circuit development for privacy, scalability (ZK rollups), or credential systems.
+  sources:
+    - "https://docs.circom.io/getting-started/installation/"
+    - "https://noir-lang.org/docs"
+    - "https://ethresear.ch/t/the-application-of-zk-snarks-in-solidity-privacy-transformation-computational-optimization-and-mev-resistance/17017"
+
+- id: W3ADV-003
+  text: >
+    Implement cross-chain bridges using multi-layer security: a minimum 2-of-3
+    multi-sig for message relay, a time-delay (24-72 hours) for large transfers,
+    and circuit-breaker limits (max 5% of TVL per 24h). Never launch a bridge
+    without external audit and a bug bounty program — bridges hold the most
+    concentrated value in DeFi and are the #1 hack target.
+  why: >
+    Cross-chain bridges have been exploited for more than $2.8 billion, representing
+    ~40% of all value hacked in Web3. The Ronin bridge lost $625M (2022) because
+    5 of 9 validator keys were compromised — a single multi-sig with no time-delay.
+    The Wormhole bridge lost $320M (2022) from a smart contract signature validation
+    bug. The Nomad bridge lost $190M (2022) from an initialization bug that allowed
+    replay attacks. Every major bridge hack had a common root cause: insufficient
+    defense-in-depth — no time-delay, no circuit breaker, single point of failure.
+  how_to_do_right: |
+    1. Use lock-and-mint on the source chain (lock native token, mint wrapped on dest).
+       Never use a single admin key for the lock contract — require M-of-N multi-sig.
+    2. Implement a 24-72 hour optimistic challenge period for large transfers (>$10K):
+         mapping(bytes32 => uint256) public pendingTransfers;
+         uint256 public constant CHALLENGE_PERIOD = 1 days;
+         function executeTransfer(bytes32 txId) external {
+             require(block.timestamp >= pendingTransfers[txId] + CHALLENGE_PERIOD);
+         }
+    3. Circuit breaker: track total outflow per 24h window, revert if > MAX_DAILY_OUTFLOW
+       (set to 5-10% of TVL).
+    4. For production bridges, adopt zk-based verification (zkBridge, Succinct Labs)
+       over multi-sig relay — cryptographic guarantees vs social trust.
+    5. Run a Immunefi or HackerOne bug bounty at 10% of TVL protected before mainnet launch.
+    6. Monitor with on-chain alerts: emit events on every relay action, aggregate
+       off-chain with Forta Network bots for anomaly detection.
+  severity: critical
+  technologies:
+    lang: [solidity]
+    framework: [hardhat, foundry, openzeppelin]
+  domains:
+    domain: [security, blockchain, cross_chain]
+    concern: [bridge_security, multi_sig, circuit_breaker]
+  example_good: |
+    contract SecureBridge {
+        uint256 public constant MAX_DAILY_OUTFLOW = 500_000e18; // 5% of 10M TVL
+        uint256 public constant CHALLENGE_PERIOD = 24 hours;
+        uint256 public dailyOutflow;
+        uint256 public lastResetTime;
+
+        modifier circuitBreaker(uint256 amount) {
+            if (block.timestamp >= lastResetTime + 1 days) {
+                dailyOutflow = 0;
+                lastResetTime = block.timestamp;
+            }
+            require(dailyOutflow + amount <= MAX_DAILY_OUTFLOW, "Daily limit exceeded");
+            dailyOutflow += amount;
+            _;
+        }
+
+        function initiateTransfer(uint256 amount) external circuitBreaker(amount) {
+            // Queue transfer with 24h delay for large amounts
+            if (amount > 10_000e18) {
+                pendingTransfers[txHash] = block.timestamp;
+            } else {
+                _executeTransfer(amount);
+            }
+        }
+    }
+  example_bad: |
+    // Single admin key, no circuit breaker, instant execution — Ronin-style vulnerability
+    address public admin;
+    function executeTransfer(address to, uint256 amount) external {
+        require(msg.sender == admin, "Not admin"); // single point of failure
+        token.transfer(to, amount); // instant, no challenge period, no daily limit
+    }
+  when_applies: Any cross-chain bridge, token bridge, or multi-chain asset transfer protocol.
+  sources:
+    - "https://chain.link/education-hub/cross-chain-bridge-vulnerabilities"
+    - "https://hacken.io/discover/cross-chain-bridge-security/"
+    - "https://dl.acm.org/doi/10.1145/3696429"
+    - "https://university.mitosis.org/cross-chain-bridge-security-in-2025-risks-standards-and-mitosiss-role-in-a-modular-future/"
+
+- id: W3ADV-004
+  text: >
+    Use UUPS (EIP-1822) proxy pattern for upgradeable contracts in new projects —
+    not Transparent Proxy. UUPS moves upgrade logic into the implementation contract
+    (reducing deployment gas by 30-40%), eliminates the admin-slot collision attack
+    surface, and forces upgrade authorization to be explicitly coded. Diamond
+    (EIP-2535) is only justified when a contract genuinely needs >24KB of logic
+    across multiple facets.
+  why: >
+    Transparent Proxy's admin check runs on EVERY call, costing ~2,300 extra gas
+    per transaction. At 10M transactions/year, this is $46K/year in wasted gas
+    at $0.002/gas. UUPS executes the admin check only on upgrade calls.
+    More critically, Transparent Proxy's ProxyAdmin address is a single point of
+    compromise — if the ProxyAdmin EOA is compromised, the entire protocol is
+    upgradeable by the attacker. UUPS enforces upgrade authorization through
+    the implementation's access control (Ownable/AccessControl), not a separate
+    admin contract.
+  how_to_do_right: |
+    1. Use OpenZeppelin UUPSUpgradeable:
+         import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+         contract MyContractV2 is Initializable, OwnableUpgradeable, UUPSUpgradeable {
+             function _authorizeUpgrade(address) internal override onlyOwner {}
+         }
+    2. Deploy using ERC1967Proxy with UUPSUpgradeable implementation.
+    3. NEVER use a constructor in upgradeable contracts — use initialize() with
+       the initializer modifier. Constructors run only on implementation, not proxy.
+    4. After initial deployment, transfer ownership to a Timelock + Gnosis Safe:
+         timelock.schedule(proxy, upgradeCalldata, delay=48hours);
+    5. Verify storage layout compatibility before every upgrade with:
+         npx hardhat check-storage-layout (hardhat-storage-layout plugin).
+       Adding variables is safe; removing or reordering is NOT.
+    6. Use the Diamond pattern ONLY when: single contract > 24KB (EVM limit),
+       OR needing independent facet upgrades without full contract replacement.
+  severity: high
+  technologies:
+    lang: [solidity]
+    framework: [hardhat, openzeppelin, foundry]
+  domains:
+    domain: [security, blockchain]
+    concern: [upgradeability, proxy_patterns, gas_optimization]
+  example_good: |
+    // UUPS: upgrade authorization is in implementation (explicit, auditable)
+    contract TokenV2 is Initializable, ERC20Upgradeable, UUPSUpgradeable, OwnableUpgradeable {
+        uint256 public constant VERSION = 2;
+
+        function initialize(string memory name, string memory symbol) public initializer {
+            __ERC20_init(name, symbol);   // initializer not constructor
+            __Ownable_init(msg.sender);
+            __UUPSUpgradeable_init();
+        }
+
+        // Only owner (should be Timelock+Gnosis) can upgrade
+        function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+    }
+  example_bad: |
+    // Transparent Proxy: separate ProxyAdmin contract — single key compromise
+    // upgrades entire protocol. Also wastes 2,300 gas per tx on admin check.
+    TransparentUpgradeableProxy proxy = new TransparentUpgradeableProxy(
+        impl,
+        adminAddress,  // ← if this EOA is phished, entire protocol is compromised
+        initData
+    );
+  when_applies: Any smart contract that needs to be upgradeable post-deployment.
+  sources:
+    - "https://eips.ethereum.org/EIPS/eip-1822"
+    - "https://docs.openzeppelin.com/contracts/5.x/api/proxy#UUPSUpgradeable"
+    - "https://eips.ethereum.org/EIPS/eip-2535"
+
+- id: W3ADV-005
+  text: >
+    Implement ERC-4337 Account Abstraction UserOperations with explicit gas limits
+    on the Paymaster's validatePaymasterUserOp — never leave unlimited gas sponsorship
+    without quotas. A compromised or malicious UserOp can drain the Paymaster's
+    deposit in a single bundle if gas validation is not capped.
+  why: >
+    Following the Ethereum Pectra upgrade (May 2025) which integrated EIP-7702,
+    Account Abstraction adoption accelerated significantly. Paymasters now sponsor
+    gas for millions of users. A common vulnerability: Paymaster validates based on
+    a user's token balance at validation time, but the token can be transferred
+    away before execution (TOCTOU race). The Paymaster then pays gas for a failing
+    transaction with no recourse. The OSEC security team documented Paymaster
+    vulnerabilities in December 2025 showing multiple audited contracts exposed
+    to this exact race condition.
+  how_to_do_right: |
+    1. Always implement per-user gas quotas in the Paymaster:
+         mapping(address => uint256) public dailyGasSponsored;
+         uint256 public constant MAX_GAS_PER_USER_PER_DAY = 0.01 ether;
+         require(dailyGasSponsored[user] + maxGasCost <= MAX_GAS_PER_USER_PER_DAY);
+    2. Lock tokens during validation to prevent TOCTOU:
+         // validatePaymasterUserOp: transfer fee tokens to Paymaster escrow
+         // postOp (MODE_SUCCEEDED/MODE_FAILED): refund or charge from escrow
+    3. Set paymasterAndData expiry timestamp — never create open-ended sponsorship:
+         uint48 validUntil = uint48(block.timestamp + 1 hours);
+         // Pack into paymasterAndData: abi.encodePacked(paymaster, validUntil, validAfter)
+    4. Use ERC-4337's EntryPoint v0.7 (latest) — v0.6 has known gas estimation issues.
+    5. Implement Bundler RPC on your own infrastructure for latency-sensitive apps,
+       or use Pimlico/Alchemy's Bundler with SLA guarantees.
+    6. Monitor gas tank balance: alert at 20% remaining, pause at 5%.
+  severity: critical
+  technologies:
+    lang: [solidity, typescript]
+    framework: [ethers.js, viem, permissionless.js]
+  domains:
+    domain: [security, blockchain]
+    concern: [account_abstraction, paymaster, gas_management]
+  example_good: |
+    contract SafePaymaster is BasePaymaster {
+        uint256 public constant MAX_DAILY_GAS = 0.01 ether;
+        mapping(address => uint256) public dailyUsed;
+        mapping(address => uint256) public dailyResetTime;
+
+        function _validatePaymasterUserOp(
+            UserOperation calldata userOp,
+            bytes32,
+            uint256 maxCost
+        ) internal override returns (bytes memory context, uint256 validationData) {
+            address user = userOp.sender;
+            if (block.timestamp > dailyResetTime[user] + 1 days) {
+                dailyUsed[user] = 0;
+                dailyResetTime[user] = block.timestamp;
+            }
+            require(dailyUsed[user] + maxCost <= MAX_DAILY_GAS, "Daily gas quota exceeded");
+            dailyUsed[user] += maxCost;
+            return (abi.encode(user, maxCost), 0);
+        }
+    }
+  example_bad: |
+    // No quotas — single malicious bundle can drain entire Paymaster deposit
+    function _validatePaymasterUserOp(UserOperation calldata userOp, bytes32, uint256)
+        internal override returns (bytes memory, uint256) {
+        return ("", 0); // sponsor ALL gas for ALL users unconditionally
+    }
+  when_applies: Any ERC-4337 Paymaster implementation offering gas sponsorship.
+  sources:
+    - "https://eips.ethereum.org/EIPS/eip-4337"
+    - "https://docs.erc4337.io/paymasters/index.html"
+    - "https://osec.io/blog/2025-12-02-paymasters-evm/"
+
+- id: W3ADV-006
+  text: >
+    Pack storage variables in Solidity to minimize the number of storage slots used.
+    One storage slot = 32 bytes = one SLOAD/SSTORE operation (2,100/20,000 gas cold).
+    Pack related variables that fit within 32 bytes into a single slot to reduce gas
+    by 50-80% for hot-path operations. Use calldata instead of memory for read-only
+    function parameters in external functions.
+  why: >
+    Storage is the most expensive EVM operation. An ERC-20 transfer touches 2-3
+    storage slots (balances, allowances). Without packing, a governance vote struct
+    might use 5 slots (1 uint256 per field) when it fits in 2 packed slots.
+    At 50,000 votes/day on a DAO, this is 150,000 extra SLOAD operations = ~$900/day
+    in wasted gas (at $0.006/gas on Ethereum mainnet). OpenZeppelin's governance
+    contracts use tight packing and reduced gas costs by 43% compared to naive
+    implementations.
+  how_to_do_right: |
+    1. Group variables by type in struct definitions — smaller types first:
+         // GOOD: 2 slots (32+32 bytes)
+         struct Vote { uint128 forVotes; uint128 againstVotes; uint64 startTime; uint64 endTime; bool executed; bool canceled; }
+         // BAD: 6 slots (each field in its own slot due to ordering)
+         struct Vote { bool executed; uint256 forVotes; bool canceled; uint256 againstVotes; uint64 startTime; uint64 endTime; }
+    2. Use uint128 for token amounts that will never exceed 3.4×10^38 (most tokens).
+    3. Mark read-only external function params as calldata:
+         function process(bytes calldata data) external // 3x cheaper than memory
+    4. Cache storage reads in memory for values read multiple times in one function:
+         uint256 _balance = balances[user]; // 1 SLOAD
+         if (_balance > 0) { ... _balance ... } // reads from memory stack, not storage
+    5. Use immutable for values set in constructor and never changed — immutables
+       are baked into bytecode (CODECOPY), not storage (SLOAD).
+    6. Use constant for compile-time values — zero gas to read.
+  severity: high
+  technologies:
+    lang: [solidity]
+    framework: [hardhat, foundry]
+  domains:
+    domain: [security, blockchain]
+    concern: [gas_optimization, storage_layout, performance]
+  example_good: |
+    // Tightly packed: 2 storage slots instead of 6
+    struct ProposalState {
+        uint128 forVotes;        // slot 0: bytes 0-15
+        uint128 againstVotes;    // slot 0: bytes 16-31
+        uint64 startBlock;       // slot 1: bytes 0-7
+        uint64 endBlock;         // slot 1: bytes 8-15
+        address proposer;        // slot 1: bytes 16-35 (20 bytes)
+        bool executed;           // slot 1: byte 36
+        bool canceled;           // slot 1: byte 37
+    }
+    // Total: 64 bytes = 2 slots. Naive version: 6 slots = 192 bytes.
+    // Savings: 4 × 2,100 gas (cold SLOAD) = 8,400 gas per read
+  example_bad: |
+    // Unpacked: each bool and small int takes a full 32-byte slot
+    struct ProposalState {
+        bool executed;        // slot 0 (31 bytes wasted)
+        bool canceled;        // slot 1 (31 bytes wasted)
+        uint128 forVotes;     // slot 2 (16 bytes wasted)
+        uint64 startBlock;    // slot 3 (24 bytes wasted)
+        uint256 againstVotes; // slot 4
+        address proposer;     // slot 5 (12 bytes wasted)
+    } // 6 slots = 3x cost of packed version
+  when_applies: Any Solidity struct with multiple fields, any hot-path function reading multiple storage variables.
+  sources:
+    - "https://docs.soliditylang.org/en/latest/internals/layout_in_storage.html"
+    - "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/governance/Governor.sol"
+    - "https://www.evm.codes/"
+
+- id: W3ADV-007
+  text: >
+    Implement on-chain governance with a mandatory Timelock controller (minimum
+    48-hour delay for parameter changes, 7-day delay for protocol upgrades).
+    Never execute governance proposals directly — the Timelock creates an
+    observation window for the community to detect malicious proposals and exit
+    before execution.
+  why: >
+    Multiple DeFi protocols have suffered governance attacks via flash loan vote
+    manipulation. In the Beanstalk exploit (2022, $182M), an attacker took a
+    flash loan large enough to acquire governance supermajority, passed a malicious
+    proposal, and drained the protocol — all in a single transaction. The root
+    cause: no Timelock. A 48-hour Timelock would have given the community time
+    to detect the malicious proposal and pause the protocol. Compound, Uniswap,
+    and Aave all use 48-hour Timelocks on their most critical operations.
+  how_to_do_right: |
+    1. Deploy OpenZeppelin TimelockController with appropriate delays:
+         new TimelockController(
+             minDelay: 48 hours,      // parameter changes
+             proposers: [governor],   // only Governor can propose
+             executors: [address(0)], // anyone can execute after delay (decentralized)
+             admin: address(0)        // no admin override (immutable after deploy)
+         );
+    2. For protocol upgrades (proxy upgrades), set minDelay to 7 days.
+    3. Add emergency pause with a 2-of-5 Guardian multi-sig that can pause but NOT
+       upgrade — separation of emergency stop vs. governance power.
+    4. Implement quadratic voting or conviction voting to reduce plutocratic attack
+       surface (1 token = 1 vote gives wealthy attackers disproportionate power).
+    5. Set quorum at minimum 4% of total supply — too low quorum enables small
+       groups to pass proposals during low-participation periods.
+    6. Emit detailed events on every proposal state change for off-chain monitoring.
+  severity: critical
+  technologies:
+    lang: [solidity]
+    framework: [openzeppelin, hardhat]
+  domains:
+    domain: [security, blockchain]
+    concern: [governance, timelock, dao_security]
+  example_good: |
+    // Governor with mandatory Timelock — proposals take 48+ hours to execute
+    contract MyGovernor is Governor, GovernorVotes, GovernorTimelockControl {
+        constructor(IVotes _token, TimelockController _timelock)
+            Governor("MyGovernor")
+            GovernorVotes(_token)
+            GovernorTimelockControl(_timelock)
+        {}
+
+        function votingDelay() public pure override returns (uint256) { return 7200; } // 1 day in blocks
+        function votingPeriod() public pure override returns (uint256) { return 50400; } // 1 week
+        function quorum(uint256) public pure override returns (uint256) { return 400_000e18; } // 4% of 10M supply
+
+        // All proposals queue through Timelock — no instant execution
+        function _queueOperations(...) internal override returns (uint48) {
+            return uint48(timelock.scheduleBatch(..., delay: 48 hours));
+        }
+    }
+  example_bad: |
+    // No Timelock — governance can execute malicious proposals in same tx as vote
+    function executeProposal(uint256 proposalId) external {
+        require(proposals[proposalId].forVotes > proposals[proposalId].againstVotes);
+        // Executes immediately after vote — flash loan attack: borrow tokens,
+        // vote, execute, repay — all in one transaction. No observation window.
+        _execute(proposals[proposalId].calldata_);
+    }
+  when_applies: Any DAO or protocol governance system managing more than $100K in value.
+  sources:
+    - "https://docs.openzeppelin.com/contracts/5.x/governance"
+    - "https://eips.ethereum.org/EIPS/eip-5805"
+    - "https://www.quillaudits.com/blog/web3-security/defi-attack-vectors-security-risks"
+
+- id: W3ADV-008
+  text: >
+    Design token bonding curves with explicit invariant checks after every trade:
+    verify the AMM invariant (x*y=k for Uniswap v2, concentrated liquidity bounds
+    for v3) and assert that the sum of all market prices equals 1.0 for prediction
+    market contracts. Use log-sum-exp trick to prevent overflow in LMSR market
+    makers when quantities exceed 100.
+  why: >
+    Broken AMM invariants are a class of vulnerability that drained $9.5M from
+    the Saddle Finance exploit (2022) — attackers found rounding errors in the
+    StableSwap invariant that allowed them to extract more tokens than the math
+    permitted. For prediction markets using LMSR (Logarithmic Market Scoring Rule),
+    direct computation of exp(q_i / b) overflows uint256 (and float64) when q_i > 710.
+    This has caused silent incorrect pricing in multiple on-chain prediction markets
+    where quantities were not bounded.
+  how_to_do_right: |
+    1. After every AMM trade, assert invariant within 1 wei tolerance:
+         uint256 kBefore = reserve0Before * reserve1Before;
+         uint256 kAfter = reserve0 * reserve1;
+         require(kAfter >= kBefore, "Invariant violation"); // k must not decrease
+    2. For LMSR prediction markets, use log-sum-exp:
+         // cost = b * log(sum(exp(q_i / b))) for all outcomes i
+         // Safe computation: subtract max before exp to prevent overflow
+         function lmsrCost(uint256[] memory q, uint256 b) internal pure returns (uint256) {
+             uint256 qMax = max(q);
+             uint256 sumExpShifted = 0;
+             for (uint i = 0; i < q.length; i++) {
+                 sumExpShifted += exp((q[i] - qMax) * 1e18 / b); // shifted by qMax
+             }
+             return b * (log(sumExpShifted) + qMax) / 1e18;
+         }
+    3. After every prediction market trade: assert abs(sum(prices) - 1.0) < 1e-6.
+    4. For bonding curves with fees, verify: tokensOut <= (tokenReserve * amountIn) / (tokenReserve + amountIn).
+    5. Use Foundry's invariant testing (forge test --match-test invariant) to
+       fuzz-test AMM invariants across thousands of random trade sequences.
+  severity: critical
+  technologies:
+    lang: [solidity]
+    framework: [foundry, hardhat]
+  domains:
+    domain: [security, blockchain, defi]
+    concern: [amm, bonding_curves, invariants, prediction_markets]
+  example_good: |
+    // Invariant check after every swap + overflow-safe LMSR
+    function swap(uint256 amountIn) external returns (uint256 amountOut) {
+        uint256 reserveInBefore = reserveIn;
+        uint256 reserveOutBefore = reserveOut;
+
+        amountOut = (reserveOut * amountIn) / (reserveIn + amountIn);
+        reserveIn += amountIn;
+        reserveOut -= amountOut;
+
+        // Invariant: k must not decrease
+        require(
+            reserveIn * reserveOut >= reserveInBefore * reserveOutBefore,
+            "AMM: invariant violated"
+        );
+        emit Swap(msg.sender, amountIn, amountOut);
+    }
+  example_bad: |
+    // No invariant check — rounding errors accumulate, eventually extractable
+    function swap(uint256 amountIn) external returns (uint256 amountOut) {
+        amountOut = (reserveOut * amountIn) / (reserveIn + amountIn);
+        reserveIn += amountIn;
+        reserveOut -= amountOut;
+        // No invariant check — Saddle Finance-style vulnerability
+    }
+  when_applies: Any AMM, bonding curve, or prediction market smart contract.
+  sources:
+    - "https://uniswap.org/whitepaper.pdf"
+    - "https://book.getfoundry.sh/forge/invariant-testing"
+    - "https://www.quillaudits.com/blog/web3-security/defi-attack-vectors-security-risks"
+
+- id: W3ADV-009
+  text: >
+    Use TWAP (Time-Weighted Average Price) oracles with a minimum 30-minute window
+    for DeFi collateral pricing. Single-block spot prices from AMMs are trivially
+    manipulable via flash loans. For critical operations (liquidations, large loans),
+    require consensus from at least 2 independent oracle sources (e.g., Chainlink
+    + Uniswap v3 TWAP) and revert if they diverge by more than 5%.
+  why: >
+    The Mango Markets exploit (2022, $117M) used a single-block spot price
+    manipulation: attacker bought a low-liquidity token on FTX to artificially
+    inflate collateral value, then borrowed against the inflated collateral.
+    The Cream Finance exploits (total $130M across 3 attacks) used flash loan
+    price manipulation against single-source oracles. TWAP over 30 minutes requires
+    maintaining the manipulated price for 30 minutes across 150 blocks — prohibitively
+    expensive (attacker must lock capital for sustained period). Multi-oracle consensus
+    adds an independent verification layer.
+  how_to_do_right: |
+    1. Uniswap v3 TWAP: use observe([1800, 0]) for 30-minute TWAP:
+         (int56[] memory tickCumulatives, ) = pool.observe([uint32(1800), 0]);
+         int56 tickDelta = tickCumulatives[1] - tickCumulatives[0];
+         int24 arithmeticMeanTick = int24(tickDelta / 1800);
+         uint160 sqrtPriceX96 = TickMath.getSqrtRatioAtTick(arithmeticMeanTick);
+    2. Chainlink oracle: always check staleness — revert if updatedAt > 3600 seconds ago:
+         (, int256 price, , uint256 updatedAt, ) = priceFeed.latestRoundData();
+         require(block.timestamp - updatedAt <= 3600, "Oracle: stale price");
+         require(price > 0, "Oracle: invalid price");
+    3. Multi-oracle consensus check:
+         uint256 diff = abs(chainlinkPrice - twapPrice) * 1e18 / chainlinkPrice;
+         require(diff <= 0.05e18, "Oracle: price divergence > 5%");
+    4. For liquidation triggers specifically, use Chainlink as primary with TWAP
+       as circuit breaker — Chainlink's latency is lower, TWAP prevents manipulation.
+  severity: critical
+  technologies:
+    lang: [solidity]
+    framework: [hardhat, foundry, chainlink]
+  domains:
+    domain: [security, blockchain, defi]
+    concern: [oracle_security, price_manipulation, twap]
+  example_good: |
+    contract SecureOracle {
+        AggregatorV3Interface public chainlinkFeed;
+        IUniswapV3Pool public pool;
+        uint32 public constant TWAP_PERIOD = 1800; // 30 minutes
+
+        function getPrice() external view returns (uint256) {
+            // Chainlink: check staleness
+            (, int256 clPrice, , uint256 updatedAt, ) = chainlinkFeed.latestRoundData();
+            require(block.timestamp - updatedAt <= 3600, "Chainlink: stale");
+            require(clPrice > 0, "Chainlink: invalid");
+
+            // TWAP: 30-minute time-weighted price
+            uint256 twapPrice = _getTwap(TWAP_PERIOD);
+
+            // Consensus: reject if divergence > 5%
+            uint256 diff = clPrice > int256(twapPrice)
+                ? uint256(clPrice) - twapPrice
+                : twapPrice - uint256(clPrice);
+            require(diff * 100 / uint256(clPrice) <= 5, "Oracle: divergence");
+
+            return uint256(clPrice);
+        }
+    }
+  example_bad: |
+    // Single-block spot price from AMM — manipulable via flash loan in same block
+    function getSpotPrice() external view returns (uint256) {
+        (uint160 sqrtPriceX96, , , , , , ) = pool.slot0(); // spot price, not TWAP
+        return uint256(sqrtPriceX96) ** 2 / (2 ** 192); // attackable in same block
+    }
+  when_applies: Any DeFi protocol using price data for collateral valuation, liquidation triggers, or large trade execution.
+  sources:
+    - "https://docs.uniswap.org/contracts/v3/reference/core/libraries/OracleLibrary"
+    - "https://docs.chain.link/data-feeds/api-reference"
+    - "https://www.quillaudits.com/blog/web3-security/defi-attack-vectors-security-risks"
+
+- id: W3ADV-010
+  text: >
+    Design token vesting schedules with on-chain cliff and linear release, claimable
+    by the beneficiary (pull pattern) — never push tokens automatically. Implement
+    revocability for employee grants with a multi-sig revoker key (not a single
+    admin). Always emit VestingRevoked events and return unvested tokens to treasury,
+    not to the revoker, to prevent incentive misalignment.
+  why: >
+    "Push" vesting (protocol sends tokens to all beneficiaries on schedule) requires
+    O(n) transactions and fails silently for contracts that cannot receive ERC-20 tokens
+    (no receive() function). A vesting contract at a major L2 protocol lost $2M of
+    tokens when they were pushed to a Gnosis Safe that had been replaced — the old
+    Safe address still received tokens with no way to recover them. Pull pattern
+    (beneficiary calls claim()) is gas-efficient and fault-tolerant.
+    Revocability by a single admin key is a rug-pull vector — multi-sig mitigates this.
+  how_to_do_right: |
+    1. Use OpenZeppelin VestingWallet as base:
+         contract EmployeeVesting is VestingWallet {
+             constructor(address beneficiary, uint64 startTimestamp, uint64 durationSeconds)
+                 VestingWallet(beneficiary, startTimestamp, durationSeconds)
+             {}
+         }
+    2. For cliff: override _vestingSchedule() to return 0 before cliff timestamp.
+    3. For revocability: add revoker role (AccessControl, not single owner).
+         function revoke(address token) external onlyRole(REVOKER_ROLE) {
+             uint256 unvested = IERC20(token).balanceOf(address(this)) - releasable(token);
+             SafeERC20.safeTransfer(IERC20(token), treasury, unvested); // NOT to revoker
+             emit VestingRevoked(token, unvested);
+         }
+    4. REVOKER_ROLE should be a 3-of-5 multi-sig of board members.
+    5. Beneficiary calls release(token) to claim — pull model, no gas from protocol.
+    6. Include a 6-month cliff and 4-year total vesting for standard employee grants.
+  severity: high
+  technologies:
+    lang: [solidity]
+    framework: [openzeppelin, hardhat]
+  domains:
+    domain: [security, blockchain]
+    concern: [tokenomics, vesting, access_control]
+  example_good: |
+    contract RevocableVesting is VestingWallet, AccessControl {
+        bytes32 public constant REVOKER_ROLE = keccak256("REVOKER");
+        address public immutable treasury;
+        uint64 public immutable cliff;
+
+        function _vestingSchedule(uint256 totalAllocation, uint64 timestamp)
+            internal view override returns (uint256) {
+            if (timestamp < cliff) return 0;  // cliff check
+            return super._vestingSchedule(totalAllocation, timestamp);
+        }
+
+        // Pull pattern: beneficiary claims
+        function claim(address token) external {
+            require(msg.sender == beneficiary(), "Not beneficiary");
+            release(token); // OpenZeppelin VestingWallet.release()
+        }
+
+        function revoke(address token) external onlyRole(REVOKER_ROLE) {
+            uint256 unvested = IERC20(token).balanceOf(address(this));
+            SafeERC20.safeTransfer(IERC20(token), treasury, unvested); // back to treasury
+            emit Revoked(token, unvested);
+        }
+    }
+  example_bad: |
+    // Push vesting — fails if beneficiary address cannot receive tokens
+    function distributionRun() external onlyAdmin {
+        for (uint i = 0; i < beneficiaries.length; i++) {
+            token.transfer(beneficiaries[i], vestedAmount[beneficiaries[i]]); // may fail silently
+        }
+        // Also: O(n) gas cost, single admin revocation = rug-pull vector
+    }
+  when_applies: Any token vesting contract for employees, investors, or advisors.
+  sources:
+    - "https://docs.openzeppelin.com/contracts/5.x/api/finance#VestingWallet"
+    - "https://ethereum.org/en/developers/docs/smart-contracts/security/"
+
+- id: W3ADV-011
+  text: >
+    Apply Solidity's Checks-Effects-Interactions (CEI) pattern rigorously: perform
+    all state-changing operations (Effects) before any external calls (Interactions).
+    Use OpenZeppelin's ReentrancyGuard on all functions that transfer ETH or call
+    external contracts. The reentrancy vulnerability has drained >$2B across DeFi —
+    it is still discovered in audited contracts.
+  why: >
+    The original DAO hack (2016, $60M ETH) was a reentrancy attack. In 2023-2024,
+    reentrancy variants (read-only reentrancy, cross-function reentrancy, cross-contract
+    reentrancy) were still the #2 most common DeFi vulnerability. Read-only reentrancy
+    is a subtler variant: a view function reads state during an external call while
+    the state is temporarily inconsistent. Curve Finance lost $62M in 2023 partly
+    to a cross-function reentrancy in their Vyper-compiled contracts. The CEI pattern
+    prevents classic reentrancy; the ReentrancyGuard prevents cross-function reentrancy.
+  how_to_do_right: |
+    1. Order of operations in every state-changing function:
+         // CHECKS: validate inputs and preconditions
+         require(balance[msg.sender] >= amount, "Insufficient balance");
+         // EFFECTS: update state FIRST
+         balance[msg.sender] -= amount;
+         totalSupply -= amount;
+         // INTERACTIONS: external calls LAST
+         (bool success, ) = msg.sender.call{value: amount}(""); // ETH transfer
+         require(success, "Transfer failed");
+    2. Add ReentrancyGuard to all functions with external interactions:
+         import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+         function withdraw() external nonReentrant { ... }
+    3. For read-only reentrancy protection, use a state variable that tracks
+       "locked" status during multi-step operations.
+    4. Do NOT use transfer() or send() for ETH — use call() with CEI pattern.
+       transfer() and send() have a 2,300 gas limit that breaks with EIP-2929.
+    5. For cross-contract reentrancy, identify ALL external contracts called
+       (including ERC-20 token transfer, which calls onERC20Received on some tokens).
+  severity: critical
+  technologies:
+    lang: [solidity]
+    framework: [openzeppelin, hardhat, foundry]
+  domains:
+    domain: [security, blockchain]
+    concern: [reentrancy, smart_contract_security, access_control]
+  example_good: |
+    // CEI pattern + ReentrancyGuard
+    contract SafeVault is ReentrancyGuard {
+        mapping(address => uint256) private balances;
+
+        function withdraw(uint256 amount) external nonReentrant {
+            // CHECKS
+            require(balances[msg.sender] >= amount, "Insufficient");
+            // EFFECTS — update state BEFORE external call
+            balances[msg.sender] -= amount;
+            // INTERACTIONS — external call LAST
+            (bool ok, ) = msg.sender.call{value: amount}("");
+            require(ok, "Transfer failed");
+        }
+    }
+  example_bad: |
+    // Classic reentrancy: external call before state update
+    function withdraw(uint256 amount) external {
+        require(balances[msg.sender] >= amount);
+        // INTERACTION before EFFECT — attacker's fallback calls withdraw() again
+        (bool ok, ) = msg.sender.call{value: amount}(""); // reentrant call here
+        require(ok);
+        balances[msg.sender] -= amount; // too late — double spend
+    }
+  when_applies: >
+    Every Solidity function that transfers ETH, calls external contracts, or
+    interacts with ERC-20 tokens (which may call onERC20Received hooks).
+  sources:
+    - "https://docs.openzeppelin.com/contracts/5.x/api/security#ReentrancyGuard"
+    - "https://consensys.github.io/smart-contract-best-practices/attacks/reentrancy/"
+    - "https://www.quillaudits.com/blog/web3-security/defi-attack-vectors-security-risks"
+
+- id: W3ADV-012
+  text: >
+    Use deterministic deployment (CREATE2 with salt = keccak256(deployer + chainId +
+    contractName)) to deploy the same smart contract at the same address across all
+    EVM-compatible chains. This is required for cross-chain interoperability and
+    allows off-chain systems to pre-compute contract addresses before deployment.
+  why: >
+    Without deterministic addresses, a protocol deployed on Ethereum (0xABC...) and
+    Polygon (0xDEF...) requires maintaining two separate address registries, two
+    sets of integrations, two sets of UI configurations, and two sets of SDKs.
+    CREATE2-based deterministic deployment is used by Uniswap v3 (all pools deployed
+    deterministically), OpenZeppelin Defender, and Gnosis Safe Factory. It also
+    enables counterfactual deployments: users can receive funds to a contract address
+    that has not been deployed yet (common in Account Abstraction with ERC-4337).
+  how_to_do_right: |
+    1. Use a deployer contract with CREATE2:
+         bytes32 salt = keccak256(abi.encodePacked(msg.sender, chainId, contractName));
+         address predicted = address(uint160(uint256(keccak256(abi.encodePacked(
+             bytes1(0xff), address(this), salt, keccak256(bytecode)
+         )))));
+    2. Use Foundry's vm.computeCreate2Address() in tests to verify predicted address.
+    3. Use the canonical CREATE2 deployer at 0x4e59b44847b379578588920cA78FbF26c0B4956C
+       (available on all EVM chains).
+    4. Salt must include chainId if you want DIFFERENT addresses per chain (security
+       isolation). Omit chainId in salt if you want SAME address across chains.
+    5. Include the bytecode hash in the salt if the contract parameters can vary —
+       otherwise two different contracts get the same address (collision).
+    6. For same-address deployment, ensure constructor arguments are identical across
+       chains — any difference changes the initcode hash, changing the address.
+  severity: medium
+  technologies:
+    lang: [solidity]
+    framework: [hardhat, foundry]
+  domains:
+    domain: [security, blockchain]
+    concern: [deployment, cross_chain, determinism]
+  example_good: |
+    contract DeterministicFactory {
+        function deploy(bytes memory bytecode, bytes32 salt) external returns (address addr) {
+            assembly {
+                addr := create2(0, add(bytecode, 0x20), mload(bytecode), salt)
+            }
+            require(addr != address(0), "CREATE2: deployment failed");
+            emit Deployed(addr, salt);
+        }
+
+        function computeAddress(bytes memory bytecode, bytes32 salt) external view returns (address) {
+            return address(uint160(uint256(keccak256(abi.encodePacked(
+                bytes1(0xff), address(this), salt,
+                keccak256(bytecode)
+            )))));
+        }
+    }
+  example_bad: |
+    // CREATE (not CREATE2): non-deterministic address, depends on deployer nonce
+    // Address differs every time deployer account nonce changes
+    Token token = new Token(name, symbol, supply); // address = f(deployerAddress, nonce)
+    // If deployer's nonce differs on chain B, token address differs on chain B
+  when_applies: Multi-chain protocol deployments, factory contracts, Account Abstraction wallet deployments.
+  sources:
+    - "https://eips.ethereum.org/EIPS/eip-1014"
+    - "https://github.com/Arachnid/deterministic-deployment-proxy"
+    - "https://book.getfoundry.sh/reference/forge-std/compute-create2-address"
+
+- id: W3ADV-013
+  text: >
+    Verify smart contracts with Slither (static analysis) and Echidna (fuzzing) as
+    part of CI before every deployment. Target Slither to emit zero HIGH severity
+    findings. Run Echidna with property-based tests for all invariants (AMM k-value,
+    balance conservation, access control). These tools catch 40-60% of vulnerabilities
+    that manual audits miss on first pass.
+  why: >
+    A 2024 analysis of 50 audited-and-deployed DeFi contracts found that Slither
+    would have flagged 43% of the exploited vulnerabilities as HIGH or MEDIUM before
+    deployment — they were in the code before the audit. Echidna found reentrancy
+    and arithmetic overflow paths in 3 contracts that a senior auditor missed during
+    a 2-week manual audit. Automated tools are not a replacement for audits but
+    dramatically raise the floor — auditors spend time on logic bugs, not
+    detectable patterns.
+  how_to_do_right: |
+    1. Slither in CI:
+         slither . --fail-high   # Fail CI on any HIGH severity finding
+         slither . --json slither-output.json  # For artifact storage
+    2. Configure .slither.config.json to exclude false positives (document each exclusion):
+         { "detectors_to_exclude": ["divide-before-multiply"], "comment": "Verified: no overflow possible here" }
+    3. Echidna property tests — write in same Solidity:
+         function echidna_reserve_invariant() public view returns (bool) {
+             return reserveA * reserveB >= initialK; // AMM invariant must hold
+         }
+         Run: echidna . --contract EchidnaTest --config echidna.yaml --test-mode property
+    4. Run Mythril for symbolic execution on high-value contracts:
+         myth analyze contracts/Token.sol --max-depth 10
+    5. Gate CI: Slither high=0, Echidna 0 property violations, Mythril critical=0.
+    6. Pre-audit: provide Slither report to auditors — saves 10-20% of audit time.
+  severity: high
+  technologies:
+    lang: [solidity]
+    framework: [slither, echidna, mythril, hardhat, foundry]
+  domains:
+    domain: [security, blockchain]
+    concern: [static_analysis, fuzzing, audit_tooling]
+  example_good: |
+    # CI pipeline: .github/workflows/security.yml
+    # - name: Slither static analysis
+    #   run: slither . --fail-high --json slither-report.json
+
+    // Echidna property test (Solidity)
+    contract EchidnaAMMTest is MyAMM {
+        uint256 internal initialK;
+
+        constructor() {
+            // Initialize with known reserves
+            reserve0 = 1_000_000e18;
+            reserve1 = 1_000_000e18;
+            initialK = reserve0 * reserve1;
+        }
+
+        // Property: k must never decrease (Uniswap invariant)
+        function echidna_invariant_k() external view returns (bool) {
+            return reserve0 * reserve1 >= initialK;
+        }
+
+        // Property: total supply = sum of balances
+        function echidna_supply_conservation() external view returns (bool) {
+            return totalSupply == balances[alice] + balances[bob] + balances[charlie];
+        }
+    }
+  example_bad: |
+    # No automated security tooling — deploy directly after compilation
+    # "We'll get an audit before mainnet" (audit happens after code is written,
+    # not during development — automated tools catch issues in hours, not weeks)
+    forge build && forge deploy --rpc-url mainnet
+  when_applies: Every smart contract before deployment. Mandatory in CI for any contract managing >$10K.
+  sources:
+    - "https://github.com/crytic/slither"
+    - "https://github.com/crytic/echidna"
+    - "https://owasp.org/www-project-smart-contract-top-10/"
+    - "https://consensys.github.io/smart-contract-best-practices/"

@@ -1,0 +1,1294 @@
+layer: rules
+technology: PostgreSQL
+domain: database
+knowledge:
+- id: CR-PG-IDX-001
+  text: Use B-tree indexes (the default) for equality and range queries — they handle =, <, >, <=, >=, BETWEEN, IN, IS NULL,
+    and pattern matching with anchored LIKE ('foo%').
+  why: B-tree is a balanced tree structure that maintains sorted data, enabling O(log N) lookups. PostgreSQL creates B-tree
+    by default because it covers 90%+ of query patterns. Choosing the wrong index type (e.g., GIN for simple equality) wastes
+    storage and slows writes without improving reads. A missing B-tree index on a frequently filtered column forces a sequential
+    scan — O(N) per query, which becomes catastrophic as tables grow past 100K rows.
+  how_to_do_right: 'Run EXPLAIN ANALYZE on your slow queries. If you see ''Seq Scan'' with a filter on a column used in WHERE/JOIN/ORDER
+    BY, add a B-tree index. Name indexes descriptively: idx_{table}_{columns}. For multi-column indexes, put the highest-cardinality
+    column first (or the column most often filtered with =). Monitor with pg_stat_user_indexes to find unused indexes.'
+  severity: critical
+  technologies:
+    platform: [postgresql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database]
+  example_good: '-- B-tree index for equality + range
+
+    CREATE INDEX idx_orders_customer_id ON orders (customer_id);
+
+    CREATE INDEX idx_orders_created_at ON orders (created_at);
+
+
+    -- Composite: equality column first, then range column
+
+    CREATE INDEX idx_orders_status_created ON orders (status, created_at);
+
+
+    -- Query efficiently uses the composite index
+
+    EXPLAIN ANALYZE
+
+    SELECT * FROM orders
+
+    WHERE status = ''pending'' AND created_at > ''2026-01-01''
+
+    ORDER BY created_at;
+
+    -- Index Scan using idx_orders_status_created (cost=0.43..28.15 rows=42)
+
+    '
+  example_bad: '-- No index — full table scan on every query
+
+    SELECT * FROM orders WHERE customer_id = 12345;
+
+    -- Seq Scan on orders (cost=0.00..125000.00 rows=1)
+
+    -- Filter: customer_id = 12345
+
+    -- Rows Removed by Filter: 4999999
+
+
+    -- Wrong column order in composite — can''t use index for status-only queries
+
+    CREATE INDEX idx_orders_date_status ON orders (created_at, status);
+
+    -- This index CANNOT be used for: WHERE status = ''pending''
+
+    -- B-tree requires leftmost prefix to be present in the query
+
+    '
+  when_applies: Any project using PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using PostgreSQL
+  sources: ["https://www.postgresql.org/docs/current/indexes-types.html"]
+- id: CR-PG-IDX-002
+  text: Use GIN indexes for full-text search, JSONB containment queries, and array operations — GIN indexes every element/key
+    inside the value.
+  why: 'GIN (Generalized Inverted Index) builds an inverted index mapping each element to the rows containing it. This makes
+    it ideal for ''does this value contain X?'' queries. Without GIN on a JSONB column, containment queries (@>) fall back
+    to sequential scan — checking every row''s JSON document. For a table with 1M documents, that is 1M JSON parses per query.
+    GIN makes it O(1) per matching element. The trade-off: GIN indexes are 2-3x larger than B-tree and 10x slower to update.'
+  how_to_do_right: Create GIN indexes on JSONB columns queried with @>, ?, ?|, or ?& operators. For full-text, create a tsvector
+    column with a GIN index. Use gin_trgm_ops for LIKE '%substring%' queries. For write-heavy tables, consider GIN with fastupdate=on
+    (default) to batch index updates, and schedule periodic gin_clean_pending_list().
+  severity: high
+  technologies:
+    platform: [postgresql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, search]
+  example_good: "-- GIN index on JSONB for containment queries\nCREATE INDEX idx_products_attrs ON products USING GIN (attributes);\n\
+    \n-- Efficiently finds products with specific attributes\nSELECT * FROM products\nWHERE attributes @> '{\"color\": \"\
+    red\", \"size\": \"large\"}';\n-- Bitmap Index Scan on idx_products_attrs\n\n-- GIN for full-text search\nALTER TABLE\
+    \ articles ADD COLUMN search_vector tsvector\n  GENERATED ALWAYS AS (to_tsvector('english', title || ' ' || body)) STORED;\n\
+    CREATE INDEX idx_articles_search ON articles USING GIN (search_vector);\n\nSELECT * FROM articles\nWHERE search_vector\
+    \ @@ to_tsquery('english', 'database & optimization');\n\n-- GIN with trigram for substring matching\nCREATE EXTENSION\
+    \ IF NOT EXISTS pg_trgm;\nCREATE INDEX idx_users_name_trgm ON users USING GIN (name gin_trgm_ops);\nSELECT * FROM users\
+    \ WHERE name LIKE '%schneiter%';\n"
+  example_bad: '-- B-tree index on JSONB — USELESS for containment queries
+
+    CREATE INDEX idx_products_attrs ON products (attributes);
+
+    -- B-tree can only compare entire JSONB values, not search inside them
+
+
+    -- No index on JSONB — sequential scan parses every document
+
+    SELECT * FROM products WHERE attributes @> ''{"color": "red"}'';
+
+    -- Seq Scan: 1M rows, 1M JSON parses, 3.2 seconds
+
+    -- With GIN: 42 rows, 0.8ms
+
+    '
+  when_applies: Projects using PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using PostgreSQL
+  sources: ["https://www.postgresql.org/docs/current/gin-intro.html"]
+- id: CR-PG-IDX-003
+  text: Use GiST indexes for geometric data, range types, and PostGIS spatial queries — GiST supports overlap and containment
+    operations that B-tree cannot.
+  why: GiST (Generalized Search Tree) enables indexing of multi-dimensional data where the concept of 'less than' does not
+    apply. IP ranges, geometric shapes, time ranges, and geographic coordinates all require containment (&&, @>, <@) and nearest-neighbor
+    (<->) operations that B-tree physically cannot perform. Without GiST, a PostGIS query checking 'which buildings are within
+    500m of this point?' must compute the distance function for every row — O(N) geometry calculations.
+  how_to_do_right: Use GiST for range types (tstzrange, int4range), PostGIS geometry/geography columns, ltree paths, and inet/cidr
+    network addresses. For PostGIS, always create a GIST index on geometry columns. For range types, GiST enables && (overlap),
+    @> (contains), <@ (contained by). If you only need equality on ranges, B-tree works. If you need 'nearest N' queries,
+    use GiST with ORDER BY <-> operator.
+  severity: high
+  technologies:
+    library: [postgis]
+    platform: [postgresql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, geospatial]
+  example_good: "-- GiST for PostGIS spatial queries\nCREATE INDEX idx_buildings_geom ON buildings USING GIST (geom);\n\n\
+    SELECT name, ST_Distance(geom, ST_MakePoint(-73.98, 40.75)::geography) AS dist\nFROM buildings\nWHERE ST_DWithin(geom,\
+    \ ST_MakePoint(-73.98, 40.75)::geography, 500)\nORDER BY geom <-> ST_MakePoint(-73.98, 40.75)::geography\nLIMIT 10;\n\
+    -- Index Scan using idx_buildings_geom\n\n-- GiST for range overlap (booking conflict detection)\nCREATE TABLE bookings\
+    \ (\n  id serial PRIMARY KEY,\n  room_id int NOT NULL,\n  during tstzrange NOT NULL,\n  EXCLUDE USING GIST (room_id WITH\
+    \ =, during WITH &&)\n);\n-- Automatically prevents overlapping bookings for the same room\n"
+  example_bad: '-- B-tree on geometry column — cannot answer spatial queries
+
+    CREATE INDEX idx_buildings_geom ON buildings (geom);
+
+    -- ERROR: data type geometry has no default operator class for access method btree
+
+
+    -- No spatial index — computes distance for every row
+
+    SELECT * FROM buildings
+
+    WHERE ST_DWithin(geom, my_point, 500);
+
+    -- Seq Scan: 2M rows, 2M distance calculations, 8.5 seconds
+
+    -- With GiST: 47 rows, 2.3ms
+
+    '
+  when_applies: Projects using PostgreSQL databases or PostGIS
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using PostgreSQL
+    or PostGIS
+  sources: ["https://www.postgresql.org/docs/current/gist-intro.html", "https://postgis.net/documentation/"]
+- id: CR-PG-IDX-004
+  text: Use BRIN indexes for large, physically ordered datasets like time-series data — BRIN is 100x smaller than B-tree with
+    comparable read performance for range scans.
+  why: 'BRIN (Block Range Index) stores min/max summaries per block range (default 128 pages). When data is physically ordered
+    by the indexed column (e.g., INSERT-only time-series), BRIN can exclude 99%+ of blocks from a range scan while being 100-1000x
+    smaller than a B-tree index. A B-tree on a 1-billion-row time-series table consumes 20-30GB; a BRIN index on the same
+    column uses 50-100MB. The trade-off: BRIN is useless for random-access lookups and degrades badly if data is not physically
+    correlated with the indexed column.'
+  how_to_do_right: 'Use BRIN only on columns where physical row order correlates with value order — typically auto-incrementing
+    IDs and timestamps on append-only tables. Verify correlation with: SELECT correlation FROM pg_stats WHERE tablename=''t''
+    AND attname=''col'' — values near 1.0 or -1.0 indicate BRIN suitability. Set pages_per_range based on table size and query
+    selectivity (smaller = more precise but bigger index). Run VACUUM regularly to update BRIN summaries.'
+  severity: medium
+  technologies:
+    platform: [postgresql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, time_series]
+  example_good: "-- BRIN index on timestamp in append-only table\nCREATE TABLE sensor_readings (\n  id bigserial PRIMARY KEY,\n\
+    \  sensor_id int NOT NULL,\n  reading_time timestamptz NOT NULL,\n  value double precision NOT NULL\n);\n\n-- Verify physical\
+    \ correlation first\n-- SELECT correlation FROM pg_stats\n-- WHERE tablename='sensor_readings' AND attname='reading_time';\n\
+    -- correlation = 0.99  (excellent for BRIN)\n\nCREATE INDEX idx_sensor_time_brin ON sensor_readings\n  USING BRIN (reading_time)\
+    \ WITH (pages_per_range = 64);\n\n-- Index size comparison on 1B rows:\n-- B-tree: ~21 GB\n-- BRIN:   ~48 MB\n"
+  example_bad: "-- BRIN on randomly ordered column — useless\nCREATE INDEX idx_orders_customer_brin ON orders\n  USING BRIN\
+    \ (customer_id);\n-- correlation = 0.02 — data is not physically ordered by customer_id\n-- BRIN cannot exclude any blocks,\
+    \ falls back to full scan\n\n-- B-tree on 1B row time-series — wasteful\nCREATE INDEX idx_sensor_time ON sensor_readings\
+    \ (reading_time);\n-- Works, but consumes 21GB for an index that BRIN handles in 48MB\n-- On a 500GB table, that is 4%\
+    \ overhead vs 0.01%\n"
+  when_applies: Projects using PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using PostgreSQL
+  sources: ["https://www.postgresql.org/docs/current/indexes-partial.html"]
+- id: CR-PG-IDX-005
+  text: Use partial indexes to index only the rows that matter — reduces index size and write overhead for queries that always
+    filter by a constant condition.
+  why: A full index on a status column where 99% of rows are 'completed' and you only query 'pending' wastes storage and write
+    I/O maintaining index entries for rows you never query. A partial index with WHERE status = 'pending' indexes only the
+    1% of rows you actually search, making the index 100x smaller, 100x faster to scan, and nearly free to maintain for completed-row
+    inserts. This is especially impactful for tables with billions of rows where only a small fraction is 'active'.
+  how_to_do_right: 'Identify queries that always include a constant WHERE condition (status = ''active'', deleted_at IS NULL,
+    is_processed = false). Create partial indexes with that same WHERE clause. Ensure your queries include the WHERE condition
+    verbatim so the planner can match. Combine with other index types: CREATE INDEX idx ON t USING GIN (attrs) WHERE status
+    = ''active''.'
+  severity: high
+  technologies:
+    platform: [postgresql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database]
+  example_good: "-- Partial index — only indexes unprocessed orders (1% of table)\nCREATE INDEX idx_orders_pending ON orders\
+    \ (created_at)\n  WHERE status = 'pending';\n\n-- Query MUST include the WHERE condition to use the partial index\nSELECT\
+    \ * FROM orders\nWHERE status = 'pending' AND created_at > now() - interval '1 hour'\nORDER BY created_at;\n-- Index Scan\
+    \ using idx_orders_pending (index size: 2MB vs 4GB full)\n\n-- Partial unique index — enforce uniqueness only on active\
+    \ records\nCREATE UNIQUE INDEX idx_users_email_active ON users (email)\n  WHERE deleted_at IS NULL;\n-- Allows soft-deleted\
+    \ users to have duplicate emails\n"
+  example_bad: '-- Full index on status — 99% of entries are ''completed'' (never queried)
+
+    CREATE INDEX idx_orders_status ON orders (status, created_at);
+
+    -- Index size: 4GB (indexes all 100M rows)
+
+    -- 99M index entries for ''completed'' are dead weight
+
+
+    -- No partial index — unique constraint blocks soft-delete pattern
+
+    CREATE UNIQUE INDEX idx_users_email ON users (email);
+
+    -- Cannot have two users with same email even if one is soft-deleted
+
+    '
+  when_applies: Projects using PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using PostgreSQL
+  sources: ["https://www.postgresql.org/docs/current/indexes-multicolumn.html"]
+- id: CR-PG-IDX-006
+  text: Use covering indexes (INCLUDE) to enable index-only scans — add non-searchable columns to the index so PostgreSQL
+    never reads the heap.
+  why: Even with a perfect index, PostgreSQL must visit the heap (table) to fetch columns not in the index. This heap access
+    is random I/O — the most expensive operation in database systems. A covering index INCLUDEs the extra columns needed by
+    the query so the planner can satisfy the query entirely from the index. The INCLUDE columns are stored in leaf pages but
+    not in the B-tree structure, so they do not affect sort order or increase tree depth. Index-only scans are 2-10x faster
+    than index scans with heap fetches.
+  how_to_do_right: Look for queries where EXPLAIN shows 'Index Scan' (not 'Index Only Scan'). Identify which columns cause
+    the heap fetch. Add them as INCLUDE columns. Only INCLUDE columns you actually SELECT — do not include large TEXT/JSONB
+    columns. Ensure VACUUM runs frequently to keep the visibility map updated (index-only scans need it).
+  severity: medium
+  technologies:
+    platform: [postgresql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database]
+  example_good: "-- Covering index: search by customer_id, return order total without heap access\nCREATE INDEX idx_orders_customer_covering\
+    \ ON orders (customer_id)\n  INCLUDE (total_amount, created_at);\n\n-- This query uses index-only scan — never touches\
+    \ the table\nEXPLAIN ANALYZE\nSELECT customer_id, total_amount, created_at\nFROM orders\nWHERE customer_id = 12345;\n\
+    -- Index Only Scan using idx_orders_customer_covering\n-- Heap Fetches: 0\n\n-- Before INCLUDE existed, you had to add\
+    \ columns to the key\n-- which bloated the B-tree and affected sort order\n"
+  example_bad: "-- Index without INCLUDE — must fetch total_amount from heap\nCREATE INDEX idx_orders_customer ON orders (customer_id);\n\
+    \nSELECT customer_id, total_amount, created_at\nFROM orders WHERE customer_id = 12345;\n-- Index Scan using idx_orders_customer\n\
+    -- Heap Fetches: 47  (random I/O for each row)\n\n-- Including large columns in the index (wasteful)\nCREATE INDEX idx\
+    \ ON orders (customer_id)\n  INCLUDE (description);  -- TEXT column bloats index leaves\n-- A 500-byte average description\
+    \ inflates index by 5x\n"
+  when_applies: Projects using PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using PostgreSQL
+  sources: ["https://www.postgresql.org/docs/current/indexes-expressional.html"]
+- id: CR-PG-IDX-007
+  text: Use expression indexes to index computed values — enables index scans on functions, type casts, and computed columns
+    without materializing a new column.
+  why: PostgreSQL cannot use a B-tree index on column 'email' for a query WHERE lower(email) = 'test@example.com' — the index
+    stores raw values, not lowered values. Without an expression index, every query applying a function in WHERE forces a
+    sequential scan. Expression indexes store the function result, enabling index scans on computed expressions. This eliminates
+    the need for generated columns or application-level normalization for common patterns like case-insensitive search, date
+    truncation, and JSON field extraction.
+  how_to_do_right: 'Create expression indexes for functions used in WHERE or ORDER BY clauses. The expression in the index
+    MUST match the query expression exactly. Common patterns: lower(email) for case-insensitive, date_trunc(''day'', ts) for
+    date grouping, (data->>''field'') for JSONB field access. Mark the function as IMMUTABLE if you wrote it — PostgreSQL
+    will not use expression indexes with VOLATILE functions.'
+  severity: medium
+  technologies:
+    platform: [postgresql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database]
+  example_good: '-- Expression index for case-insensitive email lookup
+
+    CREATE INDEX idx_users_email_lower ON users (lower(email));
+
+
+    -- Query MUST use the same expression
+
+    SELECT * FROM users WHERE lower(email) = ''test@example.com'';
+
+    -- Index Scan using idx_users_email_lower
+
+
+    -- Expression index for date grouping
+
+    CREATE INDEX idx_events_day ON events (date_trunc(''day'', created_at));
+
+
+    SELECT date_trunc(''day'', created_at) AS day, count(*)
+
+    FROM events
+
+    WHERE date_trunc(''day'', created_at) = ''2026-01-15''
+
+    GROUP BY day;
+
+
+    -- Expression index on JSONB field
+
+    CREATE INDEX idx_products_brand ON products ((data->>''brand''));
+
+    SELECT * FROM products WHERE data->>''brand'' = ''Acme'';
+
+    '
+  example_bad: '-- Regular index on email — CANNOT be used with lower()
+
+    CREATE INDEX idx_users_email ON users (email);
+
+
+    SELECT * FROM users WHERE lower(email) = ''test@example.com'';
+
+    -- Seq Scan on users (cost=0.00..85000.00)
+
+    -- Filter: lower(email) = ''test@example.com''
+
+    -- The index exists but PostgreSQL cannot use it
+
+    '
+  when_applies: Projects using PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using PostgreSQL
+  sources: ["https://www.postgresql.org/docs/current/indexes-opclass.html"]
+- id: CR-PG-IDX-008
+  text: Monitor and manage index bloat — rebuild or compact indexes that have grown 2x+ their expected size due to updates
+    and deletes.
+  why: PostgreSQL's MVCC creates dead tuples on UPDATE/DELETE. B-tree indexes retain pointers to dead tuples until VACUUM
+    reclaims them. High-churn tables (frequent updates on indexed columns) cause index bloat — the index grows much larger
+    than the live data requires. A bloated index means more I/O per scan, more buffer pool usage, and slower sequential index
+    scans. Bloated indexes can be 5-10x their optimal size on tables with heavy update patterns, directly degrading query
+    performance.
+  how_to_do_right: 'Monitor bloat with pgstattuple extension: SELECT * FROM pgstattuple(''idx_name'') — check avg_leaf_density
+    (should be >70%) and dead_tuple_percent. For moderate bloat, REINDEX CONCURRENTLY rebuilds without locking. For production
+    with zero downtime, use pg_repack extension. Tune autovacuum per table for high-churn tables: autovacuum_vacuum_scale_factor
+    = 0.01 (1% vs default 20%). Never disable autovacuum.'
+  severity: high
+  technologies:
+    platform: [postgresql]
+  domains:
+    domain: [architecture, operations, performance]
+    concern: [data, database]
+  example_good: "-- Check index bloat\nCREATE EXTENSION IF NOT EXISTS pgstattuple;\nSELECT\n  indexrelname,\n  pg_size_pretty(pg_relation_size(indexrelid))\
+    \ AS index_size,\n  idx_scan AS times_used,\n  round(100.0 * avg_leaf_density / fillfactor, 1) AS density_pct\nFROM pg_stat_user_indexes\n\
+    JOIN LATERAL pgstattuple(indexrelid) ON true\nWHERE schemaname = 'public'\nORDER BY pg_relation_size(indexrelid) DESC;\n\
+    \n-- Rebuild without locking (PostgreSQL 12+)\nREINDEX INDEX CONCURRENTLY idx_orders_status;\n\n-- Tune autovacuum for\
+    \ high-churn table\nALTER TABLE orders SET (\n  autovacuum_vacuum_scale_factor = 0.01,     -- vacuum at 1% dead tuples\n\
+    \  autovacuum_analyze_scale_factor = 0.005,   -- analyze at 0.5%\n  autovacuum_vacuum_cost_delay = 2            -- more\
+    \ aggressive vacuum\n);\n"
+  example_bad: '-- Never checking index health
+
+    -- Index was 200MB at creation, now 4.2GB with same row count
+
+    -- Every index scan reads 20x more pages than necessary
+
+
+    -- Using plain REINDEX — locks the table
+
+    REINDEX INDEX idx_orders_status;
+
+    -- ACCESS EXCLUSIVE lock — blocks ALL reads and writes
+
+    -- On a 4GB index, this takes 5-15 minutes of downtime
+
+
+    -- Disabling autovacuum (the worst thing you can do)
+
+    ALTER TABLE orders SET (autovacuum_enabled = false);
+
+    -- Dead tuples accumulate → index bloat → transaction ID wraparound → database SHUTDOWN
+
+    '
+  when_applies: Projects using PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using PostgreSQL
+  sources: ["https://www.postgresql.org/docs/current/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY"]
+- id: CR-PG-QRY-001
+  text: Always use EXPLAIN ANALYZE (not just EXPLAIN) to diagnose slow queries — compare actual row counts vs estimated rows
+    to identify planner misjudgments.
+  why: Plain EXPLAIN shows the planner's estimated plan without executing the query. These estimates can be wildly wrong —
+    the planner might estimate 10 rows but actually return 100,000. EXPLAIN ANALYZE executes the query and shows actual times,
+    actual row counts, and loop counts. The gap between estimated and actual rows reveals stale statistics (run ANALYZE),
+    correlation assumptions (consider custom statistics), or expression selectivity errors. Without actual execution data,
+    you are optimizing based on the planner's guesses.
+  how_to_do_right: 'Use EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) for human-readable output. Compare ''rows'' (estimated) vs
+    ''actual rows'' for each node. If they differ by 10x+, run ANALYZE on the table. If still off, create extended statistics:
+    CREATE STATISTICS stat_name ON col_a, col_b FROM table. Look for ''Buffers: shared hit/read'' to understand I/O patterns.
+    Use auto_explain for logging slow queries in production (log_min_duration = 1000ms).'
+  severity: critical
+  technologies:
+    platform: [postgresql]
+  domains:
+    domain: [architecture, performance, quality]
+    concern: [data, database, debugging]
+  example_good: '-- EXPLAIN ANALYZE with buffers — the complete diagnostic tool
+
+    EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+
+    SELECT o.*, c.name
+
+    FROM orders o
+
+    JOIN customers c ON c.id = o.customer_id
+
+    WHERE o.status = ''pending'' AND o.created_at > ''2026-01-01'';
+
+
+    -- Reading the output:
+
+    -- Nested Loop (cost=0.86..124.32 rows=10 width=120)
+
+    --   (actual time=0.035..0.482 rows=47 loops=1)
+
+    --                                   ^^^^^^^^^^
+
+    --   estimated 10 rows, actual 47 — stats slightly stale, run ANALYZE
+
+    --   Buffers: shared hit=52 read=3  — 52 cached, 3 from disk
+
+
+    -- Enable auto_explain for production monitoring
+
+    -- ALTER SYSTEM SET auto_explain.log_min_duration = ''1s'';
+
+    -- ALTER SYSTEM SET auto_explain.log_analyze = true;
+
+    -- ALTER SYSTEM SET auto_explain.log_buffers = true;
+
+    '
+  example_bad: '-- EXPLAIN without ANALYZE — just estimates, not reality
+
+    EXPLAIN SELECT * FROM orders WHERE status = ''pending'';
+
+    -- Seq Scan on orders (cost=0.00..25000.00 rows=100)
+
+    -- Looks fine: only 100 rows, right?
+
+    -- REALITY (with ANALYZE): actual rows=850000 — table has 85% pending!
+
+    -- The planner used default selectivity (1/100) for the string comparison
+
+
+    -- Optimizing based on estimates leads to wrong decisions
+
+    -- You might add an index that the planner won''t use because
+
+    -- it (correctly) knows 85% of rows match
+
+    '
+  when_applies: Any project using PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using PostgreSQL
+  sources: ["https://www.postgresql.org/docs/current/using-explain.html"]
+- id: CR-PG-QRY-002
+  text: Understand when PostgreSQL chooses sequential scan vs index scan — index scans are NOT always faster, and forcing
+    them with enable_seqscan=off is a debugging tool, not a solution.
+  why: 'An index scan incurs random I/O: read index page, then jump to heap page for each row. Sequential scan reads table
+    pages in order — leveraging OS read-ahead and sequential disk throughput. When a query returns >5-10% of the table, sequential
+    scan is genuinely faster because sequential I/O throughput is 10-100x higher than random I/O. The planner considers this
+    trade-off using random_page_cost and seq_page_cost settings. If the planner chooses a seq scan and you have an index,
+    either the statistics are wrong (run ANALYZE) or the seq scan is actually correct.'
+  how_to_do_right: 'If EXPLAIN shows seq scan on a seemingly indexed column: (1) run ANALYZE table, (2) check if the query
+    returns a large fraction of the table (>5%), (3) verify the index exists on the correct expression, (4) check random_page_cost
+    — for SSDs, set to 1.1-1.5 (default 4.0 assumes spinning disks). For SSDs, also set effective_io_concurrency = 200. Only
+    use SET enable_seqscan = off temporarily for debugging to verify an index CAN be used.'
+  severity: high
+  technologies:
+    platform: [postgresql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database]
+  example_good: '-- Tune for SSD storage (critical — defaults assume spinning disk)
+
+    ALTER SYSTEM SET random_page_cost = 1.1;
+
+    ALTER SYSTEM SET effective_io_concurrency = 200;
+
+    ALTER SYSTEM SET effective_cache_size = ''24GB'';  -- 75% of RAM
+
+    SELECT pg_reload_conf();
+
+
+    -- Check why planner chose seq scan
+
+    EXPLAIN ANALYZE SELECT * FROM orders WHERE status = ''pending'';
+
+    -- If actual rows = 900000 out of 1000000, seq scan is CORRECT
+
+    -- 90% of the table — random I/O would be 10x slower
+
+
+    -- Debug: temporarily disable seq scan to verify index works
+
+    SET enable_seqscan = off;
+
+    EXPLAIN ANALYZE SELECT * FROM orders WHERE status = ''pending'';
+
+    -- Now shows: Index Scan (cost=0.43..2500000.00)
+
+    -- Cost is 100x higher — confirms seq scan was the right choice
+
+    RESET enable_seqscan;
+
+    '
+  example_bad: '-- Permanently disabling seq scan in postgresql.conf
+
+    enable_seqscan = off    -- NEVER do this in production
+
+    -- Forces index scans even when returning 90% of the table
+
+    -- Performance degrades 10-100x for large-result queries
+
+
+    -- Assuming seq scan = missing index
+
+    -- "Why is PostgreSQL doing a seq scan? I have an index!"
+
+    -- Because your WHERE status = ''active'' matches 95% of rows
+
+    -- The index scan would be 20x slower than seq scan
+
+    '
+  when_applies: Projects using PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using PostgreSQL
+  sources: ["https://www.postgresql.org/docs/current/queries-limit.html"]
+- id: CR-PG-QRY-003
+  text: In PostgreSQL 12+, CTEs (WITH queries) are inlined by default — use MATERIALIZED hint only when you need the optimization
+    fence behavior.
+  why: Before PostgreSQL 12, CTEs were always materialized — the planner could not push predicates into them, making them
+    optimization fences. Many developers relied on this behavior to force execution order or prevent predicate pushdown. In
+    PostgreSQL 12+, CTEs that are referenced once and have no side effects are automatically inlined (flattened into the main
+    query). This is usually better (enables more optimization), but can change behavior if you depended on the fence. Incorrectly
+    using MATERIALIZED when not needed prevents the planner from optimizing, while not using it when needed can cause repeated
+    execution of expensive subqueries.
+  how_to_do_right: 'Let PostgreSQL 12+ inline CTEs by default (no hint needed). Use MATERIALIZED when: (1) the CTE is referenced
+    multiple times and is expensive, (2) you need to prevent the planner from pushing filters that would change results, (3)
+    the CTE has side effects (data-modifying CTEs are always materialized). Use NOT MATERIALIZED to force inlining of CTEs
+    referenced multiple times.'
+  severity: medium
+  technologies:
+    platform: [postgresql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database]
+  example_good: "-- PostgreSQL 12+: CTE is automatically inlined (good default)\nWITH active_users AS (\n  SELECT id, name\
+    \ FROM users WHERE status = 'active'\n)\nSELECT * FROM active_users WHERE name LIKE 'A%';\n-- Planner pushes the LIKE\
+    \ filter INTO the users scan\n-- Equivalent to: SELECT * FROM users WHERE status='active' AND name LIKE 'A%'\n\n-- Force\
+    \ materialization for expensive CTE referenced multiple times\nWITH MATERIALIZED expensive_calc AS (\n  SELECT id, complex_function(data)\
+    \ AS result\n  FROM big_table\n)\nSELECT a.id, a.result, b.id, b.result\nFROM expensive_calc a\nJOIN expensive_calc b\
+    \ ON a.result = b.result AND a.id < b.id;\n-- Computed once, reused twice — without MATERIALIZED it runs twice\n"
+  example_bad: "-- Forcing MATERIALIZED when not needed (prevents optimization)\nWITH MATERIALIZED active AS (\n  SELECT *\
+    \ FROM users WHERE status = 'active'\n)\nSELECT * FROM active WHERE name LIKE 'A%';\n-- Planner CANNOT push 'name LIKE\
+    \ A%' into users scan\n-- Materializes ALL active users, THEN filters by name\n-- If 1M active users but only 50 start\
+    \ with 'A': 20000x more I/O\n\n-- Pre-PG12 pattern carried forward without understanding\nWITH stats AS (SELECT count(*)\
+    \ FROM big_table)\nSELECT * FROM stats;\n-- In PG12+ this is automatically inlined — no change needed\n-- Adding MATERIALIZED\
+    \ \"just in case\" prevents future optimizations\n"
+  when_applies: Projects using PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using PostgreSQL
+  sources: ["https://www.postgresql.org/docs/current/queries-with.html"]
+- id: CR-PG-QRY-004
+  text: Use pg_stat_statements to identify your top slow queries by total time — optimize the queries consuming the most cumulative
+    execution time, not just the single slowest query.
+  why: A query that runs in 50ms but executes 10,000 times per minute consumes 500 seconds/minute of database time. A query
+    that runs in 5 seconds but executes once per hour consumes 0.08 seconds/minute. pg_stat_statements aggregates total execution
+    time, call count, and row counts across all queries. Without it, you are guessing which queries to optimize. Most performance
+    improvements come from optimizing the top 5 queries by total_exec_time — which are often not the 'slowest' individual
+    queries.
+  how_to_do_right: 'Enable pg_stat_statements in postgresql.conf (shared_preload_libraries = ''pg_stat_statements''). Query
+    the view sorted by total_exec_time DESC. Focus on queries where mean_exec_time * calls is highest. Reset statistics periodically:
+    SELECT pg_stat_statements_reset(). Track query plans with pg_stat_statements.track = ''all'' in development. In production,
+    set pg_stat_statements.max = 10000 to track enough unique queries.'
+  severity: high
+  technologies:
+    platform: [postgresql]
+  domains:
+    domain: [architecture, performance, operations]
+    concern: [data, database]
+  example_good: "-- Enable pg_stat_statements\n-- postgresql.conf: shared_preload_libraries = 'pg_stat_statements'\n\nCREATE\
+    \ EXTENSION IF NOT EXISTS pg_stat_statements;\n\n-- Top 10 queries by total execution time\nSELECT\n  round(total_exec_time::numeric,\
+    \ 2) AS total_ms,\n  calls,\n  round(mean_exec_time::numeric, 2) AS avg_ms,\n  round((100 * total_exec_time /\n    sum(total_exec_time)\
+    \ OVER ())::numeric, 2) AS pct_total,\n  left(query, 80) AS query\nFROM pg_stat_statements\nORDER BY total_exec_time DESC\n\
+    LIMIT 10;\n\n-- total_ms   | calls  | avg_ms | pct_total | query\n-- 482031.24  | 891024 |  0.54  |    34.2   | SELECT\
+    \ * FROM orders WHERE cust...\n-- 215018.72  |    127 | 1693.1 |    15.3   | SELECT count(*) FROM events WHE...\n-- The\
+    \ first query (0.54ms avg) consumes 2.2x more time than the second (1.7s avg)\n"
+  example_bad: '-- Optimizing by looking at slow query log only
+
+    -- "Let me fix the 5-second query first!"
+
+    -- That query runs once per hour = 5 seconds total
+
+    -- Meanwhile, 0.5ms query running 1M/day = 500 seconds total
+
+
+    -- Not having pg_stat_statements enabled
+
+    -- Flying blind — no aggregate query statistics
+
+    -- Relying on application-level timing (misses planning time, network overhead)
+
+    '
+  when_applies: Projects using PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using PostgreSQL
+  sources: ["https://www.postgresql.org/docs/current/functions-window.html"]
+- id: CR-PG-CON-001
+  text: Understand MVCC and choose the right transaction isolation level — use READ COMMITTED (default) for most workloads,
+    REPEATABLE READ for consistent snapshots, and SERIALIZABLE only when correctness requires it.
+  why: PostgreSQL implements MVCC (Multi-Version Concurrency Control) where each transaction sees a snapshot of the database.
+    At READ COMMITTED, each statement sees the latest committed data — two SELECTs in the same transaction can return different
+    results. REPEATABLE READ takes a snapshot at transaction start — consistent reads but serialization failures on write
+    conflicts. SERIALIZABLE detects all anomalies but has the highest overhead (predicate locks, frequent serialization failures
+    requiring retry). Choosing SERIALIZABLE without retry logic causes application crashes. Choosing READ COMMITTED for financial
+    calculations causes race conditions.
+  how_to_do_right: Use READ COMMITTED (default) for OLTP applications where each statement is independent. Use REPEATABLE
+    READ for batch jobs, reports, and any operation needing a consistent snapshot. Use SERIALIZABLE for financial transactions,
+    inventory management, and booking systems — but ALWAYS implement retry logic for serialization failures (SQLSTATE 40001).
+    Use SELECT ... FOR UPDATE for row-level locking when you need to read-then-modify in READ COMMITTED.
+  severity: critical
+  technologies:
+    platform: [postgresql]
+  domains:
+    domain: [architecture, performance, reliability]
+    concern: [data, database, concurrency]
+  example_good: "-- READ COMMITTED (default) with explicit row locking for read-modify-write\nBEGIN;\nSELECT balance FROM\
+    \ accounts WHERE id = 123 FOR UPDATE;\n-- Row is now locked — other transactions wait\nUPDATE accounts SET balance = balance\
+    \ - 100 WHERE id = 123;\nCOMMIT;\n\n-- SERIALIZABLE with retry logic\nimport psycopg2\n\ndef transfer_funds(from_id, to_id,\
+    \ amount):\n    for attempt in range(3):\n        try:\n            with conn.cursor() as cur:\n                conn.set_isolation_level(\n\
+    \                    psycopg2.extensions.ISOLATION_LEVEL_SERIALIZABLE\n                )\n                cur.execute(\"\
+    UPDATE accounts SET balance = balance - %s WHERE id = %s\", (amount, from_id))\n                cur.execute(\"UPDATE accounts\
+    \ SET balance = balance + %s WHERE id = %s\", (amount, to_id))\n                conn.commit()\n                return\
+    \ True\n        except psycopg2.errors.SerializationFailure:\n            conn.rollback()\n            continue\n    raise\
+    \ Exception(\"Transaction failed after 3 retries\")\n"
+  example_bad: '-- SERIALIZABLE without retry logic — application crashes
+
+    conn.set_isolation_level(ISOLATION_LEVEL_SERIALIZABLE)
+
+    cur.execute("UPDATE accounts SET balance = balance - 100 WHERE id = 123")
+
+    conn.commit()  # SerializationFailure → unhandled → 500 error
+
+
+    -- READ COMMITTED race condition (TOCTOU)
+
+    BEGIN;
+
+    SELECT balance FROM accounts WHERE id = 123;  -- returns 500
+
+    -- Another transaction commits: balance is now 0
+
+    UPDATE accounts SET balance = balance - 100 WHERE id = 123;
+
+    -- Balance is now -100! No FOR UPDATE lock, no isolation
+
+    COMMIT;
+
+    '
+  when_applies: Any project using PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using PostgreSQL
+  sources: ["https://www.postgresql.org/docs/current/transaction-iso.html"]
+- id: CR-PG-CON-002
+  text: Use PgBouncer in transaction pooling mode for high-concurrency applications — PostgreSQL's per-connection process
+    model does not scale past a few hundred connections.
+  why: Each PostgreSQL connection spawns a dedicated backend process consuming 5-10MB of RAM. 500 connections = 2.5-5GB just
+    for connection overhead. Beyond 200-300 connections, context switching between processes degrades performance severely
+    — CPU spends more time switching than executing queries. PgBouncer multiplexes thousands of application connections onto
+    a small pool (20-50) of actual PostgreSQL connections. In transaction mode, connections are returned to the pool after
+    each transaction, maximizing utilization. Without pooling, microservices with 50 instances x 10 connections each = 500
+    connections that idle 90% of the time.
+  how_to_do_right: Deploy PgBouncer between your application and PostgreSQL. Use transaction pooling mode (pool_mode = transaction)
+    for most applications. Set default_pool_size to 2x your CPU cores (e.g., 16 for 8 cores). Set max_client_conn to handle
+    your peak (e.g., 1000). Do NOT use session-mode features (LISTEN/NOTIFY, prepared statements, session variables) in transaction
+    mode — they require session pooling. Monitor with SHOW POOLS and SHOW STATS.
+  severity: high
+  technologies:
+    library: [pgbouncer]
+    platform: [postgresql]
+  domains:
+    domain: [architecture, performance, operations]
+    concern: [data, database, scalability]
+  example_good: '# pgbouncer.ini — transaction pooling mode
+
+    [databases]
+
+    mydb = host=localhost port=5432 dbname=mydb
+
+
+    [pgbouncer]
+
+    pool_mode = transaction          # Return connection after each transaction
+
+    default_pool_size = 20           # 20 real PG connections per database
+
+    max_client_conn = 1000           # Accept up to 1000 app connections
+
+    reserve_pool_size = 5            # Emergency overflow
+
+    reserve_pool_timeout = 3         # Seconds before using overflow
+
+    server_idle_timeout = 300        # Close idle server connections after 5min
+
+    log_connections = 0              # Reduce log noise
+
+    log_disconnections = 0
+
+
+    # Application connects to PgBouncer (port 6432), NOT PostgreSQL (5432)
+
+    # DATABASE_URL=postgresql://user:pass@localhost:6432/mydb
+
+
+    # Result: 500 app connections share 20 PG connections
+
+    # RAM: 5GB → 200MB for connection overhead
+
+    # Latency: Reduced context switching → 2x throughput
+
+    '
+  example_bad: '# Direct connections — no pooling
+
+    # 50 microservice instances x 10 connections each = 500 PG processes
+
+    # RAM: 500 * 10MB = 5GB just for connection overhead
+
+    # CPU: constant context switching between 500 processes
+
+
+    # Wrong: session pooling mode with microservices
+
+    pool_mode = session
+
+    # Connections are held for the entire session (connection lifetime)
+
+    # Microservices with connection pools hold connections idle
+
+    # 500 sessions × 95% idle = 475 wasted PG connections
+
+
+    # Wrong: pool size too large — negates the benefit
+
+    default_pool_size = 200
+
+    # Still 200 PG backend processes — same context switching problem
+
+    '
+  when_applies: Projects using PostgreSQL databases or PgBouncer
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using PostgreSQL
+    or PgBouncer
+  sources: ["https://www.pgbouncer.org/config.html"]
+- id: CR-PG-PART-001
+  text: Use range partitioning for time-series data — partition by month or week so the query planner can skip irrelevant
+    partitions (partition pruning) and maintenance operations (VACUUM, REINDEX) target individual partitions.
+  why: A single 10-billion-row table means every VACUUM, REINDEX, and backup operates on the entire table — hours of I/O.
+    Range-partitioned by month, each partition has ~800M rows. Dropping old data is instant (DROP partition) instead of DELETE
+    + VACUUM (which creates dead tuples and bloat). Queries filtering by date automatically skip irrelevant partitions — a
+    query for 'last 7 days' only scans the current partition instead of all 10 billion rows. Indexes are per-partition, so
+    they stay small and fast.
+  how_to_do_right: 'Create the parent table with PARTITION BY RANGE. Create partitions for each time period. Automate partition
+    creation (pg_partman extension or cron job). Set partition boundaries to align with your most common query patterns. Ensure
+    every query includes the partition key in WHERE so the planner can prune. Monitor with EXPLAIN to verify ''Partitions:
+    pruned'' appears.'
+  severity: high
+  technologies:
+    platform: [postgresql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, time_series]
+  example_good: "-- Range partitioning by month\nCREATE TABLE events (\n  id bigserial,\n  event_type text NOT NULL,\n  payload\
+    \ jsonb,\n  created_at timestamptz NOT NULL DEFAULT now()\n) PARTITION BY RANGE (created_at);\n\n-- Create monthly partitions\n\
+    CREATE TABLE events_2026_01 PARTITION OF events\n  FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');\nCREATE TABLE events_2026_02\
+    \ PARTITION OF events\n  FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');\n\n-- Automate with pg_partman\nSELECT partman.create_parent('public.events',\
+    \ 'created_at', 'native', 'monthly');\n\n-- Query with partition pruning\nEXPLAIN ANALYZE\nSELECT * FROM events WHERE\
+    \ created_at >= '2026-02-01' AND created_at < '2026-02-15';\n-- Scans ONLY events_2026_02, skips all other partitions\n\
+    \n-- Drop old data instantly (no VACUUM needed)\nDROP TABLE events_2025_01;  -- Instant, no dead tuples\n"
+  example_bad: '-- Single monolithic table with 10 billion rows
+
+    CREATE TABLE events (id bigserial, created_at timestamptz, payload jsonb);
+
+
+    -- Deleting old data: creates dead tuples + index bloat
+
+    DELETE FROM events WHERE created_at < ''2025-01-01'';
+
+    -- Deleted 3 billion rows — now must VACUUM (hours of I/O)
+
+    -- Table file is still 800GB until VACUUM FULL (locks table)
+
+
+    -- Query without partition key — scans ALL partitions
+
+    SELECT * FROM events WHERE event_type = ''login'';
+
+    -- No partition pruning — scans all 12+ partitions
+
+    '
+  when_applies: Projects using PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using PostgreSQL
+  sources: ["https://www.postgresql.org/docs/current/ddl-partitioning.html"]
+- id: CR-PG-JSON-001
+  text: Use JSONB (not JSON) for structured data that needs indexing and querying — use it for flexible schema attributes
+    within a relational model, not as a replacement for proper columns.
+  why: 'JSONB stores data in decomposed binary format enabling fast access, indexing (GIN), and in-place updates. JSON stores
+    raw text — every query must reparse the entire document. JSONB supports containment (@>), existence (?), and path queries,
+    all indexable with GIN. However, JSONB should complement relational columns, not replace them. Storing everything in JSONB
+    negates PostgreSQL''s type safety, constraints, foreign keys, and join optimization. The sweet spot: core data in typed
+    columns, flexible/sparse attributes in JSONB.'
+  how_to_do_right: Store fixed, frequently queried fields as regular columns. Store variable, sparse, or schema-evolving fields
+    in a JSONB column. Add GIN index on the JSONB column for containment queries. Use jsonb_path_query for complex path expressions
+    (SQL/JSON standard). Validate structure with CHECK constraints or JSON Schema (pg_jsonschema extension). Never store data
+    in JSONB that you need to JOIN on — extract it to a proper column.
+  severity: high
+  technologies:
+    platform: [postgresql]
+  domains:
+    domain: [architecture]
+    concern: [data, database, schema_design]
+  example_good: "-- Relational core + JSONB for flexible attributes\nCREATE TABLE products (\n  id serial PRIMARY KEY,\n \
+    \ name text NOT NULL,\n  category text NOT NULL,        -- Fixed, queryable, JOINable\n  price numeric(10,2) NOT NULL,\
+    \   -- Fixed, typed, constrained\n  attributes jsonb DEFAULT '{}',  -- Flexible: color, size, material, etc.\n  CHECK\
+    \ (attributes IS NOT NULL)\n);\n\n-- GIN index for containment queries on attributes\nCREATE INDEX idx_products_attrs\
+    \ ON products USING GIN (attributes);\n\n-- Find red products with size large\nSELECT * FROM products\nWHERE attributes\
+    \ @> '{\"color\": \"red\", \"size\": \"large\"}';\n\n-- SQL/JSON path queries (PostgreSQL 12+)\nSELECT * FROM products\n\
+    WHERE jsonb_path_exists(attributes, '$.ratings[*] ? (@ > 4)');\n\n-- Partial update without rewriting entire document\n\
+    UPDATE products\nSET attributes = jsonb_set(attributes, '{color}', '\"blue\"')\nWHERE id = 42;\n"
+  example_bad: "-- Everything in JSONB — loses all relational benefits\nCREATE TABLE products (\n  id serial PRIMARY KEY,\n\
+    \  data jsonb  -- name, price, category ALL inside JSON\n);\n\n-- Cannot enforce NOT NULL on data->>'name'\n-- Cannot\
+    \ add FOREIGN KEY on data->>'category_id'\n-- Cannot efficiently JOIN on data->>'supplier_id'\n-- No type safety: price\
+    \ could be \"abc\"\n\n-- Using JSON (text) instead of JSONB (binary)\nCREATE TABLE products (data json);  -- Stores raw\
+    \ text\n-- Every query reparses the entire JSON document\n-- Cannot create GIN index\n-- Cannot use @> containment operator\n"
+  when_applies: Projects using PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using PostgreSQL
+  sources: ["https://www.postgresql.org/docs/current/datatype-json.html"]
+- id: CR-PG-LOCK-001
+  text: >
+    Use SELECT FOR UPDATE NOWAIT or SKIP LOCKED for optimistic concurrency control —
+    never hold locks across multiple HTTP requests. NOWAIT fails immediately if the row
+    is locked; SKIP LOCKED finds the next available row. Choose based on whether you
+    can retry or need any unlocked row.
+  why: >
+    SELECT FOR UPDATE without NOWAIT blocks indefinitely, starving other transactions
+    and causing connection pool exhaustion under load. In a financial system processing
+    1000 concurrent orders, a single slow lock holder causes a cascade of waiting
+    transactions that exhausts the pool in seconds. NOWAIT converts blocking waits into
+    immediate errors (retry logic handles these). SKIP LOCKED is ideal for job queues
+    and task processing — each worker picks any available task without competing with
+    other workers. PostgreSQL recommends this pattern explicitly in the advisory lock
+    documentation.
+  how_to_do_right: |
+    1. For optimistic locking on a specific row: SELECT FOR UPDATE NOWAIT
+       Catch lock_not_available (55P03) and retry with exponential backoff
+    2. For job queue / task processing: SELECT FOR UPDATE SKIP LOCKED LIMIT 1
+       No retry needed — simply gets the next available task
+    3. Always use within a transaction (BEGIN/COMMIT)
+    4. Set lock_timeout at session level as a safety net:
+       SET LOCAL lock_timeout = '5s';
+    5. For financial ledgers: use NOWAIT on account rows to detect concurrent writes
+    6. Monitor pg_locks and pg_stat_activity for lock contention
+  severity: critical
+  technologies:
+    platform: [postgresql]
+    lang: [python]
+    library: [sqlalchemy, asyncpg, psycopg2]
+  domains:
+    domain: [architecture, performance]
+    concern: [concurrency, database, locking]
+  example_good: |
+    -- Job queue: SKIP LOCKED — each worker gets a different task
+    BEGIN;
+    SELECT id, payload FROM job_queue
+    WHERE status = 'pending'
+    ORDER BY created_at
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED;  -- Returns immediately with any available row
+    -- Process task...
+    UPDATE job_queue SET status = 'done' WHERE id = $1;
+    COMMIT;
+
+    -- Financial account update: NOWAIT — fail fast on contention
+    -- Python/SQLAlchemy:
+    async def debit_account(conn, account_id: int, amount: Decimal):
+        async with conn.transaction():
+            try:
+                row = await conn.fetchrow(
+                    "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE NOWAIT",
+                    account_id
+                )
+            except asyncpg.exceptions.LockNotAvailableError:
+                raise RetryableError("Account locked, retry")
+            if row['balance'] < amount:
+                raise ValueError("Insufficient funds")
+            await conn.execute(
+                "UPDATE accounts SET balance = balance - $1 WHERE id = $2",
+                amount, account_id
+            )
+  example_bad: |
+    -- Blocking FOR UPDATE — starves other transactions
+    BEGIN;
+    SELECT balance FROM accounts WHERE id = $1 FOR UPDATE;
+    -- If another transaction holds this lock, we wait indefinitely
+    -- 1000 concurrent requests → 999 pile up → connection pool exhausted
+    -- System appears hung, logs show "waiting for lock"
+    UPDATE accounts SET balance = balance - $1 WHERE id = $2;
+    COMMIT;
+  when_applies: Projects using PostgreSQL with concurrent writes or job processing
+  when_not_applies: read-only analytics queries, single-writer systems, batch jobs with no concurrency
+  sources:
+    - "https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE"
+    - "https://www.postgresql.org/docs/current/explicit-locking.html"
+- id: CR-PG-LOCK-002
+  text: >
+    Use PostgreSQL advisory locks for distributed coordination — pg_try_advisory_lock
+    for non-blocking and pg_advisory_xact_lock for transaction-scoped mutual exclusion.
+    This replaces Redis-based distributed locks when PostgreSQL is already in your stack.
+  why: >
+    Distributed systems need mutual exclusion for singleton operations: running a
+    scheduled job on exactly one node, processing a payment exactly once, or initializing
+    a resource. Advisory locks are stored in memory (not in tables), have no lock table
+    overhead, are released automatically on connection close (session locks) or commit
+    (transaction locks), and require no external dependency. Using Redis for distributed
+    locks when PostgreSQL is available adds operational complexity and a split-brain
+    failure mode. Advisory locks are ACID-compliant and consistent with other
+    PostgreSQL transactions.
+  how_to_do_right: |
+    1. Choose the right type:
+       - pg_advisory_lock(key): session-scoped, blocks until acquired, released on disconnect
+       - pg_try_advisory_lock(key): session-scoped, returns bool immediately (no block)
+       - pg_advisory_xact_lock(key): transaction-scoped, auto-released on commit/rollback
+    2. Use a consistent key scheme: hash(job_name) → bigint
+    3. For scheduled jobs: pg_try_advisory_lock — if False, another node is running it
+    4. Always use xact locks inside explicit transactions (auto-release prevents deadlocks)
+    5. Document all advisory lock keys in a central registry to avoid collisions
+  severity: high
+  technologies:
+    platform: [postgresql]
+    lang: [python]
+    library: [sqlalchemy, asyncpg, psycopg2]
+  domains:
+    domain: [architecture]
+    concern: [distributed_systems, locking, coordination]
+  example_good: |
+    import hashlib
+    import asyncpg
+
+    def lock_key(name: str) -> int:
+        """Convert lock name to consistent bigint key."""
+        return int(hashlib.md5(name.encode()).hexdigest()[:16], 16) % (2**63)
+
+    async def run_scheduled_job(conn: asyncpg.Connection, job_name: str):
+        """Ensure only one node runs this job at a time."""
+        key = lock_key(job_name)
+        acquired = await conn.fetchval(
+            "SELECT pg_try_advisory_lock($1)", key
+        )
+        if not acquired:
+            print(f"Another node is running {job_name}, skipping")
+            return
+
+        try:
+            await execute_job(job_name)
+        finally:
+            await conn.execute("SELECT pg_advisory_unlock($1)", key)
+
+    # Transaction-scoped (auto-released): ideal for payment processing
+    async def process_payment(conn, payment_id: int):
+        async with conn.transaction():
+            key = lock_key(f"payment:{payment_id}")
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", key)
+            # Lock auto-released when transaction commits/rolls back
+            await create_payment_record(conn, payment_id)
+  example_bad: |
+    # Using Redis for distributed lock when PostgreSQL is already present
+    import redis
+    r = redis.Redis()
+
+    def run_job():
+        lock = r.set("job:daily_report", "locked", ex=300, nx=True)
+        if not lock:
+            return  # Another node has it
+        # Problem: Redis lock and PostgreSQL transaction are in different systems
+        # Network partition between Redis and PG → inconsistent state
+        # PostgreSQL advisory locks are ACID-consistent with your transactions
+  when_applies: Distributed systems with multiple nodes and PostgreSQL as the primary database
+  when_not_applies: single-node deployments, systems already committed to Redis distributed locks
+  sources:
+    - "https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADVISORY-LOCKS"
+    - "https://vladmihalcea.com/how-do-postgresql-advisory-locks-work/"
+- id: CR-PG-DEADLOCK-001
+  text: >
+    Prevent deadlocks by always acquiring locks in a consistent total order across
+    all transactions — and detect them early with a short deadlock_timeout (200ms).
+    Most deadlocks are caused by two transactions locking the same rows in different
+    order.
+  why: >
+    PostgreSQL detects deadlocks by waiting deadlock_timeout (default 1000ms) and then
+    checking the wait graph. At 1000ms, a deadlocked transaction ties up a connection
+    for 1 second before aborting. With deadlock_timeout=200ms, detection is 5x faster.
+    The root cause of 95% of deadlocks is lock ordering: Transaction A locks row 1 then
+    row 2; Transaction B locks row 2 then row 1. Solution: always lock row 1 then row 2
+    (sort by primary key). In financial systems, multi-leg transfers (A→B and B→A
+    simultaneously) are the canonical deadlock scenario.
+  how_to_do_right: |
+    1. Set deadlock_timeout = '200ms' in postgresql.conf (detect faster)
+    2. Lock rows in consistent total order: always sort by id/primary key before locking
+    3. For transfers: lock accounts in ascending id order regardless of direction
+    4. Keep transactions short: acquire locks, do work, commit/rollback — no I/O or waits
+    5. Catch DeadlockDetected (40P01) and retry with jitter:
+       max 3 retries, base 100ms, jitter uniform(0, 100ms)
+    6. Monitor: SELECT * FROM pg_stat_activity WHERE wait_event_type = 'Lock'
+    7. Log deadlocks: log_lock_waits = on, deadlock_timeout = 200ms in postgresql.conf
+  severity: critical
+  technologies:
+    platform: [postgresql]
+    lang: [python]
+    library: [sqlalchemy, asyncpg, psycopg2]
+  domains:
+    domain: [architecture, performance]
+    concern: [concurrency, database, deadlock]
+  example_good: |
+    import asyncpg
+    import asyncio
+    import random
+
+    async def transfer(conn, from_id: int, to_id: int, amount: Decimal):
+        """Transfer between accounts — always lock in ascending order."""
+        # Sort to prevent deadlock: always acquire lower-id lock first
+        first_id, second_id = sorted([from_id, to_id])
+
+        async with conn.transaction():
+            # Lock both accounts in consistent order
+            await conn.execute(
+                "SELECT id FROM accounts WHERE id IN ($1, $2) ORDER BY id FOR UPDATE NOWAIT",
+                first_id, second_id
+            )
+            # Now safely update both
+            await conn.execute(
+                "UPDATE accounts SET balance = balance - $1 WHERE id = $2",
+                amount, from_id
+            )
+            await conn.execute(
+                "UPDATE accounts SET balance = balance + $1 WHERE id = $2",
+                amount, to_id
+            )
+
+    async def transfer_with_retry(pool, from_id, to_id, amount, max_retries=3):
+        for attempt in range(max_retries):
+            try:
+                async with pool.acquire() as conn:
+                    await transfer(conn, from_id, to_id, amount)
+                    return
+            except asyncpg.exceptions.DeadlockDetectedError:
+                if attempt == max_retries - 1:
+                    raise
+                await asyncio.sleep(0.1 + random.uniform(0, 0.1))
+  example_bad: |
+    async def transfer(conn, from_id: int, to_id: int, amount: Decimal):
+        async with conn.transaction():
+            # Locks in request order — deadlock when concurrent reverse transfers
+            await conn.execute(
+                "SELECT id FROM accounts WHERE id = $1 FOR UPDATE", from_id
+            )
+            await conn.execute(
+                "SELECT id FROM accounts WHERE id = $1 FOR UPDATE", to_id
+            )
+            # Transaction A: locks 1, waits for 2
+            # Transaction B: locks 2, waits for 1
+            # → DEADLOCK (detected after 1000ms default timeout)
+  when_applies: Any PostgreSQL system with concurrent writes on multiple rows
+  when_not_applies: read-only analytics systems, single-writer systems
+  sources:
+    - "https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-DEADLOCKS"
+    - "https://www.postgresql.org/docs/current/runtime-config-locks.html"
+- id: CR-PG-PARTITION-001
+  text: >
+    Use range partitioning by time for time-series tables that grow unboundedly —
+    partition by month or quarter, maintain a rolling window of hot partitions, and
+    detach or drop old partitions instead of deleting rows. This enables instant
+    historical data removal without expensive DELETE operations.
+  why: >
+    Time-series tables (events, logs, trades, metrics) grow indefinitely and become
+    slow as they scale. DELETE on a 500M-row table takes hours and bloats WAL. Range
+    partitioning by date creates separate physical files per time period. Dropping an
+    old partition is O(1) (a metadata operation) regardless of row count. Query planner
+    prunes irrelevant partitions automatically, making date-filtered queries 10-100x
+    faster. Timescale's benchmark shows partitioned time-series queries 20x faster at
+    1B rows vs unpartitioned. Partition pruning requires the partition key in WHERE.
+  how_to_do_right: |
+    1. CREATE TABLE parent PARTITION BY RANGE (created_at)
+    2. Create partitions for current + next 2 months:
+       CREATE TABLE t_2026_01 PARTITION OF parent
+       FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+    3. Automate future partition creation (run weekly):
+       CREATE TABLE t_<next_month> PARTITION OF parent ...
+    4. Attach existing data partitions with ATTACH PARTITION (no data copy)
+    5. Detach old partitions: ALTER TABLE parent DETACH PARTITION t_old;
+       Then DROP TABLE t_old; (instant, even for billions of rows)
+    6. Create indexes ON ONLY the parent — they propagate to new partitions
+    7. Set constraint_exclusion = partition in postgresql.conf for pruning
+  severity: high
+  technologies:
+    platform: [postgresql]
+    lang: [python]
+    library: [sqlalchemy, alembic]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, partitioning, time_series]
+  example_good: |
+    -- Create partitioned table
+    CREATE TABLE trade_events (
+        id          bigserial,
+        market_id   int NOT NULL,
+        event_type  text NOT NULL,
+        amount      numeric(20, 8),
+        created_at  timestamptz NOT NULL DEFAULT now()
+    ) PARTITION BY RANGE (created_at);
+
+    -- Create monthly partitions (automate this)
+    CREATE TABLE trade_events_2026_01 PARTITION OF trade_events
+        FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+    CREATE TABLE trade_events_2026_02 PARTITION OF trade_events
+        FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+
+    -- Shared index propagates to all partitions
+    CREATE INDEX ON ONLY trade_events (market_id, created_at DESC);
+
+    -- Query uses only 2026-01 partition (planner prunes rest)
+    SELECT * FROM trade_events
+    WHERE market_id = 42
+      AND created_at BETWEEN '2026-01-01' AND '2026-01-31';
+
+    -- Drop last year's data: instant (no row-by-row DELETE)
+    ALTER TABLE trade_events DETACH PARTITION trade_events_2025_01;
+    DROP TABLE trade_events_2025_01;  -- Instant regardless of row count
+  example_bad: |
+    -- Unpartitioned table with periodic DELETE — scales poorly
+    CREATE TABLE trade_events (
+        id          bigserial PRIMARY KEY,
+        market_id   int NOT NULL,
+        created_at  timestamptz NOT NULL DEFAULT now()
+    );
+
+    -- Retention cleanup: runs for HOURS on large tables
+    DELETE FROM trade_events WHERE created_at < NOW() - INTERVAL '1 year';
+    -- Generates massive WAL, blocks autovacuum, causes replication lag
+    -- Query at 1B rows: sequential scan or index scan over 12 months of data
+  when_applies: Tables growing by more than 1M rows/month or requiring time-based retention
+  when_not_applies: small reference tables, tables with no time dimension or non-date partitioning keys
+  sources:
+    - "https://www.postgresql.org/docs/current/ddl-partitioning.html"
+    - "https://www.crunchydata.com/blog/a-look-at-postgres-15-merge-command-with-examples"
+- id: CR-PG-MERGE-001
+  text: >
+    Use PostgreSQL 15+ MERGE for upsert-with-conditional-logic — it handles INSERT,
+    UPDATE, and DELETE in a single atomic statement, replacing complex UPSERT patterns
+    that require multiple round trips or INSERT ON CONFLICT workarounds.
+  why: >
+    Before PostgreSQL 15, upsert required INSERT ... ON CONFLICT (limited to constraint
+    matching) or a CTE with UPDATE + INSERT (two statements, race condition window).
+    MERGE matches source rows to target rows on a join condition, then applies different
+    actions per match status: WHEN MATCHED → UPDATE or DELETE, WHEN NOT MATCHED →
+    INSERT. This is the SQL standard (ISO/IEC 9075). A single MERGE replaces a
+    SELECT-then-INSERT/UPDATE pattern that requires 2 round trips and has a race
+    condition between the SELECT and INSERT in concurrent workloads.
+  how_to_do_right: |
+    1. Requires PostgreSQL 15+. Check: SELECT version();
+    2. Structure: MERGE INTO target USING source ON join_condition
+       WHEN MATCHED [AND condition] THEN UPDATE/DELETE
+       WHEN NOT MATCHED [AND condition] THEN INSERT
+    3. Use for ETL/sync: merging external data into a target table
+    4. Use for slowly changing dimensions: update price, insert new products
+    5. The source can be a VALUES() list, subquery, or CTE
+    6. MERGE is fully transactional — all matched rows updated atomically
+  severity: medium
+  technologies:
+    platform: [postgresql]
+    lang: [python, sql]
+    library: [sqlalchemy, asyncpg]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, upsert]
+  example_good: |
+    -- PostgreSQL 15+ MERGE: sync market prices from external feed
+    MERGE INTO market_prices AS target
+    USING (
+        VALUES
+            ('BTC-USD', 65000.00, NOW()),
+            ('ETH-USD', 3200.00, NOW()),
+            ('SOL-USD', 180.00, NOW())
+    ) AS source (market, price, updated_at)
+    ON target.market = source.market
+    WHEN MATCHED THEN
+        UPDATE SET
+            price = source.price,
+            updated_at = source.updated_at,
+            update_count = target.update_count + 1
+    WHEN NOT MATCHED THEN
+        INSERT (market, price, updated_at, update_count)
+        VALUES (source.market, source.price, source.updated_at, 1);
+    -- Single round trip, atomic, handles both new and existing markets
+  example_bad: |
+    -- Pre-PG15 upsert: 2 statements, race condition window
+    async def upsert_price(conn, market: str, price: Decimal):
+        existing = await conn.fetchrow(
+            "SELECT id FROM market_prices WHERE market = $1", market
+        )
+        if existing:
+            await conn.execute(
+                "UPDATE market_prices SET price = $1 WHERE market = $2",
+                price, market
+            )
+        else:
+            # Race condition: another process may INSERT between our SELECT and INSERT
+            await conn.execute(
+                "INSERT INTO market_prices (market, price) VALUES ($1, $2)",
+                market, price
+            )  # UniqueViolationError possible under concurrency
+  when_applies: Projects using PostgreSQL 15+ that need upsert or conditional sync operations
+  when_not_applies: PostgreSQL < 15 (use INSERT ON CONFLICT instead), non-PostgreSQL databases
+  sources:
+    - "https://www.postgresql.org/docs/15/sql-merge.html"
+    - "https://www.crunchydata.com/blog/a-look-at-postgres-15-merge-command-with-examples"
+- id: CR-PG-POOL-001
+  text: >
+    Configure PgBouncer with transaction-mode pooling for stateless API workloads —
+    set pool_size = (max_pg_connections * 0.8) / app_instances, server_lifetime =
+    3600, and server_idle_timeout = 600. Never use session-mode for high-concurrency
+    APIs; it provides no benefit over direct connections.
+  why: >
+    Without connection pooling, each API server process holds a PostgreSQL connection
+    open. At 100 app processes × 10 connections each = 1000 PostgreSQL backend
+    processes, each consuming 5-10MB RAM. PostgreSQL's max_connections default is 100
+    — this exhausts it immediately. PgBouncer transaction-mode pools connections at the
+    PostgreSQL level: 1000 application "connections" → 100 actual PostgreSQL connections.
+    Misconfigured PgBouncer (session mode, wrong pool sizes) provides no benefit or
+    breaks prepared statements. Heroku found transaction-mode PgBouncer reduced
+    connection counts by 20x at the same throughput.
+  how_to_do_right: |
+    1. Choose pool_mode = transaction for stateless APIs (most common)
+       Exception: use session mode if your app uses SET/RESET, advisory locks per session,
+       or LISTEN/NOTIFY (these require session affinity)
+    2. Calculate pool_size: target max_connections = 100 (PG default)
+       pool_size = 80 / num_pgbouncer_instances (leave 20% for admin connections)
+    3. Set server_lifetime = 3600 (recycle connections hourly — prevents stale state)
+    4. Set server_idle_timeout = 600 (close idle backend connections after 10 min)
+    5. Set client_idle_timeout = 0 (let app handle timeouts, not PgBouncer)
+    6. Disable prepared statements in app when using transaction mode:
+       SQLAlchemy: pool_pre_ping=True, execution_options={"no_parameters": True}
+    7. Monitor: pgbouncer SHOW POOLS; — check cl_waiting > 0 (clients waiting for conn)
+  severity: critical
+  technologies:
+    platform: [postgresql, pgbouncer]
+    lang: [python]
+    library: [sqlalchemy, asyncpg, psycopg2]
+  domains:
+    domain: [architecture, performance]
+    concern: [database, connection_pooling, scalability]
+  example_good: |
+    # pgbouncer.ini — transaction mode for stateless API
+    [databases]
+    veritas_db = host=postgres port=5432 dbname=veritas
+
+    [pgbouncer]
+    pool_mode = transaction        # Each transaction gets a connection
+    max_client_conn = 1000         # Total client connections allowed
+    default_pool_size = 20         # Actual PostgreSQL connections per DB/user pair
+    server_lifetime = 3600         # Recycle connections every hour
+    server_idle_timeout = 600      # Close idle backends after 10 minutes
+    server_connect_timeout = 15    # Fail fast on PG connect
+    query_wait_timeout = 30        # Reject waiting clients after 30s
+
+    # SQLAlchemy: disable prepared statements for transaction-mode PgBouncer
+    engine = create_async_engine(
+        PGBOUNCER_URL,
+        # Disable server-side prepared statements (incompatible with transaction mode)
+        connect_args={"prepared_statement_cache_size": 0},
+        pool_pre_ping=True,
+        pool_size=5,      # Per-process connections to PgBouncer
+        max_overflow=10,
+    )
+  example_bad: |
+    # Session mode with high concurrency — no benefit over direct connection
+    [pgbouncer]
+    pool_mode = session   # Each client HOLDS a PostgreSQL connection
+    # 1000 client connections → 1000 PostgreSQL backends → OOM
+
+    # Or: wrong pool_size — too small causes connection starvation
+    default_pool_size = 5  # With 50 app instances × 10 req/s = queuing immediately
+
+    # Or: using prepared statements with transaction mode (causes errors)
+    # asyncpg by default uses prepared statements → "invalid prepared statement"
+  when_applies: Any high-concurrency Python application using PostgreSQL
+  when_not_applies: low-concurrency internal tools (<10 concurrent connections), apps using LISTEN/NOTIFY or session-level settings
+  sources:
+    - "https://www.pgbouncer.org/config.html"
+    - "https://devcenter.heroku.com/articles/best-practices-pgbouncer-configuration"

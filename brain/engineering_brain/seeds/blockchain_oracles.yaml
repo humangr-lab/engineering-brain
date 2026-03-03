@@ -1,0 +1,858 @@
+layer: rules
+domain: prediction_markets
+knowledge:
+- id: PM-ORACLE-001
+  text: "Chainlink oracle architecture provides decentralized data feeds by aggregating responses from multiple independent node operators — use it as the primary oracle for price feeds and event resolution."
+  why: >
+    A single oracle node is a single point of failure and manipulation. If one data source
+    reports the wrong result, the entire market resolves incorrectly. In 2022, a Mango Markets
+    exploit manipulated a single oracle price feed to inflate collateral value, stealing $114M.
+    Chainlink aggregates data from 7-31 independent nodes with Byzantine fault tolerance,
+    making manipulation economically infeasible.
+  how_to_do_right: |
+    1. Use Chainlink Price Feeds for financial data (crypto, forex, commodities)
+    2. Each feed aggregates from multiple node operators with deviation threshold triggers
+    3. Check the feed's heartbeat interval (e.g., 1 hour for ETH/USD) — stale data is dangerous
+    4. Verify the feed address on-chain matches the official Chainlink registry
+    5. Use latestRoundData() not latestAnswer() — the former includes timestamp and round metadata
+    6. Always check answer > 0 and updatedAt > 0 to detect stale or invalid responses
+  severity: critical
+  technologies:
+    lang: [python, javascript]
+    library: [web3, ethers]
+  domains:
+    domain: [prediction_markets, blockchain]
+    concern: [domain_specific]
+  example_good: |
+    from web3 import Web3
+
+    CHAINLINK_ETH_USD = "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419"
+    AGGREGATOR_ABI = [{"inputs":[],"name":"latestRoundData","outputs":[
+        {"name":"roundId","type":"uint80"},
+        {"name":"answer","type":"int256"},
+        {"name":"startedAt","type":"uint256"},
+        {"name":"updatedAt","type":"uint256"},
+        {"name":"answeredInRound","type":"uint80"}
+    ],"stateMutability":"view","type":"function"}]
+
+    def get_eth_price(w3: Web3) -> float:
+        feed = w3.eth.contract(address=CHAINLINK_ETH_USD, abi=AGGREGATOR_ABI)
+        round_id, answer, started_at, updated_at, answered_in_round = feed.functions.latestRoundData().call()
+
+        # Validate freshness and validity
+        assert answer > 0, "Invalid price from oracle"
+        assert updated_at > 0, "Stale oracle round"
+        assert (w3.eth.get_block('latest').timestamp - updated_at) < 3600, "Oracle data older than 1 hour"
+        assert answered_in_round >= round_id, "Stale round — answer not updated"
+
+        return answer / 1e8  # Chainlink ETH/USD has 8 decimals
+  example_bad: |
+    # No validation — uses stale or manipulated data silently
+    def get_eth_price(w3):
+        feed = w3.eth.contract(address=CHAINLINK_ETH_USD, abi=AGGREGATOR_ABI)
+        answer = feed.functions.latestAnswer().call()  # Deprecated function, no metadata
+        return answer / 1e8  # Could be 0, negative, or hours old
+  when_applies: Any prediction market or DeFi application that needs external price data or event resolution
+  sources: ["https://docs.chain.link/data-feeds"]
+
+- id: PM-ORACLE-002
+  text: "UMA Optimistic Oracle resolves subjective or complex events through an escalation game — use it for markets that cannot be resolved by a simple price feed."
+  why: >
+    Many prediction market questions are subjective ("Will Company X announce layoffs by Q2?")
+    and cannot be answered by a Chainlink price feed. UMA's Optimistic Oracle uses a game-theoretic
+    approach: anyone can propose an answer, and it is accepted unless someone disputes it within
+    a challenge period (typically 2 hours). Disputes escalate to UMA token holders who vote.
+    The bond mechanism ensures honest proposals — proposers lose their bond if disputed and wrong.
+  how_to_do_right: |
+    1. Define a clear, unambiguous resolution criteria in the market description (UMA calls this the "ancillary data")
+    2. Set bond size proportional to market volume (minimum $1,000 for serious markets)
+    3. Set challenge period to at least 2 hours (shorter allows front-running disputes)
+    4. Listen for ProposePrice and DisputePrice events to track resolution status
+    5. Implement a fallback if the oracle fails to resolve within a timeout (e.g., 7 days)
+    6. Cache resolution results — do not call the oracle repeatedly for resolved markets
+  severity: critical
+  technologies:
+    lang: [python, javascript]
+    library: [web3, ethers]
+  domains:
+    domain: [prediction_markets, blockchain]
+    concern: [domain_specific]
+  example_good: |
+    from web3 import Web3
+    import json
+    import time
+
+    class UMAOracleClient:
+        CHALLENGE_PERIOD = 7200  # 2 hours in seconds
+
+        def __init__(self, w3: Web3, oracle_address: str):
+            self.w3 = w3
+            self.oracle = w3.eth.contract(address=oracle_address, abi=self._load_abi())
+            self._resolution_cache: dict[str, int] = {}
+
+        def request_resolution(self, market_id: str, ancillary_data: bytes, bond_wei: int):
+            """Request price/resolution from UMA oracle with bond."""
+            assert bond_wei >= Web3.to_wei(1000, 'ether'), "Bond too low for serious market"
+            tx = self.oracle.functions.requestPrice(
+                identifier=b"YES_OR_NO_QUERY",
+                timestamp=int(time.time()),
+                ancillaryData=ancillary_data,
+            ).transact({'value': bond_wei})
+            return tx
+
+        def get_resolution(self, market_id: str, request_timestamp: int) -> int | None:
+            """Get resolution, returns None if still in challenge period."""
+            if market_id in self._resolution_cache:
+                return self._resolution_cache[market_id]
+
+            settled = self.oracle.functions.getRequest(
+                identifier=b"YES_OR_NO_QUERY",
+                timestamp=request_timestamp,
+            ).call()
+
+            if settled['settled']:
+                result = settled['resolvedPrice']
+                self._resolution_cache[market_id] = result
+                return result
+            return None
+  example_bad: |
+    # No bond validation, no caching, no challenge period awareness
+    def resolve_market(oracle, market_id):
+        result = oracle.functions.getPrice(market_id).call()  # Wrong API
+        return result  # No check if settled, could be in dispute
+  when_applies: Prediction markets with subjective questions, event-based resolution, or complex resolution criteria
+  sources: ["https://docs.uma.xyz/protocol-overview/how-does-umas-oracle-work"]
+
+- id: PM-ORACLE-003
+  text: "Multi-oracle consensus requires at least 2-of-3 oracles to agree on a result before accepting it — never rely on a single oracle for market resolution."
+  why: >
+    Single-oracle dependency is the most exploited vulnerability in DeFi. Even Chainlink
+    has had temporary outages (Arbitrum sequencer downtime in June 2023 caused stale prices).
+    A multi-oracle system with 2-of-3 consensus means an attacker must compromise two independent
+    systems simultaneously, increasing attack cost by orders of magnitude. It also provides
+    redundancy — if one oracle is down, the other two can still reach consensus.
+  how_to_do_right: |
+    1. Use at least 3 independent oracle sources (e.g., Chainlink + UMA + custom API oracle)
+    2. Require 2-of-3 agreement within a tolerance band (e.g., prices within 1% of median)
+    3. Weight oracles by reliability: Chainlink weight 2, others weight 1 (weighted majority)
+    4. If no consensus within timeout (e.g., 1 hour), escalate to manual review
+    5. Log all oracle responses and disagreements for audit trail
+    6. Monitor oracle health independently — alert if any oracle is stale or unreachable
+  severity: critical
+  technologies:
+    lang: [python, javascript]
+    library: [web3, ethers]
+  domains:
+    domain: [prediction_markets, blockchain]
+    concern: [domain_specific]
+  example_good: |
+    from dataclasses import dataclass
+    from statistics import median
+
+    @dataclass
+    class OracleResponse:
+        source: str
+        value: float
+        timestamp: int
+        weight: int = 1
+
+    class MultiOracleConsensus:
+        TOLERANCE_PERCENT = 1.0  # 1% deviation tolerance
+        MIN_AGREE = 2
+
+        def __init__(self, oracles: list):
+            self.oracles = oracles  # List of oracle clients
+
+        def get_consensus(self, query: str) -> float | None:
+            responses: list[OracleResponse] = []
+            for oracle in self.oracles:
+                try:
+                    resp = oracle.query(query)
+                    responses.append(resp)
+                except Exception as e:
+                    logging.warning(f"Oracle {oracle.name} failed: {e}")
+
+            if len(responses) < self.MIN_AGREE:
+                logging.error(f"Only {len(responses)} oracles responded, need {self.MIN_AGREE}")
+                return None
+
+            median_value = median([r.value for r in responses])
+            agreeing = [
+                r for r in responses
+                if abs(r.value - median_value) / median_value * 100 <= self.TOLERANCE_PERCENT
+            ]
+
+            weighted_agree = sum(r.weight for r in agreeing)
+            total_weight = sum(r.weight for r in responses)
+
+            if weighted_agree >= total_weight * 0.5:
+                consensus = sum(r.value * r.weight for r in agreeing) / sum(r.weight for r in agreeing)
+                logging.info(f"Consensus reached: {consensus} ({len(agreeing)}/{len(responses)} agree)")
+                return consensus
+
+            logging.error(f"No consensus: responses={[r.value for r in responses]}")
+            return None
+  example_bad: |
+    # Single oracle, no fallback, no consensus
+    def get_price(oracle):
+        return oracle.get_latest_price()  # If this oracle fails or is manipulated, game over
+  when_applies: Any prediction market or DeFi protocol that uses oracles for resolution or pricing
+  sources: ["https://docs.chain.link/architecture-overview/architecture-decentralized-model"]
+
+- id: PM-ORACLE-004
+  text: "Oracle manipulation resistance requires TWAP (Time-Weighted Average Price), median filtering, and outlier rejection — never use a single spot price for resolution."
+  why: >
+    Flash loan attacks can manipulate spot prices for a single block. An attacker borrows
+    millions, moves the price, triggers a resolution, then repays — all in one transaction.
+    The Beanstalk exploit ($182M) and multiple Euler/Cream attacks used exactly this pattern.
+    TWAP over 30 minutes makes manipulation 1000x more expensive because the attacker must
+    sustain the manipulation across many blocks.
+  how_to_do_right: |
+    1. Use TWAP over minimum 30 minutes (ideally 1-2 hours) for price-based resolution
+    2. Apply median filter: take 5+ samples and use median, not mean (resistant to outliers)
+    3. Reject outliers: discard any sample >3 standard deviations from the rolling mean
+    4. For event-based markets, use the UMA optimistic oracle pattern with challenge period
+    5. Never resolve based on a single block's price — always aggregate across time
+    6. Log all raw oracle data for post-mortem analysis
+  severity: critical
+  technologies:
+    lang: [python, javascript]
+    library: [web3, ethers]
+  domains:
+    domain: [prediction_markets, blockchain, security]
+    concern: [domain_specific]
+  example_good: |
+    import numpy as np
+    from collections import deque
+    import time
+
+    class TWAPCalculator:
+        def __init__(self, window_seconds: int = 1800, max_samples: int = 500):
+            self.window = window_seconds
+            self.samples: deque = deque(maxlen=max_samples)
+
+        def add_sample(self, price: float, timestamp: int | None = None):
+            ts = timestamp or int(time.time())
+            self.samples.append((ts, price))
+            self._prune_old_samples()
+
+        def _prune_old_samples(self):
+            cutoff = int(time.time()) - self.window
+            while self.samples and self.samples[0][0] < cutoff:
+                self.samples.popleft()
+
+        def get_twap(self) -> float | None:
+            if len(self.samples) < 10:
+                return None  # Not enough data for reliable TWAP
+
+            prices = [p for _, p in self.samples]
+
+            # Outlier rejection: remove >3 std deviations
+            mean = np.mean(prices)
+            std = np.std(prices)
+            filtered = [p for p in prices if abs(p - mean) <= 3 * std]
+
+            if len(filtered) < len(prices) * 0.5:
+                raise ValueError("Over 50% of samples are outliers — possible manipulation")
+
+            # Time-weighted average
+            total_time_weighted = 0.0
+            total_time = 0.0
+            for i in range(1, len(self.samples)):
+                dt = self.samples[i][0] - self.samples[i-1][0]
+                total_time_weighted += self.samples[i][1] * dt
+                total_time += dt
+
+            return total_time_weighted / total_time if total_time > 0 else np.median(filtered)
+  example_bad: |
+    # Single spot price — vulnerable to flash loan manipulation
+    def resolve_market(oracle, market_id):
+        price = oracle.get_latest_price()  # Single block price
+        if price > threshold:
+            return "YES"
+        return "NO"
+  when_applies: Any prediction market or DeFi protocol that resolves based on price data
+  sources: ["https://blog.uniswap.org/uniswap-v3-oracles"]
+
+- id: PM-ORACLE-005
+  text: "On-chain resolution provides finality and censorship resistance but costs gas — use off-chain resolution with on-chain verification for cost-efficient markets."
+  why: >
+    Fully on-chain resolution costs $5-50 per market in gas fees on Ethereum mainnet.
+    For a platform with 1,000 active markets, that is $5,000-$50,000/month in resolution gas alone.
+    Off-chain resolution with on-chain verification (e.g., signed message from oracle committee)
+    reduces costs by 90%+ while maintaining verifiability. However, pure off-chain resolution
+    without any on-chain anchor loses censorship resistance and auditability.
+  how_to_do_right: |
+    1. Compute resolution result off-chain (API calls, data aggregation, TWAP calculation)
+    2. Have 2+ oracle signers sign the result with EIP-712 typed data
+    3. Submit one transaction with the result and signatures — contract verifies on-chain
+    4. Store resolution hash on-chain for audit trail (32 bytes, minimal gas)
+    5. Allow a challenge period (24-48 hours) where anyone can dispute with evidence
+    6. For high-value markets (>$100K volume), use fully on-chain resolution for maximum trust
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    library: [web3, ethers]
+  domains:
+    domain: [prediction_markets, blockchain]
+    concern: [domain_specific]
+  example_good: |
+    from eth_account import Account
+    from eth_account.messages import encode_typed_data
+
+    class OffChainResolver:
+        def __init__(self, signer_keys: list[str], min_signatures: int = 2):
+            self.signers = [Account.from_key(k) for k in signer_keys]
+            self.min_sigs = min_signatures
+
+        def resolve_and_sign(self, market_id: str, result: int, evidence_hash: str) -> dict:
+            """Resolve off-chain and produce EIP-712 signatures for on-chain verification."""
+            domain = {
+                "name": "PredictionMarket",
+                "version": "1",
+                "chainId": 1,
+                "verifyingContract": self.contract_address,
+            }
+            message = {
+                "marketId": market_id,
+                "result": result,  # 1 = YES, 0 = NO
+                "evidenceHash": evidence_hash,
+                "timestamp": int(time.time()),
+            }
+            types = {
+                "Resolution": [
+                    {"name": "marketId", "type": "string"},
+                    {"name": "result", "type": "uint8"},
+                    {"name": "evidenceHash", "type": "bytes32"},
+                    {"name": "timestamp", "type": "uint256"},
+                ],
+            }
+
+            signatures = []
+            for signer in self.signers[:self.min_sigs]:
+                sig = signer.sign_typed_data(domain, types, message)
+                signatures.append(sig.signature.hex())
+
+            return {"message": message, "signatures": signatures}
+
+        def submit_resolution(self, w3, resolution: dict):
+            """Submit resolution with signatures to smart contract."""
+            tx = self.contract.functions.resolveWithSignatures(
+                resolution["message"],
+                resolution["signatures"],
+            ).transact()
+            return tx
+  example_bad: |
+    # Fully on-chain resolution for every market — expensive and slow
+    def resolve_all_markets(contract, markets):
+        for market in markets:
+            result = fetch_result(market.id)
+            contract.functions.resolve(market.id, result).transact()  # $5-50 per tx
+  when_applies: Prediction market platforms that need to balance cost efficiency with trustlessness
+  sources: ["https://ethereum.org/en/developers/docs/standards/tokens/erc-712/"]
+
+- id: PM-ORACLE-006
+  text: "Oracle latency must be below 30 seconds for trading-critical data and below 5 minutes for resolution data — stale oracle data is a security vulnerability."
+  why: >
+    Stale oracle data allows arbitrage at the expense of other users. If the oracle reports
+    a price from 10 minutes ago, a trader with access to real-time data can trade against
+    stale prices. On Synthetix in 2019, stale oracle data allowed a trader to extract $1B
+    in synthetic assets (later returned). For prediction market resolution, 5-minute latency
+    is acceptable since resolution is a one-time event, but trading data must be fresh.
+  how_to_do_right: |
+    1. Check oracle updatedAt timestamp on every read — reject if older than max_staleness
+    2. For trading: max_staleness = 30 seconds (Chainlink heartbeat for major pairs is 1 hour, but deviation triggers are faster)
+    3. For resolution: max_staleness = 5 minutes (acceptable for one-time events)
+    4. Implement a circuit breaker: if oracle is stale, pause trading (do not use stale data)
+    5. Monitor oracle latency with alerts at p95 > 15 seconds
+    6. Use multiple oracle sources with different update frequencies for redundancy
+  severity: critical
+  technologies:
+    lang: [python, javascript]
+    library: [web3, ethers]
+  domains:
+    domain: [prediction_markets, blockchain, reliability]
+    concern: [domain_specific]
+  example_good: |
+    import time
+    import logging
+
+    class OracleFreshnessGuard:
+        def __init__(self, max_staleness_trading: int = 30, max_staleness_resolution: int = 300):
+            self.max_staleness_trading = max_staleness_trading
+            self.max_staleness_resolution = max_staleness_resolution
+            self._circuit_open = False
+
+        def get_price_for_trading(self, oracle) -> float:
+            """Get price with strict freshness requirement for trading."""
+            _, answer, _, updated_at, _ = oracle.functions.latestRoundData().call()
+            staleness = int(time.time()) - updated_at
+
+            if staleness > self.max_staleness_trading:
+                self._circuit_open = True
+                logging.critical(f"Oracle stale by {staleness}s — trading paused")
+                raise OracleStaleError(f"Oracle data is {staleness}s old, max allowed: {self.max_staleness_trading}s")
+
+            if self._circuit_open:
+                self._circuit_open = False
+                logging.info("Oracle freshness restored — trading resumed")
+
+            return answer / 1e8
+
+        def get_price_for_resolution(self, oracle) -> float:
+            """Get price with relaxed freshness for one-time resolution."""
+            _, answer, _, updated_at, _ = oracle.functions.latestRoundData().call()
+            staleness = int(time.time()) - updated_at
+
+            if staleness > self.max_staleness_resolution:
+                raise OracleStaleError(f"Oracle data is {staleness}s old, max allowed: {self.max_staleness_resolution}s")
+
+            return answer / 1e8
+  example_bad: |
+    # No staleness check — uses whatever the oracle returns
+    def get_price(oracle):
+        answer = oracle.functions.latestAnswer().call()
+        return answer / 1e8  # Could be hours old, enabling arbitrage
+  when_applies: Any trading system or prediction market that relies on oracle data for pricing or resolution
+  sources: ["https://docs.chain.link/data-feeds/selecting-data-feeds"]
+
+- id: PM-ORACLE-007
+  text: "Oracle reliability monitoring must track uptime, latency, and deviation per oracle source with automated alerts and failover."
+  why: >
+    Oracle failures are not if but when. Chainlink had a 2-hour partial outage during the
+    FTX collapse (November 2022) due to extreme price volatility. Without monitoring, you
+    discover oracle failures only when users report wrong prices or failed trades —
+    by which time financial damage has already occurred. Proactive monitoring with alerting
+    catches oracle degradation in seconds, not hours.
+  how_to_do_right: |
+    1. Track per oracle: uptime %, p50/p95/p99 latency, update frequency, deviation from median
+    2. Alert if any oracle latency > 2x its normal p95 (e.g., Chainlink normally 1s, alert at 2s)
+    3. Alert if oracle update frequency drops below 50% of expected (e.g., expected every 60s, none for 120s)
+    4. Alert if oracle deviates >2% from median of all oracles (possible manipulation)
+    5. Implement automatic failover: if primary oracle fails, switch to secondary within 5 seconds
+    6. Dashboard showing all oracle health in real-time with 24h/7d/30d history
+  severity: high
+  technologies:
+    lang: [python]
+    library: [web3]
+  domains:
+    domain: [prediction_markets, blockchain, observability]
+    concern: [metrics]
+  example_good: |
+    import time
+    import logging
+    from dataclasses import dataclass, field
+    from collections import deque
+
+    @dataclass
+    class OracleHealthMetrics:
+        source: str
+        total_queries: int = 0
+        successful_queries: int = 0
+        latencies_ms: deque = field(default_factory=lambda: deque(maxlen=1000))
+        last_update_ts: int = 0
+        last_value: float = 0.0
+
+        @property
+        def uptime_pct(self) -> float:
+            return (self.successful_queries / max(self.total_queries, 1)) * 100
+
+        @property
+        def p95_latency_ms(self) -> float:
+            if not self.latencies_ms:
+                return 0
+            sorted_lats = sorted(self.latencies_ms)
+            idx = int(len(sorted_lats) * 0.95)
+            return sorted_lats[min(idx, len(sorted_lats) - 1)]
+
+    class OracleMonitor:
+        def __init__(self, oracles: dict[str, object], alert_callback=None):
+            self.oracles = oracles
+            self.metrics: dict[str, OracleHealthMetrics] = {
+                name: OracleHealthMetrics(source=name) for name in oracles
+            }
+            self.alert = alert_callback or logging.critical
+
+        def check_all(self):
+            values = {}
+            for name, oracle in self.oracles.items():
+                m = self.metrics[name]
+                m.total_queries += 1
+                start = time.monotonic()
+                try:
+                    value = oracle.get_latest_price()
+                    latency_ms = (time.monotonic() - start) * 1000
+                    m.successful_queries += 1
+                    m.latencies_ms.append(latency_ms)
+                    m.last_value = value
+                    m.last_update_ts = int(time.time())
+                    values[name] = value
+                except Exception as e:
+                    self.alert(f"Oracle {name} failed: {e}")
+
+            # Check deviation between oracles
+            if len(values) >= 2:
+                from statistics import median
+                med = median(values.values())
+                for name, val in values.items():
+                    deviation_pct = abs(val - med) / med * 100
+                    if deviation_pct > 2.0:
+                        self.alert(f"Oracle {name} deviates {deviation_pct:.1f}% from median ({val} vs {med})")
+  example_bad: |
+    # No monitoring — discover failures when users complain
+    def get_price(oracle):
+        try:
+            return oracle.get_price()
+        except:
+            return None  # Silently returns None, no alert, no logging
+  when_applies: Any system relying on external oracles for pricing or event data
+  sources: ["https://docs.chain.link/data-feeds"]
+
+- id: PM-ORACLE-008
+  text: "Running a Chainlink node requires dedicated infrastructure with high uptime SLA — do not run a node unless you need custom data feeds or earn revenue as a node operator."
+  why: >
+    Running a Chainlink node requires 99.9% uptime, dedicated Ethereum RPC endpoint,
+    PostgreSQL database, and ongoing maintenance. If your node goes offline or provides
+    stale data, you lose your staked LINK and reputation. Most prediction market platforms
+    should consume existing Chainlink feeds (free) rather than operate nodes.
+    Only run a node if you need custom data feeds (e.g., esoteric sports data) or want
+    to earn LINK rewards as a node operator.
+  how_to_do_right: |
+    1. Use existing Chainlink feeds for standard data (crypto prices, forex, weather)
+    2. Only consider running a node for custom data feeds not available on Chainlink
+    3. If running a node: use dedicated server with 99.9% uptime SLA, 4+ CPU cores, 16GB RAM
+    4. Run a PostgreSQL database for the Chainlink node (not SQLite)
+    5. Use a dedicated Ethereum RPC endpoint (Alchemy/Infura) with generous rate limits
+    6. Monitor node health with the Chainlink node UI dashboard and external alerting
+  severity: high
+  technologies:
+    lang: [javascript]
+    library: [ethers]
+  domains:
+    domain: [prediction_markets, blockchain, operations]
+    concern: [domain_specific]
+  example_good: |
+    # Decision framework: Should you run a Chainlink node?
+    # config/oracle_strategy.yaml
+
+    oracle_strategy:
+      # Standard feeds — use existing Chainlink feeds (FREE)
+      standard_feeds:
+        - name: "ETH/USD"
+          address: "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419"
+          heartbeat: 3600  # 1 hour
+          deviation: 0.5  # 0.5%
+
+      # Custom feeds — requires own node or External Adapter
+      custom_feeds:
+        - name: "Election result"
+          type: "uma_optimistic"  # Use UMA instead of custom Chainlink node
+
+      # Decision: Do NOT run Chainlink node for prediction markets
+      # Reason: All needed data available via existing feeds or UMA
+      run_own_node: false
+  example_bad: |
+    # Running a Chainlink node just to read ETH/USD — massive overkill
+    # docker-compose.yml
+    # services:
+    #   chainlink-node:
+    #     image: smartcontract/chainlink:latest
+    #     # ... complex setup for data that's freely available
+  when_applies: Teams evaluating whether to operate their own Chainlink node infrastructure
+  sources: ["https://docs.chain.link/chainlink-nodes"]
+
+- id: PM-ORACLE-009
+  text: "Custom oracle design for prediction markets must separate data sourcing, aggregation, and on-chain submission into independent components with clear interfaces."
+  why: >
+    A monolithic oracle that fetches data, aggregates it, and submits on-chain in one
+    process is impossible to test, debug, or upgrade. When the data source API changes
+    (which happens frequently — Twitter/X API changed 3 times in 2023-2024), you need
+    to update only the sourcing layer without touching aggregation or submission.
+    Separation also allows independent scaling: data sourcing can run every second while
+    on-chain submission only happens when the result changes.
+  how_to_do_right: |
+    1. Layer 1 — Data Sourcing: Independent adapters per source (API, scraper, feed)
+    2. Layer 2 — Aggregation: Median/TWAP/consensus logic, source-agnostic
+    3. Layer 3 — Submission: On-chain transaction management (gas, nonce, retry)
+    4. Each layer communicates via typed interfaces (dataclasses/Pydantic models)
+    5. Each layer independently testable with mocks for adjacent layers
+    6. Circuit breaker between layers: if sourcing fails, aggregation uses cached data
+  severity: high
+  technologies:
+    lang: [python]
+    library: [web3]
+  domains:
+    domain: [prediction_markets, blockchain, architecture]
+    concern: [domain_specific]
+  example_good: |
+    from abc import ABC, abstractmethod
+    from dataclasses import dataclass
+    from datetime import datetime
+
+    @dataclass
+    class OracleDataPoint:
+        source: str
+        value: float
+        timestamp: datetime
+        confidence: float  # 0.0 to 1.0
+
+    # Layer 1: Data Sourcing (independent per source)
+    class DataSource(ABC):
+        @abstractmethod
+        def fetch(self, query: str) -> OracleDataPoint:
+            ...
+
+    class ChainlinkSource(DataSource):
+        def fetch(self, query: str) -> OracleDataPoint:
+            data = self.feed.functions.latestRoundData().call()
+            return OracleDataPoint(source="chainlink", value=data[1] / 1e8, timestamp=datetime.fromtimestamp(data[3]), confidence=0.95)
+
+    class APISource(DataSource):
+        def fetch(self, query: str) -> OracleDataPoint:
+            resp = httpx.get(f"{self.base_url}/price/{query}")
+            return OracleDataPoint(source="api", value=resp.json()["price"], timestamp=datetime.now(), confidence=0.8)
+
+    # Layer 2: Aggregation (source-agnostic)
+    class Aggregator:
+        def aggregate(self, points: list[OracleDataPoint]) -> float:
+            weighted = [(p.value, p.confidence) for p in points]
+            total_weight = sum(w for _, w in weighted)
+            return sum(v * w for v, w in weighted) / total_weight
+
+    # Layer 3: Submission (aggregation-agnostic)
+    class OnChainSubmitter:
+        def submit(self, market_id: str, result: float):
+            tx = self.contract.functions.submitResult(market_id, int(result * 1e8)).transact()
+            return self.w3.eth.wait_for_transaction_receipt(tx)
+  example_bad: |
+    # Monolithic oracle — untestable, fragile, impossible to upgrade
+    def resolve_market(market_id):
+        price = requests.get("https://api.example.com/price").json()["price"]  # source
+        result = 1 if price > 100 else 0  # aggregation
+        contract.functions.resolve(market_id, result).transact()  # submission
+  when_applies: Any prediction market building custom oracle infrastructure beyond standard Chainlink feeds
+  sources: ["https://docs.chain.link/architecture-overview/architecture-overview"]
+
+- id: PM-ORACLE-010
+  text: "Oracle data validation must check value bounds, type constraints, and temporal consistency before using any oracle response."
+  why: >
+    Oracles can return garbage data due to API errors, network issues, or smart contract bugs.
+    A Chainlink feed returning 0 for ETH/USD would trigger incorrect resolution of every
+    market using that feed. In 2020, a Compound oracle returned an incorrect USDT price
+    ($1.3 instead of $1.0), enabling $89M in excess borrowing. Defensive validation
+    catches these errors before they cause financial damage.
+  how_to_do_right: |
+    1. Check value bounds: price must be > 0 and within 10x of last known good value
+    2. Check type: ensure numeric, not None/null/NaN
+    3. Check temporal consistency: new value timestamp must be > previous timestamp
+    4. Check rate of change: reject if price changes >50% in one update (likely error)
+    5. Maintain a "last known good" cache for comparison
+    6. Log all rejected values with reason for forensic analysis
+  severity: critical
+  technologies:
+    lang: [python]
+    library: [web3]
+  domains:
+    domain: [prediction_markets, blockchain, reliability]
+    concern: [domain_specific]
+  example_good: |
+    import math
+    import logging
+
+    class OracleValidator:
+        MAX_DEVIATION_PCT = 50.0  # Reject >50% change in single update
+        MAX_STALENESS_SEC = 3600  # 1 hour
+
+        def __init__(self):
+            self._last_good: dict[str, tuple[float, int]] = {}  # feed_id -> (value, timestamp)
+
+        def validate(self, feed_id: str, value: float, timestamp: int) -> float:
+            """Validate oracle response. Returns value or raises ValueError."""
+            # Type check
+            if value is None or math.isnan(value) or math.isinf(value):
+                raise ValueError(f"Oracle {feed_id}: invalid value type: {value}")
+
+            # Bounds check
+            if value <= 0:
+                raise ValueError(f"Oracle {feed_id}: non-positive value: {value}")
+
+            # Temporal consistency
+            if feed_id in self._last_good:
+                last_value, last_ts = self._last_good[feed_id]
+
+                if timestamp <= last_ts:
+                    raise ValueError(f"Oracle {feed_id}: timestamp not advancing ({timestamp} <= {last_ts})")
+
+                # Rate of change check
+                change_pct = abs(value - last_value) / last_value * 100
+                if change_pct > self.MAX_DEVIATION_PCT:
+                    logging.warning(f"Oracle {feed_id}: {change_pct:.1f}% change ({last_value} -> {value})")
+                    raise ValueError(f"Oracle {feed_id}: suspicious {change_pct:.1f}% deviation")
+
+            # All checks passed — update last known good
+            self._last_good[feed_id] = (value, timestamp)
+            logging.debug(f"Oracle {feed_id}: validated value={value} ts={timestamp}")
+            return value
+  example_bad: |
+    # No validation — trusts oracle blindly
+    def get_oracle_value(feed):
+        return feed.get_latest()  # Could be 0, None, NaN, or wildly wrong
+  when_applies: Any system consuming external oracle data for financial decisions
+  sources: ["https://docs.chain.link/data-feeds/api-reference"]
+
+- id: PM-ORACLE-011
+  text: "Oracle fallback strategies must define a clear priority chain with automatic switching — primary to secondary to cached to paused."
+  why: >
+    Every oracle will eventually fail. Without a fallback strategy, your platform stops
+    functioning when the primary oracle goes down. During Ethereum gas spikes, Chainlink
+    updates can be delayed by hours. Without a fallback, your platform either uses stale
+    data (dangerous) or stops entirely (lost revenue). A clear fallback chain with automatic
+    switching keeps the platform operational during oracle outages.
+  how_to_do_right: |
+    1. Define priority: Primary (Chainlink) -> Secondary (custom API) -> Cached (last good value) -> Paused (stop trading)
+    2. Switch automatically based on staleness threshold (e.g., >60s = try secondary)
+    3. When using cached value, display warning to users: "Using cached price from 2 min ago"
+    4. When paused, disable trading but keep UI accessible for viewing positions
+    5. Log every fallback switch with timestamp and reason
+    6. Auto-recover: continuously check primary and switch back when it recovers
+  severity: high
+  technologies:
+    lang: [python]
+    library: [web3]
+  domains:
+    domain: [prediction_markets, blockchain, reliability]
+    concern: [domain_specific]
+  example_good: |
+    import time
+    import logging
+    from enum import Enum
+
+    class OracleState(Enum):
+        PRIMARY = "primary"
+        SECONDARY = "secondary"
+        CACHED = "cached"
+        PAUSED = "paused"
+
+    class OracleFallbackChain:
+        def __init__(self, primary, secondary, max_cache_age: int = 300):
+            self.primary = primary
+            self.secondary = secondary
+            self.max_cache_age = max_cache_age
+            self.state = OracleState.PRIMARY
+            self._cache: dict[str, tuple[float, int]] = {}
+
+        def get_price(self, feed_id: str) -> tuple[float, OracleState]:
+            # Try primary
+            try:
+                value, ts = self.primary.get_price(feed_id)
+                if int(time.time()) - ts < 60:
+                    self._cache[feed_id] = (value, ts)
+                    if self.state != OracleState.PRIMARY:
+                        logging.info(f"Oracle recovered to PRIMARY for {feed_id}")
+                        self.state = OracleState.PRIMARY
+                    return value, OracleState.PRIMARY
+            except Exception as e:
+                logging.warning(f"Primary oracle failed for {feed_id}: {e}")
+
+            # Try secondary
+            try:
+                value, ts = self.secondary.get_price(feed_id)
+                if int(time.time()) - ts < 120:
+                    self._cache[feed_id] = (value, ts)
+                    self.state = OracleState.SECONDARY
+                    return value, OracleState.SECONDARY
+            except Exception as e:
+                logging.warning(f"Secondary oracle failed for {feed_id}: {e}")
+
+            # Try cache
+            if feed_id in self._cache:
+                cached_value, cached_ts = self._cache[feed_id]
+                if int(time.time()) - cached_ts < self.max_cache_age:
+                    self.state = OracleState.CACHED
+                    logging.warning(f"Using cached price for {feed_id} (age: {int(time.time()) - cached_ts}s)")
+                    return cached_value, OracleState.CACHED
+
+            # All sources exhausted — pause
+            self.state = OracleState.PAUSED
+            logging.critical(f"All oracles failed for {feed_id} — trading paused")
+            raise OracleUnavailableError(f"No oracle data available for {feed_id}")
+  example_bad: |
+    # No fallback — entire platform dies when oracle fails
+    def get_price(feed_id):
+        return chainlink.get_price(feed_id)  # If Chainlink is down, everything stops
+  when_applies: Any production system relying on external oracle data
+  sources: ["https://docs.chain.link/data-feeds"]
+
+- id: PM-ORACLE-012
+  text: "Oracle testing must include mainnet fork tests with real contract state and mock oracle tests for edge cases — never deploy oracle integration untested against real data."
+  why: >
+    Unit tests with hardcoded mock values do not catch real-world oracle behavior: gas
+    estimation failures, ABI encoding issues, stale round detection, and decimal precision
+    errors. A team tested their oracle integration only with mocks, deployed to mainnet,
+    and discovered the Chainlink feed returned 8 decimals instead of the 18 they assumed —
+    all prices were off by 10 orders of magnitude. Mainnet fork tests catch these issues
+    before deployment.
+  how_to_do_right: |
+    1. Mainnet fork tests: use Hardhat/Anvil to fork mainnet state and test against real oracle contracts
+    2. Mock tests: test edge cases impossible to reproduce on mainnet (oracle returns 0, negative, overflow)
+    3. Test decimal handling: verify your code handles 8-decimal (Chainlink) and 18-decimal (ERC20) correctly
+    4. Test staleness handling: set block.timestamp to future to simulate stale oracle
+    5. Test gas estimation: ensure oracle read calls estimate gas correctly on fork
+    6. Run fork tests in CI against a recent mainnet block (cache the fork for speed)
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    library: [web3, ethers]
+  domains:
+    domain: [prediction_markets, blockchain, testing]
+    concern: [domain_specific]
+  example_good: |
+    import pytest
+    from web3 import Web3
+    from unittest.mock import MagicMock
+
+    # Test 1: Mainnet fork — real oracle data
+    @pytest.fixture
+    def mainnet_fork():
+        """Create a mainnet fork using Anvil."""
+        w3 = Web3(Web3.HTTPProvider("http://localhost:8545"))
+        # Anvil started with: anvil --fork-url https://eth-mainnet.g.alchemy.com/v2/KEY
+        return w3
+
+    def test_chainlink_eth_usd_real_data(mainnet_fork):
+        """Test against real Chainlink feed on forked mainnet."""
+        feed = mainnet_fork.eth.contract(address=CHAINLINK_ETH_USD, abi=AGGREGATOR_ABI)
+        _, answer, _, updated_at, _ = feed.functions.latestRoundData().call()
+        assert answer > 0, "Price must be positive"
+        assert answer / 1e8 > 100, "ETH price should be > $100"
+        assert answer / 1e8 < 100000, "ETH price should be < $100,000"
+        assert updated_at > 0, "Timestamp must be set"
+
+    # Test 2: Mock oracle — edge cases
+    def test_oracle_handles_zero_price():
+        mock_oracle = MagicMock()
+        mock_oracle.functions.latestRoundData.return_value.call.return_value = (1, 0, 0, 0, 1)
+        validator = OracleValidator()
+        with pytest.raises(ValueError, match="non-positive value"):
+            validator.validate("ETH/USD", 0, int(time.time()))
+
+    def test_oracle_handles_stale_data():
+        validator = OracleValidator()
+        old_timestamp = int(time.time()) - 7200  # 2 hours ago
+        validator.validate("ETH/USD", 2000.0, old_timestamp - 100)  # Set baseline
+        # Stale detection is in the consumer, not validator — test consumer
+        guard = OracleFreshnessGuard(max_staleness_trading=30)
+        with pytest.raises(OracleStaleError):
+            guard.get_price_for_trading(mock_stale_oracle)
+
+    # Test 3: Decimal handling
+    def test_chainlink_8_decimal_handling():
+        raw_answer = 200000000000  # 2000.00000000 (8 decimals)
+        price = raw_answer / 1e8
+        assert price == 2000.0, f"Expected 2000.0, got {price}"
+  example_bad: |
+    # Only tests with hardcoded values — misses real-world issues
+    def test_oracle():
+        assert get_price(mock_oracle) == 2000.0  # Hardcoded, never fails, never catches real bugs
+  when_applies: Any project integrating with blockchain oracles before deployment to mainnet or testnet
+  sources: ["https://docs.chain.link/data-feeds/getting-started"]

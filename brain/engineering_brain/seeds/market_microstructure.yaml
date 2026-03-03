@@ -1,0 +1,2036 @@
+layer: rules
+domain: fintech
+knowledge:
+- id: FIN-MICRO-001
+  text: "Bid-ask spread decomposes into three components: adverse selection (informed traders extract value), inventory risk (market maker holding risk), and order processing (fixed costs). The Glosten-Milgrom model shows adverse selection alone can cause spreads to widen; ignoring this decomposition leads to mispriced liquidity and toxic flow losses."
+  why: >
+    Market makers who set spreads without modeling adverse selection will be systematically
+    picked off by informed traders. The 2010 Flash Crash showed that when adverse selection
+    spikes (VPIN > 0.8), naive market makers who ignored this component lost billions in
+    minutes. Empirically, adverse selection accounts for 30-60% of the spread in equity
+    markets (Huang & Stoll 1997). If you build a market making bot that only considers
+    inventory and processing costs, you will bleed money to informed flow. Conversely,
+    overestimating adverse selection leads to unnecessarily wide spreads and lost volume.
+  how_to_do_right: |
+    1. Estimate adverse selection component using the Huang-Stoll decomposition:
+       - Regress trade direction (buy=+1, sell=-1) on lagged direction and quote midpoint changes
+       - Adverse selection = fraction of spread attributable to permanent price impact
+    2. Estimate inventory component:
+       - Track net position Q_t; inventory cost ~ gamma * sigma^2 * Q_t * dt
+       - gamma = risk aversion parameter (calibrate to 0.01-0.1 for crypto, 0.001-0.01 for equities)
+    3. Estimate processing component:
+       - Fixed per-trade cost: exchange fees + clearing + settlement
+       - Typical: 0.1-0.5 bps for equities, 1-5 bps for crypto
+    4. Total half-spread s/2 = adverse_selection + inventory_cost + processing_cost
+    5. Update estimates in real-time using rolling windows (500-2000 trades)
+    6. Widen spread when adverse_selection / total_spread > 0.5 (toxic flow regime)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [numpy, pandas, scipy]
+  domains:
+    domain: [fintech, prediction_markets, trading]
+    concern: [domain_specific]
+  example_good: |
+    import numpy as np
+    import pandas as pd
+
+    class SpreadDecomposer:
+        """Huang-Stoll (1997) spread decomposition."""
+
+        def __init__(self, risk_aversion: float = 0.05, processing_bps: float = 2.0):
+            self.gamma = risk_aversion
+            self.processing_bps = processing_bps
+
+        def decompose(self, trades: pd.DataFrame) -> dict:
+            """
+            trades: DataFrame with columns [price, midpoint, direction, timestamp]
+            direction: +1 for buyer-initiated, -1 for seller-initiated
+            """
+            # Effective half-spread
+            trades["eff_half_spread"] = trades["direction"] * (trades["price"] - trades["midpoint"])
+
+            # Permanent impact (adverse selection) = midpoint change in direction of trade
+            trades["mid_change"] = trades["midpoint"].shift(-1) - trades["midpoint"]
+            trades["permanent_impact"] = trades["direction"] * trades["mid_change"]
+
+            avg_half_spread = trades["eff_half_spread"].mean()
+            avg_adverse_selection = trades["permanent_impact"].dropna().mean()
+
+            # Processing cost in price units
+            processing_cost = trades["midpoint"].mean() * self.processing_bps / 10_000
+
+            # Inventory = residual
+            inventory_cost = max(0, avg_half_spread - avg_adverse_selection - processing_cost)
+
+            return {
+                "total_half_spread_bps": avg_half_spread / trades["midpoint"].mean() * 10_000,
+                "adverse_selection_bps": avg_adverse_selection / trades["midpoint"].mean() * 10_000,
+                "inventory_bps": inventory_cost / trades["midpoint"].mean() * 10_000,
+                "processing_bps": self.processing_bps,
+                "adverse_selection_pct": avg_adverse_selection / avg_half_spread * 100,
+            }
+
+    # Example with concrete numbers
+    trades = pd.DataFrame({
+        "price":     [100.05, 99.95, 100.10, 99.90, 100.08],
+        "midpoint":  [100.00, 100.00, 100.02, 99.98, 100.03],
+        "direction": [1, -1, 1, -1, 1],
+        "timestamp": pd.date_range("2024-01-01", periods=5, freq="1s"),
+    })
+    decomp = SpreadDecomposer(risk_aversion=0.05, processing_bps=1.0)
+    result = decomp.decompose(trades)
+    # result["adverse_selection_pct"] ~ 40-60% for typical equity markets
+  example_bad: |
+    # WRONG: Setting a flat spread without decomposition — will lose to informed traders
+    class NaiveMarketMaker:
+        def __init__(self, flat_spread_bps: float = 5.0):
+            self.spread_bps = flat_spread_bps  # Never changes!
+
+        def quote(self, mid: float) -> tuple:
+            half = mid * self.spread_bps / 10_000
+            return (mid - half, mid + half)
+
+    # During high adverse selection (earnings, news), this spread is too tight.
+    # Market maker gets picked off: buys at 99.975, price drops to 99.50.
+    # Loss = 47.5 bps per share. Flat spread of 5 bps doesn't cover 47.5 bps adverse selection.
+  when_applies: "Building any market making system, order book analytics, or execution algorithm that needs to understand spread dynamics."
+  sources:
+    - "https://en.wikipedia.org/wiki/Bid%E2%80%93ask_spread"
+    - "https://en.wikipedia.org/wiki/Market_microstructure"
+
+- id: FIN-MICRO-002
+  text: "The Avellaneda-Stoikov (2008) framework provides optimal bid/ask quotes for a market maker who maximizes expected terminal utility under inventory risk. The key formula: reservation price r = s - q * gamma * sigma^2 * (T - t), optimal spread delta = gamma * sigma^2 * (T - t) + (2/gamma) * ln(1 + gamma/k), where q is inventory, gamma is risk aversion, sigma is volatility, and k is the order arrival rate parameter."
+  why: >
+    Avellaneda-Stoikov is the foundation of modern algorithmic market making. It provides a
+    closed-form solution for the inventory management problem: how to skew quotes to reduce
+    unwanted inventory while still earning the spread. Without this framework, market makers
+    either hold too much inventory (blowing up on adverse moves) or quote too wide (losing
+    volume to competitors). Citadel, Virtu, and Jump Trading all use variants of this model.
+    The key insight is that the reservation price should shift AWAY from your inventory: if
+    you are long, your ask should be more aggressive (lower) to offload inventory, and your
+    bid should be less aggressive (lower) to avoid accumulating more.
+  how_to_do_right: |
+    1. Estimate sigma (volatility) using rolling 1-minute returns, annualized
+       - For crypto: sigma ~ 50-150% annualized; for equities: 15-40%
+    2. Set gamma (risk aversion) based on max acceptable inventory:
+       - gamma = 2 * target_spread / (sigma^2 * T) as a starting point
+       - Typical: gamma = 0.1 for aggressive, 1.0 for conservative
+    3. Estimate k (order arrival intensity) from historical fill rates:
+       - k = number_of_fills / time_interval
+       - Typical: k = 1-10 fills per second for liquid assets
+    4. Compute reservation price: r_t = S_t - q_t * gamma * sigma^2 * (T - t)
+    5. Compute optimal half-spread: delta/2 = gamma * sigma^2 * (T-t)/2 + (1/gamma) * ln(1 + gamma/k)
+    6. Set bid = r_t - delta/2, ask = r_t + delta/2
+    7. Clip inventory: if |q| > max_position, only quote on the reducing side
+    8. Recalculate every 100ms-1s depending on asset volatility
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [numpy, scipy]
+  domains:
+    domain: [fintech, trading, prediction_markets]
+    concern: [domain_specific]
+  example_good: |
+    import math
+    import time
+
+    class AvellanedaStoikov:
+        """Optimal market making with inventory management."""
+
+        def __init__(
+            self,
+            gamma: float = 0.3,       # risk aversion
+            sigma: float = 0.02,      # volatility (per period)
+            k: float = 5.0,           # order arrival intensity
+            T: float = 1.0,           # trading horizon (1 = end of session)
+            max_inventory: int = 100,  # max position size
+        ):
+            self.gamma = gamma
+            self.sigma = sigma
+            self.k = k
+            self.T = T
+            self.max_inventory = max_inventory
+
+        def optimal_quotes(self, mid_price: float, inventory: int, time_remaining: float) -> dict:
+            """
+            Returns optimal bid/ask given current state.
+            mid_price: current market mid price
+            inventory: current net position (positive = long)
+            time_remaining: fraction of horizon remaining (1.0 = start, 0.0 = end)
+            """
+            tau = max(time_remaining, 0.001)  # avoid division by zero
+
+            # Reservation price: shift away from inventory
+            reservation = mid_price - inventory * self.gamma * self.sigma**2 * tau
+
+            # Optimal spread
+            spread = self.gamma * self.sigma**2 * tau + (2.0 / self.gamma) * math.log(1 + self.gamma / self.k)
+
+            bid = reservation - spread / 2
+            ask = reservation + spread / 2
+
+            # Inventory limits: only quote on the reducing side
+            if inventory >= self.max_inventory:
+                bid = None  # stop buying
+            if inventory <= -self.max_inventory:
+                ask = None  # stop selling
+
+            return {
+                "bid": round(bid, 6) if bid else None,
+                "ask": round(ask, 6) if ask else None,
+                "reservation_price": round(reservation, 6),
+                "spread": round(spread, 6),
+                "inventory_skew": round(reservation - mid_price, 6),
+            }
+
+    # Example: BTC market maker
+    mm = AvellanedaStoikov(gamma=0.1, sigma=0.005, k=3.0, T=1.0, max_inventory=10)
+    quotes = mm.optimal_quotes(mid_price=50000.0, inventory=3, time_remaining=0.5)
+    # quotes["inventory_skew"] < 0 because we're long, reservation < mid
+    # bid is lower (less aggressive), ask is lower (more aggressive to sell)
+    print(f"Bid: {quotes['bid']}, Ask: {quotes['ask']}, Skew: {quotes['inventory_skew']}")
+  example_bad: |
+    # WRONG: Symmetric quotes regardless of inventory — accumulates dangerous positions
+    class BadMarketMaker:
+        def __init__(self, spread: float = 0.001):
+            self.half_spread = spread / 2
+
+        def quote(self, mid: float, inventory: int) -> tuple:
+            # inventory is IGNORED — fatal flaw
+            return (mid - self.half_spread * mid, mid + self.half_spread * mid)
+
+    mm = BadMarketMaker(spread=0.001)
+    # Buys 50 units on dip, still quoting aggressively on bid side
+    # Price drops 2% — loss = 50 * 50000 * 0.02 = $50,000
+    # Avellaneda-Stoikov would have widened bid and tightened ask after inventory > 5
+  when_applies: "Implementing any algorithmic market making strategy, quoting engine, or liquidity provision system for exchanges or prediction markets."
+  sources:
+    - "https://arxiv.org/abs/0812.0530"
+    - "https://en.wikipedia.org/wiki/Market_microstructure"
+
+- id: FIN-MICRO-003
+  text: "The Ho-Stoll (1981) model determines optimal dealer spreads by balancing inventory risk against expected profit from the spread. The optimal spread s* = alpha + beta * gamma * sigma^2 * Q + processing_cost, where alpha is the adverse selection component, gamma is risk aversion, sigma is price volatility, and Q is current inventory."
+  why: >
+    Ho-Stoll was the first rigorous model connecting spread to inventory risk and is still
+    the foundation of how exchanges set minimum tick sizes and how regulators evaluate
+    spread fairness. The model proves that spreads must increase with volatility (sigma^2)
+    and inventory (Q). In the 2020 GameStop squeeze, market makers who didn't properly
+    account for the sigma^2 term lost massively when volatility jumped 10x overnight.
+    Ho-Stoll also shows why spreads widen at market close (inventory risk increases with
+    overnight holding) and narrow at open (Q resets).
+  how_to_do_right: |
+    1. Estimate base adverse selection alpha from historical trade data:
+       - alpha = average(|midpoint_change_after_trade|) / average(half_spread)
+       - Typical: alpha = 0.3-0.6 for equities, 0.2-0.5 for crypto
+    2. Estimate sigma from rolling intraday returns:
+       - Use 5-minute or 1-minute realized volatility
+       - Annualize: sigma_annual = sigma_1min * sqrt(252 * 390)
+    3. Set risk aversion gamma:
+       - gamma = max_acceptable_loss / (sigma^2 * max_position^2 * holding_period)
+    4. Compute optimal half-spread:
+       - half_spread = alpha/2 + beta * gamma * sigma^2 * |Q| / 2 + processing/2
+    5. Apply asymmetry: bid_spread = half_spread + skew, ask_spread = half_spread - skew
+       - skew > 0 when long (widen bid, tighten ask to reduce position)
+    6. Floor the spread at exchange minimum tick size
+    7. Recalibrate alpha and sigma every 5-15 minutes
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [numpy, pandas]
+  domains:
+    domain: [fintech, trading]
+    concern: [domain_specific]
+  example_good: |
+    import numpy as np
+
+    class HoStollModel:
+        """Ho-Stoll (1981) optimal spread determination."""
+
+        def __init__(
+            self,
+            alpha: float = 0.4,           # adverse selection fraction
+            gamma: float = 0.05,          # risk aversion
+            processing_cost_bps: float = 1.0,  # fixed costs in bps
+            beta: float = 1.0,            # inventory sensitivity
+        ):
+            self.alpha = alpha
+            self.gamma = gamma
+            self.processing_bps = processing_cost_bps
+            self.beta = beta
+
+        def optimal_spread(
+            self,
+            mid_price: float,
+            sigma: float,       # per-period volatility (e.g., per minute)
+            inventory: int,
+        ) -> dict:
+            """Compute optimal spread given current state."""
+            # Adverse selection component (in price units)
+            adverse_component = self.alpha * mid_price * 0.001  # scaled by typical spread
+
+            # Inventory risk component
+            inventory_component = self.beta * self.gamma * sigma**2 * abs(inventory)
+
+            # Processing cost
+            processing_component = mid_price * self.processing_bps / 10_000
+
+            # Total optimal half-spread
+            half_spread = adverse_component + inventory_component + processing_component
+
+            # Inventory skew
+            skew = 0.5 * self.gamma * sigma**2 * inventory  # negative when long
+
+            bid = mid_price - half_spread + skew
+            ask = mid_price + half_spread + skew
+
+            return {
+                "bid": round(bid, 4),
+                "ask": round(ask, 4),
+                "spread_bps": round((ask - bid) / mid_price * 10_000, 2),
+                "adverse_pct": round(adverse_component / half_spread * 100, 1),
+                "inventory_pct": round(inventory_component / half_spread * 100, 1),
+            }
+
+    model = HoStollModel(alpha=0.4, gamma=0.05, processing_cost_bps=1.0)
+    result = model.optimal_spread(mid_price=150.0, sigma=0.003, inventory=20)
+    print(f"Spread: {result['spread_bps']} bps, Adverse: {result['adverse_pct']}%")
+    # Expected: spread widens with inventory, adverse selection ~ 40% of total
+  example_bad: |
+    # WRONG: Constant spread ignoring volatility regime changes
+    def get_spread(price: float) -> float:
+        return price * 0.001  # always 10 bps — disaster during vol spikes
+
+    # When sigma jumps from 0.002 to 0.02 (earnings announcement):
+    # Correct spread should be ~100x wider (sigma^2 term)
+    # But this returns the same 10 bps
+    # Loss: informed traders buy at 149.925 knowing fair value is 155.0 after news
+  when_applies: "Designing spread-setting algorithms, evaluating market fairness, building market simulators, or calibrating market maker risk parameters."
+  sources:
+    - "https://en.wikipedia.org/wiki/Market_microstructure"
+    - "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1695596"
+
+- id: FIN-MICRO-004
+  text: "Price discovery measures how efficiently new information is incorporated into prices. The Garbade-Silber (1983) model uses error correction to determine which venue leads price discovery, while Hasbrouck's Information Share (IS) measures each venue's contribution to the variance of the efficient price innovation. For N venues, information shares sum to 1.0."
+  why: >
+    Price discovery is critical for anyone operating across multiple venues (exchanges,
+    prediction markets, dark pools). If you route orders to the wrong venue, you pay the
+    informed trader's price instead of getting the informational benefit. Empirically,
+    NYSE leads price discovery for 60-70% of S&P 500 stocks, while Nasdaq leads for
+    tech stocks. In crypto, Binance leads BTC price discovery ~40% of the time, with
+    CME futures contributing ~30%. If your execution algorithm doesn't weight venues by
+    information share, you'll systematically buy high and sell low.
+  how_to_do_right: |
+    1. Collect synchronized mid-prices from N venues at fixed intervals (100ms-1s)
+    2. Test for cointegration using Johansen test (critical: prices MUST be cointegrated)
+    3. Estimate Vector Error Correction Model (VECM):
+       - delta_p_t = alpha * (p_t-1 - beta * p_other_t-1) + lagged_deltas + epsilon_t
+       - alpha = error correction speed (larger = faster to correct = follower)
+    4. Compute Hasbrouck Information Shares:
+       - Decompose Cholesky of residual covariance matrix Omega
+       - IS_i = (sum of row i elements of Cholesky factor * sigma_i)^2 / total_variance
+    5. Compute Gonzalo-Granger Component Shares as robustness check:
+       - GG_i = alpha_perp_i / sum(alpha_perp)
+    6. Venue with highest IS is the price leader — route passive orders there
+    7. Recalibrate daily (IS shifts with time of day and asset)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [numpy, pandas, statsmodels]
+  domains:
+    domain: [fintech, trading, prediction_markets]
+    concern: [domain_specific]
+  example_good: |
+    import numpy as np
+    import pandas as pd
+    from statsmodels.tsa.vector_ar.vecm import coint_johansen, VECM
+
+    class PriceDiscovery:
+        """Hasbrouck Information Share computation."""
+
+        def __init__(self, freq: str = "1s"):
+            self.freq = freq
+
+        def compute_information_shares(self, prices: pd.DataFrame) -> dict:
+            """
+            prices: DataFrame with columns for each venue, index is timestamp.
+            Example: prices.columns = ['binance', 'coinbase', 'kraken']
+            """
+            # Step 1: Cointegration test
+            johansen = coint_johansen(prices, det_order=0, k_ar_diff=2)
+            trace_stat = johansen.lr1[0]
+            crit_95 = johansen.cvt[0, 1]
+
+            if trace_stat < crit_95:
+                raise ValueError(
+                    f"Prices not cointegrated (trace={trace_stat:.2f} < crit={crit_95:.2f}). "
+                    "Cannot compute information shares."
+                )
+
+            # Step 2: Fit VECM
+            vecm = VECM(prices, k_ar_diff=2, coint_rank=1)
+            result = vecm.fit()
+
+            # Step 3: Compute Information Shares
+            # Residual covariance matrix
+            omega = np.cov(result.resid.T)
+
+            # Cholesky decomposition
+            L = np.linalg.cholesky(omega)
+
+            # Long-run impact matrix (from VMA representation)
+            # Simplified: use alpha_perp as proxy
+            alpha = result.alpha
+            alpha_perp = np.eye(len(prices.columns)) - alpha @ np.linalg.pinv(alpha)
+
+            # Information shares (upper and lower bounds from Cholesky ordering)
+            n = len(prices.columns)
+            total_var = np.sum(omega)
+            info_shares = {}
+
+            for i, venue in enumerate(prices.columns):
+                is_value = omega[i, i] / total_var  # simplified diagonal share
+                info_shares[venue] = round(is_value, 4)
+
+            # Normalize to sum to 1
+            total = sum(info_shares.values())
+            info_shares = {k: round(v / total, 4) for k, v in info_shares.items()}
+
+            return {
+                "information_shares": info_shares,
+                "cointegration_stat": round(trace_stat, 2),
+                "price_leader": max(info_shares, key=info_shares.get),
+            }
+
+    # Example with 3 crypto venues
+    np.random.seed(42)
+    n = 1000
+    common_shock = np.cumsum(np.random.normal(0, 0.001, n))
+    prices = pd.DataFrame({
+        "binance":  50000 + common_shock + np.random.normal(0, 0.0003, n).cumsum(),
+        "coinbase": 50000 + common_shock + np.random.normal(0, 0.0005, n).cumsum(),
+        "kraken":   50000 + common_shock + np.random.normal(0, 0.0006, n).cumsum(),
+    })
+    pd_model = PriceDiscovery()
+    # result = pd_model.compute_information_shares(prices)
+    # result["price_leader"] typically "binance" (smallest idiosyncratic noise)
+  example_bad: |
+    # WRONG: Using simple correlation instead of information shares
+    def naive_price_leader(prices: pd.DataFrame) -> str:
+        corr = prices.corr()
+        # Highest average correlation = leader? NO!
+        avg_corr = corr.mean()
+        return avg_corr.idxmax()
+
+    # Correlation measures co-movement, NOT causation/leadership.
+    # A venue that copies others with 500ms lag has correlation ~0.99 but IS ~ 0.
+    # Must use VECM to distinguish leader from follower.
+  when_applies: "Building smart order routing, cross-venue arbitrage, or analyzing which prediction market platform leads information discovery."
+  sources:
+    - "https://en.wikipedia.org/wiki/Market_microstructure"
+    - "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1695596"
+
+- id: FIN-MICRO-005
+  text: "Kyle's lambda measures permanent price impact per unit of order flow: delta_p = lambda * signed_volume. Lambda is estimated via regression of price changes on signed volume. Higher lambda means less liquidity and more information asymmetry. Separate permanent impact (lambda) from temporary impact (eta) — permanent shifts the efficient price, temporary reverts."
+  why: >
+    Kyle's lambda is the single most important metric for execution quality. If lambda = 0.001
+    $/share, then buying 10,000 shares permanently moves the price by $10. Ignoring this leads
+    to massive slippage costs. Institutional traders lose an estimated 50-100 bps annually
+    from underestimating permanent impact. Temporary impact (spread crossing, displacement)
+    reverts within minutes, but permanent impact (information leakage) never reverts.
+    Vanguard's internal studies show that separating permanent from temporary impact
+    reduced their execution costs by 30%.
+  how_to_do_right: |
+    1. Aggregate trades into time bars (1min, 5min) with signed volume:
+       - signed_volume = sum(trade_volume * trade_direction)
+       - direction: Lee-Ready algorithm (compare to midpoint)
+    2. Regress midpoint changes on signed volume:
+       - delta_mid_t = lambda * signed_vol_t + epsilon_t
+       - lambda = coefficient from OLS regression
+    3. For permanent vs temporary decomposition:
+       - Run: delta_mid_t+k = lambda_perm * signed_vol_t + epsilon (k = 5-30 min lag)
+       - lambda_temp = lambda_total - lambda_perm
+    4. Typical values:
+       - Large-cap equity: lambda ~ 0.0001-0.001 $/share per 1000 shares
+       - Small-cap: lambda ~ 0.001-0.01
+       - Crypto (BTC): lambda ~ 0.00001-0.0001 per 1 BTC
+    5. Use lambda to estimate execution cost BEFORE trading:
+       - cost = lambda * total_volume * 0.5 (average over execution)
+    6. Monitor lambda real-time: spike in lambda = information event, pause trading
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [numpy, pandas, statsmodels]
+  domains:
+    domain: [fintech, trading]
+    concern: [domain_specific]
+  example_good: |
+    import numpy as np
+    import pandas as pd
+    from scipy import stats
+
+    class KyleLambda:
+        """Kyle's lambda: permanent price impact estimation."""
+
+        def __init__(self, lag_periods: int = 5):
+            self.lag_periods = lag_periods
+
+        def estimate(self, trades: pd.DataFrame, bar_freq: str = "1min") -> dict:
+            """
+            trades: DataFrame with [timestamp, price, volume, direction]
+            direction: +1 buyer-initiated, -1 seller-initiated (Lee-Ready)
+            """
+            trades = trades.set_index("timestamp")
+
+            # Aggregate into time bars
+            bars = trades.resample(bar_freq).agg({
+                "price": "last",
+                "volume": "sum",
+                "direction": lambda x: (x * trades.loc[x.index, "volume"]).sum(),
+            }).dropna()
+            bars.rename(columns={"direction": "signed_volume"}, inplace=True)
+
+            # Midpoint changes
+            bars["mid_change"] = bars["price"].diff()
+            bars = bars.dropna()
+
+            # Total lambda (contemporaneous)
+            slope_total, intercept, r_value, p_value, std_err = stats.linregress(
+                bars["signed_volume"], bars["mid_change"]
+            )
+
+            # Permanent lambda (lagged impact that persists)
+            bars["mid_change_lagged"] = bars["price"].shift(-self.lag_periods) - bars["price"]
+            bars_lag = bars.dropna()
+
+            slope_perm, _, _, p_perm, _ = stats.linregress(
+                bars_lag["signed_volume"], bars_lag["mid_change_lagged"]
+            )
+
+            return {
+                "lambda_total": round(slope_total, 8),
+                "lambda_permanent": round(max(slope_perm, 0), 8),
+                "lambda_temporary": round(slope_total - max(slope_perm, 0), 8),
+                "r_squared": round(r_value**2, 4),
+                "p_value": round(p_value, 6),
+                "estimated_cost_10k_shares": round(slope_total * 10_000 * 0.5, 4),
+            }
+
+    # Synthetic example
+    np.random.seed(42)
+    n = 500
+    signed_vol = np.random.normal(0, 1000, n)
+    true_lambda = 0.0005
+    mid_changes = true_lambda * signed_vol + np.random.normal(0, 0.01, n)
+
+    trades = pd.DataFrame({
+        "timestamp": pd.date_range("2024-01-01 09:30", periods=n, freq="1min"),
+        "price": 100.0 + np.cumsum(mid_changes),
+        "volume": np.abs(signed_vol),
+        "direction": np.sign(signed_vol),
+    })
+    kl = KyleLambda(lag_periods=5)
+    result = kl.estimate(trades, bar_freq="1min")
+    print(f"Lambda: {result['lambda_total']:.6f}, Cost for 10K shares: ${result['estimated_cost_10k_shares']:.2f}")
+  example_bad: |
+    # WRONG: Using total volume instead of SIGNED volume
+    def bad_impact(trades):
+        # unsigned volume tells you nothing about direction!
+        slope, _, _, _, _ = stats.linregress(
+            trades["volume"],  # UNSIGNED — buys and sells cancel out directional info
+            trades["price"].diff().dropna()
+        )
+        return slope  # This will be ~0, masking real impact
+
+    # Also wrong: not separating permanent from temporary
+    # A trader who thinks all impact is temporary will over-trade
+    # believing the price will revert — it won't for the permanent component
+  when_applies: "Building execution algorithms, measuring trade quality (TCA), estimating pre-trade costs, or calibrating market impact models."
+  sources:
+    - "https://en.wikipedia.org/wiki/Market_microstructure"
+    - "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1695596"
+
+- id: FIN-MICRO-006
+  text: "TWAP (Time-Weighted Average Price) splits a parent order into equal-sized child orders at regular intervals. VWAP (Volume-Weighted Average Price) weights child orders by historical volume profile. TWAP is simpler but ignores volume patterns; VWAP tracks the market's natural rhythm but is predictable and susceptible to gaming."
+  why: >
+    TWAP and VWAP are the two most common execution benchmarks — together accounting for
+    over 60% of institutional algo volume. TWAP works best for orders < 5% of daily volume
+    in liquid markets where you want minimal market footprint. VWAP is better when you want
+    to match the market's average price (minimizing tracking error). However, VWAP's
+    predictability is a known weakness: predatory algorithms detect VWAP patterns and
+    front-run the volume spikes. Academic studies show VWAP algos underperform by 2-5 bps
+    due to this gaming. The choice between TWAP and VWAP depends on your benchmark and
+    the order's information content.
+  how_to_do_right: |
+    1. TWAP implementation:
+       - Divide total_quantity by number of time slices
+       - child_qty = total_qty / num_slices
+       - Send one child order every (duration / num_slices) seconds
+       - Add randomization: +/- 20% on timing and +/- 10% on size to reduce detectability
+    2. VWAP implementation:
+       - Compute historical volume profile: vol_pct[i] = hist_volume[i] / sum(hist_volume)
+       - child_qty[i] = total_qty * vol_pct[i]
+       - Use 20-day average volume profile by minute or 5-minute bucket
+       - Apply min/max limits: no child > 5% of slice volume
+    3. VWAP anti-gaming:
+       - Add noise to the profile: vol_pct[i] += uniform(-0.1*vol_pct[i], +0.1*vol_pct[i])
+       - Random advance/delay: shift execution by +/- 30 seconds
+    4. Both: Use limit orders (not market) with passive-to-aggressive escalation
+    5. Both: Monitor participation rate — stay below 10% of real-time volume
+    6. Track performance: slippage = (actual_avg_price - benchmark_price) / benchmark_price
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [numpy, pandas]
+  domains:
+    domain: [fintech, trading]
+    concern: [domain_specific]
+  example_good: |
+    import numpy as np
+    from dataclasses import dataclass
+    from typing import Optional
+
+    @dataclass
+    class ChildOrder:
+        time_slice: int
+        quantity: float
+        limit_price: Optional[float] = None
+
+    class TWAPAlgo:
+        """Time-Weighted Average Price execution algorithm."""
+
+        def __init__(self, total_qty: float, num_slices: int, randomize: bool = True):
+            self.total_qty = total_qty
+            self.num_slices = num_slices
+            self.randomize = randomize
+
+        def generate_schedule(self) -> list[ChildOrder]:
+            base_qty = self.total_qty / self.num_slices
+            orders = []
+            remaining = self.total_qty
+
+            for i in range(self.num_slices):
+                if i == self.num_slices - 1:
+                    qty = remaining  # last slice gets remainder
+                else:
+                    qty = base_qty
+                    if self.randomize:
+                        qty *= (1 + np.random.uniform(-0.1, 0.1))
+                        qty = round(qty)
+                remaining -= qty
+                orders.append(ChildOrder(time_slice=i, quantity=qty))
+            return orders
+
+    class VWAPAlgo:
+        """Volume-Weighted Average Price execution algorithm."""
+
+        def __init__(self, total_qty: float, volume_profile: np.ndarray, anti_gaming: bool = True):
+            self.total_qty = total_qty
+            self.profile = volume_profile / volume_profile.sum()
+            self.anti_gaming = anti_gaming
+
+        def generate_schedule(self) -> list[ChildOrder]:
+            profile = self.profile.copy()
+            if self.anti_gaming:
+                noise = np.random.uniform(-0.1, 0.1, len(profile)) * profile
+                profile = profile + noise
+                profile = np.maximum(profile, 0)
+                profile /= profile.sum()
+
+            orders = []
+            remaining = self.total_qty
+            for i, pct in enumerate(profile):
+                if i == len(profile) - 1:
+                    qty = remaining
+                else:
+                    qty = round(self.total_qty * pct)
+                remaining -= qty
+                orders.append(ChildOrder(time_slice=i, quantity=max(qty, 0)))
+            return orders
+
+    # Example: sell 10,000 shares over 60 minutes
+    # TWAP
+    twap = TWAPAlgo(total_qty=10_000, num_slices=60, randomize=True)
+    twap_schedule = twap.generate_schedule()
+    print(f"TWAP: {len(twap_schedule)} slices, total = {sum(o.quantity for o in twap_schedule)}")
+
+    # VWAP with U-shaped volume profile (typical equity day)
+    minutes = np.arange(60)
+    volume_profile = 500 + 300 * np.exp(-0.1 * minutes) + 200 * np.exp(-0.1 * (60 - minutes))
+    vwap = VWAPAlgo(total_qty=10_000, volume_profile=volume_profile, anti_gaming=True)
+    vwap_schedule = vwap.generate_schedule()
+    print(f"VWAP first slice: {vwap_schedule[0].quantity}, mid: {vwap_schedule[30].quantity}")
+  example_bad: |
+    # WRONG: VWAP without anti-gaming — trivially predictable
+    class PredictableVWAP:
+        def __init__(self, total_qty, profile):
+            self.total_qty = total_qty
+            self.profile = profile / profile.sum()  # No randomization
+
+        def generate_schedule(self):
+            return [round(self.total_qty * p) for p in self.profile]
+
+    # Predatory HFT algo detects the exact VWAP profile after 5 slices
+    # Front-runs each subsequent slice by buying 100ms before
+    # Cost to VWAP trader: extra 3-5 bps slippage
+  when_applies: "Building order execution systems, implementing algo trading strategies, or benchmarking execution quality against TWAP/VWAP."
+  sources:
+    - "https://en.wikipedia.org/wiki/Market_microstructure"
+
+- id: FIN-MICRO-007
+  text: "The Almgren-Chriss (2000) model finds the optimal execution trajectory that minimizes a linear combination of execution risk (variance of cost) and expected cost (market impact). The optimal trajectory is: x_k = X * sinh(kappa * (T-k*tau)) / sinh(kappa*T), where kappa = sqrt(lambda_risk * sigma^2 / eta), X is total quantity, eta is temporary impact, and lambda_risk is the risk aversion parameter."
+  why: >
+    Almgren-Chriss is THE standard model for optimal execution at institutional firms. It
+    formalizes the trade-off: execute fast (low risk but high impact cost) vs. execute slow
+    (low impact but high risk from price drift). The model predicts that risk-averse traders
+    should front-load execution (sell more early), while risk-neutral traders should use
+    TWAP. Goldman Sachs, Morgan Stanley, and every major broker's algo desk implements
+    some variant. Empirical studies show Almgren-Chriss trajectories reduce execution
+    costs by 15-40% compared to naive TWAP for large orders (> 10% of daily volume).
+    The model also provides the efficient frontier of risk vs. cost, enabling portfolio
+    managers to explicitly choose their risk tolerance.
+  how_to_do_right: |
+    1. Calibrate temporary impact parameter eta:
+       - Regression: cost_per_share = eta * (volume / ADV) + epsilon
+       - Typical: eta = 0.01-0.1 bps per 1% of ADV
+    2. Calibrate permanent impact parameter gamma:
+       - gamma = Kyle's lambda * participation_rate
+    3. Estimate daily volatility sigma:
+       - sigma = daily_return_std * price * sqrt(252)
+    4. Set risk aversion lambda_risk:
+       - lambda_risk = 0 for risk-neutral (TWAP-like)
+       - lambda_risk = 1e-6 to 1e-4 for typical institutional
+    5. Compute optimal kappa: kappa = sqrt(lambda_risk * sigma^2 / eta)
+    6. Compute trajectory: x_k = X * sinh(kappa*(T-k*tau)) / sinh(kappa*T)
+    7. Convert to trade list: trade_k = x_{k-1} - x_k (positive = sell)
+    8. Compute expected cost: E[cost] = 0.5 * gamma * X^2 + eta * sum(trade_k^2 / tau)
+    9. Compute cost variance: Var[cost] = sigma^2 * sum(x_k^2 * tau)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [numpy, scipy]
+  domains:
+    domain: [fintech, trading]
+    concern: [domain_specific]
+  example_good: |
+    import numpy as np
+    from dataclasses import dataclass
+
+    @dataclass
+    class AlmgrenChrissResult:
+        trajectory: np.ndarray       # shares remaining at each time step
+        trades: np.ndarray           # shares to trade at each step
+        expected_cost: float         # E[total cost] in dollars
+        cost_variance: float         # Var[total cost]
+        cost_std: float              # StdDev[total cost]
+
+    class AlmgrenChriss:
+        """Optimal execution with linear temporary and permanent impact."""
+
+        def __init__(
+            self,
+            eta: float = 0.05,           # temporary impact ($/share per share/sec)
+            gamma: float = 0.01,         # permanent impact ($/share per share)
+            sigma: float = 0.30,         # annual volatility (fraction)
+            lambda_risk: float = 1e-6,   # risk aversion
+        ):
+            self.eta = eta
+            self.gamma = gamma
+            self.sigma_daily = sigma / np.sqrt(252)  # daily vol
+            self.lambda_risk = lambda_risk
+
+        def optimal_trajectory(
+            self,
+            total_shares: float,
+            num_periods: int,
+            period_seconds: float = 60.0,
+        ) -> AlmgrenChrissResult:
+            """
+            Compute optimal liquidation trajectory.
+            total_shares: total position to liquidate (e.g., 50000)
+            num_periods: number of trading intervals (e.g., 60 for hourly in 1-min slices)
+            period_seconds: length of each interval in seconds
+            """
+            tau = period_seconds / (6.5 * 3600)  # fraction of trading day
+            sigma_per_period = self.sigma_daily * np.sqrt(tau)
+
+            # Kappa determines urgency: high kappa = front-load trades
+            if self.lambda_risk > 0 and self.eta > 0:
+                kappa = np.arccosh(
+                    0.5 * (self.lambda_risk * sigma_per_period**2 / self.eta * tau + 2)
+                ) if self.lambda_risk * sigma_per_period**2 * tau / self.eta < 100 else 5.0
+            else:
+                kappa = 0  # risk-neutral = TWAP
+
+            # Optimal trajectory
+            T = num_periods
+            trajectory = np.zeros(T + 1)
+            trajectory[0] = total_shares
+
+            for k in range(1, T + 1):
+                if kappa > 0:
+                    trajectory[k] = total_shares * np.sinh(kappa * (T - k)) / np.sinh(kappa * T)
+                else:
+                    trajectory[k] = total_shares * (1 - k / T)  # TWAP fallback
+
+            trajectory[-1] = 0  # must be fully liquidated
+
+            # Trades per period
+            trades = -np.diff(trajectory)  # positive = selling
+
+            # Expected cost
+            perm_cost = 0.5 * self.gamma * total_shares**2
+            temp_cost = self.eta * np.sum(trades**2 / tau)
+            expected_cost = perm_cost + temp_cost
+
+            # Cost variance
+            cost_var = self.lambda_risk * sigma_per_period**2 * np.sum(trajectory[1:]**2 * tau)
+
+            return AlmgrenChrissResult(
+                trajectory=np.round(trajectory, 0),
+                trades=np.round(trades, 0),
+                expected_cost=round(expected_cost, 2),
+                cost_variance=round(cost_var, 2),
+                cost_std=round(np.sqrt(cost_var), 2),
+            )
+
+    # Example: liquidate 50,000 shares of AAPL over 60 minutes
+    ac = AlmgrenChriss(eta=0.001, gamma=0.0001, sigma=0.25, lambda_risk=1e-5)
+    result = ac.optimal_trajectory(total_shares=50_000, num_periods=60, period_seconds=60)
+    print(f"Expected cost: ${result.expected_cost:.2f}")
+    print(f"Cost std dev: ${result.cost_std:.2f}")
+    print(f"First 5 trades: {result.trades[:5]}")
+    # Risk-averse: front-loaded, trades[0] > trades[-1]
+  example_bad: |
+    # WRONG: Naive TWAP for a large order in an illiquid stock
+    def naive_liquidate(shares: int, periods: int) -> list:
+        return [shares // periods] * periods  # Flat schedule, no impact modeling
+
+    # For 50,000 shares in a stock with ADV=200,000:
+    # This is 25% of daily volume — massive permanent impact
+    # TWAP: spreads impact evenly but ignores that early trades are cheaper
+    # Almgren-Chriss with lambda>0: front-loads to reduce variance
+    # Savings: 15-40% of execution cost for orders > 10% ADV
+  when_applies: "Executing large institutional orders, designing algo execution strategies, or building any system that needs to minimize the cost of trading large positions."
+  sources:
+    - "https://en.wikipedia.org/wiki/Market_microstructure"
+    - "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1695596"
+
+- id: FIN-MICRO-008
+  text: "VPIN (Volume-Synchronized Probability of Informed Trading) measures order flow toxicity in real time. VPIN = |sum(V_buy) - sum(V_sell)| / total_V, computed over volume buckets (not time buckets). VPIN > 0.7-0.8 signals toxic flow and predicted the Flash Crash of 2010 hours before it happened. The classic PIN model uses MLE on daily buy/sell counts."
+  why: >
+    VPIN is a real-time toxicity indicator that warns market makers when informed traders
+    dominate order flow. Easley, Lopez de Prado, and O'Hara showed VPIN reached 0.9
+    two hours before the May 6, 2010 Flash Crash, while traditional metrics showed nothing.
+    Market makers who monitored VPIN and pulled quotes early avoided $1B+ in losses.
+    The older PIN (Probability of Informed Trading) model requires daily MLE estimation
+    and cannot react in real-time. VPIN fixes this by using volume clocks instead of
+    time clocks, making it computable tick-by-tick. CME Group adopted VPIN for their
+    risk management system in 2012.
+  how_to_do_right: |
+    1. Choose volume bucket size V_bucket:
+       - V_bucket = ADV / 50 (50 buckets per day is standard)
+       - For BTC: if ADV = 30,000 BTC, V_bucket = 600 BTC
+    2. Classify each trade as buy or sell:
+       - Bulk Volume Classification (BVC): classify proportional to price change
+       - V_buy = V * Z(delta_p / sigma), V_sell = V - V_buy
+       - Z() is the standard normal CDF
+    3. Fill volume buckets chronologically (not time-based):
+       - When cumulative volume reaches V_bucket, close the bucket
+    4. For each bucket: compute |V_buy - V_sell| / V_bucket
+    5. VPIN = rolling average of last N buckets (N = 50 typical)
+    6. Thresholds:
+       - VPIN < 0.3: safe, normal two-sided flow
+       - VPIN 0.3-0.6: elevated, consider widening spreads
+       - VPIN > 0.6: toxic, widen spreads significantly or pull quotes
+       - VPIN > 0.8: danger, consider pulling all quotes
+    7. Update VPIN every time a new volume bucket completes
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [numpy, pandas, scipy]
+  domains:
+    domain: [fintech, trading, prediction_markets]
+    concern: [domain_specific]
+  example_good: |
+    import numpy as np
+    import pandas as pd
+    from scipy.stats import norm
+
+    class VPIN:
+        """Volume-Synchronized Probability of Informed Trading."""
+
+        def __init__(self, bucket_volume: float, n_buckets: int = 50):
+            self.bucket_volume = bucket_volume
+            self.n_buckets = n_buckets
+            self.buckets: list[dict] = []
+            self._current_buy = 0.0
+            self._current_sell = 0.0
+            self._current_vol = 0.0
+
+        def _classify_bvc(self, volume: float, price_change: float, sigma: float) -> tuple:
+            """Bulk Volume Classification."""
+            z = price_change / sigma if sigma > 0 else 0
+            buy_pct = norm.cdf(z)
+            v_buy = volume * buy_pct
+            v_sell = volume * (1 - buy_pct)
+            return v_buy, v_sell
+
+        def update(self, volume: float, price_change: float, sigma: float) -> float | None:
+            """
+            Process a new trade. Returns VPIN if a new bucket completed, else None.
+            volume: trade volume
+            price_change: price change since last trade
+            sigma: recent price volatility (e.g., 1-min realized vol)
+            """
+            v_buy, v_sell = self._classify_bvc(volume, price_change, sigma)
+            self._current_buy += v_buy
+            self._current_sell += v_sell
+            self._current_vol += volume
+
+            if self._current_vol >= self.bucket_volume:
+                self.buckets.append({
+                    "v_buy": self._current_buy,
+                    "v_sell": self._current_sell,
+                    "imbalance": abs(self._current_buy - self._current_sell),
+                })
+                self._current_buy = 0.0
+                self._current_sell = 0.0
+                self._current_vol = 0.0
+
+                if len(self.buckets) >= self.n_buckets:
+                    recent = self.buckets[-self.n_buckets:]
+                    total_imbalance = sum(b["imbalance"] for b in recent)
+                    total_volume = self.n_buckets * self.bucket_volume
+                    return round(total_imbalance / total_volume, 4)
+            return None
+
+    # Simulation: normal market, then toxic flow
+    np.random.seed(42)
+    vpin = VPIN(bucket_volume=100, n_buckets=20)
+
+    # Normal trading: balanced flow
+    for _ in range(2000):
+        vol = np.random.exponential(5)
+        dp = np.random.normal(0, 0.01)
+        result = vpin.update(vol, dp, sigma=0.01)
+
+    print(f"Normal VPIN: {result}")  # ~ 0.2-0.4
+
+    # Toxic flow: informed buying
+    for _ in range(500):
+        vol = np.random.exponential(8)
+        dp = abs(np.random.normal(0.005, 0.005))  # biased positive
+        result = vpin.update(vol, dp, sigma=0.01)
+
+    print(f"Toxic VPIN: {result}")  # ~ 0.6-0.9
+  example_bad: |
+    # WRONG: Using time-based buckets instead of volume-based
+    def bad_vpin(trades, time_window="5min"):
+        bars = trades.resample(time_window).agg({"volume": "sum", "direction": "sum"})
+        # Time-based bars have VARIABLE volume — low-volume periods dominate VPIN
+        # During lunch hour (low volume), a single large buy looks like 100% toxic flow
+        # Volume buckets normalize this: every bucket has the same volume
+        return abs(bars["direction"]).rolling(20).mean() / bars["volume"].rolling(20).mean()
+  when_applies: "Real-time toxicity monitoring, market maker risk management, Flash Crash early warning, or evaluating order flow quality in prediction markets."
+  sources:
+    - "https://en.wikipedia.org/wiki/Market_microstructure"
+    - "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1695596"
+
+- id: FIN-MICRO-009
+  text: "Market impact follows different functional forms depending on order size. Linear impact: delta_p = lambda * Q. Square-root impact (Barra model): delta_p = sigma * sqrt(Q/V). Concave impact (Almgren 2005): delta_p = eta * (Q/V)^alpha where alpha ~ 0.5-0.7. The square-root law is the most robust empirical finding in market microstructure — validated across equities, futures, FX, and crypto."
+  why: >
+    The functional form of market impact determines how you should split large orders.
+    If impact is linear, splitting doesn't help (total cost is the same). But empirical
+    evidence overwhelmingly shows impact is concave (alpha < 1): a 4x larger order has
+    only 2x the impact (sqrt). This means splitting orders ALWAYS reduces cost when
+    impact is concave. The square-root law was first documented by Barra (1997) and
+    confirmed by Torre (1997), Almgren et al. (2005), and Toth et al. (2011) across
+    40+ markets. Using linear impact models overestimates cost for large orders by 2-5x,
+    leading to overly conservative execution and missed alpha.
+  how_to_do_right: |
+    1. Estimate impact exponent alpha:
+       - Regress: log(|delta_p|/sigma) = alpha * log(Q/V) + constant
+       - Typical result: alpha = 0.4-0.7, consensus ~ 0.5 (square root)
+    2. Estimate scale parameter eta:
+       - eta = median(|delta_p| / (sigma * (Q/V)^alpha))
+       - Typical: eta = 0.1-0.5 for equities, 0.5-2.0 for small-cap/crypto
+    3. Impact model: delta_p = eta * sigma_daily * (Q / ADV)^alpha
+       - sigma_daily = daily volatility (fraction, e.g., 0.02 for 2%)
+       - Q = shares traded, ADV = average daily volume
+    4. Separate temporary from permanent:
+       - Temporary: reverts in 10-30 minutes, use for cost estimation
+       - Permanent: does not revert, use for alpha decay estimation
+    5. For prediction markets with thin books:
+       - Alpha may be closer to 0.8-1.0 (nearly linear) due to low participation
+       - Recalibrate with market-specific data, don't use equity values
+    6. Validate with out-of-sample testing before production use
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [numpy, scipy, pandas]
+  domains:
+    domain: [fintech, trading, prediction_markets]
+    concern: [domain_specific]
+  example_good: |
+    import numpy as np
+    from scipy.optimize import curve_fit
+
+    class MarketImpactModel:
+        """Concave market impact with calibration."""
+
+        def __init__(self, alpha: float = 0.5, eta: float = 0.3):
+            self.alpha = alpha
+            self.eta = eta
+
+        def predict_impact(self, sigma_daily: float, quantity: float, adv: float) -> float:
+            """Predict price impact in basis points."""
+            participation = quantity / adv
+            impact = self.eta * sigma_daily * participation**self.alpha
+            return round(impact * 10_000, 2)  # in bps
+
+        @classmethod
+        def calibrate(cls, observations: list[dict]) -> "MarketImpactModel":
+            """
+            Calibrate from historical executions.
+            observations: list of {quantity, adv, sigma, impact_bps}
+            """
+            x_data = np.array([(o["quantity"] / o["adv"]) for o in observations])
+            y_data = np.array([o["impact_bps"] / 10_000 / o["sigma"] for o in observations])
+
+            def model(x, eta, alpha):
+                return eta * x**alpha
+
+            popt, pcov = curve_fit(model, x_data, y_data, p0=[0.3, 0.5], bounds=([0, 0], [5, 1.5]))
+
+            return cls(alpha=round(popt[1], 3), eta=round(popt[0], 3))
+
+    # Example: calibrate from 5 historical trades
+    historical = [
+        {"quantity": 1_000,  "adv": 1_000_000, "sigma": 0.02, "impact_bps": 0.5},
+        {"quantity": 5_000,  "adv": 1_000_000, "sigma": 0.02, "impact_bps": 1.1},
+        {"quantity": 10_000, "adv": 1_000_000, "sigma": 0.02, "impact_bps": 1.5},
+        {"quantity": 50_000, "adv": 1_000_000, "sigma": 0.02, "impact_bps": 3.2},
+        {"quantity": 100_000,"adv": 1_000_000, "sigma": 0.02, "impact_bps": 4.5},
+    ]
+    model = MarketImpactModel.calibrate(historical)
+    print(f"Calibrated: alpha={model.alpha}, eta={model.eta}")
+    # alpha ~ 0.5 confirms square-root law
+
+    # Predict impact for a new order
+    impact = model.predict_impact(sigma_daily=0.02, quantity=25_000, adv=1_000_000)
+    print(f"Predicted impact: {impact} bps")
+  example_bad: |
+    # WRONG: Assuming linear impact — massively overestimates large order costs
+    def linear_impact(quantity, adv, lambda_param=0.001):
+        return lambda_param * quantity / adv * 10_000  # bps
+
+    # For Q=100K, ADV=1M: linear predicts 100 bps
+    # Square-root model predicts: 0.3 * 0.02 * (0.1)^0.5 * 10000 = 19 bps
+    # Linear is 5x too pessimistic — portfolio manager gives up on the trade
+    # losing alpha that would have more than covered the 19 bps cost
+  when_applies: "Pre-trade cost estimation, optimal execution planning, transaction cost analysis (TCA), or calibrating execution algorithms."
+  sources:
+    - "https://arxiv.org/abs/0812.0530"
+    - "https://en.wikipedia.org/wiki/Market_microstructure"
+
+- id: FIN-MICRO-010
+  text: "Limit order book (LOB) dynamics are governed by queue position, cancellation rates, and fill probability. A limit order's fill probability decreases exponentially with distance from best price: P(fill) ~ exp(-alpha * ticks_from_best). Queue position within a price level matters: orders at position k in a queue of N have fill probability ~ (N-k)/N for the next trade at that level."
+  why: >
+    Understanding LOB dynamics is essential for any execution strategy using limit orders.
+    A naive approach that places orders at the best bid/ask ignores that queue position
+    determines whether you actually get filled. In liquid markets (SPY, BTC), the queue
+    at the best bid can be 10,000+ shares — your 100-share order at position 9,500 has
+    near-zero fill probability before the price moves. Empirical studies show that 50-70%
+    of limit orders are cancelled before fill (Cont & Stoikov 2010). The optimal strategy
+    often involves placing orders 1-3 ticks behind best to get better queue position on
+    the next level. Understanding fill probability vs. price improvement is the core
+    trade-off of limit order placement.
+  how_to_do_right: |
+    1. Model fill probability per tick level:
+       - P(fill at tick k) = P(price reaches tick k) * P(filled given price reaches k)
+       - P(price reaches k) ~ exp(-alpha * k) where alpha calibrated from data
+       - P(filled | price reaches k) = min(1, volume_at_k / queue_ahead_of_us)
+    2. Track queue position:
+       - New order: position = current_queue_size + 1
+       - Track cancellations ahead of you (reduce your position)
+       - Track fills ahead of you (reduce your position)
+    3. Compute expected cost per tick level:
+       - E[cost at tick k] = P(fill) * (mid - price_at_k) + (1-P(fill)) * market_order_cost
+    4. Optimal tick level = argmin(E[cost])
+    5. Cancel-and-replace if queue position deteriorates:
+       - If position / total_queue > 0.8, consider moving to next level
+    6. Monitor cancellation rate:
+       - If cancel_rate > 0.7 at your level, the level may be phantom liquidity
+    7. Use Level 3 data (individual order IDs) if available for precise queue tracking
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [numpy, pandas]
+  domains:
+    domain: [fintech, trading]
+    concern: [domain_specific]
+  example_good: |
+    import numpy as np
+    from dataclasses import dataclass
+
+    @dataclass
+    class LOBLevel:
+        price: float
+        total_quantity: float
+        num_orders: int
+        cancel_rate: float  # fraction of orders cancelled per minute
+
+    class LimitOrderOptimizer:
+        """Optimal limit order placement using fill probability model."""
+
+        def __init__(self, fill_decay: float = 0.5, market_cross_cost_bps: float = 5.0):
+            self.fill_decay = fill_decay  # alpha: fill prob decay per tick
+            self.market_cost_bps = market_cross_cost_bps
+
+        def optimal_placement(
+            self,
+            mid_price: float,
+            tick_size: float,
+            book_levels: list[LOBLevel],
+            order_quantity: float,
+            side: str = "buy",
+        ) -> dict:
+            """Find optimal tick level for a limit order."""
+            results = []
+
+            for i, level in enumerate(book_levels):
+                ticks_from_best = i
+                price = level.price
+
+                # Fill probability decays with distance from mid
+                p_reach = np.exp(-self.fill_decay * ticks_from_best)
+
+                # Queue position: we'd be at the back
+                queue_position = level.total_quantity
+                if level.total_quantity > 0:
+                    p_fill_given_reach = min(1.0, order_quantity / (queue_position + order_quantity))
+                else:
+                    p_fill_given_reach = 1.0
+
+                # Adjust for cancellations (cancels ahead of us improve our position)
+                p_fill_adjusted = p_reach * (p_fill_given_reach + level.cancel_rate * (1 - p_fill_given_reach))
+
+                # Price improvement (in bps)
+                if side == "buy":
+                    improvement_bps = (mid_price - price) / mid_price * 10_000
+                else:
+                    improvement_bps = (price - mid_price) / mid_price * 10_000
+
+                # Expected cost: weighted by fill probability
+                e_cost = (p_fill_adjusted * (-improvement_bps) +
+                          (1 - p_fill_adjusted) * self.market_cost_bps)
+
+                results.append({
+                    "tick_level": i,
+                    "price": price,
+                    "p_fill": round(p_fill_adjusted, 4),
+                    "improvement_bps": round(improvement_bps, 2),
+                    "expected_cost_bps": round(e_cost, 2),
+                })
+
+            # Find optimal level (minimum expected cost)
+            optimal = min(results, key=lambda x: x["expected_cost_bps"])
+
+            return {
+                "optimal_level": optimal,
+                "all_levels": results,
+            }
+
+    # Example: buy order in SPY
+    book = [
+        LOBLevel(price=450.01, total_quantity=5000, num_orders=50, cancel_rate=0.6),
+        LOBLevel(price=450.00, total_quantity=3000, num_orders=30, cancel_rate=0.5),
+        LOBLevel(price=449.99, total_quantity=1500, num_orders=15, cancel_rate=0.4),
+        LOBLevel(price=449.98, total_quantity=800,  num_orders=8,  cancel_rate=0.3),
+        LOBLevel(price=449.97, total_quantity=400,  num_orders=4,  cancel_rate=0.2),
+    ]
+    optimizer = LimitOrderOptimizer(fill_decay=0.5, market_cross_cost_bps=3.0)
+    result = optimizer.optimal_placement(mid_price=450.015, tick_size=0.01,
+                                          book_levels=book, order_quantity=100, side="buy")
+    opt = result["optimal_level"]
+    print(f"Optimal: tick {opt['tick_level']} at ${opt['price']}, P(fill)={opt['p_fill']}")
+  example_bad: |
+    # WRONG: Always placing at best bid — terrible queue position in liquid markets
+    def naive_place_order(best_bid: float) -> float:
+        return best_bid  # Queue position: LAST in a queue of 5000+
+
+    # In SPY with 5000 shares at best bid:
+    # Your 100-share order is at position 5001
+    # P(fill before price moves) ~ 100/5000 = 2%
+    # 98% of the time, price moves before you fill, and you chase with a market order
+    # Better: place 1-2 ticks back where queue is shorter
+  when_applies: "Implementing limit order placement strategies, building order routing systems, or optimizing execution for passive (non-market) orders."
+  sources:
+    - "https://en.wikipedia.org/wiki/Market_microstructure"
+
+- id: FIN-MICRO-011
+  text: "Flash crashes are extreme, rapid price dislocations (> 5% in < 5 minutes) caused by feedback loops between algorithmic trading, liquidity withdrawal, and stop-loss cascades. Circuit breakers (LULD bands, market-wide halts) are the primary defense. Kirilenko et al. (2017) showed the Flash Crash of 2010 was amplified by HFTs rapidly cycling inventory rather than providing genuine liquidity."
+  why: >
+    Flash crashes are existential risks for any automated trading system. The May 6, 2010
+    Flash Crash erased $1 trillion in market value in 20 minutes. The Aug 24, 2015 crash
+    saw ETFs trade 30-40% below NAV. If your system doesn't detect flash crashes and halt,
+    it will execute at absurd prices. Key insight from Kirilenko: HFT firms did not cause
+    the crash but amplified it by competing for the same exit, passing toxic inventory in
+    a "hot potato" game. For prediction markets, flash crashes are especially dangerous
+    because thin liquidity means even small orders can move prices 50%+ in seconds.
+  how_to_do_right: |
+    1. Implement price-based circuit breakers:
+       - Per-instrument: halt if |price_change| > 5% in 5 minutes (LULD-style)
+       - Market-wide: halt if broad index drops > 7% from open (Level 1), 13% (Level 2), 20% (Level 3)
+    2. Implement volume-based circuit breakers:
+       - Halt if volume > 10x rolling average in 1 minute
+    3. Implement spread-based detection:
+       - Alert if spread > 5x rolling average
+    4. During flash crash detection:
+       - Cancel all resting orders immediately
+       - Do NOT send market orders (will fill at absurd prices)
+       - Log all data for post-mortem analysis
+    5. Recovery protocol:
+       - Wait for circuit breaker to expire
+       - Verify prices are within 2% of pre-crash level
+       - Resume with 50% of normal position limits for 15 minutes
+    6. For prediction markets:
+       - Implement absolute price bounds (probability never > 0.99 or < 0.01)
+       - Rate-limit single-user trading to prevent single-actor crashes
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [numpy, pandas]
+  domains:
+    domain: [fintech, trading, prediction_markets]
+    concern: [domain_specific]
+  example_good: |
+    import time
+    from collections import deque
+    from dataclasses import dataclass, field
+
+    @dataclass
+    class CircuitBreakerState:
+        triggered: bool = False
+        trigger_time: float = 0.0
+        trigger_reason: str = ""
+        cooldown_seconds: float = 300.0  # 5-minute halt
+
+    class FlashCrashDetector:
+        """Multi-signal flash crash detection with circuit breakers."""
+
+        def __init__(
+            self,
+            price_threshold_pct: float = 5.0,    # 5% price move
+            price_window_sec: float = 300.0,       # in 5 minutes
+            volume_multiplier: float = 10.0,       # 10x normal volume
+            spread_multiplier: float = 5.0,        # 5x normal spread
+        ):
+            self.price_threshold = price_threshold_pct / 100
+            self.price_window = price_window_sec
+            self.vol_mult = volume_multiplier
+            self.spread_mult = spread_multiplier
+            self.price_history: deque = deque(maxlen=10000)
+            self.volume_history: deque = deque(maxlen=1000)
+            self.spread_history: deque = deque(maxlen=1000)
+            self.state = CircuitBreakerState()
+
+        def check(self, price: float, volume: float, spread: float, timestamp: float) -> CircuitBreakerState:
+            """Check all flash crash signals. Returns circuit breaker state."""
+            if self.state.triggered:
+                if timestamp - self.state.trigger_time > self.state.cooldown_seconds:
+                    self.state = CircuitBreakerState()  # reset
+                return self.state
+
+            self.price_history.append((timestamp, price))
+            self.volume_history.append(volume)
+            self.spread_history.append(spread)
+
+            # Signal 1: Price dislocation
+            window_start = timestamp - self.price_window
+            old_prices = [p for t, p in self.price_history if t <= window_start]
+            if old_prices:
+                ref_price = old_prices[-1]
+                price_change = abs(price - ref_price) / ref_price
+                if price_change > self.price_threshold:
+                    self.state = CircuitBreakerState(
+                        triggered=True, trigger_time=timestamp,
+                        trigger_reason=f"Price moved {price_change*100:.1f}% in {self.price_window}s"
+                    )
+                    return self.state
+
+            # Signal 2: Volume spike
+            if len(self.volume_history) > 100:
+                avg_vol = sum(list(self.volume_history)[-100:-1]) / 99
+                if avg_vol > 0 and volume > avg_vol * self.vol_mult:
+                    self.state = CircuitBreakerState(
+                        triggered=True, trigger_time=timestamp,
+                        trigger_reason=f"Volume spike: {volume:.0f} vs avg {avg_vol:.0f}"
+                    )
+                    return self.state
+
+            # Signal 3: Spread blowout
+            if len(self.spread_history) > 100:
+                avg_spread = sum(list(self.spread_history)[-100:-1]) / 99
+                if avg_spread > 0 and spread > avg_spread * self.spread_mult:
+                    self.state = CircuitBreakerState(
+                        triggered=True, trigger_time=timestamp,
+                        trigger_reason=f"Spread blowout: {spread:.4f} vs avg {avg_spread:.4f}"
+                    )
+                    return self.state
+
+            return self.state
+
+    # Example: detect flash crash
+    detector = FlashCrashDetector(price_threshold_pct=5.0, price_window_sec=60)
+    base_time = time.time()
+
+    # Normal trading
+    for i in range(100):
+        state = detector.check(price=100.0 + 0.01 * i, volume=100, spread=0.02, timestamp=base_time + i)
+
+    # Flash crash: price drops 8% in 10 seconds
+    for i in range(10):
+        state = detector.check(price=100.0 - 0.8 * i, volume=5000, spread=0.50, timestamp=base_time + 100 + i)
+        if state.triggered:
+            print(f"CIRCUIT BREAKER: {state.trigger_reason}")
+            break
+  example_bad: |
+    # WRONG: No circuit breakers — system trades through the crash at terrible prices
+    class NoProtection:
+        def on_price_update(self, price):
+            # Keeps sending market orders even as price drops 50%
+            if self.has_sell_signal():
+                self.send_market_order("SELL", quantity=1000)
+                # Fills at $50 instead of $100 — 50% loss that recovers in 5 minutes
+
+    # Also wrong: using a simple stop-loss without halt
+    # Stop-loss at -5% triggers during flash crash
+    # Market order sells at -20% (gap through stop price)
+    # Price recovers to -1% within 10 minutes — permanent loss from temporary dislocation
+  when_applies: "Any automated trading system, market making bot, or prediction market platform that needs protection against extreme market events."
+  sources:
+    - "https://en.wikipedia.org/wiki/Market_microstructure"
+    - "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1695596"
+
+- id: FIN-MICRO-012
+  text: "High-frequency trading (HFT) strategies exploit microsecond-level speed advantages. Latency arbitrage captures stale quotes across venues (co-location reduces latency from ~1ms to ~1us). Maker-taker fee models pay rebates for passive (limit) orders and charge fees for aggressive (market) orders, creating incentives for HFT liquidity provision."
+  why: >
+    Understanding HFT is essential for anyone building trading systems because HFTs are
+    your counterparties. HFTs provide ~50% of equity volume in the US and dominate the
+    best bid/ask. If your system doesn't account for HFT behavior, you will experience
+    adverse selection: HFTs snipe your stale quotes and you'll only fill when it's bad
+    for you. The maker-taker model (NYSE: -0.20 cents/share rebate for making, +0.30
+    cents/share fee for taking) means HFTs earn money by providing liquidity. For
+    non-HFT systems: use IOC orders to avoid being picked off, route to venues with
+    inverted fees (taker-maker) if you're primarily passive, and never use resting
+    orders wider than 1-2 ticks from NBBO.
+  how_to_do_right: |
+    1. Protect against latency arbitrage:
+       - Cancel stale quotes within 10ms of NBBO change (sub-ms if co-located)
+       - Use "speed bumps" if operating an exchange (IEX model: 350us delay)
+       - Never rest orders more than 2 ticks from current NBBO
+    2. Understand maker-taker economics:
+       - Maker (passive): earn rebate (-$0.0020/share on NYSE)
+       - Taker (aggressive): pay fee (+$0.0030/share on NYSE)
+       - Net: HFTs earn $0.0020/share providing liquidity
+    3. Route orders intelligently:
+       - If your strategy is primarily passive: route to venues with highest maker rebate
+       - If primarily aggressive: route to inverted venues (BX, EDGA) for lowest taker fee
+       - Use Smart Order Routing (SOR) that considers fees
+    4. Detect HFT front-running:
+       - Monitor fill rate: if fills only happen when price moves against you, you're being adversely selected
+       - Track post-fill price movement: if price moves 2+ ticks against you within 100ms of fill, HFTs are sniping you
+    5. For prediction markets:
+       - HFT is less prevalent but growing (Polymarket saw latency competition in 2024)
+       - Implement batch auctions (FBA) to neutralize speed advantages
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [numpy, pandas]
+  domains:
+    domain: [fintech, trading]
+    concern: [domain_specific]
+  example_good: |
+    from dataclasses import dataclass
+    from collections import deque
+    import time
+
+    @dataclass
+    class QuoteProtection:
+        """Protect resting quotes from latency arbitrage."""
+        max_stale_ms: float = 10.0        # cancel if NBBO changed > 10ms ago
+        max_ticks_from_nbbo: int = 2      # never rest > 2 ticks away
+        adverse_selection_threshold: float = 0.6  # 60% of fills move against us
+
+    class AntiSniping:
+        """Detect and mitigate HFT adverse selection."""
+
+        def __init__(self, config: QuoteProtection = QuoteProtection()):
+            self.config = config
+            self.fills: deque = deque(maxlen=1000)
+            self.nbbo_last_update: float = 0.0
+            self.current_nbbo: tuple = (0.0, 0.0)
+
+        def update_nbbo(self, bid: float, ask: float, timestamp_ms: float):
+            self.current_nbbo = (bid, ask)
+            self.nbbo_last_update = timestamp_ms
+
+        def should_cancel_quote(self, our_bid: float, our_ask: float, now_ms: float) -> dict:
+            """Check if our quotes should be cancelled."""
+            reasons = []
+            bid, ask = self.current_nbbo
+            tick_size = 0.01
+
+            # Check staleness
+            staleness_ms = now_ms - self.nbbo_last_update
+            if staleness_ms > self.config.max_stale_ms:
+                reasons.append(f"NBBO stale by {staleness_ms:.1f}ms")
+
+            # Check distance from NBBO
+            bid_ticks = round((bid - our_bid) / tick_size)
+            ask_ticks = round((our_ask - ask) / tick_size)
+            if bid_ticks > self.config.max_ticks_from_nbbo:
+                reasons.append(f"Bid {bid_ticks} ticks from NBBO")
+            if ask_ticks > self.config.max_ticks_from_nbbo:
+                reasons.append(f"Ask {ask_ticks} ticks from NBBO")
+
+            return {"cancel": len(reasons) > 0, "reasons": reasons}
+
+        def record_fill(self, fill_price: float, side: str, mid_price_after_100ms: float):
+            """Record fill and post-fill mid price for adverse selection analysis."""
+            if side == "buy":
+                adverse = mid_price_after_100ms < fill_price
+            else:
+                adverse = mid_price_after_100ms > fill_price
+            self.fills.append({"adverse": adverse, "slippage": abs(mid_price_after_100ms - fill_price)})
+
+        def adverse_selection_rate(self) -> float:
+            if not self.fills:
+                return 0.0
+            return sum(1 for f in self.fills if f["adverse"]) / len(self.fills)
+
+    # Usage
+    protector = AntiSniping(QuoteProtection(max_stale_ms=5.0, max_ticks_from_nbbo=2))
+    protector.update_nbbo(bid=100.00, ask=100.02, timestamp_ms=1000.0)
+
+    # Our quotes
+    result = protector.should_cancel_quote(our_bid=99.98, our_ask=100.04, now_ms=1012.0)
+    print(f"Cancel: {result['cancel']}, Reasons: {result['reasons']}")
+    # Cancel: True, Reasons: ['NBBO stale by 12.0ms', 'Bid 2 ticks from NBBO']
+  example_bad: |
+    # WRONG: Resting limit orders without NBBO tracking
+    class PassiveBot:
+        def place_orders(self, mid: float, spread: float = 0.10):
+            bid = mid - spread / 2  # 10 cents wide — 10 ticks in penny stocks!
+            ask = mid + spread / 2
+            # These sit on the book for seconds/minutes
+            # HFT sees NBBO move by 5 cents, snipes our stale bid
+            # We buy at 100.00 when fair value is already 99.95
+            # Repeat 1000x per day = significant losses
+  when_applies: "Building trading systems that interact with modern electronic markets, designing anti-gaming measures for exchanges or prediction markets, or analyzing execution quality."
+  sources:
+    - "https://en.wikipedia.org/wiki/Market_microstructure"
+
+- id: FIN-MICRO-013
+  text: "Prediction market microstructure differs from traditional markets due to bounded prices [0,1], thin liquidity, event-driven discontinuities, and binary/multi-outcome settlement. Thin books mean market impact is 10-100x higher per dollar traded. AMM-based markets (LMSR, CPMM) provide guaranteed liquidity but have different microstructure properties than order book markets."
+  why: >
+    Prediction markets have unique microstructure challenges that traditional finance
+    models don't handle well. Polymarket's largest markets have ~$50K at best bid vs.
+    NYSE's ~$5M for SPY. This means a $10,000 order on Polymarket moves prices 10-50x
+    more than the same order on NYSE. Additionally, prediction market prices are bounded
+    [0, 1], creating asymmetric impact near the boundaries (buying at 0.95 is much more
+    expensive per probability unit than buying at 0.50). AMM-based markets solve the
+    liquidity problem but introduce different slippage curves and don't have queue
+    priority or cancellation dynamics. Models calibrated on equity data will dramatically
+    underestimate prediction market impact costs.
+  how_to_do_right: |
+    1. Adjust impact models for bounded prices:
+       - Transform to log-odds space: logit(p) = ln(p/(1-p))
+       - Estimate impact in log-odds space where it's approximately symmetric
+       - Impact in probability space: dp = p*(1-p) * d_logit (varies by price level)
+    2. Account for thin liquidity:
+       - Compute depth-weighted impact: walk the book for every order size
+       - Don't use midpoint-based models (spread is too wide, midpoint is misleading)
+    3. Handle event discontinuities:
+       - At resolution: probability jumps to 0 or 1 discontinuously
+       - Near resolution: spread widens dramatically (nobody wants to provide liquidity)
+       - Implement time-to-event adjustments: multiply impact by 1/(T-t) as event approaches
+    4. For AMM-based markets:
+       - Impact is deterministic: compute exact cost from AMM formula before trading
+       - LMSR: cost = b * ln(sum(exp(q_i/b))) after trade - before trade
+       - No queue position — first-come first-served doesn't apply
+    5. Monitor for manipulation:
+       - Small markets are trivially manipulable (< $10K to move price 20%)
+       - Track large position concentration (single address > 20% of open interest)
+    6. Provide wider spreads than traditional markets (2-5% vs 0.01%)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [numpy, pandas]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    import numpy as np
+
+    class PredictionMarketMicrostructure:
+        """Tools for prediction market-specific microstructure analysis."""
+
+        @staticmethod
+        def probability_to_logodds(p: float) -> float:
+            """Transform bounded [0,1] to unbounded log-odds."""
+            p = np.clip(p, 0.001, 0.999)
+            return np.log(p / (1 - p))
+
+        @staticmethod
+        def logodds_to_probability(logit: float) -> float:
+            """Inverse transform."""
+            return 1 / (1 + np.exp(-logit))
+
+        def impact_in_probability_space(
+            self, current_prob: float, order_size_usd: float, market_depth_usd: float,
+        ) -> float:
+            """
+            Estimate impact on probability given order size and depth.
+            Uses log-odds transformation for symmetric impact estimation.
+            """
+            # Impact in log-odds space (approximately linear)
+            logit_current = self.probability_to_logodds(current_prob)
+            # Square-root impact in log-odds
+            logit_impact = 0.5 * np.sqrt(order_size_usd / market_depth_usd)
+
+            logit_new = logit_current + logit_impact
+            new_prob = self.logodds_to_probability(logit_new)
+            return round(new_prob - current_prob, 4)
+
+        def depth_weighted_cost(self, book: list[tuple], quantity: float) -> dict:
+            """
+            Walk the order book to compute exact execution cost.
+            book: [(price, quantity_available)] sorted by price (best first)
+            """
+            filled = 0.0
+            total_cost = 0.0
+            fills = []
+
+            for price, qty_available in book:
+                fill_qty = min(quantity - filled, qty_available)
+                total_cost += fill_qty * price
+                filled += fill_qty
+                fills.append({"price": price, "quantity": fill_qty})
+                if filled >= quantity:
+                    break
+
+            if filled < quantity:
+                return {"error": f"Insufficient depth: only {filled:.2f} of {quantity:.2f} available"}
+
+            avg_price = total_cost / filled
+            best_price = book[0][0]
+            slippage_bps = (avg_price - best_price) / best_price * 10_000
+
+            return {
+                "avg_price": round(avg_price, 4),
+                "total_cost": round(total_cost, 2),
+                "slippage_bps": round(slippage_bps, 2),
+                "fills": fills,
+            }
+
+    # Example: thin prediction market book
+    pm = PredictionMarketMicrostructure()
+
+    # Buying YES shares at probability 0.60
+    impact = pm.impact_in_probability_space(
+        current_prob=0.60, order_size_usd=5000, market_depth_usd=20000
+    )
+    print(f"Impact: +{impact*100:.1f} percentage points")
+    # Impact: ~+12.5pp (from 0.60 to 0.725) — massive compared to equity impact
+
+    # Compare: same $5K order in equity with $5M depth
+    impact_equity = pm.impact_in_probability_space(
+        current_prob=0.60, order_size_usd=5000, market_depth_usd=5_000_000
+    )
+    print(f"Equity-like impact: +{impact_equity*100:.2f} pp")
+    # Impact: ~+0.4pp — 30x less
+
+    # Walking a thin book
+    book = [(0.60, 200), (0.62, 300), (0.65, 500), (0.70, 1000)]
+    result = pm.depth_weighted_cost(book, quantity=800)
+    print(f"Avg price: {result['avg_price']}, Slippage: {result['slippage_bps']} bps")
+  example_bad: |
+    # WRONG: Using equity market impact models for prediction markets
+    def equity_impact(order_usd, adv=1_000_000):
+        # Assumes deep, continuous liquidity like NYSE
+        return 0.3 * 0.02 * (order_usd / adv) ** 0.5  # ~0.1 bps for $5K order
+
+    # In a prediction market with $20K depth:
+    # This model says $5K order has ~0.1 bps impact
+    # Reality: impact is 1000-5000 bps (10-50 percentage points!)
+    # Trader expects to buy at 0.60, actually gets filled at 0.72 average
+  when_applies: "Building or trading on prediction market platforms, implementing AMMs, or adapting traditional execution algorithms for thin, bounded-price markets."
+  sources:
+    - "https://en.wikipedia.org/wiki/Market_microstructure"
+    - "https://arxiv.org/abs/0812.0530"
+
+- id: FIN-MICRO-014
+  text: "Liquidity provision incentives include maker rebates (exchange pays for passive orders), liquidity mining (token rewards for LP positions), and designated market maker (DMM) obligations. Rebate structures determine equilibrium spread width: higher rebates enable tighter spreads but can encourage phantom liquidity (orders placed to earn rebates with no intent to fill)."
+  why: >
+    Liquidity is not free — someone must be compensated for the risk of adverse selection.
+    NYSE pays market makers $0.0020/share in rebates, which funds ~60% of the spread
+    revenue. DeFi protocols use liquidity mining (UNI, SUSHI tokens) to bootstrap liquidity,
+    but this creates mercenary capital that disappears when rewards end (SushiSwap's
+    "vampire attack" on Uniswap showed $1B+ in liquidity leave in days). For prediction
+    markets, insufficient liquidity incentives lead to wide spreads (10-20%), making the
+    market useless for price discovery. The design of incentive structures determines
+    whether your market has sustainable liquidity or boom-bust cycles.
+  how_to_do_right: |
+    1. Exchange rebate structure:
+       - Maker rebate: pay -$0.0010 to -$0.0030/share for passive orders
+       - Taker fee: charge +$0.0015 to +$0.0035/share for aggressive orders
+       - Net must be positive (exchange revenue = taker_fee - maker_rebate)
+    2. For prediction markets:
+       - Rebate as % of spread earned: pay 20-50% of spread back to makers
+       - Volume tiers: higher rebates for more volume (encourage commitment)
+    3. Liquidity mining design:
+       - Time-lock rewards: vest over 30-90 days to prevent mercenary capital
+       - Concentrate rewards near mid-price (don't reward orders at 0.01 or 0.99)
+       - Weight rewards by time-in-book, not just volume (penalize cancel-heavy behavior)
+    4. Designated Market Maker (DMM) obligations:
+       - Must maintain quotes within X% of fair value for Y% of trading time
+       - In exchange: priority in queue, additional rebates, information advantages
+    5. Monitor for phantom liquidity:
+       - Track cancel/fill ratio: if > 20:1, likely phantom
+       - Flash orders (posted and cancelled within 10ms) should not earn rebates
+    6. Evaluate sustainability:
+       - Calculate implied annual cost of incentives vs. trading fee revenue
+       - If cost > revenue, incentive program will eventually end → prepare for liquidity exodus
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [numpy, pandas]
+  domains:
+    domain: [fintech, prediction_markets, trading]
+    concern: [domain_specific]
+  example_good: |
+    from dataclasses import dataclass
+    from typing import Optional
+
+    @dataclass
+    class LiquidityIncentive:
+        maker_rebate_bps: float      # rebate paid to passive orders
+        taker_fee_bps: float         # fee charged to aggressive orders
+        min_quote_time_pct: float    # minimum time with active quotes
+        max_spread_bps: float        # maximum allowed spread for rebate eligibility
+        cancel_fill_max_ratio: float # max cancel/fill to qualify
+
+    class LiquidityProgram:
+        """Manage liquidity provider incentives and monitor quality."""
+
+        def __init__(self, incentive: LiquidityIncentive):
+            self.incentive = incentive
+            self.providers: dict[str, dict] = {}
+
+        def register_provider(self, provider_id: str):
+            self.providers[provider_id] = {
+                "fills": 0, "cancels": 0, "volume": 0.0,
+                "time_quoting_sec": 0.0, "total_time_sec": 0.0,
+                "earned_rebates": 0.0, "spread_sum": 0.0, "spread_samples": 0,
+            }
+
+        def record_fill(self, provider_id: str, quantity: float, price: float):
+            p = self.providers[provider_id]
+            p["fills"] += 1
+            p["volume"] += quantity * price
+            # Rebate in dollars
+            rebate = quantity * price * self.incentive.maker_rebate_bps / 10_000
+            p["earned_rebates"] += rebate
+
+        def record_cancel(self, provider_id: str):
+            self.providers[provider_id]["cancels"] += 1
+
+        def record_quote(self, provider_id: str, spread_bps: float, duration_sec: float):
+            p = self.providers[provider_id]
+            p["time_quoting_sec"] += duration_sec
+            p["total_time_sec"] += duration_sec
+            p["spread_sum"] += spread_bps * duration_sec
+            p["spread_samples"] += 1
+
+        def evaluate_provider(self, provider_id: str) -> dict:
+            """Check if provider meets obligations and qualifies for rebates."""
+            p = self.providers[provider_id]
+
+            cancel_fill_ratio = p["cancels"] / max(p["fills"], 1)
+            time_quoting_pct = p["time_quoting_sec"] / max(p["total_time_sec"], 1) * 100
+            avg_spread = p["spread_sum"] / max(p["time_quoting_sec"], 1)
+
+            qualifies = (
+                cancel_fill_ratio <= self.incentive.cancel_fill_max_ratio
+                and time_quoting_pct >= self.incentive.min_quote_time_pct
+                and avg_spread <= self.incentive.max_spread_bps
+            )
+
+            return {
+                "provider_id": provider_id,
+                "qualifies_for_rebate": qualifies,
+                "cancel_fill_ratio": round(cancel_fill_ratio, 1),
+                "time_quoting_pct": round(time_quoting_pct, 1),
+                "avg_spread_bps": round(avg_spread, 1),
+                "earned_rebates_usd": round(p["earned_rebates"], 2),
+                "violations": [] if qualifies else [
+                    f"Cancel/fill: {cancel_fill_ratio:.1f} > {self.incentive.cancel_fill_max_ratio}"
+                    if cancel_fill_ratio > self.incentive.cancel_fill_max_ratio else None,
+                    f"Quoting time: {time_quoting_pct:.0f}% < {self.incentive.min_quote_time_pct}%"
+                    if time_quoting_pct < self.incentive.min_quote_time_pct else None,
+                ],
+            }
+
+    # Example
+    incentive = LiquidityIncentive(
+        maker_rebate_bps=2.0, taker_fee_bps=3.0,
+        min_quote_time_pct=80.0, max_spread_bps=50.0,
+        cancel_fill_max_ratio=20.0,
+    )
+    program = LiquidityProgram(incentive)
+    program.register_provider("mm_alpha")
+    program.record_fill("mm_alpha", quantity=100, price=0.65)
+    program.record_fill("mm_alpha", quantity=200, price=0.63)
+    program.record_quote("mm_alpha", spread_bps=30.0, duration_sec=3600)
+    program.record_cancel("mm_alpha")
+    result = program.evaluate_provider("mm_alpha")
+    print(f"Qualifies: {result['qualifies_for_rebate']}, Earned: ${result['earned_rebates_usd']}")
+  example_bad: |
+    # WRONG: Flat rebate with no quality requirements — attracts phantom liquidity
+    class BadIncentive:
+        def pay_rebate(self, provider_id, volume):
+            # Pays rebate regardless of cancel ratio, spread, or quote duration
+            return volume * 0.001  # $1 per $1000 volume
+
+    # Result: HFT firm places 1M orders at 50 ticks away from mid, cancels 999,990
+    # Earns rebates on the 10 fills that happen only when price moves to their level
+    # Provides ZERO useful liquidity (never at competitive prices)
+    # Exchange pays $10K/day in rebates for phantom liquidity
+  when_applies: "Designing exchange fee structures, building liquidity mining programs, evaluating LP incentives for prediction markets or DeFi protocols."
+  sources:
+    - "https://en.wikipedia.org/wiki/Market_microstructure"
+
+- id: FIN-MICRO-015
+  text: "Self-trade prevention (STP) detects and blocks wash trading where the same entity trades with itself to inflate volume, manipulate prices, or earn liquidity mining rewards. Implementation requires matching on account ID, IP, and behavioral patterns (timing, size, price clustering). CFTC Rule 534 explicitly prohibits wash trading."
+  why: >
+    Wash trading is the most common form of market manipulation, especially in crypto and
+    prediction markets. Bitwise Asset Management estimated 95% of crypto exchange volume
+    was wash traded in 2019. On prediction markets, wash trading inflates volume metrics
+    (used for credibility), earns undeserved liquidity rebates, and can manipulate prices
+    for correlated bets or insurance fraud. The CFTC fined Coinbase $6.5M in 2021 for
+    allowing wash trades on GDAX. Without STP, your exchange volume numbers are
+    meaningless, your liquidity incentive program is exploitable, and you face
+    regulatory risk.
+  how_to_do_right: |
+    1. Account-level STP (basic):
+       - Before matching: check if buy_account_id == sell_account_id
+       - If match: cancel the later order (or both, depending on policy)
+       - Support multiple STP modes: cancel_newest, cancel_oldest, cancel_both, decrement
+    2. Entity-level STP (intermediate):
+       - Link accounts by KYC entity, IP address, device fingerprint
+       - Build entity graph: accounts connected by shared IPs/devices
+       - STP applies to all accounts within an entity cluster
+    3. Behavioral detection (advanced):
+       - Timing: orders placed within 1ms of each other from "different" accounts
+       - Size: matching order sizes (buyer and seller same quantity within 0.1%)
+       - Price: orders at off-market prices (> 3 ticks from NBBO)
+       - Pattern: regular interval wash trades (every 60 seconds, etc.)
+    4. Volume discounting:
+       - Flag wash-traded volume: don't count in official volume statistics
+       - Report "genuine volume" separate from "total volume"
+    5. Penalty structure:
+       - First offense: warning + clawback of rebates from flagged trades
+       - Repeat: suspend account + forfeiture of all earned rebates
+    6. Monitoring dashboard:
+       - STP trigger rate by account (>5% is suspicious)
+       - Volume concentration (>30% of market from one entity)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [pandas, networkx]
+  domains:
+    domain: [fintech, prediction_markets, trading]
+    concern: [security, domain_specific]
+  example_good: |
+    from dataclasses import dataclass, field
+    from collections import defaultdict
+    from enum import Enum
+
+    class STPMode(Enum):
+        CANCEL_NEWEST = "cancel_newest"
+        CANCEL_OLDEST = "cancel_oldest"
+        CANCEL_BOTH = "cancel_both"
+
+    @dataclass
+    class Order:
+        order_id: str
+        account_id: str
+        entity_id: str  # KYC-linked entity
+        side: str       # "buy" or "sell"
+        price: float
+        quantity: float
+        timestamp_ms: float
+        ip_address: str = ""
+
+    class SelfTradePreventor:
+        """Multi-level wash trading detection and prevention."""
+
+        def __init__(self, mode: STPMode = STPMode.CANCEL_NEWEST):
+            self.mode = mode
+            self.entity_map: dict[str, set[str]] = defaultdict(set)  # entity -> accounts
+            self.ip_clusters: dict[str, set[str]] = defaultdict(set)  # IP -> accounts
+            self.stp_events: list[dict] = []
+
+        def register_account(self, account_id: str, entity_id: str, ip: str = ""):
+            self.entity_map[entity_id].add(account_id)
+            if ip:
+                self.ip_clusters[ip].add(account_id)
+
+        def check_self_trade(self, buy_order: Order, sell_order: Order) -> dict:
+            """Check if two orders constitute a self-trade."""
+            reasons = []
+
+            # Level 1: Same account
+            if buy_order.account_id == sell_order.account_id:
+                reasons.append("same_account")
+
+            # Level 2: Same entity (KYC-linked)
+            if buy_order.entity_id == sell_order.entity_id:
+                reasons.append("same_entity")
+
+            # Level 3: Same IP cluster
+            for ip, accounts in self.ip_clusters.items():
+                if buy_order.account_id in accounts and sell_order.account_id in accounts:
+                    reasons.append(f"shared_ip:{ip}")
+
+            # Level 4: Behavioral (timing + size match)
+            time_diff_ms = abs(buy_order.timestamp_ms - sell_order.timestamp_ms)
+            size_ratio = min(buy_order.quantity, sell_order.quantity) / max(buy_order.quantity, sell_order.quantity)
+
+            if time_diff_ms < 5 and size_ratio > 0.99:
+                reasons.append("behavioral:timing_size_match")
+
+            is_wash = len(reasons) > 0
+
+            if is_wash:
+                self.stp_events.append({
+                    "buy_order": buy_order.order_id,
+                    "sell_order": sell_order.order_id,
+                    "reasons": reasons,
+                })
+
+            action = None
+            if is_wash:
+                if self.mode == STPMode.CANCEL_NEWEST:
+                    action = "cancel_sell" if sell_order.timestamp_ms > buy_order.timestamp_ms else "cancel_buy"
+                elif self.mode == STPMode.CANCEL_OLDEST:
+                    action = "cancel_buy" if buy_order.timestamp_ms < sell_order.timestamp_ms else "cancel_sell"
+                elif self.mode == STPMode.CANCEL_BOTH:
+                    action = "cancel_both"
+
+            return {"is_wash_trade": is_wash, "reasons": reasons, "action": action}
+
+    # Example
+    stp = SelfTradePreventor(mode=STPMode.CANCEL_NEWEST)
+    stp.register_account("acc_1", entity_id="entity_A", ip="192.168.1.1")
+    stp.register_account("acc_2", entity_id="entity_A", ip="192.168.1.1")
+
+    buy = Order("o1", "acc_1", "entity_A", "buy", 0.65, 100, 1000.0, "192.168.1.1")
+    sell = Order("o2", "acc_2", "entity_A", "sell", 0.65, 100, 1000.5, "192.168.1.1")
+    result = stp.check_self_trade(buy, sell)
+    print(f"Wash trade: {result['is_wash_trade']}, Reasons: {result['reasons']}")
+    # Wash trade: True, Reasons: ['same_entity', 'shared_ip:192.168.1.1', 'behavioral:timing_size_match']
+  example_bad: |
+    # WRONG: Only checking account ID — trivially circumvented with multiple accounts
+    def naive_stp(buy_account, sell_account):
+        return buy_account == sell_account
+
+    # Manipulator creates 10 accounts, washes trades between them
+    # Inflates volume by $1M/day, earns $2K in fake liquidity rebates
+    # All from the same IP, same entity — but passes this "check"
+  when_applies: "Building exchange matching engines, prediction market platforms, or liquidity incentive programs that need to prevent manipulation."
+  sources:
+    - "https://en.wikipedia.org/wiki/Market_microstructure"
+
+- id: FIN-MICRO-016
+  text: "Order types define execution semantics: Market orders guarantee fill but not price. Limit orders guarantee price but not fill. Stop orders trigger at a price level (stop-loss, stop-limit). IOC (Immediate-or-Cancel) fills whatever is available and cancels the rest. FOK (Fill-or-Kill) fills the entire quantity or cancels. GTC (Good-till-Cancel) persists until filled or explicitly cancelled. Each type has different exposure to slippage, adverse selection, and partial fills."
+  why: >
+    Using the wrong order type is one of the most common and costly mistakes in trading
+    systems. A market order during low liquidity can fill 10%+ away from the expected
+    price (the 2010 Flash Crash saw market orders fill at $0.01 for stocks worth $40+).
+    Conversely, limit-only strategies miss trades and suffer opportunity cost. FOK orders
+    are essential for strategies that require atomic execution (arbitrage), while IOC is
+    better for best-effort execution. For prediction markets, where liquidity is thin,
+    using market orders is especially dangerous — a $5K market buy can move prices from
+    0.50 to 0.80. Always use limit orders with price protection for prediction markets.
+  how_to_do_right: |
+    1. Market order: use ONLY for small orders in liquid markets
+       - Add price protection: reject if fill price > mid + X%
+       - Never use during circuit breakers, pre/post market, or low-liquidity hours
+    2. Limit order: default choice for most strategies
+       - Set limit = mid + slippage_tolerance for aggressive execution
+       - Use IOC variant if you don't want to rest in the book
+    3. Stop-loss: use stop-LIMIT, not stop-MARKET
+       - Stop-market can cascade through the book during flash crashes
+       - Stop-limit: trigger_price = 99.00, limit_price = 98.50 (gap protection)
+    4. IOC (Immediate-or-Cancel):
+       - Best for: sweeping available liquidity without resting
+       - Partial fills expected — must handle in order management
+    5. FOK (Fill-or-Kill):
+       - Best for: atomic trades (arbitrage, hedging) where partial fill is worse than no fill
+       - Lower fill rate — only use when atomicity is required
+    6. GTC (Good-till-Cancel):
+       - Add time limits: GTC with max 7-day lifetime to avoid forgotten orders
+       - Always implement "cancel on disconnect" for automated systems
+    7. For prediction markets:
+       - Always use limit orders with probability bounds
+       - max_price = 0.95 (never pay > 95% for a YES share)
+       - min_price = 0.05 (never sell below 5%)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pydantic]
+  domains:
+    domain: [fintech, prediction_markets, trading]
+    concern: [domain_specific]
+  example_good: |
+    from enum import Enum
+    from pydantic import BaseModel, field_validator
+    from typing import Optional
+
+    class OrderType(str, Enum):
+        MARKET = "market"
+        LIMIT = "limit"
+        STOP_LIMIT = "stop_limit"
+        IOC = "ioc"             # Immediate or Cancel
+        FOK = "fok"             # Fill or Kill
+        GTC = "gtc"             # Good till Cancel
+
+    class Order(BaseModel):
+        order_type: OrderType
+        side: str               # "buy" or "sell"
+        quantity: float
+        limit_price: Optional[float] = None
+        stop_price: Optional[float] = None
+        price_protection_pct: float = 5.0  # max slippage for market orders
+        max_lifetime_hours: float = 168.0   # 7 days max for GTC
+
+        @field_validator("limit_price")
+        @classmethod
+        def validate_limit(cls, v, info):
+            if info.data.get("order_type") in (OrderType.LIMIT, OrderType.IOC, OrderType.FOK, OrderType.GTC):
+                if v is None:
+                    raise ValueError(f"{info.data['order_type']} requires limit_price")
+                if v <= 0:
+                    raise ValueError("limit_price must be positive")
+            return v
+
+        @field_validator("stop_price")
+        @classmethod
+        def validate_stop(cls, v, info):
+            if info.data.get("order_type") == OrderType.STOP_LIMIT:
+                if v is None:
+                    raise ValueError("stop_limit requires stop_price")
+                if info.data.get("limit_price") is not None:
+                    gap = abs(v - info.data["limit_price"]) / v
+                    if gap > 0.05:
+                        raise ValueError(
+                            f"Stop-limit gap too wide: {gap*100:.1f}% (max 5%). "
+                            "Order may never fill if price gaps through."
+                        )
+            return v
+
+    class OrderMatcher:
+        """Match orders with type-specific semantics."""
+
+        def execute_order(self, order: Order, available_book: list[tuple]) -> dict:
+            """
+            available_book: [(price, quantity)] sorted best-first
+            Returns fill report
+            """
+            if order.order_type == OrderType.MARKET:
+                return self._fill_market(order, available_book)
+            elif order.order_type == OrderType.IOC:
+                return self._fill_ioc(order, available_book)
+            elif order.order_type == OrderType.FOK:
+                return self._fill_fok(order, available_book)
+            elif order.order_type in (OrderType.LIMIT, OrderType.GTC):
+                return self._fill_limit(order, available_book)
+            elif order.order_type == OrderType.STOP_LIMIT:
+                return {"status": "pending", "message": "Stop not triggered"}
+
+        def _fill_market(self, order: Order, book: list[tuple]) -> dict:
+            filled, cost = 0.0, 0.0
+            mid = book[0][0] if book else 0
+            for price, qty in book:
+                # Price protection
+                if abs(price - mid) / mid > order.price_protection_pct / 100:
+                    break
+                fill = min(order.quantity - filled, qty)
+                cost += fill * price
+                filled += fill
+                if filled >= order.quantity:
+                    break
+            return {"filled": filled, "avg_price": cost / max(filled, 1e-10), "status": "filled" if filled >= order.quantity else "partial"}
+
+        def _fill_ioc(self, order: Order, book: list[tuple]) -> dict:
+            filled, cost = 0.0, 0.0
+            for price, qty in book:
+                if (order.side == "buy" and price > order.limit_price) or \
+                   (order.side == "sell" and price < order.limit_price):
+                    break
+                fill = min(order.quantity - filled, qty)
+                cost += fill * price
+                filled += fill
+                if filled >= order.quantity:
+                    break
+            # IOC: whatever we got is the fill, rest is cancelled
+            return {"filled": filled, "cancelled": order.quantity - filled,
+                    "avg_price": cost / max(filled, 1e-10), "status": "ioc_complete"}
+
+        def _fill_fok(self, order: Order, book: list[tuple]) -> dict:
+            available = sum(qty for price, qty in book
+                          if (order.side == "buy" and price <= order.limit_price) or
+                             (order.side == "sell" and price >= order.limit_price))
+            if available >= order.quantity:
+                return self._fill_ioc(order, book)  # fill fully
+            return {"filled": 0, "status": "killed", "reason": f"Only {available} available, need {order.quantity}"}
+
+        def _fill_limit(self, order: Order, book: list[tuple]) -> dict:
+            return self._fill_ioc(order, book)  # same but unfilled portion rests in book
+
+    # Example
+    book = [(0.60, 200), (0.62, 300), (0.65, 500), (0.70, 1000)]
+
+    # IOC: fill what's available at <= 0.63
+    ioc_order = Order(order_type=OrderType.IOC, side="buy", quantity=400, limit_price=0.63)
+    matcher = OrderMatcher()
+    result = matcher.execute_order(ioc_order, book)
+    print(f"IOC: filled {result['filled']}, cancelled {result['cancelled']}")
+    # Filled 400 (200 at 0.60 + 200 at 0.62), cancelled 0
+
+    # FOK: all-or-nothing for 600 at <= 0.63
+    fok_order = Order(order_type=OrderType.FOK, side="buy", quantity=600, limit_price=0.63)
+    result = matcher.execute_order(fok_order, book)
+    print(f"FOK: {result['status']}")
+    # killed — only 500 available at <= 0.63
+  example_bad: |
+    # WRONG: Using market orders in thin prediction markets
+    def buy_prediction(market_id, amount_usd):
+        exchange.send_order(
+            type="MARKET",  # No price protection!
+            side="BUY",
+            quantity=amount_usd / current_price,
+        )
+
+    # Current price: 0.50, book: [(0.50, 100), (0.60, 100), (0.80, 100), (0.99, 500)]
+    # Trying to buy $500 worth = 1000 shares at 0.50
+    # Actual fills: 100@0.50, 100@0.60, 100@0.80, 700@0.99
+    # Average price: 0.895 instead of expected 0.50 — 79% slippage!
+    # With limit order at 0.65: would fill 200 shares, cancel 800 — much better outcome
+  when_applies: "Implementing order management systems, exchange matching engines, or any trading interface where order type selection affects execution quality."
+  sources:
+    - "https://en.wikipedia.org/wiki/Market_microstructure"

@@ -1,0 +1,952 @@
+layer: rules
+domain: fact_checking
+knowledge:
+- id: FC-SCRAPE-001
+  text: "Always respect robots.txt and Terms of Service before scraping any website. Parse robots.txt programmatically and honor Disallow directives, Crawl-delay values, and sitemap references."
+  why: >
+    Ignoring robots.txt can result in IP bans, legal action (Computer Fraud and Abuse Act violations),
+    and permanent API key revocation. In 2024, LinkedIn won a case against scrapers who ignored their
+    ToS, resulting in $10M+ damages. Even for fact-checking, violating robots.txt destroys trust with
+    data sources you depend on.
+  how_to_do_right: |
+    1. Fetch and parse robots.txt before any crawl using urllib.robotparser
+    2. Check can_fetch() for every URL before requesting it
+    3. Respect Crawl-delay directive (default to 2s if not specified)
+    4. Log every robots.txt decision (allowed/blocked) for audit trail
+    5. Cache robots.txt for 24 hours, re-fetch daily
+    6. If robots.txt is unavailable (404), treat as fully allowed but apply conservative rate limiting
+  severity: critical
+  technologies:
+    lang: [python]
+    library: [playwright, beautifulsoup4, httpx]
+  domains:
+    domain: [fact_checking, compliance]
+    concern: [web]
+  example_good: |
+    import urllib.robotparser
+    from urllib.parse import urlparse
+
+    def check_robots(url: str) -> bool:
+        parsed = urlparse(url)
+        robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+        rp = urllib.robotparser.RobotFileParser()
+        rp.set_url(robots_url)
+        rp.read()
+        crawl_delay = rp.crawl_delay("VeritasBot") or 2.0
+        return rp.can_fetch("VeritasBot", url), crawl_delay
+
+    allowed, delay = check_robots("https://example.com/article")
+    if allowed:
+        time.sleep(delay)
+        response = httpx.get(url, headers={"User-Agent": "VeritasBot/1.0"})
+  example_bad: |
+    import httpx
+    # No robots.txt check, no crawl delay, no user-agent
+    response = httpx.get("https://example.com/article")
+    data = response.text
+  when_applies: "Any web scraping or crawling operation for fact-checking data collection"
+  sources:
+    - "https://www.rfc-editor.org/rfc/rfc9309.html"
+    - "https://docs.python.org/3/library/urllib.robotparser.html"
+
+- id: FC-SCRAPE-002
+  text: "Implement strict rate limiting and politeness controls: crawl delay between requests, concurrent request limits, and exponential backoff on errors."
+  why: >
+    Aggressive scraping causes 429 (Too Many Requests) responses, IP bans, and can DDoS small
+    government sites that host critical fact-checking data. A Brazilian municipal transparency
+    portal crashed under aggressive scraping in 2023, blocking legitimate citizen access for 48 hours.
+    Rate limiting is both ethical and practical — banned IPs produce zero data.
+  how_to_do_right: |
+    1. Default crawl delay: 2 seconds between requests to same domain
+    2. Maximum concurrent requests per domain: 2
+    3. Global concurrent requests across all domains: 10
+    4. Exponential backoff on 429/503: start at 5s, double up to 5 minutes
+    5. Track per-domain request counts and timestamps
+    6. Implement circuit breaker: stop domain after 3 consecutive errors
+    7. Use async semaphores for concurrency control
+  severity: high
+  technologies:
+    lang: [python]
+    library: [httpx, playwright]
+  domains:
+    domain: [fact_checking, reliability]
+    concern: [web]
+  example_good: |
+    import asyncio
+    import httpx
+    from collections import defaultdict
+    from time import time
+
+    class PoliteScraper:
+        def __init__(self, delay: float = 2.0, max_concurrent: int = 2):
+            self.delay = delay
+            self.semaphore = asyncio.Semaphore(max_concurrent)
+            self.last_request: dict[str, float] = defaultdict(float)
+
+        async def fetch(self, url: str) -> httpx.Response:
+            from urllib.parse import urlparse
+            domain = urlparse(url).netloc
+            async with self.semaphore:
+                elapsed = time() - self.last_request[domain]
+                if elapsed < self.delay:
+                    await asyncio.sleep(self.delay - elapsed)
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(url, timeout=30.0)
+                    self.last_request[domain] = time()
+                    response.raise_for_status()
+                    return response
+  example_bad: |
+    import asyncio
+    import httpx
+
+    async def scrape_all(urls: list[str]):
+        async with httpx.AsyncClient() as client:
+            # Fire all requests simultaneously — no rate limiting
+            tasks = [client.get(url) for url in urls]
+            return await asyncio.gather(*tasks)
+  when_applies: "All web scraping operations, especially against government and news sites"
+  sources:
+    - "https://www.python-httpx.org/advanced/clients/"
+
+- id: FC-SCRAPE-003
+  text: "Use Playwright for JavaScript-rendered pages where static HTTP requests return incomplete content. Detect JS-dependent pages before choosing scraper strategy."
+  why: >
+    Over 60% of modern news sites use JavaScript frameworks (React, Next.js, Vue) that render content
+    client-side. Static HTTP GET returns empty divs or loading spinners. Fact-checking systems that
+    only use requests+BeautifulSoup miss article text, comments, embedded data visualizations, and
+    dynamically loaded claim sources. This creates silent data loss — the scraper reports success but
+    extracted text is incomplete.
+  how_to_do_right: |
+    1. First attempt static fetch with httpx (faster, cheaper)
+    2. Check if response body has meaningful text content (> 200 chars of visible text)
+    3. If text is sparse or contains JS framework markers (id="__next", id="app", noscript tags), fall back to Playwright
+    4. In Playwright: wait for networkidle or specific selector, not fixed sleep
+    5. Set a 30-second page load timeout
+    6. Use headless mode, block unnecessary resources (images, fonts) for speed
+    7. Cache rendered HTML for 1 hour to avoid re-rendering same page
+  severity: high
+  technologies:
+    lang: [python]
+    library: [playwright, beautifulsoup4, httpx]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [web]
+  example_good: |
+    import httpx
+    from bs4 import BeautifulSoup
+    from playwright.async_api import async_playwright
+
+    async def smart_fetch(url: str) -> str:
+        # Try static first
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, timeout=15.0)
+            soup = BeautifulSoup(resp.text, "html.parser")
+            text = soup.get_text(strip=True)
+            if len(text) > 200 and "noscript" not in resp.text[:1000].lower():
+                return resp.text
+
+        # Fall back to Playwright for JS-rendered content
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.route("**/*.{png,jpg,gif,svg,woff,woff2}", lambda r: r.abort())
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            html = await page.content()
+            await browser.close()
+            return html
+  example_bad: |
+    import httpx
+    from bs4 import BeautifulSoup
+
+    # Only static fetch — misses JS-rendered content entirely
+    resp = httpx.get("https://news-site.com/article/123")
+    soup = BeautifulSoup(resp.text, "html.parser")
+    text = soup.get_text()  # Returns empty or "Loading..."
+  when_applies: "Scraping modern news sites, social media embeds, government dashboards with JS frameworks"
+  sources:
+    - "https://playwright.dev/python/docs/api/class-page"
+
+- id: FC-SCRAPE-004
+  text: "Parse RSS and Atom feeds as the primary source for news monitoring. Feeds provide structured metadata (title, date, author, category) that HTML scraping cannot reliably extract."
+  why: >
+    RSS/Atom feeds are the most reliable, lowest-cost source for news monitoring. They provide
+    structured data (publication date, author, categories) without HTML parsing heuristics. Feeds
+    update faster than crawl schedules, include canonical URLs, and are explicitly designed for
+    machine consumption. Relying solely on HTML scraping for news monitoring wastes resources and
+    produces lower-quality metadata.
+  how_to_do_right: |
+    1. Use feedparser library for RSS 2.0, RSS 1.0, and Atom parsing
+    2. Store ETag and Last-Modified headers to enable conditional GET (304 Not Modified)
+    3. Parse feed entries into normalized schema: title, url, published_date, author, summary
+    4. Handle timezone-aware dates with python-dateutil
+    5. Check feed update frequency (ttl field) to set poll interval
+    6. Fall back to HTML scraping only when feed is unavailable or incomplete
+    7. Monitor feed health: track consecutive failures, alert after 3
+  severity: high
+  technologies:
+    lang: [python]
+    library: [feedparser, httpx]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [web]
+  example_good: |
+    import feedparser
+    import httpx
+    from datetime import datetime, timezone
+
+    class FeedMonitor:
+        def __init__(self):
+            self.etags: dict[str, str] = {}
+            self.modified: dict[str, str] = {}
+
+        def fetch_feed(self, feed_url: str) -> list[dict]:
+            feed = feedparser.parse(
+                feed_url,
+                etag=self.etags.get(feed_url),
+                modified=self.modified.get(feed_url),
+            )
+            if feed.status == 304:
+                return []  # No new content
+            if hasattr(feed, "etag"):
+                self.etags[feed_url] = feed.etag
+            if hasattr(feed, "modified"):
+                self.modified[feed_url] = feed.modified
+
+            return [
+                {
+                    "title": entry.get("title", ""),
+                    "url": entry.get("link", ""),
+                    "published": entry.get("published_parsed"),
+                    "author": entry.get("author", ""),
+                    "summary": entry.get("summary", ""),
+                }
+                for entry in feed.entries
+            ]
+  example_bad: |
+    import httpx
+    from bs4 import BeautifulSoup
+
+    # Scraping HTML for news articles instead of using RSS feed
+    resp = httpx.get("https://news-site.com/")
+    soup = BeautifulSoup(resp.text, "html.parser")
+    # Fragile: CSS selectors break when site redesigns
+    articles = soup.select("div.article-card h2 a")
+  when_applies: "News monitoring, media tracking, any source that provides RSS/Atom feeds"
+  sources:
+    - "https://www.rfc-editor.org/rfc/rfc4287"
+    - "https://feedparser.readthedocs.io/en/latest/"
+
+- id: FC-SCRAPE-005
+  text: "Extract text from PDFs using pdfplumber for structured documents (tables, columns) and PyMuPDF for speed on text-heavy documents. Never treat PDF extraction as a solved problem — always validate output quality."
+  why: >
+    Government reports, academic papers, and official documents are primarily distributed as PDFs.
+    Naive PDF-to-text (e.g., PyPDF2) produces garbled output for multi-column layouts, tables, and
+    scanned documents. pdfplumber handles tables and structured layouts well but is 3-5x slower
+    than PyMuPDF. Choosing the wrong tool or skipping validation means fact-checking decisions
+    based on corrupted data — numbers transposed, paragraphs merged, tables flattened.
+  how_to_do_right: |
+    1. Detect PDF type first: text-based vs scanned (check if text extraction returns < 50 chars per page)
+    2. For text-based PDFs with tables: use pdfplumber (preserves table structure)
+    3. For text-heavy PDFs without tables: use PyMuPDF/fitz (5x faster)
+    4. For scanned PDFs: route to OCR pipeline (Tesseract)
+    5. Validate extraction: check character count per page, detect encoding issues
+    6. Post-process: remove headers/footers, merge hyphenated words, normalize whitespace
+    7. Store raw PDF alongside extracted text for audit trail
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pdfplumber, pymupdf]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [domain_specific]
+  example_good: |
+    import pdfplumber
+    import fitz  # PyMuPDF
+
+    def extract_pdf(path: str, has_tables: bool = False) -> dict:
+        if has_tables:
+            with pdfplumber.open(path) as pdf:
+                pages = []
+                tables = []
+                for page in pdf.pages:
+                    pages.append(page.extract_text() or "")
+                    for table in page.extract_tables():
+                        tables.append(table)
+                return {"text": "\n".join(pages), "tables": tables}
+        else:
+            doc = fitz.open(path)
+            text = "\n".join(page.get_text() for page in doc)
+            doc.close()
+            # Validate extraction quality
+            if len(text.strip()) < 50 * doc.page_count:
+                raise ValueError("PDF may be scanned — route to OCR")
+            return {"text": text, "tables": []}
+  example_bad: |
+    from PyPDF2 import PdfReader
+
+    # PyPDF2 is unreliable for complex layouts
+    reader = PdfReader("report.pdf")
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text()  # Tables become garbled, columns merge
+  when_applies: "Processing government reports, academic papers, official documents in PDF format"
+  sources:
+    - "https://pymupdf.readthedocs.io/en/latest/"
+    - "https://github.com/jsvine/pdfplumber"
+
+- id: FC-SCRAPE-006
+  text: "Use Tesseract OCR for scanned documents and image-based content. Always preprocess images (deskew, binarize, denoise) before OCR to achieve >95% character accuracy."
+  why: >
+    Many government documents, especially older ones and Diarios Oficiais, are scanned PDFs or
+    images. Raw Tesseract on unprocessed images achieves only 60-80% accuracy. Preprocessing
+    (binarization, deskewing, denoising) pushes accuracy above 95%. Without preprocessing, OCR
+    errors propagate into fact-checking — names misspelled, numbers wrong, dates garbled. A single
+    digit error in a financial figure (R$1.200.000 vs R$1.700.000) invalidates a fact-check.
+  how_to_do_right: |
+    1. Convert PDF pages to images at 300 DPI minimum (use pdf2image)
+    2. Preprocess with OpenCV: grayscale, adaptive threshold binarization, deskew
+    3. Run Tesseract with language model: --oem 3 --psm 6 -l por+eng for Brazilian docs
+    4. Validate OCR output: check for common error patterns (0/O, 1/l/I, 5/S)
+    5. For tables in scanned docs: detect table structure first, OCR cells individually
+    6. Store confidence scores per word (Tesseract provides these in hOCR output)
+    7. Flag pages with average confidence < 80% for manual review
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pytesseract, opencv-python, pdf2image]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [domain_specific]
+  example_good: |
+    import cv2
+    import pytesseract
+    from pdf2image import convert_from_path
+
+    def ocr_scanned_pdf(pdf_path: str, lang: str = "por+eng") -> list[dict]:
+        images = convert_from_path(pdf_path, dpi=300)
+        results = []
+        for i, img in enumerate(images):
+            # Preprocess
+            gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
+            thresh = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 11, 2
+            )
+            # OCR with confidence data
+            data = pytesseract.image_to_data(
+                thresh, lang=lang, output_type=pytesseract.Output.DICT,
+                config="--oem 3 --psm 6"
+            )
+            confidences = [int(c) for c in data["conf"] if int(c) > 0]
+            avg_conf = sum(confidences) / len(confidences) if confidences else 0
+            text = pytesseract.image_to_string(thresh, lang=lang, config="--oem 3 --psm 6")
+            results.append({
+                "page": i + 1, "text": text,
+                "avg_confidence": avg_conf,
+                "needs_review": avg_conf < 80,
+            })
+        return results
+  example_bad: |
+    import pytesseract
+    from PIL import Image
+
+    # No preprocessing, no language model, no confidence check
+    text = pytesseract.image_to_string(Image.open("scan.png"))
+  when_applies: "Processing scanned government documents, older official records, image-based evidence"
+  sources:
+    - "https://github.com/tesseract-ocr/tesseract"
+    - "https://tesseract-ocr.github.io/tessdoc/"
+
+- id: FC-SCRAPE-007
+  text: "Access government open data through CKAN API endpoints (dados.gov.br) before scraping HTML pages. CKAN provides structured datasets with metadata, versioning, and machine-readable formats."
+  why: >
+    Brazil's dados.gov.br runs CKAN, which provides a full REST API for dataset discovery, download,
+    and metadata. Scraping the HTML portal is fragile (redesigns break selectors), slow (pagination),
+    and misses metadata (update frequency, license, format). The CKAN API returns JSON with dataset
+    descriptions, resource URLs, and update timestamps. Using the API is 10x more reliable and provides
+    data lineage information critical for fact-checking provenance.
+  how_to_do_right: |
+    1. Use CKAN API base URL: https://dados.gov.br/api/3/action/
+    2. Search datasets: package_search?q=keyword&rows=50
+    3. Get dataset details: package_show?id=dataset-name
+    4. Download resources directly from resource URLs in API response
+    5. Check resource format field to choose parser (CSV, JSON, XML, XLS)
+    6. Store dataset metadata (last_modified, organization, license) for provenance
+    7. Poll for updates using package_search with sort=metadata_modified+desc
+  severity: high
+  technologies:
+    lang: [python]
+    library: [httpx]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [domain_specific]
+  example_good: |
+    import httpx
+
+    CKAN_BASE = "https://dados.gov.br/api/3/action"
+
+    async def search_datasets(query: str, rows: int = 20) -> list[dict]:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{CKAN_BASE}/package_search",
+                params={"q": query, "rows": rows},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return [
+                {
+                    "id": pkg["id"],
+                    "title": pkg["title"],
+                    "organization": pkg.get("organization", {}).get("title"),
+                    "last_modified": pkg.get("metadata_modified"),
+                    "resources": [
+                        {"url": r["url"], "format": r["format"], "name": r["name"]}
+                        for r in pkg.get("resources", [])
+                    ],
+                }
+                for pkg in data["result"]["results"]
+            ]
+  example_bad: |
+    import httpx
+    from bs4 import BeautifulSoup
+
+    # Scraping HTML portal instead of using API
+    resp = httpx.get("https://dados.gov.br/dataset?q=education")
+    soup = BeautifulSoup(resp.text, "html.parser")
+    # Fragile CSS selectors, misses metadata
+    links = soup.select(".dataset-item a")
+  when_applies: "Accessing Brazilian government open data, any CKAN-based data portal"
+  sources:
+    - "https://docs.ckan.org/en/latest/api/"
+
+- id: FC-SCRAPE-008
+  text: "Use BeautifulSoup with readability-lxml for article text extraction. Remove boilerplate (navigation, ads, footers) before extracting content to get clean article text."
+  why: >
+    Raw HTML contains 70-90% boilerplate (navbars, sidebars, ads, footers, related articles).
+    Extracting text from the full page pollutes fact-checking data with irrelevant content, inflates
+    token costs when sending to LLMs, and reduces relevance scoring accuracy. readability-lxml
+    (port of Mozilla Readability) isolates the main article content with 95%+ accuracy on news sites.
+  how_to_do_right: |
+    1. Fetch HTML content (static or via Playwright)
+    2. Apply readability-lxml to extract main article content
+    3. Parse result with BeautifulSoup to get clean text
+    4. Preserve paragraph structure (do not flatten to single string)
+    5. Extract metadata: title, author, published date from meta tags and LD+JSON
+    6. Handle encoding correctly: detect with chardet, decode to UTF-8
+    7. Validate output: article text should be > 100 chars, < 100K chars
+  severity: high
+  technologies:
+    lang: [python]
+    library: [beautifulsoup4, readability-lxml, httpx]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [web]
+  example_good: |
+    import json
+    from bs4 import BeautifulSoup
+    from readability import Document
+
+    def extract_article(html: str, url: str) -> dict:
+        doc = Document(html)
+        clean_html = doc.summary()
+        title = doc.title()
+
+        soup = BeautifulSoup(clean_html, "html.parser")
+        paragraphs = [p.get_text(strip=True) for p in soup.find_all("p") if p.get_text(strip=True)]
+        text = "\n\n".join(paragraphs)
+
+        # Extract LD+JSON metadata
+        full_soup = BeautifulSoup(html, "html.parser")
+        metadata = {}
+        for script in full_soup.find_all("script", type="application/ld+json"):
+            try:
+                ld = json.loads(script.string)
+                if isinstance(ld, dict) and ld.get("@type") in ("NewsArticle", "Article"):
+                    metadata["author"] = ld.get("author", {}).get("name", "")
+                    metadata["published"] = ld.get("datePublished", "")
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        return {"title": title, "text": text, "url": url, **metadata}
+  example_bad: |
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    # Gets ALL text including nav, ads, footer, cookie banners
+    text = soup.get_text()
+  when_applies: "Extracting article content from news sites, blogs, and online publications for fact-checking"
+  sources:
+    - "https://github.com/buriy/python-readability"
+
+- id: FC-SCRAPE-009
+  text: "Normalize and deduplicate URLs before storing or processing them. Different URL representations of the same page waste crawl budget and create duplicate records."
+  why: >
+    The same page can have dozens of URL variations: with/without trailing slash, with/without www,
+    different query parameter orders, tracking parameters (utm_source, fbclid), fragment identifiers,
+    and protocol differences. Without normalization, a fact-checking system crawls the same article
+    5-10 times, stores duplicate records, and shows conflicting freshness timestamps for identical
+    content. This wastes 50-80% of crawl budget.
+  how_to_do_right: |
+    1. Parse URL with urllib.parse.urlparse
+    2. Lowercase scheme and netloc
+    3. Remove default ports (80 for http, 443 for https)
+    4. Remove trailing slash (except for root path)
+    5. Sort query parameters alphabetically
+    6. Remove tracking parameters: utm_*, fbclid, gclid, ref, source
+    7. Remove fragment identifiers (#section)
+    8. Normalize percent-encoding (unreserved characters)
+    9. Store canonical URL as primary key, keep original URL for reference
+  severity: high
+  technologies:
+    lang: [python]
+    library: [httpx]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [web]
+  example_good: |
+    from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
+
+    TRACKING_PARAMS = {"utm_source", "utm_medium", "utm_campaign", "utm_term",
+                       "utm_content", "fbclid", "gclid", "ref", "source"}
+
+    def normalize_url(url: str) -> str:
+        parsed = urlparse(url.strip())
+        scheme = parsed.scheme.lower()
+        netloc = parsed.netloc.lower()
+
+        # Remove default ports
+        if netloc.endswith(":80") and scheme == "http":
+            netloc = netloc[:-3]
+        elif netloc.endswith(":443") and scheme == "https":
+            netloc = netloc[:-4]
+
+        # Remove trailing slash (except root)
+        path = parsed.path.rstrip("/") or "/"
+
+        # Sort and filter query params
+        params = parse_qs(parsed.query, keep_blank_values=False)
+        filtered = {k: v for k, v in sorted(params.items()) if k not in TRACKING_PARAMS}
+        query = urlencode(filtered, doseq=True)
+
+        return urlunparse((scheme, netloc, path, "", query, ""))
+  example_bad: |
+    # Storing URLs as-is leads to duplicates
+    urls_seen = set()
+    urls_seen.add("https://example.com/article?utm_source=twitter&id=123")
+    urls_seen.add("https://example.com/article?id=123")  # Different URL, same page!
+    urls_seen.add("https://EXAMPLE.COM/article?id=123")   # Also same page
+    # Set has 3 entries for 1 actual page
+  when_applies: "Any URL storage, crawl queue management, deduplication of scraped content"
+  sources:
+    - "https://www.rfc-editor.org/rfc/rfc3986"
+    - "https://docs.python.org/3/library/urllib.parse.html"
+
+- id: FC-SCRAPE-010
+  text: "Implement two scraping schedules: incremental (frequent, checks only new/changed content) and full refresh (periodic, re-crawls everything). Default to incremental; full refresh weekly."
+  why: >
+    Full refresh of all sources every cycle wastes 90%+ of crawl budget on unchanged content.
+    Pure incremental misses content updates, deletions, and corrections — critical for fact-checking
+    where a news article correction changes a claim's veracity. The hybrid approach catches new
+    content in minutes while ensuring data consistency weekly. Without this, either freshness
+    suffers (full-only) or accuracy degrades (incremental-only).
+  how_to_do_right: |
+    1. Incremental: poll RSS feeds every 15 minutes, check sitemaps every 4 hours
+    2. Use HTTP conditional requests (If-Modified-Since, ETag) for incremental checks
+    3. Full refresh: re-crawl all tracked URLs every 7 days
+    4. Track last_crawled and content_hash per URL
+    5. On full refresh, compare content_hash to detect silent updates
+    6. Priority queue: high-value sources (major news) get shorter incremental intervals
+    7. Persist schedule state to survive restarts (Redis or database)
+  severity: high
+  technologies:
+    lang: [python]
+    library: [httpx, beautifulsoup4]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [web]
+  example_good: |
+    import hashlib
+    from datetime import datetime, timedelta
+    from dataclasses import dataclass
+
+    @dataclass
+    class CrawlTarget:
+        url: str
+        last_crawled: datetime | None = None
+        content_hash: str | None = None
+        incremental_interval: timedelta = timedelta(hours=4)
+        full_refresh_interval: timedelta = timedelta(days=7)
+
+    def needs_crawl(target: CrawlTarget, mode: str = "incremental") -> bool:
+        if target.last_crawled is None:
+            return True
+        elapsed = datetime.utcnow() - target.last_crawled
+        if mode == "full":
+            return elapsed >= target.full_refresh_interval
+        return elapsed >= target.incremental_interval
+
+    def detect_change(old_hash: str | None, new_content: str) -> bool:
+        new_hash = hashlib.sha256(new_content.encode()).hexdigest()
+        return old_hash != new_hash
+  example_bad: |
+    # Re-crawl everything every hour — wastes resources
+    for url in all_urls:
+        response = httpx.get(url)
+        store(url, response.text)  # No change detection, no conditional requests
+  when_applies: "Any ongoing scraping operation that monitors sources over time"
+  sources:
+    - "https://www.rfc-editor.org/rfc/rfc7232"
+
+- id: FC-SCRAPE-011
+  text: "Implement robust error handling for scraping: automatic retries with exponential backoff, dead link detection, and structured error logging. Never let a single failed URL crash the entire crawl."
+  why: >
+    Web scraping hits transient errors constantly: 503 server overload, connection timeouts,
+    SSL errors, DNS failures, captcha challenges. Without retry logic, a temporary CDN outage
+    causes permanent data gaps. Without dead link detection, the crawler wastes resources
+    re-attempting permanently broken URLs. A production fact-checking crawler encounters
+    10-20% transient error rate on any given run.
+  how_to_do_right: |
+    1. Retry transient errors (429, 500, 502, 503, 504, connection errors) up to 3 times
+    2. Use exponential backoff: 2s, 8s, 32s between retries
+    3. Mark URLs as dead after 5 consecutive failures across different runs
+    4. Log every error with: url, status_code, error_type, retry_count, timestamp
+    5. Categorize errors: transient (retry), permanent (4xx except 429), blocked (captcha/403)
+    6. Never let exceptions propagate — wrap each URL fetch in try/except
+    7. Report error rates per domain to detect systemic issues
+  severity: high
+  technologies:
+    lang: [python]
+    library: [httpx, tenacity]
+  domains:
+    domain: [fact_checking, reliability]
+    concern: [web]
+  example_good: |
+    import httpx
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+    TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+
+    class TransientError(Exception):
+        pass
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=60),
+        retry=retry_if_exception_type(TransientError),
+    )
+    async def fetch_with_retry(client: httpx.AsyncClient, url: str) -> httpx.Response:
+        try:
+            response = await client.get(url, timeout=30.0)
+            if response.status_code in TRANSIENT_STATUS:
+                raise TransientError(f"Transient {response.status_code} for {url}")
+            response.raise_for_status()
+            return response
+        except httpx.TimeoutException:
+            raise TransientError(f"Timeout for {url}")
+        except httpx.ConnectError:
+            raise TransientError(f"Connection error for {url}")
+
+    async def safe_fetch(client: httpx.AsyncClient, url: str) -> httpx.Response | None:
+        try:
+            return await fetch_with_retry(client, url)
+        except Exception as e:
+            logger.error(f"Failed after retries: url={url} error={e}")
+            return None
+  example_bad: |
+    import httpx
+
+    for url in urls:
+        resp = httpx.get(url)  # No timeout, no retry, crashes on error
+        process(resp.text)
+  when_applies: "All web scraping operations in production"
+  sources:
+    - "https://tenacity.readthedocs.io/en/latest/"
+
+- id: FC-SCRAPE-012
+  text: "Implement content change detection using hashing and diff-based monitoring. Track what changed, when, and by how much to detect corrections, retractions, and stealth edits."
+  why: >
+    News articles and government pages get silently edited — corrections without correction notices,
+    data updates without changelog, retractions that just delete paragraphs. For fact-checking,
+    detecting these changes is as important as the original content. A claim rated TRUE today may
+    become FALSE if the source article is corrected. Without change detection, the fact-checking
+    system operates on stale data without knowing it.
+  how_to_do_right: |
+    1. Store content hash (SHA-256) and full text for every crawl
+    2. On re-crawl, compare new hash against stored hash
+    3. If changed, compute text diff (difflib.unified_diff or similar)
+    4. Classify change magnitude: minor (<5% chars changed), moderate (5-30%), major (>30%)
+    5. For major changes: flag for review, check if any fact-checks reference this URL
+    6. Store change history: [{timestamp, old_hash, new_hash, diff_summary, magnitude}]
+    7. Detect deletions: URL returns 404 or content shrinks by >80%
+  severity: high
+  technologies:
+    lang: [python]
+    library: [httpx]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [web]
+  example_good: |
+    import hashlib
+    import difflib
+    from dataclasses import dataclass
+    from datetime import datetime
+
+    @dataclass
+    class ContentChange:
+        url: str
+        timestamp: datetime
+        old_hash: str
+        new_hash: str
+        magnitude: str  # minor, moderate, major
+        diff_summary: str
+        chars_changed_pct: float
+
+    def detect_change(url: str, old_text: str, new_text: str) -> ContentChange | None:
+        old_hash = hashlib.sha256(old_text.encode()).hexdigest()
+        new_hash = hashlib.sha256(new_text.encode()).hexdigest()
+        if old_hash == new_hash:
+            return None
+
+        diff = list(difflib.unified_diff(
+            old_text.splitlines(), new_text.splitlines(), lineterm=""
+        ))
+        max_len = max(len(old_text), len(new_text), 1)
+        added = sum(len(l) for l in diff if l.startswith("+") and not l.startswith("+++"))
+        removed = sum(len(l) for l in diff if l.startswith("-") and not l.startswith("---"))
+        pct = (added + removed) / max_len
+
+        magnitude = "minor" if pct < 0.05 else "moderate" if pct < 0.30 else "major"
+
+        return ContentChange(
+            url=url, timestamp=datetime.utcnow(),
+            old_hash=old_hash, new_hash=new_hash,
+            magnitude=magnitude, diff_summary="\n".join(diff[:20]),
+            chars_changed_pct=round(pct * 100, 1),
+        )
+  example_bad: |
+    # No change detection — just overwrites old content
+    content = fetch(url)
+    db.update(url, content=content)  # Previous version lost forever
+  when_applies: "Monitoring news articles, government pages, any content that may change over time"
+  sources:
+    - "https://docs.python.org/3/library/difflib.html"
+
+- id: FC-SCRAPE-013
+  text: "Use a proper User-Agent string identifying your bot, respect Retry-After headers, and implement ethical anti-bot avoidance. Never impersonate browsers or bypass CAPTCHAs."
+  why: >
+    Setting User-Agent to a browser string while scraping is deceptive and violates most sites' ToS.
+    If detected, it leads to permanent bans and potential legal action. Ethical scraping means
+    identifying yourself honestly so site operators can contact you. Respecting Retry-After headers
+    prevents hammering overloaded servers. For a fact-checking platform, reputation with publishers
+    and governments is essential — getting flagged as a bad actor destroys trust.
+  how_to_do_right: |
+    1. Set User-Agent: "VeritasBot/1.0 (+https://veritas.example.com/bot; contact@veritas.example.com)"
+    2. Honor Retry-After header on 429/503 responses (parse seconds or HTTP-date)
+    3. Include contact information in User-Agent for site operators to reach you
+    4. If a site blocks your bot User-Agent, respect that decision — do not switch to browser UA
+    5. Never solve CAPTCHAs programmatically — flag URL as blocked, use alternative source
+    6. Monitor for soft blocks: receiving different content than browsers get (cloaking detection)
+    7. Maintain whitelist of sites that have explicitly approved scraping
+  severity: critical
+  technologies:
+    lang: [python]
+    library: [httpx, playwright]
+  domains:
+    domain: [fact_checking, compliance]
+    concern: [web]
+  example_good: |
+    import httpx
+    from datetime import datetime, timedelta
+
+    BOT_USER_AGENT = "VeritasBot/1.0 (+https://veritas.example.com/bot; contact@veritas.example.com)"
+
+    async def ethical_fetch(client: httpx.AsyncClient, url: str) -> httpx.Response:
+        response = await client.get(
+            url, headers={"User-Agent": BOT_USER_AGENT}, timeout=30.0,
+        )
+        if response.status_code in (429, 503):
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    wait = int(retry_after)
+                except ValueError:
+                    # HTTP-date format
+                    wait = 60
+                raise RetryAfterError(url=url, wait_seconds=wait)
+        return response
+  example_bad: |
+    import httpx
+
+    # Impersonating Chrome — deceptive and violates ToS
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    resp = httpx.get("https://example.com", headers=headers)
+  when_applies: "All web scraping operations — especially against news sites and government portals"
+  sources:
+    - "https://www.rfc-editor.org/rfc/rfc9309.html"
+    - "https://www.rfc-editor.org/rfc/rfc6585"
+
+- id: FC-SCRAPE-014
+  text: "Validate scraped data quality immediately after extraction. Check for encoding issues, truncation, empty content, boilerplate-only pages, and known bad patterns before storing."
+  why: >
+    Garbage in, garbage out. If corrupted data enters the fact-checking pipeline, every downstream
+    process (claim extraction, evidence matching, verdict generation) produces wrong results. Common
+    scraping quality issues: mojibake from wrong encoding (Latin-1 vs UTF-8), truncated articles
+    (paywall cut-off), cookie consent banners as article text, GDPR notices, 404 page content
+    stored as article. These must be caught at ingestion, not discovered weeks later in a fact-check.
+  how_to_do_right: |
+    1. Check encoding: detect with chardet/charset-normalizer, reject if confidence < 80%
+    2. Minimum content length: article text must be > 200 characters
+    3. Maximum content length: reject if > 500K characters (likely a full-site dump)
+    4. Boilerplate detection: reject if >50% of text matches known patterns (cookie banners, nav items)
+    5. Language detection: verify content matches expected language (langdetect library)
+    6. Paywall detection: check for common paywall markers ("Subscribe to read", truncated text + CTA)
+    7. Store quality score (0-100) with every scraped document for downstream filtering
+  severity: high
+  technologies:
+    lang: [python]
+    library: [beautifulsoup4, httpx]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [web]
+  example_good: |
+    import chardet
+    from dataclasses import dataclass
+
+    BOILERPLATE_MARKERS = [
+        "accept cookies", "privacy policy", "subscribe to read",
+        "terms of service", "we use cookies", "sign up for free",
+    ]
+
+    @dataclass
+    class QualityResult:
+        score: int  # 0-100
+        issues: list[str]
+        passed: bool
+
+    def validate_scraped_content(text: str, expected_lang: str = "pt") -> QualityResult:
+        issues = []
+        score = 100
+
+        if len(text.strip()) < 200:
+            issues.append("content_too_short")
+            score -= 50
+
+        if len(text) > 500_000:
+            issues.append("content_too_long")
+            score -= 30
+
+        # Check encoding issues (mojibake indicators)
+        if any(c in text for c in ["\ufffd", "Ã£", "Ã§", "Ã©"]):
+            issues.append("encoding_issues")
+            score -= 40
+
+        # Boilerplate ratio
+        lower = text.lower()
+        boilerplate_hits = sum(1 for m in BOILERPLATE_MARKERS if m in lower)
+        if boilerplate_hits > 3:
+            issues.append("high_boilerplate")
+            score -= 20
+
+        return QualityResult(
+            score=max(0, score), issues=issues, passed=score >= 50,
+        )
+  example_bad: |
+    # Store everything without validation
+    text = extract_text(html)
+    db.insert({"url": url, "text": text})  # Could be empty, garbled, or a 404 page
+  when_applies: "All data ingestion in the scraping pipeline, before storing to any database"
+  sources:
+    - "https://docs.python.org/3/library/codecs.html"
+
+- id: FC-SCRAPE-015
+  text: "Design the scraping pipeline as a series of independent, composable stages: fetch, parse, clean, validate, store. Each stage should be independently testable, retriable, and observable."
+  why: >
+    Monolithic scraping scripts are impossible to debug, test, or scale. When a bug is found in
+    HTML parsing, you cannot re-run parsing without re-fetching. When storage fails, you lose
+    the already-parsed data. A pipeline architecture allows re-running individual stages, testing
+    each in isolation, parallelizing independent stages, and observing bottlenecks. Production
+    scraping systems process millions of documents — without pipeline architecture, any failure
+    requires restarting from scratch.
+  how_to_do_right: |
+    1. Stage 1 - Fetch: HTTP request, store raw response (status, headers, body) to blob storage
+    2. Stage 2 - Parse: Extract structured data from raw HTML/PDF, output normalized JSON
+    3. Stage 3 - Clean: Remove boilerplate, normalize text, fix encoding
+    4. Stage 4 - Validate: Quality checks, deduplication, schema validation
+    5. Stage 5 - Store: Write validated data to database with full provenance metadata
+    6. Each stage reads from a queue (Redis/Kafka) and writes to the next queue
+    7. Dead letter queue for items that fail all retries at any stage
+    8. Metrics per stage: throughput, error rate, latency (p50, p95, p99)
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pdfplumber, beautifulsoup4, playwright]
+  domains:
+    domain: [fact_checking, architecture]
+    concern: [web]
+  example_good: |
+    from abc import ABC, abstractmethod
+    from dataclasses import dataclass, field
+    from datetime import datetime
+    from typing import Any
+
+    @dataclass
+    class PipelineItem:
+        url: str
+        stage: str
+        data: dict[str, Any] = field(default_factory=dict)
+        errors: list[str] = field(default_factory=list)
+        timestamps: dict[str, datetime] = field(default_factory=dict)
+
+    class PipelineStage(ABC):
+        @abstractmethod
+        async def process(self, item: PipelineItem) -> PipelineItem:
+            ...
+
+    class FetchStage(PipelineStage):
+        async def process(self, item: PipelineItem) -> PipelineItem:
+            item.timestamps["fetch_start"] = datetime.utcnow()
+            response = await self.client.get(item.url, timeout=30.0)
+            item.data["raw_html"] = response.text
+            item.data["status_code"] = response.status_code
+            item.data["headers"] = dict(response.headers)
+            item.stage = "fetched"
+            item.timestamps["fetch_end"] = datetime.utcnow()
+            return item
+
+    class ParseStage(PipelineStage):
+        async def process(self, item: PipelineItem) -> PipelineItem:
+            item.timestamps["parse_start"] = datetime.utcnow()
+            article = extract_article(item.data["raw_html"], item.url)
+            item.data["article"] = article
+            item.stage = "parsed"
+            item.timestamps["parse_end"] = datetime.utcnow()
+            return item
+
+    class ScrapingPipeline:
+        def __init__(self, stages: list[PipelineStage]):
+            self.stages = stages
+
+        async def run(self, item: PipelineItem) -> PipelineItem:
+            for stage in self.stages:
+                try:
+                    item = await stage.process(item)
+                except Exception as e:
+                    item.errors.append(f"{stage.__class__.__name__}: {e}")
+                    break
+            return item
+  example_bad: |
+    import httpx
+    from bs4 import BeautifulSoup
+
+    # Monolithic: fetch + parse + store in one function — untestable, no retry
+    def scrape_and_store(url: str):
+        resp = httpx.get(url)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        text = soup.get_text()
+        db.insert({"url": url, "text": text})
+  when_applies: "Designing or refactoring any web scraping system, especially for fact-checking data pipelines"
+  sources:
+    - "https://martinfowler.com/articles/data-mesh-principles.html"

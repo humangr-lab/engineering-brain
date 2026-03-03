@@ -1,0 +1,354 @@
+layer: rules
+technology: SRE
+domain: distributed_systems
+knowledge:
+- id: CR-SRE-DIST-001
+  text: Distributed transactions should be avoided — use saga pattern or eventual consistency instead. Two-phase commit (2PC)
+    blocks all participants while waiting for the coordinator, creating a single point of failure that can freeze the entire
+    system.
+  why: 'Google avoids distributed transactions (2PC) in nearly all systems because they violate the independence that makes
+    microservices valuable. In 2PC: phase 1 (prepare) — coordinator asks all participants to lock resources and vote commit/abort.
+    Phase 2 (commit/abort) — coordinator tells all participants the decision. The problem: if the coordinator crashes between
+    phase 1 and phase 2, all participants are BLOCKED with locked resources. They can''t commit (don''t know the decision)
+    and can''t abort (might violate consistency if coordinator decided to commit). This blocking can last minutes to hours.
+    Google''s alternative: sagas — a sequence of local transactions where each step has a compensating action. If step 3 fails,
+    execute compensations for steps 2 and 1. No global locks, no coordinator dependency.
+
+    '
+  how_to_do_right: '1. Default to eventual consistency: most use cases don''t need strict consistency. An order confirmation
+    arriving 2 seconds after payment is acceptable.
+
+    2. Use saga pattern for multi-service transactions: each service performs its local transaction and publishes an event.
+    On failure, compensating transactions undo previous steps.
+
+    3. Implement compensating actions for every saga step: if "charge payment" succeeds but "reserve inventory" fails, the
+    compensation is "refund payment."
+
+    4. Use an orchestrator or choreography for saga coordination. Orchestrator: central coordinator sends commands. Choreography:
+    services react to events.
+
+    5. Handle partial failures: the order was created but inventory reservation failed. Track saga state to enable retry or
+    manual resolution.
+
+    6. If you truly need distributed transactions (financial systems, regulated data), use a purpose-built coordinator (Google
+    Spanner, CockroachDB) — don''t build your own.
+
+    '
+  example_good: "# Saga pattern with compensating transactions\nfrom enum import Enum\nfrom dataclasses import dataclass\n\nclass SagaStepStatus(Enum):\n    PENDING = 'pending'\n    COMPLETED = 'completed'\n    COMPENSATED = 'compensated'\n\n@dataclass\nclass SagaStep:\n    name: str\n    execute: callable\n    compensate: callable\n    status: SagaStepStatus = SagaStepStatus.PENDING\n\ndef run_saga(steps: list[SagaStep]) -> bool:\n    completed = []\n    for step in steps:\n        try:\n            step.execute()\n            step.status = SagaStepStatus.COMPLETED\n            completed.append(step)\n        except Exception:\n            # Compensate all completed steps in reverse\n            for s in reversed(completed):\n                s.compensate()\n                s.status = SagaStepStatus.COMPENSATED\n            return False\n    return True\n\n# Example: charge_payment -> reserve_inventory -> create_shipment\n# If reserve_inventory fails -> refund_payment (compensation)\n"
+  example_bad: "# Distributed transaction with 2PC — blocks on coordinator failure\ndef transfer_between_services(order_id, payment_svc, inventory_svc):\n    # Phase 1: prepare\n    payment_svc.prepare(order_id)     # locks payment row\n    inventory_svc.prepare(order_id)   # locks inventory row\n    # If coordinator crashes HERE:\n    # -> both services are BLOCKED with locked resources\n    # -> can't commit (don't know decision)\n    # -> can't abort (might violate consistency)\n    # -> blocked for minutes to hours\n    # Phase 2: commit\n    payment_svc.commit(order_id)\n    inventory_svc.commit(order_id)\n"
+  when_applies: "When implementing transactions that span multiple microservices, databases, or external systems."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [postgresql, kafka, rabbitmq]
+  domains:
+    domain: [architecture, databases, reliability]
+    concern: [distributed_systems, relational, transactions]
+  sources:
+  - url: https://sre.google/sre-book/managing-critical-state/
+    title: 'Google SRE Book — Chapter 23: Managing Critical State'
+  validation_status: cross_checked
+- id: CR-SRE-DIST-002
+  text: Event ordering guarantees must be explicit — systems that assume events arrive in order across partitions will produce
+    corrupt data. Kafka guarantees ordering within a partition, not across partitions. If you need global ordering, you need
+    a single partition — and accept the throughput limit.
+  why: 'Google''s data pipeline design (Chapter 25) emphasizes that ordering assumptions are the source of subtle, data-corrupting
+    bugs. In a partitioned event stream: events for different keys may be processed out of order (by design — that''s how
+    parallelism works). Events for the same key may be processed out of order if the key changes partition (repartitioning)
+    or if a consumer rebalance occurs. Duplicate events are possible (at-least-once delivery). Solutions that assume "events
+    arrive in the order they were produced" will eventually corrupt data. Example: "update user email" arrives after "delete
+    user" → the deleted user reappears with a new email.
+
+    '
+  how_to_do_right: '1. Partition by entity key (user_id, order_id) to guarantee per-entity ordering within a partition.
+
+    2. Include a sequence number or timestamp in each event. Consumers should detect and handle out-of-order events.
+
+    3. Use event version numbers: "update user (version 5)" is only applied if the current version is 4. Otherwise, it''s
+    stale and dropped.
+
+    4. Design consumers to be idempotent: processing the same event twice must produce the same result.
+
+    5. If you need cross-partition ordering, use a single partition (throughput limit) or a sequencer service that assigns
+    global sequence numbers.
+
+    6. Never assume exactly-once delivery. Design for at-least-once and use deduplication (idempotency keys, event IDs) to
+    achieve effectively-once.
+
+    '
+  example_good: "# Handle out-of-order events with version numbers\nfrom dataclasses import dataclass\n\n@dataclass\nclass VersionedEvent:\n    entity_id: str\n    version: int\n    data: dict\n\ndef apply_event(event: VersionedEvent, db) -> str:\n    current = db.get(event.entity_id)\n    if current and current['version'] >= event.version:\n        return 'skipped'  # stale event, already applied newer version\n    db.upsert(\n        entity_id=event.entity_id,\n        data=event.data,\n        version=event.version,\n    )\n    return 'applied'\n\n# Kafka: partition by entity_id for per-entity ordering\n# producer.send('users', key=user_id.encode(), value=event)\n# Within partition: events for same user_id arrive in order\n# Across partitions: no ordering guarantee (by design)\n"
+  example_bad: "# Assumes events arrive in order — data corruption\ndef apply_event(event: dict, db) -> None:\n    db.update(event['entity_id'], event['data'])\n    # No version check!\n    # 'delete user' arrives before 'update user email'\n    # -> deleted user reappears with new email\n    # No partitioning by entity_id\n    # -> events for same user processed by different consumers\n    # -> race condition -> corrupt state\n"
+  when_applies: "When consuming events from Kafka, RabbitMQ, or any distributed event stream where ordering and deduplication must be explicitly handled."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [redis, streams, kafka, rabbitmq]
+  domains:
+    domain: [architecture, messaging, reliability]
+    concern: [distributed_systems, patterns, event_sourcing]
+  sources:
+  - url: https://sre.google/sre-book/data-processing-pipelines/
+    title: 'Google SRE Book — Chapter 25: Data Processing Pipelines'
+  validation_status: cross_checked
+- id: CR-SRE-DIST-003
+  text: The CAP theorem is often misunderstood — it does not say "pick 2 of 3." It says that during a network partition (which
+    WILL happen), you must choose between consistency and availability. When there's no partition, you can have both. The
+    real choice is CP vs AP for partition behavior.
+  why: 'Google''s distributed systems practice (Chapter 23) treats the CAP theorem pragmatically: network partitions are rare
+    but inevitable. The question is not "do I want consistency or availability?" (you want both) but "what happens during
+    the rare partition?" CP systems (Spanner, ZooKeeper): during a partition, refuse writes that can''t be confirmed on a
+    quorum — maintaining consistency at the cost of availability. AP systems (Cassandra, DynamoDB): during a partition, accept
+    writes on both sides — maintaining availability at the cost of consistency (requiring conflict resolution after the partition
+    heals). Google''s Spanner chose CP because financial data requires consistency even at the cost of brief unavailability.
+    Most web services should choose AP because showing slightly stale data is better than showing an error page.
+
+    '
+  how_to_do_right: '1. Choose CP for: financial transactions, inventory management, user authentication — where inconsistency
+    causes real harm.
+
+    2. Choose AP for: content serving, recommendations, analytics, social feeds — where staleness is acceptable and availability
+    matters more.
+
+    3. Implement conflict resolution for AP systems: last-write-wins (simple but lossy), vector clocks (complex but complete),
+    or CRDTs (automatic merge).
+
+    4. Use read-your-writes consistency for AP systems: after a user writes data, that user should see their own write — even
+    if other users see stale data.
+
+    5. Monitor partition events: they should be rare (< 1/month for well-managed infrastructure). Frequent partitions indicate
+    network problems.
+
+    6. Test partition behavior: use network chaos tools to simulate partitions and verify your system behaves as designed
+    (CP rejects writes, AP accepts and resolves).
+
+    '
+  example_good: "# Choose CP vs AP based on data requirements\nfrom enum import Enum\n\nclass ConsistencyModel(Enum):\n    STRONG = 'strong'    # CP: financial, auth, inventory\n    EVENTUAL = 'eventual' # AP: content, search, recommendations\n\n# CP service (payments): reject writes during partition\nclass PaymentService:\n    def charge(self, order_id: str, amount: float) -> dict:\n        # Use PostgreSQL with synchronous replication\n        # If replica is unreachable -> write fails (CP behavior)\n        # Better: payment fails than duplicate charge\n        with self.db.transaction() as tx:\n            tx.execute('INSERT INTO charges ...', (order_id, amount))\n        return {'status': 'charged'}\n\n# AP service (recommendations): serve stale data during partition\nclass RecommendationService:\n    def get_recs(self, user_id: str) -> list:\n        # Read from local cache/replica, even if stale\n        # Better: show slightly old recommendations than error page\n        return self.cache.get(f'recs:{user_id}') or self.default_recs()\n"
+  example_bad: "# No explicit consistency model — bugs during partitions\nclass OrderService:\n    def create_order(self, data):\n        # Writes to primary (assumes always available)\n        self.primary.insert(data)\n        # Reads from replica (assumes always consistent)\n        order = self.replica.get(data['id'])\n        # During network partition:\n        # - Write succeeds on primary\n        # - Read from replica returns None (partition)\n        # - Application shows 'order not found' to user\n        # Neither CP nor AP — worst of both worlds\n"
+  when_applies: "When designing distributed systems that must behave correctly during network partitions, especially when choosing between consistency and availability."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [aws, postgresql, redis]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, data_integrity, consistency]
+  sources:
+  - url: https://sre.google/sre-book/managing-critical-state/
+    title: 'Google SRE Book — Chapter 23: Managing Critical State'
+  validation_status: cross_checked
+- id: CR-SRE-DIST-004
+  text: Distributed locks must have TTL (time-to-live) and fencing tokens. A lock without TTL becomes permanent if the holder
+    crashes. A lock without fencing tokens allows stale lock holders to corrupt data after their lock expired.
+  why: 'Google''s critical state management (Chapter 23) describes two fundamental problems with distributed locks. Problem
+    1: lock holder crashes without releasing the lock → the lock is held forever → the resource is permanently inaccessible.
+    Solution: TTL — the lock auto-expires after N seconds. Problem 2: lock holder has a GC pause or network delay → lock TTL
+    expires → another process acquires the lock → first process resumes and writes data, not knowing its lock expired → two
+    processes write concurrently → data corruption. Solution: fencing tokens — each lock acquisition returns a monotonically
+    increasing token. The storage system rejects writes with a token lower than the last accepted token. This ensures that
+    even if a stale lock holder tries to write, the write is rejected.
+
+    '
+  how_to_do_right: '1. Always set a TTL on distributed locks. Typical values: 10-30 seconds. Renew the lock if the operation
+    takes longer.
+
+    2. Use fencing tokens: each lock acquisition returns an incrementing token. Pass the token with every write operation.
+
+    3. The storage system must validate fencing tokens: reject writes with tokens lower than the last accepted token for that
+    resource.
+
+    4. Never use naive Redis SETNX for distributed locks — it doesn''t handle clock drift or single-point-of-failure. Use
+    Redlock algorithm or a proper coordination service (ZooKeeper, etcd).
+
+    5. Monitor lock contention: high contention indicates a bottleneck that should be resolved architecturally, not by increasing
+    lock timeout.
+
+    6. Prefer optimistic concurrency (version numbers, compare-and-swap) over distributed locks when possible. Locks block;
+    CAS retries.
+
+    '
+  example_good: "# Distributed lock with TTL and fencing token\nimport redis\nimport time\nimport uuid\n\nclass DistributedLock:\n    def __init__(self, redis_client: redis.Redis, resource: str, ttl_sec: int = 30):\n        self.redis = redis_client\n        self.resource = f'lock:{resource}'\n        self.ttl = ttl_sec\n        self.token = None\n\n    def acquire(self) -> str:\n        self.token = str(uuid.uuid4())\n        acquired = self.redis.set(self.resource, self.token,\n                                   nx=True, ex=self.ttl)  # TTL prevents permanent lock\n        if acquired:\n            # Get fencing token (monotonic counter)\n            fence = self.redis.incr(f'{self.resource}:fence')\n            return fence  # Pass this to storage for validation\n        return None\n\n    def release(self) -> None:\n        # Only release if we still own the lock\n        pipe = self.redis.pipeline(True)\n        pipe.watch(self.resource)\n        if pipe.get(self.resource) == self.token.encode():\n            pipe.multi()\n            pipe.delete(self.resource)\n            pipe.execute()\n\n# Storage validates: reject writes with fence_token < last_accepted_token\n"
+  example_bad: "# Naive lock without TTL or fencing — permanent lock + data corruption\nimport redis\n\ndef acquire_lock(r, resource):\n    while not r.setnx(f'lock:{resource}', '1'):  # no TTL!\n        time.sleep(0.1)\n    # If holder crashes -> lock held FOREVER -> resource permanently blocked\n\ndef release_lock(r, resource):\n    r.delete(f'lock:{resource}')  # no ownership check!\n    # Process A's lock expires (GC pause), process B acquires\n    # Process A resumes, deletes B's lock\n    # Now both A and B write concurrently -> data corruption\n    # No fencing token -> stale lock holders corrupt data\n"
+  when_applies: "When implementing mutual exclusion across distributed processes, such as leader election, job scheduling, or preventing concurrent modifications."
+  severity: critical
+  technologies:
+    lang: [general]
+    platform: [redis, kubernetes]
+  domains:
+    domain: [architecture, code_quality, reliability]
+    concern: [distributed_systems, coordination, concurrency]
+  sources:
+  - url: https://sre.google/sre-book/managing-critical-state/
+    title: 'Google SRE Book — Chapter 23: Managing Critical State'
+  validation_status: cross_checked
+- id: CR-SRE-DIST-005
+  text: Clock synchronization cannot be trusted in distributed systems — different servers have different clock values, NTP
+    can drift by milliseconds, and leap seconds cause jumps. Use logical clocks (Lamport timestamps, vector clocks) for ordering
+    events, not wall clock timestamps.
+  why: 'Google learned (and documented in Chapter 23) that wall clock timestamps are unreliable for event ordering in distributed
+    systems. NTP synchronization accuracy is typically 1-10ms across a datacenter and 10-100ms across regions. This means:
+    server A''s clock shows 14:00:00.005, server B''s shows 14:00:00.012. An event at A with timestamp 14:00:00.010 and an
+    event at B with timestamp 14:00:00.008 — which happened first? The timestamps say B, but A may have actually happened
+    first (A''s clock is 7ms behind B''s). Google''s Spanner solved this with TrueTime (GPS + atomic clocks, accuracy ±7ms)
+    and wait-out-uncertainty periods. For everyone else: use logical clocks — Lamport timestamps give causal ordering ("A
+    happened before B"), vector clocks give full causal history.
+
+    '
+  how_to_do_right: '1. Never use wall clock timestamps for ordering events across different servers. Use them only for human-readable
+    display.
+
+    2. Use Lamport timestamps for causal ordering: increment on every event, set to max(local, received) + 1 on message receipt.
+
+    3. Use vector clocks when you need to detect concurrent events (not just causal ordering): {server_A: 3, server_B: 5}.
+
+    4. If you must use wall clocks (e.g., TTL expiration), account for clock skew: add a tolerance window equal to maximum
+    expected skew.
+
+    5. Use monotonic clocks (not wall clocks) for measuring durations: wall clocks can jump backward (NTP correction, leap
+    second).
+
+    6. For unique ID generation, use: ULIDs (timestamp-ordered, collision-resistant), UUIDv7 (timestamp-ordered), or Snowflake
+    IDs (Twitter-style, timestamp + worker + sequence).
+
+    '
+  example_good: "# Lamport timestamp for causal ordering across servers\nfrom threading import Lock\n\nclass LamportClock:\n    def __init__(self):\n        self._time = 0\n        self._lock = Lock()\n\n    def tick(self) -> int:\n        \"\"\"Increment on local event.\"\"\"\n        with self._lock:\n            self._time += 1\n            return self._time\n\n    def receive(self, sender_time: int) -> int:\n        \"\"\"Update on message receipt: max(local, received) + 1.\"\"\"\n        with self._lock:\n            self._time = max(self._time, sender_time) + 1\n            return self._time\n\n    @property\n    def current(self) -> int:\n        return self._time\n\n# For unique IDs: use ULID (timestamp-ordered, collision-resistant)\nimport ulid\nevent_id = ulid.new()  # monotonic within process, sortable by time\n"
+  example_bad: "# Wall clock timestamps for event ordering — unreliable\nfrom datetime import datetime\n\ndef create_event(data: dict) -> dict:\n    return {\n        'data': data,\n        'timestamp': datetime.utcnow().isoformat(),  # wall clock\n    }\n\ndef resolve_conflict(event_a: dict, event_b: dict) -> dict:\n    # 'Later timestamp wins'\n    if event_a['timestamp'] > event_b['timestamp']:\n        return event_a\n    return event_b\n    # Server A's clock is 50ms ahead of Server B\n    # Event on B (actually first) has earlier timestamp\n    # Wrong event 'wins' -> data corruption\n"
+  when_applies: "When ordering events across distributed servers, resolving conflicts in replicated systems, or generating sortable unique IDs."
+  severity: high
+  technologies:
+    lang: [general, go, java, python]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, ordering, data_integrity, consistency]
+  sources:
+  - url: https://sre.google/sre-book/managing-critical-state/
+    title: 'Google SRE Book — Chapter 23: Managing Critical State'
+  validation_status: cross_checked
+- id: CR-SRE-DIST-006
+  text: Service mesh sidecar proxies intercept all network traffic — this means they can introduce latency, consume resources,
+    and become a single point of failure for the entire pod. Monitor sidecar health and resource usage independently from
+    the application.
+  why: 'Google''s load balancing (Chapter 20) and service mesh practices recognize that sidecars (Envoy, Istio, Linkerd) add
+    a network hop to every request. The sidecar processes: inbound request → proxy → application → proxy → outbound request.
+    At 1000 QPS with 2 proxy hops per request (inbound + outbound), the sidecar handles 2000 proxy operations per second.
+    If the sidecar is CPU-starved (no resource limits set), it adds latency to every request. If the sidecar crashes, all
+    network traffic to/from the pod stops — even if the application is healthy. If the sidecar has a memory leak, it eventually
+    OOM-kills the pod. Teams often monitor the application but forget the sidecar, leading to "the app is fine, but everything
+    is slow" debugging sessions.
+
+    '
+  how_to_do_right: '1. Set resource requests AND limits on sidecar containers. Typical: 100m CPU, 128Mi memory (adjust based
+    on traffic volume).
+
+    2. Monitor sidecar metrics independently: CPU usage, memory usage, request queue depth, proxy latency (time added by the
+    sidecar).
+
+    3. Alert on sidecar-specific failures: connection pool exhaustion, certificate expiration, control plane disconnection.
+
+    4. Test sidecar failure modes: what happens when the sidecar crashes? Does the application handle it gracefully or hang
+    indefinitely?
+
+    5. Set sidecar proxy timeouts shorter than application timeouts: if the sidecar waits 30s for a response but the application
+    times out at 10s, the sidecar timeout is meaningless.
+
+    6. Use sidecar-less approaches (ambient mesh, eBPF-based) when latency is critical and the overhead of a sidecar proxy
+    is unacceptable.
+
+    '
+  example_good: "# Sidecar with explicit resource limits and independent monitoring\napiVersion: v1\nkind: Pod\nmetadata:\n  name: api-server\nspec:\n  containers:\n  - name: api\n    image: myapp:abc123\n    resources:\n      requests: {cpu: 500m, memory: 512Mi}\n      limits: {cpu: 1000m, memory: 1Gi}\n  - name: envoy-sidecar\n    image: envoyproxy/envoy:v1.28\n    resources:\n      requests: {cpu: 100m, memory: 128Mi}   # explicit limits\n      limits: {cpu: 200m, memory: 256Mi}\n    readinessProbe:                           # independent health check\n      httpGet:\n        path: /ready\n        port: 15021\n\n# Monitor sidecar independently:\n# envoy_server_live (sidecar alive)\n# envoy_http_downstream_rq_time (proxy latency added)\n# envoy_cluster_upstream_cx_pool_overflow (connection pool exhaustion)\n"
+  example_bad: "# Sidecar with no resource limits or monitoring\napiVersion: v1\nkind: Pod\nspec:\n  containers:\n  - name: api\n    image: myapp:abc123\n  # Istio auto-injects sidecar with NO resource limits\n  # Sidecar under load: consumes all available CPU\n  # App CPU-starved: latency spikes\n  # Sidecar memory leak: OOM-kills the entire pod\n  # 'The app is healthy but everything is slow' — 2 hour debug session\n  # No sidecar monitoring -> invisible root cause\n"
+  when_applies: "When using service mesh sidecars (Envoy, Istio, Linkerd) in production Kubernetes clusters where sidecar failures can impact application reliability."
+  severity: medium
+  technologies:
+    lang: [general]
+    platform: [kubernetes, load_balancer, istio]
+  domains:
+    domain: [architecture, reliability, security]
+    concern: [distributed_systems, microservices, service_mesh, network]
+  sources:
+  - url: https://sre.google/sre-book/load-balancing-datacenter/
+    title: 'Google SRE Book — Chapter 20: Load Balancing in the Datacenter'
+  validation_status: cross_checked
+- id: CR-SRE-DIST-007
+  text: Exactly-once processing is a myth in distributed systems — what you actually get is "at-least-once delivery + idempotent
+    processing = effectively-once semantics." Design every consumer to be idempotent and stop hoping the message broker will
+    magically deliver each message exactly once.
+  why: 'Google''s pipeline design (Chapter 25) explicitly addresses the exactly-once fallacy. Distributed message delivery
+    has three possible guarantees: at-most-once (fire and forget — message may be lost), at-least-once (retry until acknowledged
+    — message may be delivered multiple times), exactly-once (each message delivered exactly once — impossible to guarantee
+    in the general case due to the Two Generals Problem). The impossibility: when a consumer processes a message and sends
+    an acknowledgment, the ack can be lost. The broker retries the message. The consumer receives it again. This is unavoidable
+    without making the consumer and broker a single atomic system. Kafka, Pulsar, and others offer "exactly-once semantics"
+    but this is actually "at-least-once delivery + idempotent producer + transactional consumer" — which is effectively-once,
+    not truly exactly-once.
+
+    '
+  how_to_do_right: '1. Design every consumer to be idempotent: processing the same message twice must produce the same result.
+
+    2. Use a deduplication table: store processed message IDs with TTL. Skip messages that already exist in the table.
+
+    3. Use database transactions as the dedup mechanism: INSERT ... ON CONFLICT DO NOTHING with the message ID as a unique
+    constraint.
+
+    4. For state updates: use compare-and-swap (CAS) operations instead of blind writes. CAS is naturally idempotent.
+
+    5. For side effects (emails, webhooks): use an outbox pattern — write the side effect to a table, then process the table
+    with deduplication.
+
+    6. Prefer idempotent operations by design: SET balance = 100 is idempotent, SET balance = balance + 10 is NOT. Use absolute
+    values when possible.
+
+    '
+  example_good: "# At-least-once delivery + idempotent consumer = effectively-once\nimport psycopg2\n\ndef process_message(msg: dict, conn) -> str:\n    msg_id = msg['id']\n    with conn.cursor() as cur:\n        # Dedup via unique constraint on message_id\n        try:\n            cur.execute(\"\"\"\n                INSERT INTO processed_messages (message_id, result, processed_at)\n                VALUES (%s, %s, NOW())\n                ON CONFLICT (message_id) DO NOTHING\n                RETURNING message_id\n            \"\"\", (msg_id, process(msg)))\n            if cur.fetchone() is None:\n                return 'duplicate'  # already processed\n            conn.commit()\n            return 'processed'\n        except Exception:\n            conn.rollback()\n            raise\n\n# For side effects (emails, webhooks): use outbox pattern\n# 1. Write side effect to outbox table (same transaction as data)\n# 2. Background worker reads outbox and executes (with dedup)\n"
+  example_bad: "# Assumes exactly-once delivery — processes duplicates\ndef process_message(msg: dict, db) -> None:\n    # No dedup check!\n    user = db.get_user(msg['user_id'])\n    user['balance'] += msg['amount']  # additive operation\n    db.update_user(user)\n    send_email(user['email'], 'Payment received!')  # side effect\n\n    # Message delivered twice (broker retry after ack lost):\n    # -> balance incremented TWICE\n    # -> user receives TWO emails\n    # 'But Kafka guarantees exactly-once!' -> No, it guarantees\n    # at-least-once + idempotent producer, not end-to-end exactly-once\n"
+  when_applies: "When building message consumers for Kafka, RabbitMQ, SQS, or any distributed message broker where duplicate delivery is possible."
+  severity: critical
+  technologies:
+    lang: [general]
+    platform: [postgresql, redis, streams, kafka, rabbitmq]
+  domains:
+    domain: [architecture, messaging, reliability]
+    concern: [api_design, idempotency, distributed_systems]
+  sources:
+  - url: https://sre.google/sre-book/data-processing-pipelines/
+    title: 'Google SRE Book — Chapter 25: Data Processing Pipelines'
+  validation_status: cross_checked
+- id: CR-SRE-DIST-008
+  text: Leader election must handle split-brain — if two nodes both believe they are the leader, the system will corrupt data.
+    Use a consensus system (etcd, ZooKeeper) with lease-based leadership and fencing tokens, never a naive "check a flag"
+    approach.
+  why: 'Google''s consensus chapter (Chapter 23) describes split-brain as the most dangerous failure mode in leader-based
+    systems. Split-brain occurs when network partitions cause two nodes to independently conclude they are the leader. Both
+    accept writes, creating conflicting state that may be impossible to merge after the partition heals. Example: two nodes
+    both accept "transfer $100 from account A to B" — the transfer happens twice. Naive leader election ("check a flag in
+    Redis") is vulnerable to split-brain because Redis itself can partition, or the flag check can race with an expiration.
+    Google''s solution: use a proper consensus protocol (Raft, Paxos) implemented in a battle-tested system (etcd, ZooKeeper,
+    Consul). These guarantee that at most one leader exists at any time, even during partitions.
+
+    '
+  how_to_do_right: '1. Use etcd, ZooKeeper, or Consul for leader election — don''t implement your own consensus protocol.
+
+    2. Use lease-based leadership: the leader must periodically renew its lease. If the lease expires, leadership is lost.
+
+    3. Set lease duration to 10-30 seconds. Too short = frequent elections (instability). Too long = slow failover.
+
+    4. Combine with fencing tokens: the leader includes its token in every write. The storage rejects writes from stale leaders.
+
+    5. The leader must step down if it cannot renew its lease — don''t continue operating with an expired lease.
+
+    6. Test leader failover: kill the leader and measure time to new leader election + recovery. This is your failover latency.
+
+    '
+  example_good: "# Leader election with etcd lease and fencing token\nimport etcd3\nimport threading\n\nclass LeaderElection:\n    def __init__(self, etcd_client: etcd3.Etcd3Client, name: str, ttl: int = 15):\n        self.client = etcd_client\n        self.name = name\n        self.ttl = ttl\n        self.lease = None\n        self.is_leader = False\n\n    def campaign(self) -> int:\n        \"\"\"Try to become leader. Returns fencing token if elected.\"\"\"\n        self.lease = self.client.lease(self.ttl)\n        # Atomic put-if-absent with lease (auto-expires if holder crashes)\n        success, _ = self.client.transaction(\n            compare=[self.client.transactions.create(f'/leaders/{self.name}') == 0],\n            success=[self.client.transactions.put(\n                f'/leaders/{self.name}', b'me', lease=self.lease)],\n            failure=[],\n        )\n        if success:\n            self.is_leader = True\n            # Start lease renewal in background\n            threading.Thread(target=self._renew_loop, daemon=True).start()\n            return self.lease.id  # use as fencing token\n        return None\n\n    def _renew_loop(self):\n        while self.is_leader:\n            self.lease.refresh()\n            time.sleep(self.ttl // 3)\n\n    def resign(self):\n        self.is_leader = False\n        self.lease.revoke()\n"
+  example_bad: "# Naive leader election with Redis flag — split-brain vulnerable\nimport redis\n\ndef try_become_leader(r: redis.Redis) -> bool:\n    return r.setnx('leader', 'me')  # no TTL, no fencing\n\ndef am_i_leader(r: redis.Redis) -> bool:\n    return r.get('leader') == b'me'\n\n# Split-brain scenario:\n# 1. Node A sets leader=A\n# 2. Network partition: Node A can't reach Redis\n# 3. Redis TTL expires (if set), Node B sets leader=B\n# 4. Partition heals: Node A still thinks it's leader (cached check)\n# 5. Both A and B accept writes -> data corruption\n# No fencing token -> stale leader's writes succeed\n"
+  when_applies: "When implementing leader election for singleton services, job schedulers, or any system where exactly one active leader is required for correctness."
+  severity: critical
+  technologies:
+    lang: [general]
+    platform: [kubernetes, networking]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, consensus]
+  sources:
+  - url: https://sre.google/sre-book/managing-critical-state/
+    title: 'Google SRE Book — Chapter 23: Managing Critical State'
+  validation_status: cross_checked

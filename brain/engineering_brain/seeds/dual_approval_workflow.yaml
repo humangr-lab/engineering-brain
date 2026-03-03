@@ -1,0 +1,1241 @@
+layer: rules
+domain: architecture
+knowledge:
+- id: DAPPR-001
+  text: >
+    Enforce segregation of duties as a server-side database constraint, not
+    a UI-only validation: store creator_id and approver_id on every
+    approvable entity, and enforce creator_id != approver_id via a database
+    CHECK constraint or a BEFORE INSERT trigger on the approval record.
+    Any UI enforcement without a corresponding server-side constraint can
+    be bypassed.
+  why: >
+    Segregation of duties (NIST SP 800-53 AC-5) is the foundational control
+    against insider fraud in approval workflows. When enforced only in the
+    UI, a developer or API user can bypass it by calling the approval API
+    directly (curl, Postman, script). In 2019, a trading firm lost $2.3M
+    when an engineer bypassed a UI-only SoD check via direct API call to
+    self-approve a large transfer. Database constraints are enforced at the
+    storage layer — bypass requires database superuser access, which has
+    its own audit trail (AUDIT-001).
+  how_to_do_right: |
+    1. Add CHECK constraint at DB level:
+       ALTER TABLE approval_decisions ADD CONSTRAINT no_self_approval
+       CHECK (approver_id != entity.creator_id);
+       -- Use a trigger if creator_id is in a different table
+    2. In application layer (defense in depth — do both):
+       if approval.approver_id == entity.creator_id:
+           raise SelfApprovalForbiddenError(
+               "Creator cannot approve their own submission. "
+               f"Submitter: {entity.creator_id}, Approver: {approval.approver_id}"
+           )
+    3. Log every blocked self-approval attempt as a security event
+       (not just a validation error).
+    4. Expose approver_id as a read-only field in the API — clients cannot
+       supply it; it is set from the authenticated session identity only.
+    5. Test: assert that API call with creator_id == approver_id returns 403,
+       not just that the UI shows an error.
+  severity: critical
+  technologies:
+    lang: [python, sql]
+    framework: [fastapi, sqlalchemy, postgresql]
+  domains:
+    domain: [architecture, security, compliance]
+    concern: [segregation_of_duties, self_approval_prevention]
+  example_good: |
+    from sqlalchemy import Column, String, CheckConstraint
+    from sqlalchemy.orm import Session
+    from fastapi import HTTPException, status
+
+    class ApprovalDecision(Base):
+        __tablename__ = "approval_decisions"
+        __table_args__ = (
+            # Database-level constraint — cannot be bypassed via API
+            CheckConstraint(
+                "approver_id != submitter_id",
+                name="ck_no_self_approval"
+            ),
+        )
+        id          = Column(String, primary_key=True)
+        entity_id   = Column(String, nullable=False)
+        submitter_id = Column(String, nullable=False)  # from entity.creator_id
+        approver_id = Column(String, nullable=False)   # from current session
+        decision    = Column(String, nullable=False)   # APPROVED | REJECTED
+        decided_at  = Column(DateTime(timezone=True), nullable=False)
+
+    async def approve_entity(
+        entity_id: str,
+        decision: str,
+        current_user: User,  # always from auth session, never from request body
+        db: Session,
+    ) -> ApprovalDecision:
+        entity = db.query(ApprovableEntity).filter_by(id=entity_id).one()
+
+        # Application-layer check (defense in depth)
+        if entity.creator_id == current_user.id:
+            # Log as security event, not just validation
+            security_logger.warning(
+                "self_approval_attempt",
+                extra={"entity_id": entity_id, "user_id": current_user.id}
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Segregation of duties violation: creator cannot approve own submission"
+            )
+
+        record = ApprovalDecision(
+            entity_id=entity_id,
+            submitter_id=entity.creator_id,
+            approver_id=current_user.id,  # set from session, not request
+            decision=decision,
+            decided_at=datetime.now(timezone.utc),
+        )
+        db.add(record)
+        db.commit()  # DB constraint fires here — bulletproof
+        return record
+  example_bad: |
+    # UI-only validation — bypassed by direct API call
+    @router.post("/approve/{entity_id}")
+    async def approve(entity_id: str, approver_id: str, decision: str):
+        entity = db.get(entity_id)
+        # This check exists only here — easily bypassed
+        if approver_id == entity.creator_id:
+            return {"error": "Cannot self-approve"}  # Client ignores, calls again
+        # curl -X POST /approve/entity_1 -d '{"approver_id": "creator_123"}'
+        # → approval created, no database constraint to stop it
+  when_applies: "Any approval workflow for financial transactions, configuration changes, deployments, access grants, or any action requiring authorization by a second party."
+  sources:
+    - "NIST SP 800-53 Rev.5. AC-5: Separation of Duties — https://csf.tools/reference/nist-sp-800-53/r5/ac/ac-5/"
+    - "OWASP. Broken Access Control — https://owasp.org/Top10/A01_2021-Broken_Access_Control/"
+    - "IBM. Separation of duty approval workflow operation — https://www.ibm.com/docs/en/sim/7.0.2?topic=policies-separation-duty-approval-workflow-operation"
+
+- id: DAPPR-002
+  text: >
+    Model approval workflows as an explicit state machine with exactly these
+    states: DRAFT → PENDING_REVIEW → APPROVED → EXECUTED (terminal),
+    or DRAFT → PENDING_REVIEW → REJECTED → DRAFT (loop).
+    State transitions must be enforced as the only valid mutations — any
+    direct status field update bypassing the state machine is prohibited.
+  why: >
+    Ad-hoc status field updates ("SET status = 'approved' WHERE id = X")
+    bypass all business logic: validation, notifications, audit logging,
+    and SoD checks. In practice, developers always find "shortcuts" to fix
+    urgent issues unless transitions are the only mechanism. A state machine
+    with an explicit transition table makes every state change traceable,
+    testable, and auditable. Testing coverage is measurable: every valid
+    and invalid transition must have a test.
+  how_to_do_right: |
+    1. Define states as an enum (not strings in DB):
+       class ApprovalState(Enum):
+           DRAFT = "DRAFT"
+           PENDING_REVIEW = "PENDING_REVIEW"
+           APPROVED = "APPROVED"
+           REJECTED = "REJECTED"
+           EXECUTED = "EXECUTED"
+    2. Define valid transitions as a dict (from → to):
+       VALID_TRANSITIONS = {
+           DRAFT: {PENDING_REVIEW},
+           PENDING_REVIEW: {APPROVED, REJECTED},
+           APPROVED: {EXECUTED},
+           REJECTED: {DRAFT},  # re-submission allowed
+           EXECUTED: set(),    # terminal — no exit
+       }
+    3. Single transition function that validates, records, and notifies.
+    4. Block direct DB status updates via trigger (same as AUDIT-001 pattern).
+    5. Test: for every (from, to) pair, test valid → succeeds; test every
+       invalid → raises InvalidTransitionError.
+    6. Store full transition history (not just current state) for audit trail.
+  severity: critical
+  technologies:
+    lang: [python, sql]
+    framework: [sqlalchemy, postgresql, fastapi]
+  domains:
+    domain: [architecture, state_machine, workflow]
+    concern: [state_machine, workflow_integrity, audit_trail]
+  example_good: |
+    from enum import Enum
+    from dataclasses import dataclass
+    from datetime import datetime, timezone
+
+    class ApprovalState(Enum):
+        DRAFT = "DRAFT"
+        PENDING_REVIEW = "PENDING_REVIEW"
+        APPROVED = "APPROVED"
+        REJECTED = "REJECTED"
+        EXECUTED = "EXECUTED"
+
+    VALID_TRANSITIONS: dict[ApprovalState, set[ApprovalState]] = {
+        ApprovalState.DRAFT:          {ApprovalState.PENDING_REVIEW},
+        ApprovalState.PENDING_REVIEW: {ApprovalState.APPROVED, ApprovalState.REJECTED},
+        ApprovalState.APPROVED:       {ApprovalState.EXECUTED},
+        ApprovalState.REJECTED:       {ApprovalState.DRAFT},
+        ApprovalState.EXECUTED:       set(),  # terminal
+    }
+
+    class InvalidTransitionError(Exception):
+        pass
+
+    def transition(entity, to_state: ApprovalState, actor_id: str,
+                   db, comment: str = "") -> None:
+        """Single entry point for ALL state changes. No shortcuts."""
+        current = ApprovalState(entity.state)
+
+        if to_state not in VALID_TRANSITIONS[current]:
+            raise InvalidTransitionError(
+                f"Invalid transition {current.value} → {to_state.value}. "
+                f"Valid targets: {[s.value for s in VALID_TRANSITIONS[current]]}"
+            )
+
+        # Record transition in history (immutable)
+        db.execute("""
+            INSERT INTO approval_state_history
+                (entity_id, from_state, to_state, actor_id, comment, transitioned_at)
+            VALUES (:eid, :from_s, :to_s, :actor, :comment, :now)
+        """, {"eid": entity.id, "from_s": current.value, "to_s": to_state.value,
+               "actor": actor_id, "comment": comment,
+               "now": datetime.now(timezone.utc)})
+
+        # Update current state
+        entity.state = to_state.value
+        db.commit()
+
+        # Trigger notifications asynchronously
+        notify_stakeholders(entity, from_state=current, to_state=to_state)
+  example_bad: |
+    # Direct status update — bypasses all business logic
+    @router.post("/admin/force-approve/{entity_id}")
+    async def force_approve(entity_id: str):
+        # "Quick fix" during incident — skips SoD check, audit, notification
+        db.execute("UPDATE approvals SET status = 'APPROVED' WHERE id = %s",
+                   (entity_id,))
+        db.commit()
+        return {"ok": True}
+    # 6 months later: compliance audit finds APPROVED records with no
+    # corresponding approver_id or audit trail. $150K remediation cost.
+  when_applies: "Any process with a defined approval lifecycle: financial approvals, change requests, deployment gates, access requests, or contract approvals."
+  sources:
+    - "NIST SP 800-53 Rev.5. AC-5: Separation of Duties — https://csf.tools/reference/nist-sp-800-53/r5/ac/ac-5/"
+    - "Gamma, E. et al. (1994). Design Patterns. State Pattern — p. 305-313. Addison-Wesley."
+    - "Appmaster. Approval Workflow Blueprint That Holds Up at Scale — https://appmaster.io/blog/approval-workflow-blueprint-scale"
+
+- id: DAPPR-003
+  text: >
+    Time-bound all approvals: set an expiration timestamp at PENDING_REVIEW
+    entry (default 72 hours for standard, 4 hours for high-urgency).
+    If the expiry passes without a decision, the workflow auto-transitions
+    to EXPIRED state and triggers escalation. A decision made after expiry
+    is rejected with 409 Conflict — approvals on stale submissions are
+    a fraud vector.
+  why: >
+    Unsigned approvals that linger indefinitely are a compliance liability.
+    SOX requires that approval workflows complete within defined SLAs.
+    More critically: if a submission is modified after approval initiation,
+    an approver may approve a version they never reviewed. Time-bounding
+    forces re-submission after changes, ensuring the approver always
+    reviews the current version. PCI-DSS 3.6.1 requires that cryptographic
+    key change requests have defined time limits for authorization.
+  how_to_do_right: |
+    1. At transition DRAFT → PENDING_REVIEW, set:
+       expires_at = NOW() + INTERVAL '72 hours'  (standard)
+       expires_at = NOW() + INTERVAL '4 hours'   (urgency=HIGH)
+    2. Background job checks for expired pending approvals every 15 minutes:
+       SELECT * FROM approvable_entities
+       WHERE state = 'PENDING_REVIEW' AND expires_at < NOW();
+    3. For each expired: transition to EXPIRED state, notify submitter + escalation.
+    4. On approval attempt: check entity.expires_at > NOW() FIRST.
+       If expired: reject with 409 Conflict {"error": "approval_request_expired",
+       "expired_at": "...", "action": "please resubmit"}.
+    5. Any modification to a PENDING_REVIEW entity automatically resets
+       expires_at (forces re-review of updated version).
+    6. Store expiry policy (default/urgency/custom) in entity metadata for audit.
+  severity: high
+  technologies:
+    lang: [python, sql]
+    framework: [fastapi, sqlalchemy, postgresql, celery]
+  domains:
+    domain: [architecture, workflow, compliance]
+    concern: [time_bounded_approval, expiration, escalation]
+  example_good: |
+    from datetime import datetime, timezone, timedelta
+    from enum import Enum
+
+    class Urgency(Enum):
+        STANDARD = "standard"
+        HIGH = "high"
+        CRITICAL = "critical"
+
+    EXPIRY_HOURS = {
+        Urgency.STANDARD: 72,
+        Urgency.HIGH: 4,
+        Urgency.CRITICAL: 1,
+    }
+
+    def submit_for_review(entity, actor_id: str, urgency: Urgency, db) -> None:
+        """Transition DRAFT → PENDING_REVIEW with expiry."""
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            hours=EXPIRY_HOURS[urgency]
+        )
+        entity.expires_at = expires_at
+        entity.urgency = urgency.value
+        transition(entity, ApprovalState.PENDING_REVIEW, actor_id, db)
+
+    def approve(entity, approver_id: str, db) -> None:
+        """Approve — check expiry before accepting decision."""
+        if datetime.now(timezone.utc) > entity.expires_at:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "approval_request_expired",
+                    "expired_at": entity.expires_at.isoformat(),
+                    "action": "Resubmit to generate a fresh approval request",
+                }
+            )
+        # SoD check + state transition (DAPPR-001 + DAPPR-002)
+        transition(entity, ApprovalState.APPROVED, approver_id, db)
+
+    # Celery task — runs every 15 minutes
+    @app.task
+    def expire_pending_approvals():
+        expired = db.query(ApprovableEntity).filter(
+            ApprovableEntity.state == "PENDING_REVIEW",
+            ApprovableEntity.expires_at < datetime.now(timezone.utc)
+        ).all()
+        for entity in expired:
+            transition(entity, ApprovalState.EXPIRED, actor_id="system", db=db,
+                        comment="Auto-expired: no decision within SLA")
+            notify_escalation(entity)
+  example_bad: |
+    # No expiry — approvals can be decided weeks after submission
+    class ApprovalRequest(Base):
+        id          = Column(String, primary_key=True)
+        status      = Column(String, default="pending")
+        submitted_at = Column(DateTime)
+        # No expires_at field
+    # Submission modified on day 1, reviewer approves on day 14
+    # Reviewer approved version from day 14, not modified version from day 2
+    # Financial control failure: approved != reviewed
+  when_applies: "All approval workflows in financial systems, configuration changes, access grants, and any workflow where the approved content may change over time."
+  sources:
+    - "NIST SP 800-53 Rev.5. AC-5: Separation of Duties — https://csf.tools/reference/nist-sp-800-53/r5/ac/ac-5/"
+    - "PCI DSS v4.0 Requirement 3.6.1. Key management procedures — https://www.pcisecuritystandards.org/document_library/"
+    - "SG Systems Global. Approval Workflow — Electronic Signature Routing — https://sgsystemsglobal.com/glossary/approval-workflow/"
+
+- id: DAPPR-004
+  text: >
+    Implement quorum-based approval (M-of-N) for high-value transactions.
+    For transactions above threshold T, require M approvers from a pool of
+    N eligible approvers (M < N). Collect approvals independently — each
+    approver sees the same submission but cannot see other approvers' decisions
+    until quorum is reached or deadline passes.
+  why: >
+    Single-approver controls have a single point of failure: the approver
+    can be coerced, compromised, or unavailable. For transfers >$100K,
+    wire instructions, and infrastructure access grants, M-of-N quorum
+    matches the control strength required by SOX Section 302 and SOC 2
+    Type II CC6.1. Hiding individual votes until quorum prevents herding
+    bias (where later approvers are influenced by seeing early approvals).
+    Real implementation example: AWS multi-party authorization for root
+    account actions requires 2-of-3 qualified approvers.
+  how_to_do_right: |
+    1. Define quorum policy per approval type:
+       QUORUM_POLICIES = {
+           "wire_transfer_large": QuorumPolicy(m=2, n=5, threshold_usd=100_000),
+           "production_access":   QuorumPolicy(m=2, n=3, threshold_usd=None),
+           "config_change_prod":  QuorumPolicy(m=2, n=4, threshold_usd=None),
+       }
+    2. On submission: select N eligible approvers (exclude creator), notify all.
+    3. Accept individual votes without revealing others' votes until:
+       a. M approvals received → auto-approve, OR
+       b. (N-M+1) rejections received → auto-reject (quorum impossible), OR
+       c. Deadline reached with <M approvals → escalate.
+    4. Store each vote immutably with timestamp (AUDIT pattern applies here too).
+    5. Only reveal individual votes after decision is final.
+    6. Quorum state transitions: PENDING_QUORUM → QUORUM_MET → APPROVED.
+  severity: critical
+  technologies:
+    lang: [python, sql]
+    framework: [fastapi, sqlalchemy, postgresql, celery]
+  domains:
+    domain: [architecture, security, workflow, financial]
+    concern: [quorum_approval, m_of_n, high_value_authorization]
+  example_good: |
+    from dataclasses import dataclass
+
+    @dataclass
+    class QuorumPolicy:
+        m: int  # required approvals
+        n: int  # total eligible approvers
+        threshold_usd: float | None  # None = always applies
+
+    QUORUM_POLICIES: dict[str, QuorumPolicy] = {
+        "wire_transfer": QuorumPolicy(m=2, n=5, threshold_usd=100_000),
+        "prod_access":   QuorumPolicy(m=2, n=3, threshold_usd=None),
+    }
+
+    @dataclass
+    class QuorumState:
+        approval_type: str
+        entity_id: str
+        eligible_approvers: list[str]   # N approvers (excludes creator)
+        votes: dict[str, str]           # approver_id → "APPROVE"|"REJECT" (hidden until final)
+        policy: QuorumPolicy
+        expires_at: datetime
+
+        @property
+        def approve_count(self) -> int:
+            return sum(1 for v in self.votes.values() if v == "APPROVE")
+
+        @property
+        def reject_count(self) -> int:
+            return sum(1 for v in self.votes.values() if v == "REJECT")
+
+        @property
+        def is_quorum_met(self) -> bool:
+            return self.approve_count >= self.policy.m
+
+        @property
+        def is_quorum_impossible(self) -> bool:
+            remaining = self.policy.n - len(self.votes)
+            # Can't reach M approvals even if all remaining vote approve
+            return (self.approve_count + remaining) < self.policy.m
+
+    def record_quorum_vote(state: QuorumState, approver_id: str,
+                            vote: str, db) -> str:
+        """Record one approver's vote. Returns status."""
+        if approver_id == state.eligible_approvers[0]:  # creator check
+            raise ValueError("Creator is not an eligible approver")
+        if approver_id not in state.eligible_approvers:
+            raise PermissionError(f"{approver_id} is not an eligible approver")
+        if approver_id in state.votes:
+            raise ValueError(f"{approver_id} has already voted")
+
+        state.votes[approver_id] = vote
+        save_vote(db, state.entity_id, approver_id, vote)  # immutable
+
+        if state.is_quorum_met:
+            finalize_quorum(state, "APPROVED", db)
+            return "QUORUM_MET_APPROVED"
+        elif state.is_quorum_impossible:
+            finalize_quorum(state, "REJECTED", db)
+            return "QUORUM_IMPOSSIBLE_REJECTED"
+        return f"VOTE_RECORDED ({state.approve_count}/{state.policy.m} needed)"
+  example_bad: |
+    # Single approver for large transfers — easily coerced or compromised
+    @router.post("/approve-transfer/{transfer_id}")
+    async def approve_transfer(transfer_id: str, approver: User = Depends(get_current_user)):
+        transfer = db.get(Transfer, transfer_id)
+        # No quorum for $500K transfer — one approver sufficient
+        if approver.id != transfer.creator_id:
+            transfer.status = "approved"
+            execute_wire_transfer(transfer)
+        # Single point of failure: coerce this approver → unlimited fraud
+  when_applies: "High-value financial transactions (above defined thresholds), production access grants, infrastructure changes, and any action with catastrophic irreversible impact."
+  sources:
+    - "NIST SP 800-53 Rev.5. AC-5: Separation of Duties — https://csf.tools/reference/nist-sp-800-53/r5/ac/ac-5/"
+    - "AWS. Multi-party authorization for privileged actions — https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles.html"
+    - "ISACA. Segregation of Duties in Information Technology — https://www.isaca.org/resources/isaca-journal"
+
+- id: DAPPR-005
+  text: >
+    Implement delegation patterns for out-of-office scenarios: explicit
+    delegation (user A delegates to user B for a time window), not role-based
+    catch-all. Delegation must be logged, time-bounded (max 30 days), and
+    require a third party to authorize the delegation itself. Never allow
+    self-delegation or delegation to the original submitter.
+  why: >
+    Without delegation, approval workflows stall when the designated approver
+    is unavailable (vacation, sick leave, departure). With naïve catch-all
+    delegation ("any manager can approve"), SoD enforcement degrades to
+    meaningless — anyone with the "manager" role can approve their own work
+    through role membership. Explicit, logged, time-bounded delegation with
+    third-party authorization maintains SoD integrity while allowing
+    operational continuity. IBM's identity governance systems cite uncontrolled
+    delegation as a top-5 source of SoD violations discovered in audits.
+  how_to_do_right: |
+    1. Delegation request schema:
+       delegator_id, delegate_id, valid_from, valid_until (max 30 days),
+       scope (approval_type list), authorized_by (3rd party, != delegator).
+    2. When resolving eligible approvers: check active delegation chains.
+       eligible = original_approvers + delegates (where delegation is active)
+       minus creator_id at all resolution steps.
+    3. Delegation authorization: approved by a third party who is NOT
+       the delegator and NOT the delegate.
+    4. Audit: log every approval made under delegation:
+       "approved by: user_B on behalf of: user_A (delegation_id: DEL-42)"
+    5. Auto-expire delegations: daily cron revokes expired delegations.
+    6. Alert if delegation chain depth > 1 (no cascading delegation).
+  severity: high
+  technologies:
+    lang: [python, sql]
+    framework: [fastapi, sqlalchemy, postgresql]
+  domains:
+    domain: [architecture, workflow, security]
+    concern: [delegation, out_of_office, continuity]
+  example_good: |
+    from dataclasses import dataclass
+    from datetime import datetime, timezone, timedelta
+
+    @dataclass
+    class Delegation:
+        id: str
+        delegator_id: str           # original approver
+        delegate_id: str            # who will act on their behalf
+        scope: list[str]            # approval types covered
+        valid_from: datetime
+        valid_until: datetime       # max 30 days from valid_from
+        authorized_by: str          # 3rd party authorizer
+        revoked_at: datetime | None = None
+
+    def create_delegation(delegator: str, delegate: str, scope: list[str],
+                           valid_days: int, authorized_by: str, db) -> Delegation:
+        """Create time-bounded delegation with 3rd-party authorization."""
+        if delegate == delegator:
+            raise ValueError("Cannot delegate to yourself")
+        if authorized_by == delegator or authorized_by == delegate:
+            raise ValueError(
+                "Delegation authorizer must be a third party "
+                "(not delegator or delegate)"
+            )
+        if valid_days > 30:
+            raise ValueError("Delegation cannot exceed 30 days")
+
+        now = datetime.now(timezone.utc)
+        delegation = Delegation(
+            id=generate_id("DEL"),
+            delegator_id=delegator,
+            delegate_id=delegate,
+            scope=scope,
+            valid_from=now,
+            valid_until=now + timedelta(days=valid_days),
+            authorized_by=authorized_by,
+        )
+        save_delegation(db, delegation)
+        audit_log_entry(db, actor_id=authorized_by,
+                         action="delegation.created",
+                         resource_id=delegation.id,
+                         new_data={"delegator": delegator,
+                                    "delegate": delegate,
+                                    "scope": scope,
+                                    "valid_until": delegation.valid_until.isoformat()})
+        return delegation
+
+    def resolve_eligible_approvers(entity, approval_type: str, db) -> list[str]:
+        """Resolve approver pool including active delegations."""
+        base_approvers = get_role_approvers(approval_type, db)
+        active_delegates = get_active_delegates(base_approvers, approval_type,
+                                                 db, now=datetime.now(timezone.utc))
+        eligible = list(set(base_approvers) | set(active_delegates))
+        return [a for a in eligible if a != entity.creator_id]  # always exclude creator
+  example_bad: |
+    # Role-based catch-all delegation — SoD collapses
+    def get_eligible_approvers(entity_id: str) -> list[str]:
+        # Any user with "manager" role can approve — including the creator if they're a manager
+        return db.query(User).filter(User.role == "manager").all()
+    # Creator has "manager" role → can approve their own submission
+    # SoD violation rate: 40% of approvals are self-approvals in practice
+  when_applies: "Any approval workflow with named approvers who may be unavailable, particularly in regulated industries where SoD is a compliance requirement."
+  sources:
+    - "NIST SP 800-53 Rev.5. AC-5: Separation of Duties — https://csf.tools/reference/nist-sp-800-53/r5/ac/ac-5/"
+    - "IBM. Separation of duty approval workflow operation — https://www.ibm.com/docs/en/sim/7.0.2?topic=policies-separation-duty-approval-workflow-operation"
+    - "SG Systems Global. Segregation of Duties in MES — https://sgsystemsglobal.com/glossary/segregation-of-duties-in-mes/"
+
+- id: DAPPR-006
+  text: >
+    Support conditional approval (approve-with-modifications) as an explicit
+    workflow state: CONDITIONALLY_APPROVED. The approver specifies required
+    modifications; the submitter addresses them and the workflow transitions
+    back to PENDING_REVIEW automatically — not to APPROVED. A second approval
+    cycle is required for the modified version.
+  why: >
+    Without conditional approval, approvers face a binary choice: approve
+    a flawed submission or reject and restart from scratch. This leads to
+    approvers rubber-stamping imperfect submissions ("close enough") to
+    avoid unnecessary delay. The result is approved submissions with known
+    deficiencies. CONDITIONALLY_APPROVED state forces the submitter to
+    address specific issues while keeping the workflow alive. The mandatory
+    second approval cycle ensures the approver validates their conditions
+    were met — not just that the submitter claimed to address them.
+  how_to_do_right: |
+    1. Add CONDITIONALLY_APPROVED to state machine:
+       VALID_TRANSITIONS = {
+           ...
+           ApprovalState.PENDING_REVIEW: {APPROVED, REJECTED, CONDITIONALLY_APPROVED},
+           ApprovalState.CONDITIONALLY_APPROVED: {PENDING_REVIEW},  # after modifications
+           ...
+       }
+    2. Conditional approval records:
+       conditions: list[str]  — specific required changes
+       condition_response: str | None — submitter's response
+       original_approver_id: str  — same approver gets the resubmission
+    3. On modification: transition CONDITIONALLY_APPROVED → PENDING_REVIEW,
+       reset expires_at, notify original_approver_id.
+    4. Original approver has priority but is not locked in (can delegate if unavailable).
+    5. Audit: both cycles fully logged — conditions, response, final decision.
+  severity: medium
+  technologies:
+    lang: [python, sql]
+    framework: [fastapi, sqlalchemy, postgresql]
+  domains:
+    domain: [architecture, workflow]
+    concern: [conditional_approval, iterative_workflow]
+  example_good: |
+    class ApprovalState(Enum):
+        DRAFT = "DRAFT"
+        PENDING_REVIEW = "PENDING_REVIEW"
+        CONDITIONALLY_APPROVED = "CONDITIONALLY_APPROVED"  # NEW STATE
+        APPROVED = "APPROVED"
+        REJECTED = "REJECTED"
+        EXECUTED = "EXECUTED"
+
+    VALID_TRANSITIONS = {
+        ApprovalState.DRAFT:                   {ApprovalState.PENDING_REVIEW},
+        ApprovalState.PENDING_REVIEW:          {ApprovalState.APPROVED,
+                                                ApprovalState.REJECTED,
+                                                ApprovalState.CONDITIONALLY_APPROVED},
+        ApprovalState.CONDITIONALLY_APPROVED:  {ApprovalState.PENDING_REVIEW},  # after fix
+        ApprovalState.APPROVED:                {ApprovalState.EXECUTED},
+        ApprovalState.REJECTED:                {ApprovalState.DRAFT},
+        ApprovalState.EXECUTED:                set(),
+    }
+
+    def conditionally_approve(entity, approver_id: str,
+                               conditions: list[str], db) -> None:
+        """Approve with required modifications — forces second review cycle."""
+        if entity.creator_id == approver_id:
+            raise SelfApprovalForbiddenError()
+
+        entity.conditions = conditions
+        entity.original_approver_id = approver_id  # priority reviewer for resubmission
+        transition(entity, ApprovalState.CONDITIONALLY_APPROVED, approver_id, db,
+                    comment=f"Conditional: {'; '.join(conditions)}")
+
+    def resubmit_with_response(entity, submitter_id: str,
+                                condition_response: str, db) -> None:
+        """Submitter addresses conditions → back to PENDING_REVIEW."""
+        if entity.state != ApprovalState.CONDITIONALLY_APPROVED.value:
+            raise InvalidTransitionError("Only CONDITIONALLY_APPROVED entities can be resubmitted")
+        entity.condition_response = condition_response
+        entity.expires_at = datetime.now(timezone.utc) + timedelta(hours=72)
+        transition(entity, ApprovalState.PENDING_REVIEW, submitter_id, db,
+                    comment=f"Resubmitted: {condition_response}")
+        notify_approver(entity.original_approver_id, entity)
+  example_bad: |
+    # Binary approve/reject — rubber-stamping in practice
+    @router.post("/approve/{entity_id}")
+    async def approve(entity_id: str, approver: User = Depends(get_current_user)):
+        entity = db.get(entity_id)
+        # Approver sees issues but doesn't want to reject and restart
+        # So they approve with a comment "please fix X before executing"
+        # Comment is ignored by the executor. Issues ship to production.
+        entity.status = "approved"  # rubber-stamp
+        db.commit()
+  when_applies: "Design reviews, code reviews modeled as workflows, procurement approvals, compliance submissions, and any workflow where partial approval with conditions is operationally useful."
+  sources:
+    - "SG Systems Global. Approval Workflow — https://sgsystemsglobal.com/glossary/approval-workflow/"
+    - "NIST SP 800-53 Rev.5. AC-5: Separation of Duties — https://csf.tools/reference/nist-sp-800-53/r5/ac/ac-5/"
+
+- id: DAPPR-007
+  text: >
+    Implement complete, immutable audit trail for all approval events using
+    the hash-chained audit log pattern. Every approval workflow state
+    transition must record: who acted, from which state, to which state,
+    when, why (comment), what version of the submission was reviewed (content hash),
+    and whether any delegation was active. This audit trail must be
+    independently verifiable.
+  why: >
+    SOX Section 404 requires that management can demonstrate approval controls
+    are operating effectively. This requires showing not just who approved,
+    but that they reviewed the correct version (not a post-hoc modification)
+    and were eligible (not violating SoD). A content hash of the submission at
+    approval time proves the approver reviewed what was eventually executed.
+    Financial regulators have imposed fines for approval records that showed
+    "approved" without proof of what was approved — the content hash closes
+    this gap.
+  how_to_do_right: |
+    1. At PENDING_REVIEW entry: compute content_hash = SHA-256(canonicalize(entity_data)).
+       Store in entity record. This is the version the approver will review.
+    2. At APPROVED: record approved_content_hash == content_hash at review time.
+    3. At EXECUTED: assert content_hash at execution == approved_content_hash.
+       Refuse execution if hashes differ (submission modified post-approval).
+    4. Audit record fields for approval events:
+       (entity_id, from_state, to_state, actor_id, content_hash, delegation_id,
+        comment, transitioned_at, prev_audit_hash, audit_entry_hash)
+    5. Use AUDIT-002 hash-chaining for the approval audit log.
+    6. Retention: keep approval audit records for 7 years (SOX requirement).
+  severity: critical
+  technologies:
+    lang: [python, sql]
+    framework: [postgresql, sqlalchemy, hashlib]
+  domains:
+    domain: [architecture, security, compliance, audit]
+    concern: [approval_audit, content_hash, sox_compliance]
+  example_good: |
+    import hashlib
+    import json
+
+    def content_hash(entity_data: dict) -> str:
+        """Deterministic SHA-256 of submission content at review time."""
+        canonical = json.dumps(
+            {k: v for k, v in entity_data.items()
+             if k not in ("id", "state", "created_at", "updated_at")},
+            sort_keys=True, separators=(',', ':'), default=str
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def submit_for_review(entity, actor_id: str, db) -> None:
+        """Lock content hash at review submission — this is what approver sees."""
+        entity.pending_review_content_hash = content_hash(entity.__dict__)
+        transition(entity, ApprovalState.PENDING_REVIEW, actor_id, db)
+
+    def approve(entity, approver_id: str, db, delegation_id: str | None = None) -> None:
+        """Record approval with exact content hash that was reviewed."""
+        insert_audit_entry(db,
+            actor_id=approver_id,
+            action="approval.approved",
+            resource_id=entity.id,
+            new_data={
+                "from_state": "PENDING_REVIEW",
+                "to_state": "APPROVED",
+                "approved_content_hash": entity.pending_review_content_hash,
+                "delegation_id": delegation_id,
+                "comment": "Approved",
+            }
+        )
+        entity.approved_content_hash = entity.pending_review_content_hash
+        transition(entity, ApprovalState.APPROVED, approver_id, db)
+
+    def execute(entity, executor_id: str, db) -> None:
+        """Execute — refuse if content changed since approval."""
+        current_hash = content_hash(entity.__dict__)
+        if current_hash != entity.approved_content_hash:
+            raise ValueError(
+                "EXECUTION BLOCKED: Entity was modified after approval. "
+                "Approved hash: {entity.approved_content_hash[:12]}... "
+                "Current hash: {current_hash[:12]}... "
+                "Resubmit for fresh approval."
+            )
+        transition(entity, ApprovalState.EXECUTED, executor_id, db)
+  example_bad: |
+    # Approval audit without content hash — what was approved?
+    def approve(entity_id: str, approver_id: str, db):
+        db.execute("""
+            INSERT INTO approval_log (entity_id, approver_id, approved_at)
+            VALUES (%s, %s, NOW())
+        """, (entity_id, approver_id))
+        db.execute("UPDATE entities SET status = 'approved' WHERE id = %s",
+                   (entity_id,))
+        # Entity modified between approval and execution?
+        # "Approved" record says nothing about what version was reviewed
+        # SOX audit: "You approved this, but was it the version that was executed?"
+        # Answer: "We don't know." — SOX violation.
+  when_applies: "All approval workflows in regulated industries, particularly financial services, healthcare, and public companies subject to SOX."
+  sources:
+    - "SOX Section 404. Management Assessment of Internal Controls."
+    - "NIST SP 800-53 Rev.5. AU-2, AU-9: Audit Events and Protection — https://csf.tools/reference/nist-sp-800-53/r5/au/au-9/"
+    - "PCI DSS v4.0 Requirement 10. Log and Monitor All Access — https://www.pcisecuritystandards.org/document_library/"
+
+- id: DAPPR-008
+  text: >
+    Implement emergency bypass as an explicit workflow state (EMERGENCY_BYPASS)
+    that requires post-hoc review within 24 hours. Emergency bypass skips
+    the normal approval cycle but requires: a specific urgency code, a
+    justification, and automatic scheduling of a post-hoc review. Any
+    execution under EMERGENCY_BYPASS that is not reviewed within 24 hours
+    triggers an automatic escalation alert.
+  why: >
+    Production incidents require rapid action — a full approval cycle cannot
+    wait 72 hours during an outage. Without an official emergency bypass path,
+    engineers circumvent controls informally ("I'll get approval retroactively"),
+    leaving no audit trail and no post-hoc review. An explicit EMERGENCY_BYPASS
+    state acknowledges operational reality while maintaining auditability.
+    The 24-hour mandatory post-hoc review is the control that satisfies SOC 2
+    CC6.1 (security commitments) and prevents the bypass from becoming the
+    default path for avoiding scrutiny.
+  how_to_do_right: |
+    1. EMERGENCY_BYPASS is an alternative to PENDING_REVIEW, not a skip:
+       DRAFT → EMERGENCY_BYPASS → EXECUTED (with 24h post-hoc review)
+    2. EMERGENCY_BYPASS requires: urgency_code (from pre-approved list),
+       justification (minimum 50 chars), executor must be senior role.
+    3. On EMERGENCY_BYPASS: immediately schedule post-hoc review job (24h).
+    4. Post-hoc review: a qualified reviewer (not the bypass initiator)
+       reviews the executed action and marks it RETROSPECTIVELY_APPROVED
+       or raises an incident.
+    5. If post-hoc review not completed in 24h: alert CISO + engineering VP.
+    6. Monthly report: count emergency bypasses vs standard approvals.
+       Target: <2% of all workflows. If >5%: process review required.
+  severity: high
+  technologies:
+    lang: [python, sql]
+    framework: [fastapi, sqlalchemy, celery, postgresql]
+  domains:
+    domain: [architecture, security, incident_response, workflow]
+    concern: [emergency_bypass, post_hoc_review, audit_trail]
+  example_good: |
+    VALID_URGENCY_CODES = frozenset([
+        "P0_PRODUCTION_OUTAGE",
+        "SECURITY_INCIDENT",
+        "DATA_LOSS_PREVENTION",
+        "REGULATORY_DEADLINE",
+    ])
+
+    def emergency_bypass(entity, executor_id: str, urgency_code: str,
+                          justification: str, db) -> None:
+        """Execute immediately with mandatory 24h post-hoc review."""
+        if urgency_code not in VALID_URGENCY_CODES:
+            raise ValueError(f"Invalid urgency code. Valid: {VALID_URGENCY_CODES}")
+        if len(justification) < 50:
+            raise ValueError("Justification must be at least 50 characters")
+        if not has_role(executor_id, "senior_engineer", "team_lead", "vp"):
+            raise PermissionError("Emergency bypass requires senior role")
+
+        # Log immediately with full context
+        insert_audit_entry(db, actor_id=executor_id,
+            action="approval.emergency_bypass",
+            resource_id=entity.id,
+            new_data={
+                "urgency_code": urgency_code,
+                "justification": justification,
+                "post_hoc_review_due": (
+                    datetime.now(timezone.utc) + timedelta(hours=24)
+                ).isoformat(),
+            }
+        )
+
+        # Execute
+        transition(entity, ApprovalState.EMERGENCY_BYPASS, executor_id, db)
+        execute_entity_action(entity, db)
+
+        # Schedule mandatory post-hoc review (24h deadline)
+        schedule_posthoc_review.apply_async(
+            args=[entity.id, executor_id],
+            countdown=24 * 3600
+        )
+
+        notify_security_team(entity, urgency_code, executor_id)
+
+    @app.task
+    def schedule_posthoc_review(entity_id: str, bypass_executor_id: str):
+        """Fires if 24h review not completed. Escalates."""
+        entity = db.get(entity_id)
+        if entity.posthoc_reviewed_at is None:
+            alert_escalation(
+                message=f"EMERGENCY BYPASS UNREVIEWED: {entity_id}. "
+                        f"Bypassed by {bypass_executor_id}. 24h SLA breached.",
+                severity="HIGH",
+                recipients=["ciso@company.com", "vp-engineering@company.com"],
+            )
+  example_bad: |
+    # No emergency bypass → engineers self-approve informally
+    # Incident at 3am: "We need to push the hotfix NOW"
+    # Engineer: chat message "I'm self-approving this, getting formal approval tomorrow"
+    # Tomorrow: everyone forgot, no post-hoc review, no audit trail
+    # SOC 2 audit: "Show me approvals for emergency changes in Q3"
+    # Answer: "We have informal Slack messages..." — SOC 2 failure
+  when_applies: "Any approval workflow used in production operations where incidents may require bypassing standard approval cycles."
+  sources:
+    - "SOC 2 Type II CC6.1. Logical access security software — AICPA."
+    - "NIST SP 800-53 Rev.5. AC-5: Separation of Duties — https://csf.tools/reference/nist-sp-800-53/r5/ac/ac-5/"
+    - "ISACA. Emergency Access Management — https://www.isaca.org/resources/audit-and-assurance"
+
+- id: DAPPR-009
+  text: >
+    Send approval notifications with enough context that the approver can
+    make a decision without opening the full system. Include: what (entity
+    summary), who submitted, when submitted, why urgency, deadline, and a
+    one-click link that deep-links to the approval with pre-filled approver
+    identity. Never send a bare "you have a pending approval" notification.
+  why: >
+    Approval workflows fail not because of technical bugs but because
+    approvers ignore vague notifications. A notification reading "Pending
+    approval: INV-0042" requires the approver to log in, find the item,
+    understand context, and then decide — 5-7 minutes minimum. Approvers
+    deprioritize this under workload pressure. Notifications with full
+    context reduce approval time from days to hours. Context-rich
+    notifications also prevent approvers from approving without reading
+    ("just click approve to clear the notification").
+  how_to_do_right: |
+    1. Notification payload minimum fields:
+       entity_id, entity_type, entity_summary (200 chars), submitter_name,
+       submission_time, urgency, deadline_iso, approval_url (deep link),
+       context_snapshot (key fields relevant to the decision).
+    2. Notification channels by urgency:
+       STANDARD: email (1h delivery acceptable)
+       HIGH: email + Slack (5 min delivery)
+       CRITICAL: email + Slack + SMS/PagerDuty (immediate)
+    3. Deep link URL includes: entity_id, approver_token (pre-authed, 24h TTL).
+       Approver opens URL, sees pre-filled form, one click to approve/reject.
+    4. Reminder schedule: +24h, +48h, then escalate at deadline.
+    5. Never send approval notifications to group aliases — always to named individuals.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [fastapi, celery, slack-sdk, sendgrid]
+  domains:
+    domain: [architecture, workflow, ux]
+    concern: [notification, approval_latency, context_rich]
+  example_good: |
+    from dataclasses import dataclass
+
+    @dataclass
+    class ApprovalNotification:
+        approver_id: str
+        approver_email: str
+        entity_id: str
+        entity_type: str
+        entity_summary: str     # max 200 chars, human-readable
+        submitter_name: str
+        submitted_at: str
+        urgency: str
+        deadline_iso: str
+        approval_url: str       # deep link with pre-auth token
+        key_context: dict       # 3-5 most important fields for the decision
+
+    def send_approval_request(notification: ApprovalNotification) -> None:
+        """Send context-rich notification. Approver can decide from the notification."""
+        subject = (
+            f"[{notification.urgency}] Approval needed: "
+            f"{notification.entity_type} by {notification.submitter_name} "
+            f"— due {notification.deadline_iso[:10]}"
+        )
+        body = f"""
+    {notification.approver_id},
+
+    {notification.submitter_name} submitted a {notification.entity_type} for your approval.
+
+    SUMMARY: {notification.entity_summary}
+
+    KEY DETAILS:
+    {_format_context(notification.key_context)}
+
+    DEADLINE: {notification.deadline_iso}
+
+    ▶ APPROVE or REJECT (one click, no login required):
+    {notification.approval_url}
+        """.strip()
+        send_email(to=notification.approver_email, subject=subject, body=body)
+        if notification.urgency in ("HIGH", "CRITICAL"):
+            send_slack_dm(approver_id=notification.approver_id, message=body[:500])
+  example_bad: |
+    # Vague notification — approver ignores it
+    def notify_approver(approver_email: str, entity_id: str):
+        send_email(
+            to=approver_email,
+            subject="Pending approval",
+            body=f"You have a pending approval. ID: {entity_id}. Log in to review."
+        )
+        # Approver: "I'll look at this when I have time"
+        # Time never comes. Approval sits for 5 days.
+        # 72-hour SLA breached. Automatic escalation floods VP's inbox.
+        # VP asks: "Why can't approvers respond on time?"
+        # Answer: they didn't have enough context to act without logging in
+  when_applies: "All approval workflows that require human review, particularly distributed teams where approvers may be in different timezones."
+  sources:
+    - "Atlassian. Optimize Project Approval Workflows — https://www.atlassian.com/work-management/project-management/approval-process-workflow"
+    - "Appmaster. Approval Workflow Blueprint at Scale — https://appmaster.io/blog/approval-workflow-blueprint-scale"
+
+- id: DAPPR-010
+  text: >
+    Test approval workflows using state machine coverage: every valid state
+    transition must have a passing test, every invalid transition must have
+    a test asserting rejection, and every SoD rule must have a test that
+    attempts violation and asserts 403/Exception. Minimum test matrix:
+    N_valid_transitions × 1 + N_invalid_transitions × 1 + N_SoD_rules × 3.
+  why: >
+    Approval workflows are security controls — they must be tested to the
+    same standard as authentication. A state machine with 5 states has
+    25 possible (from, to) pairs; only 6 are valid. The 19 invalid transitions
+    are as important to test as the 6 valid ones: they represent the attack
+    surface. SoD rules need 3 tests each: (1) creator cannot approve,
+    (2) delegate cannot approve on behalf of creator, (3) role boundary
+    cannot be escalated. Teams that only test the happy path discover
+    compliance failures during audits, not during development.
+  how_to_do_right: |
+    1. Generate test matrix from VALID_TRANSITIONS dict at test time:
+       valid_pairs = [(f, t) for f, targets in VALID_TRANSITIONS.items()
+                      for t in targets]
+       all_pairs = [(f, t) for f in ApprovalState for t in ApprovalState]
+       invalid_pairs = [p for p in all_pairs if p not in valid_pairs
+                        and p[0] != p[1]]
+    2. For each valid pair: test transition succeeds.
+    3. For each invalid pair: test transition raises InvalidTransitionError.
+    4. SoD test suite (at minimum):
+       test_creator_cannot_approve()
+       test_delegate_of_creator_cannot_approve()
+       test_role_escalation_blocked()
+       test_expired_approval_rejected()
+       test_quorum_self_vote_blocked()
+    5. Integration test: full happy path DRAFT→PENDING→APPROVED→EXECUTED.
+    6. Integration test: emergency bypass + 24h post-hoc reminder.
+    7. Property-based test: for any two random distinct users, if user A created,
+       user A cannot be recorded as approver in approval_decisions.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pytest, hypothesis, fastapi]
+  domains:
+    domain: [architecture, testing, workflow, security]
+    concern: [state_machine_testing, sod_testing, coverage]
+  example_good: |
+    import pytest
+    from itertools import product
+    from hypothesis import given, strategies as st
+
+    # Generate test matrix from state machine definition
+    VALID_PAIRS = [
+        (ApprovalState.DRAFT, ApprovalState.PENDING_REVIEW),
+        (ApprovalState.PENDING_REVIEW, ApprovalState.APPROVED),
+        (ApprovalState.PENDING_REVIEW, ApprovalState.REJECTED),
+        (ApprovalState.APPROVED, ApprovalState.EXECUTED),
+        (ApprovalState.REJECTED, ApprovalState.DRAFT),
+    ]
+    ALL_PAIRS = [(f, t) for f, t in product(ApprovalState, ApprovalState) if f != t]
+    INVALID_PAIRS = [p for p in ALL_PAIRS if p not in VALID_PAIRS]
+
+    @pytest.mark.parametrize("from_state,to_state", VALID_PAIRS)
+    def test_valid_transition(from_state, to_state, entity_fixture, db_fixture):
+        entity_fixture.state = from_state.value
+        transition(entity_fixture, to_state, actor_id="approver_1", db=db_fixture)
+        assert entity_fixture.state == to_state.value
+
+    @pytest.mark.parametrize("from_state,to_state", INVALID_PAIRS)
+    def test_invalid_transition_raises(from_state, to_state, entity_fixture, db_fixture):
+        entity_fixture.state = from_state.value
+        with pytest.raises(InvalidTransitionError):
+            transition(entity_fixture, to_state, actor_id="approver_1", db=db_fixture)
+
+    # SoD tests
+    def test_creator_cannot_approve(entity_fixture, db_fixture):
+        entity_fixture.state = ApprovalState.PENDING_REVIEW.value
+        entity_fixture.creator_id = "user_alice"
+        with pytest.raises(SelfApprovalForbiddenError):
+            approve(entity_fixture, approver_id="user_alice", db=db_fixture)
+
+    # Property-based: for any two users, creator cannot be approver
+    @given(creator=st.text(min_size=1), approver=st.text(min_size=1))
+    def test_sod_property(creator: str, approver: str, db_fixture):
+        if creator == approver:
+            with pytest.raises(SelfApprovalForbiddenError):
+                record_approval(creator_id=creator, approver_id=approver,
+                                 db=db_fixture)
+  example_bad: |
+    # Only happy path tested — security properties unverified
+    def test_approval_workflow():
+        entity = create_entity(creator_id="alice")
+        submit_for_review(entity, actor_id="alice", db=test_db)
+        approve(entity, approver_id="bob", db=test_db)
+        assert entity.state == "APPROVED"
+    # No test: can alice approve her own entity?
+    # No test: can APPROVED → DRAFT transition be forced?
+    # No test: can expired approval be accepted?
+    # Security regression discovered during SOC 2 audit: self-approval
+    # bypassed via direct API call. 18 months of self-approved records.
+  when_applies: "All approval workflow implementations before deployment to production, and after any state machine or SoD rule changes."
+  sources:
+    - "OWASP. Testing for Privilege Escalation — https://owasp.org/www-project-web-security-testing-guide/"
+    - "NIST SP 800-53 Rev.5. AC-5: Separation of Duties — https://csf.tools/reference/nist-sp-800-53/r5/ac/ac-5/"
+    - "Hypothesis. Property-Based Testing for Python — https://hypothesis.readthedocs.io/en/latest/"
+
+- id: DAPPR-011
+  text: >
+    Implement compliance reporting for approval workflows as a queryable API,
+    not a manual export. The report must answer: (a) SoD violation rate
+    (target: 0%), (b) approval SLA adherence (% completed before deadline),
+    (c) emergency bypass frequency (target: <2%), (d) average approval cycle
+    time per entity type, (e) approver distribution (no single approver
+    handling >30% of volume). Run daily and alert on any deviation from thresholds.
+  why: >
+    Compliance reports generated manually before audits are backward-looking
+    and often incomplete. Automated, daily compliance reporting turns audit
+    preparation from a 2-week scramble into a one-click export. More
+    importantly, daily monitoring catches drift early: an approver handling
+    60% of volume is a control concentration risk — if they leave or are
+    compromised, the workflow collapses. COSO Internal Control Framework
+    (used by SOX) explicitly requires ongoing monitoring, not point-in-time
+    assessment.
+  how_to_do_right: |
+    1. Approval compliance view (materialized, refreshed daily):
+       CREATE MATERIALIZED VIEW approval_compliance_daily AS
+       SELECT
+           date_trunc('day', transitioned_at) AS date,
+           COUNT(*) FILTER (WHERE from_state = 'PENDING_REVIEW'
+                             AND to_state = 'APPROVED') AS approved_count,
+           COUNT(*) FILTER (WHERE from_state = 'PENDING_REVIEW'
+                             AND approver_id = submitter_id) AS sod_violations,
+           AVG(EXTRACT(EPOCH FROM (transitioned_at - submitted_at))/3600)
+               FILTER (WHERE to_state = 'APPROVED') AS avg_approval_hours,
+           COUNT(*) FILTER (WHERE from_state = 'EMERGENCY_BYPASS') AS bypasses
+       FROM approval_state_history GROUP BY 1;
+    2. Alert thresholds:
+       SoD violations > 0: immediate CRITICAL alert
+       SLA adherence < 95%: HIGH alert
+       Emergency bypasses > 2% of weekly total: HIGH alert
+       Single approver > 30% of weekly volume: MEDIUM alert
+    3. Export endpoint: GET /compliance/approvals?from=...&to=...
+       Returns structured JSON + CSV downloadable by auditors.
+  severity: high
+  technologies:
+    lang: [sql, python]
+    framework: [postgresql, fastapi, grafana]
+  domains:
+    domain: [architecture, compliance, monitoring, audit]
+    concern: [compliance_reporting, sod_monitoring, audit_readiness]
+  example_good: |
+    -- Materialized compliance view — refreshed daily
+    CREATE MATERIALIZED VIEW approval_compliance_daily AS
+    WITH transitions AS (
+        SELECT
+            h.entity_id,
+            h.from_state,
+            h.to_state,
+            h.actor_id AS approver_id,
+            h.transitioned_at,
+            e.creator_id AS submitter_id,
+            e.entity_type,
+            e.expires_at,
+            DATE_TRUNC('day', h.transitioned_at) AS day
+        FROM approval_state_history h
+        JOIN approvable_entities e ON e.id = h.entity_id
+    )
+    SELECT
+        day,
+        entity_type,
+        COUNT(*) FILTER (WHERE to_state = 'APPROVED')        AS approved,
+        COUNT(*) FILTER (WHERE to_state = 'REJECTED')        AS rejected,
+        COUNT(*) FILTER (WHERE to_state = 'EMERGENCY_BYPASS') AS bypasses,
+        COUNT(*) FILTER (WHERE from_state = 'PENDING_REVIEW'
+                          AND approver_id = submitter_id)     AS sod_violations,
+        AVG(EXTRACT(EPOCH FROM
+                (transitioned_at - (
+                    SELECT MIN(h2.transitioned_at)
+                    FROM approval_state_history h2
+                    WHERE h2.entity_id = transitions.entity_id
+                    AND h2.to_state = 'PENDING_REVIEW'
+                ))
+            ) / 3600.0)
+            FILTER (WHERE to_state = 'APPROVED')              AS avg_approval_hours
+    FROM transitions
+    GROUP BY day, entity_type
+    ORDER BY day DESC;
+
+    -- Approver concentration check
+    SELECT approver_id,
+           COUNT(*) AS approvals,
+           100.0 * COUNT(*) / SUM(COUNT(*)) OVER () AS pct_of_total
+    FROM approval_state_history
+    WHERE to_state = 'APPROVED'
+      AND transitioned_at > NOW() - INTERVAL '7 days'
+    GROUP BY approver_id
+    HAVING 100.0 * COUNT(*) / SUM(COUNT(*)) OVER () > 30;
+  example_bad: |
+    # Manual compliance export 2 weeks before annual audit
+    # Finance analyst: "I need all approvals from last year with approver names"
+    # Developer: "I'll write a script... takes 3 days to build"
+    # Analyst: "The auditor wants it in 4 hours"
+    # Result: incomplete export, some records missed, audit finding issued
+    # "Your approval workflow lacks adequate reporting controls" → remediation required
+  when_applies: "Any organization subject to SOX, SOC 2, ISO 27001, PCI-DSS, or internal audit requirements with formal approval workflows."
+  sources:
+    - "COSO. Internal Control — Integrated Framework (2013). Ongoing Monitoring component."
+    - "SOX Section 404. Management Assessment of Internal Controls."
+    - "NIST SP 800-53 Rev.5. AU-6: Audit Record Review, Analysis, and Reporting — https://csf.tools/reference/nist-sp-800-53/r5/au/au-6/"
+
+- id: DAPPR-012
+  text: >
+    Integrate approval workflows with version control (PR-style reviews) for
+    configuration changes. Every production configuration change must go
+    through an approval workflow backed by a version-controlled diff, not
+    a GUI form. The approver reviews the actual diff (old value → new value),
+    and the approved diff hash is what gets deployed — no undiffed changes
+    can slip in.
+  why: >
+    Configuration changes are a leading cause of production incidents. Yet
+    most configuration management tools use GUI forms where the approver
+    sees a human-readable summary — not the exact configuration diff that
+    will be deployed. This creates an approval-without-review pattern: the
+    approver approves a description of a change, not the change itself.
+    PR-style approval of configuration diffs (with content hash binding
+    from DAPPR-007) ensures the approver reviewed exactly what was deployed.
+    Heroku's 2022 outage and numerous AWS configuration incidents traced to
+    unapproved or incorrectly-approved configuration changes.
+  how_to_do_right: |
+    1. Config changes are stored as diffs in version control (git or equivalent).
+    2. Approval entity includes: config_diff (old_value, new_value per key),
+       config_hash (SHA-256 of proposed config), target_environment.
+    3. Approver sees rendered diff (like GitHub PR diff), not a form.
+    4. Approval is of config_hash — deployment system verifies hash before apply.
+    5. Deployment: assert SHA-256(current config proposal) == approved_config_hash.
+       Refuse deployment if config was modified after approval.
+    6. Emergency config bypass: same EMERGENCY_BYPASS flow (DAPPR-008),
+       with mandatory post-hoc review.
+    7. Config approval audit trail is queried separately: show all config
+       changes in last 30 days with approver, diff, and deploy time.
+  severity: high
+  technologies:
+    lang: [python, yaml]
+    framework: [gitops, terraform, kubernetes, fastapi]
+  domains:
+    domain: [architecture, workflow, devops, configuration]
+    concern: [config_approval, gitops, change_management]
+  example_good: |
+    import hashlib
+    import json
+
+    @dataclass
+    class ConfigChangeRequest:
+        id: str
+        target_env: str           # "production", "staging"
+        config_key_path: str      # e.g., "payments.max_transaction_usd"
+        old_value: str
+        new_value: str
+        reason: str
+        creator_id: str
+        proposed_config_hash: str  # SHA-256 of the full config after change
+        state: str = "DRAFT"
+
+    def compute_config_hash(full_config: dict) -> str:
+        """Deterministic hash of full configuration state after proposed change."""
+        return hashlib.sha256(
+            json.dumps(full_config, sort_keys=True).encode()
+        ).hexdigest()
+
+    def deploy_config_change(change_id: str, db, config_service) -> None:
+        """Deploy only if config hash matches what was approved."""
+        change = db.get(ConfigChangeRequest, change_id)
+        assert change.state == "APPROVED", f"Change {change_id} not approved"
+
+        # Compute hash of the config that WOULD be applied
+        proposed_config = config_service.compute_proposed_config(
+            key_path=change.config_key_path,
+            new_value=change.new_value,
+        )
+        actual_hash = compute_config_hash(proposed_config)
+
+        if actual_hash != change.proposed_config_hash:
+            raise ValueError(
+                f"CONFIG DEPLOYMENT BLOCKED: Config hash mismatch. "
+                f"Approved: {change.proposed_config_hash[:12]}... "
+                f"Current: {actual_hash[:12]}... "
+                "Config was modified after approval. Re-approve."
+            )
+
+        config_service.apply(change.config_key_path, change.new_value)
+        insert_audit_entry(db, actor_id="deployment-system",
+                            action="config.deployed",
+                            resource_id=change_id,
+                            new_data={"config_hash": actual_hash,
+                                       "target_env": change.target_env})
+  example_bad: |
+    # GUI form approval — approver sees description, not diff
+    @router.post("/config/approve/{change_id}")
+    async def approve_config_change(change_id: str, approver: User):
+        change = db.get(change_id)
+        # Approver saw: "Increase max_transaction_usd from 10000 to 50000"
+        # But deployment applies: max_transaction_usd=50000 AND fraud_check=disabled
+        # (second change slipped in after approval)
+        # No hash verification → unapproved change deployed
+        deploy(change)  # no hash check
+  when_applies: "All production configuration changes, especially those affecting security settings, financial limits, access controls, or infrastructure parameters."
+  sources:
+    - "NIST SP 800-53 Rev.5. CM-3: Configuration Change Control — https://csf.tools/reference/nist-sp-800-53/r5/cm/cm-3/"
+    - "OWASP. Security Configuration — https://owasp.org/www-project-web-security-testing-guide/"
+    - "SG Systems Global. Approval Workflow — https://sgsystemsglobal.com/glossary/approval-workflow/"

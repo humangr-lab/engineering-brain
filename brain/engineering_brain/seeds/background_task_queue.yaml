@@ -1,0 +1,1072 @@
+layer: rules
+domain: architecture
+knowledge:
+- id: BTQ-001
+  text: >
+    Every Celery task must be idempotent: calling it twice with the same arguments must
+    produce the same observable state as calling it once. Use a database-level idempotency
+    key (task_id or business-level key) to detect and short-circuit duplicate execution.
+    Non-idempotent Celery tasks are a financial/data integrity time bomb in any system
+    with retries enabled.
+  why: >
+    Celery retries on network timeouts, worker crashes, and broker reconnects. A task that
+    sends an email, charges a card, or inserts a record will do so multiple times if not
+    idempotent. At a fintech startup, a non-idempotent payment task retried 3 times during
+    a Redis reconnect, charging users' cards 3 times each. The bug was invisible in testing
+    because the test environment never had Redis disconnections. Over 40% of unexpected
+    task failures in distributed systems stem from retry-related issues, per 2025 production
+    analysis.
+  how_to_do_right: |
+    1. Use a business-level idempotency key stored in Redis or DB:
+       def send_payment_confirmation(user_id: str, order_id: str) -> None:
+           key = f"task:send_email:{order_id}"
+           if redis.set(key, "1", nx=True, ex=86400):  # nx=only if not exists
+               _do_send_email(user_id, order_id)
+           # else: already sent, skip silently
+    2. For DB operations, use INSERT ... ON CONFLICT DO NOTHING with unique constraints.
+    3. For external API calls, pass an idempotency key in the request header if the API
+       supports it (Stripe, Twilio, etc.).
+    4. Make idempotency checks cheap: Redis SETNX is O(1), not a DB query.
+    5. Idempotency key TTL must exceed task retry window: if max retries take 24 hours,
+       TTL must be > 24 hours.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [celery, redis, fastapi]
+  domains:
+    domain: [architecture, background_tasks]
+    concern: [idempotency, reliability, financial_correctness]
+  example_good: |
+    # tasks/notifications.py
+    from celery import shared_task
+    import redis
+
+    r = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+
+    @shared_task(bind=True, max_retries=3, name="send_order_confirmation")
+    def send_order_confirmation(self, user_id: str, order_id: str) -> dict:
+        """Idempotent task: sends order confirmation email exactly once."""
+        idempotency_key = f"task:order_confirm:{order_id}"
+
+        # Atomic check-and-set: only proceed if first execution
+        acquired = r.set(idempotency_key, self.request.id, nx=True, ex=86400)
+        if not acquired:
+            # Already executed (or in progress from another worker)
+            return {"status": "skipped", "reason": "already_executed"}
+
+        try:
+            email_service.send_order_confirmation(user_id=user_id, order_id=order_id)
+            return {"status": "sent"}
+        except Exception as exc:
+            r.delete(idempotency_key)  # Release lock so retry can proceed
+            raise self.retry(exc=exc)
+  example_bad: |
+    # WRONG: no idempotency — retries cause duplicate emails/charges
+    @shared_task(max_retries=3)
+    def send_order_confirmation(user_id: str, order_id: str) -> None:
+        # If this task is retried due to a network timeout, user gets 3 emails
+        # If this is a charge task, user gets charged 3 times
+        email_service.send(user_id=user_id, order_id=order_id)
+  when_applies: "Every Celery task that produces side effects: emails, SMS, API calls, DB writes, payments. Mandatory for any financial task."
+  sources:
+    - "https://docs.celeryq.dev/en/stable/userguide/tasks.html#idempotence"
+    - "https://www.vintasoftware.com/blog/celery-wild-tips-and-tricks-run-async-tasks-real-world"
+
+- id: BTQ-002
+  text: >
+    Configure Celery task retries with exponential backoff and jitter using concrete
+    parameters: base_delay=1s, factor=2, jitter=uniform(0, 0.3×delay), max_delay=30s,
+    max_retries=5. These exact parameters are derived from TCP backoff research and
+    prevent thundering herd on broker recovery. Never use fixed retry delays in production.
+  why: >
+    Fixed retry delays (retry in 5 seconds) cause thundering herd: if 1000 tasks fail
+    simultaneously (broker restart), they all retry at T+5, T+10, T+15 — hammering the
+    newly recovered broker with coordinated bursts. Exponential backoff with jitter spreads
+    the retry storm over 30+ seconds, giving the broker time to stabilize. The specific
+    parameters (base=1, factor=2, max=30) are validated in AWS SQS documentation and the
+    Celery best practices guide.
+  how_to_do_right: |
+    1. Use celery's built-in autoretry_for with retry_backoff:
+       @shared_task(
+           autoretry_for=(requests.RequestException, redis.RedisError),
+           retry_backoff=True,       # enables exponential backoff
+           retry_backoff_max=30,     # max delay cap: 30 seconds
+           retry_jitter=True,        # adds random jitter
+           max_retries=5,
+       )
+    2. For custom retry logic:
+       import random, math
+       def backoff_delay(attempt: int, base: float = 1.0,
+                         factor: float = 2.0, max_delay: float = 30.0) -> float:
+           delay = min(base * (factor ** attempt), max_delay)
+           jitter = random.uniform(0, 0.3 * delay)
+           return delay + jitter
+
+       raise self.retry(exc=exc, countdown=backoff_delay(self.request.retries))
+    3. Different retry configs for different error types:
+       - Transient errors (network): 5 retries, backoff 1-30s
+       - Rate limit errors: 3 retries, backoff 60-300s (longer)
+       - Permanent errors (invalid data): 0 retries, send to DLQ immediately
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [celery]
+  domains:
+    domain: [architecture, background_tasks]
+    concern: [retry_strategy, resilience, thundering_herd]
+  example_good: |
+    # tasks/api_calls.py
+    import requests
+    import random
+    from celery import shared_task
+
+    @shared_task(
+        bind=True,
+        autoretry_for=(requests.RequestException,),
+        retry_backoff=True,        # delays: ~1s, ~2s, ~4s, ~8s, ~16s (with jitter)
+        retry_backoff_max=30,      # cap at 30s
+        retry_jitter=True,         # uniform jitter up to 0.3×delay
+        max_retries=5,
+        name="sync_external_api",
+    )
+    def sync_external_api(self, user_id: str) -> dict:
+        """Sync user data with external CRM. Retries with exponential backoff."""
+        response = requests.post(
+            f"{settings.CRM_URL}/users/{user_id}/sync",
+            headers={"Authorization": f"Bearer {settings.CRM_TOKEN}"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
+  example_bad: |
+    # WRONG: fixed delay — causes thundering herd on broker restart
+    @shared_task(bind=True, max_retries=5)
+    def sync_external_api(self, user_id: str) -> dict:
+        try:
+            return requests.post(CRM_URL).json()
+        except requests.RequestException as exc:
+            raise self.retry(exc=exc, countdown=5)  # ALL tasks retry in exactly 5s
+            # 1000 tasks fail → 1000 tasks retry at T+5s → broker crash again
+  when_applies: "Every Celery task that calls external services (HTTP, Redis, DB), which is most production tasks."
+  sources:
+    - "https://docs.celeryq.dev/en/stable/userguide/tasks.html#retrying"
+    - "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/"
+
+- id: BTQ-003
+  text: >
+    Route permanently-failed tasks to a Dead Letter Queue (DLQ) after exhausting retries.
+    The DLQ must be monitored (alert if message count > 0) and processed by a separate
+    worker that logs, alerts, and optionally replays messages after manual review.
+    Tasks that silently disappear after max_retries are lost work that nobody knows about.
+  why: >
+    The default Celery behavior after max_retries is to discard the task and log an error.
+    In production, "logged an error" means "probably nobody saw it." A webhook processing
+    service was losing 0.3% of incoming webhooks (1-2 per hour) for 6 months without
+    detection because failed tasks were discarded. The DLQ pattern makes failures visible:
+    an alert fires when the first message hits the DLQ, engineers investigate, and
+    no work is permanently lost.
+  how_to_do_right: |
+    1. Create a DLQ as a dedicated Redis list or Celery queue:
+       # celeryconfig.py
+       task_routes = {
+           "tasks.*": {"queue": "default"},
+           "tasks.dlq.*": {"queue": "dead_letter"},
+       }
+    2. Override on_failure to route to DLQ:
+       class DLQTask(Task):
+           def on_failure(self, exc, task_id, args, kwargs, einfo):
+               if self.request.retries >= self.max_retries:
+                   # Task permanently failed — route to DLQ
+                   dlq_entry = {
+                       "task": self.name,
+                       "task_id": task_id,
+                       "args": args,
+                       "kwargs": kwargs,
+                       "exception": str(exc),
+                       "failed_at": datetime.utcnow().isoformat(),
+                   }
+                   redis.lpush("celery:dlq", json.dumps(dlq_entry))
+                   metrics.increment("celery.dlq.pushed", tags={"task": self.name})
+    3. Alert: Prometheus alert if celery_dlq_size > 0 for 5 minutes.
+    4. DLQ worker: separate process that reads from DLQ, sends Slack alert, creates JIRA ticket.
+    5. Replay capability: provide script to re-queue DLQ messages after fixing root cause.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [celery, redis, prometheus]
+  domains:
+    domain: [architecture, background_tasks]
+    concern: [error_handling, observability, reliability]
+  example_good: |
+    # tasks/base.py
+    import json
+    from datetime import datetime
+    from celery import Task
+    import redis
+
+    r = redis.Redis.from_url(settings.REDIS_URL)
+
+    class ResilientTask(Task):
+        abstract = True
+
+        def on_failure(self, exc, task_id, args, kwargs, einfo):
+            """Route permanently failed tasks to DLQ for manual review."""
+            if self.request.retries >= self.max_retries:
+                dlq_entry = {
+                    "task_name": self.name,
+                    "task_id": task_id,
+                    "args": list(args),
+                    "kwargs": kwargs,
+                    "exception_type": type(exc).__name__,
+                    "exception_msg": str(exc),
+                    "traceback": str(einfo),
+                    "failed_at": datetime.utcnow().isoformat(),
+                }
+                r.lpush("celery:dlq", json.dumps(dlq_entry))
+                # Metric for Prometheus alerting
+                statsd.increment("celery.dlq.entries", tags=[f"task:{self.name}"])
+            super().on_failure(exc, task_id, args, kwargs, einfo)
+
+    # Use base class for all tasks
+    @shared_task(base=ResilientTask, max_retries=3, bind=True)
+    def process_webhook(self, payload: dict) -> None:
+        ...
+  example_bad: |
+    # WRONG: no DLQ — permanently failed tasks silently disappear
+    @shared_task(max_retries=3)
+    def process_webhook(payload: dict) -> None:
+        # After 3 retries, task is discarded with a log line nobody reads
+        # 1-2 webhooks per hour lost for 6 months before anyone notices
+        response = requests.post(internal_api, json=payload)
+        response.raise_for_status()
+  when_applies: "Every Celery task that processes business-critical data: webhooks, payment events, order processing, user notifications."
+  sources:
+    - "https://docs.celeryq.dev/en/stable/userguide/tasks.html#on-failure"
+    - "https://blog.gitguardian.com/celery-tasks-retries-errors/"
+
+- id: BTQ-004
+  text: >
+    Use ARQ (async Redis queue) instead of Celery for FastAPI applications where tasks
+    are I/O-bound and the codebase is async-first. ARQ workers run as asyncio tasks
+    within a single process, achieving higher concurrency for I/O-bound work with lower
+    memory overhead than Celery's prefork model (which spawns N processes).
+  why: >
+    A FastAPI service using Celery for webhook processing had 16 worker processes each
+    consuming 120MB RAM (1.9GB total) to handle 50 concurrent webhooks. Migrating to ARQ
+    with a single asyncio worker process handled 200 concurrent webhooks with 80MB total
+    RAM. ARQ's native async support eliminates the sync/async impedance mismatch: Celery
+    requires wrapping async functions in sync wrappers, which blocks the event loop if
+    not done carefully with run_until_complete.
+  how_to_do_right: |
+    1. Install: pip install arq
+    2. Define async task functions (not methods):
+       async def process_webhook(ctx: dict, payload: dict) -> dict:
+           async with httpx.AsyncClient() as client:
+               response = await client.post(internal_api, json=payload)
+           return {"status": response.status_code}
+    3. Worker settings class:
+       class WorkerSettings:
+           functions = [process_webhook]
+           redis_settings = RedisSettings.from_dsn(settings.REDIS_URL)
+           max_jobs = 50    # concurrent async tasks per worker
+           job_timeout = 300  # seconds
+           keep_result = 3600  # store result for 1 hour
+    4. Enqueue from FastAPI:
+       redis = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+       job = await redis.enqueue_job("process_webhook", payload=payload)
+    5. Run worker: arq myapp.worker.WorkerSettings
+    6. Choose Celery over ARQ for: CPU-bound tasks, existing Celery infrastructure,
+       complex scheduling (celery-beat), or workloads requiring Flower monitoring.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [arq, fastapi, redis, asyncio]
+  domains:
+    domain: [architecture, background_tasks]
+    concern: [async, performance, resource_efficiency]
+  example_good: |
+    # worker.py — ARQ worker for FastAPI async app
+    from arq import create_pool
+    from arq.connections import RedisSettings
+    import httpx
+
+    async def send_notification(ctx: dict, user_id: str, message: str) -> dict:
+        """Async task — runs in event loop, handles I/O concurrently."""
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(
+                f"{settings.NOTIFICATION_SERVICE}/send",
+                json={"user_id": user_id, "message": message},
+            )
+            r.raise_for_status()
+        return {"sent": True, "status": r.status_code}
+
+    class WorkerSettings:
+        functions = [send_notification]
+        redis_settings = RedisSettings.from_dsn(settings.REDIS_URL)
+        max_jobs = 100       # 100 concurrent I/O tasks, not 100 processes
+        job_timeout = 60
+        retry_jobs = True    # auto-retry on failure
+
+    # FastAPI endpoint enqueuing to ARQ
+    async def notify_user(user_id: str, message: str) -> str:
+        pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+        job = await pool.enqueue_job("send_notification", user_id, message)
+        return job.job_id
+  example_bad: |
+    # WRONG: using Celery with async functions — blocks event loop
+    # celery can't natively run async tasks
+    @shared_task
+    def send_notification(user_id: str, message: str) -> dict:
+        # Forces sync context: kills async benefits, adds 16 worker process overhead
+        import asyncio
+        return asyncio.run(async_send_notification(user_id, message))
+    # 16 processes × 120MB = 1.9GB for work that ARQ does in 80MB with 1 process
+  when_applies: "New FastAPI or async Python services with primarily I/O-bound background tasks (HTTP calls, DB reads, Redis operations)."
+  sources:
+    - "https://arq-docs.helpmanual.io/"
+    - "https://davidmuraya.com/blog/fastapi-background-tasks-arq-vs-built-in/"
+
+- id: BTQ-005
+  text: >
+    Implement task priority queues using multiple named Celery queues, not the built-in
+    priority parameter. Route critical tasks (payment processing, auth events) to a
+    high-priority queue with dedicated workers. Route analytics and reporting tasks to
+    a low-priority queue. Single queue with priority int is unreliable in Redis broker.
+  why: >
+    Redis does not implement queue priority natively — Celery's task priority parameter
+    is ignored by the Redis broker. A team discovered this when critical password-reset
+    emails were queued behind 50,000 analytics export tasks for 45 minutes. The "fix"
+    of increasing priority in the task definition did nothing because Redis broker ignores
+    it. Named queues with dedicated workers guarantee isolation: a burst of low-priority
+    tasks never delays high-priority tasks.
+  how_to_do_right: |
+    1. Define named queues in celeryconfig.py:
+       task_queues = (
+           Queue("critical", routing_key="critical"),    # payments, auth, notifications
+           Queue("default", routing_key="default"),      # standard operations
+           Queue("batch", routing_key="batch"),           # analytics, exports, reports
+       )
+    2. Route tasks to queues:
+       task_routes = {
+           "tasks.send_password_reset": {"queue": "critical"},
+           "tasks.process_payment": {"queue": "critical"},
+           "tasks.generate_report": {"queue": "batch"},
+           "tasks.export_analytics": {"queue": "batch"},
+       }
+    3. Start dedicated workers per queue with appropriate concurrency:
+       # Critical: 4 workers, handles time-sensitive tasks
+       celery -A app worker --queues=critical --concurrency=4 --loglevel=info
+       # Default: 8 workers
+       celery -A app worker --queues=default --concurrency=8
+       # Batch: 2 workers, low priority
+       celery -A app worker --queues=batch --concurrency=2
+    4. Monitor queue depth separately per queue in Prometheus/Flower.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [celery, redis]
+  domains:
+    domain: [architecture, background_tasks]
+    concern: [prioritization, resource_isolation, reliability]
+  example_good: |
+    # celeryconfig.py
+    from kombu import Queue
+
+    task_queues = (
+        Queue("critical"),
+        Queue("default"),
+        Queue("batch"),
+    )
+    task_default_queue = "default"
+
+    task_routes = {
+        "tasks.notifications.send_password_reset": {"queue": "critical"},
+        "tasks.payments.process_charge": {"queue": "critical"},
+        "tasks.users.update_profile": {"queue": "default"},
+        "tasks.analytics.generate_monthly_report": {"queue": "batch"},
+        "tasks.exports.export_user_data_csv": {"queue": "batch"},
+    }
+
+    # docker-compose.yml — separate workers per queue
+    # celery-critical-worker:
+    #   command: celery -A app worker --queues=critical --concurrency=4
+    # celery-batch-worker:
+    #   command: celery -A app worker --queues=batch --concurrency=2
+  example_bad: |
+    # WRONG: using priority parameter with Redis broker — ignored silently
+    @shared_task(priority=9)  # This does NOTHING with Redis broker
+    def send_password_reset(user_id: str) -> None:
+        ...
+
+    @shared_task(priority=1)
+    def generate_analytics_report() -> None:
+        ...
+    # Both tasks compete in the same queue, priority parameter has no effect
+    # 50,000 analytics tasks delay time-sensitive password resets
+  when_applies: "Any Celery deployment with Redis broker that has a mix of time-sensitive and batch/analytics tasks."
+  sources:
+    - "https://docs.celeryq.dev/en/stable/userguide/routing.html"
+    - "https://leapcell.io/blog/celery-versus-arq-choosing-the-right-task-queue-for-python-applications"
+
+- id: BTQ-006
+  text: >
+    Implement periodic task scheduling with celery-beat for Celery or APScheduler for
+    non-Celery async apps. Never run cron jobs directly as system cron with Python scripts
+    — they lack: distributed execution guarantees, overlap prevention, retry on failure,
+    and monitoring integration. Only 1 beat instance should run at a time (use
+    celery-redbeat for distributed locking).
+  why: >
+    A data pipeline ran a daily database cleanup task via system cron on 3 production
+    servers (all running the same Docker image). For 6 months, the cleanup ran 3x daily
+    and 3x simultaneously, corrupting soft-delete logic and creating data inconsistencies
+    that took 2 weeks to reconstruct. System cron has no concept of distributed exclusivity.
+    celery-redbeat uses Redis distributed locks to guarantee only 1 beat instance runs in
+    a multi-instance deployment.
+  how_to_do_right: |
+    1. Install: pip install celery-redbeat
+    2. Configure beat scheduler with Redis lock:
+       # celeryconfig.py
+       beat_scheduler = "redbeat.RedBeatScheduler"
+       redbeat_redis_url = settings.REDIS_URL
+       redbeat_lock_timeout = 300  # 5 min lock, release if beat crashes
+
+       beat_schedule = {
+           "daily-cleanup": {
+               "task": "tasks.maintenance.cleanup_expired_sessions",
+               "schedule": crontab(hour=2, minute=0),  # 2am UTC
+               "options": {"queue": "batch"},
+           },
+           "hourly-sync": {
+               "task": "tasks.sync.sync_external_data",
+               "schedule": crontab(minute=0),  # every hour
+               "options": {"queue": "default", "expires": 3600},  # discard if not consumed in 1h
+           },
+       }
+    3. Run only 1 beat process: celery -A app beat --scheduler redbeat.RedBeatScheduler
+    4. Kubernetes: beat as a single-replica Deployment (never scale beat replicas > 1).
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [celery, celery-redbeat, redis]
+  domains:
+    domain: [architecture, background_tasks]
+    concern: [scheduling, distributed_systems, idempotency]
+  example_good: |
+    # celeryconfig.py — distributed beat scheduling with Redis lock
+    from celery.schedules import crontab
+
+    beat_scheduler = "redbeat.RedBeatScheduler"
+    redbeat_redis_url = "redis://redis:6379/0"
+    redbeat_lock_timeout = 300  # seconds; prevents dual-leader
+
+    beat_schedule = {
+        "nightly-cleanup": {
+            "task": "tasks.db.cleanup_soft_deleted_records",
+            "schedule": crontab(hour=3, minute=0),  # 3am UTC
+            "options": {
+                "queue": "batch",
+                "expires": 7200,  # discard if not processed within 2 hours
+            },
+        },
+    }
+
+    # kubernetes/beat-deployment.yaml
+    # spec:
+    #   replicas: 1  # EXACTLY 1 — never scale this
+    #   template:
+    #     spec:
+    #       containers:
+    #         - command: ["celery", "-A", "app", "beat",
+    #                     "--scheduler", "redbeat.RedBeatScheduler"]
+  example_bad: |
+    # WRONG: system cron on all instances — runs N times on N-instance deployment
+    # /etc/cron.d/cleanup (on every Docker container)
+    # 0 3 * * * python /app/scripts/cleanup.py
+    # With 3 replicas: runs at 3am × 3 = 3 simultaneous executions, data corruption
+  when_applies: "Any Celery deployment with periodic tasks (cleanup, sync, reporting) running in a multi-instance or Kubernetes environment."
+  sources:
+    - "https://github.com/sibson/redbeat"
+    - "https://docs.celeryq.dev/en/stable/userguide/periodic-tasks.html"
+
+- id: BTQ-007
+  text: >
+    Monitor Celery queues with Flower for operational visibility and custom Prometheus
+    metrics for alerting. Alert on: queue depth > N (task backlog), task failure rate > 1%,
+    worker heartbeat missing > 60s (worker crashed). Flower is read-only visibility;
+    Prometheus is the alerting backbone.
+  why: >
+    A Celery deployment processing user uploads accumulated 50,000 queued tasks over a
+    weekend because all 3 workers crashed silently (out-of-memory) with no alerting. The
+    OOM was caused by a task that loaded entire files into memory. With queue depth alerting
+    at 100 tasks, the first alert would have fired 20 minutes after the crash, not 48 hours
+    later when a user complained. Worker heartbeat monitoring detects crashes within 90s
+    regardless of the cause.
+  how_to_do_right: |
+    1. Expose Celery metrics to Prometheus via celery-prometheus-exporter or custom metrics:
+       from prometheus_client import Counter, Gauge, Histogram
+
+       TASKS_SENT = Counter("celery_tasks_sent_total", "Tasks sent", ["name"])
+       TASKS_FAILED = Counter("celery_tasks_failed_total", "Tasks failed", ["name"])
+       QUEUE_DEPTH = Gauge("celery_queue_depth", "Tasks in queue", ["queue"])
+    2. Alert rules:
+       - alert: CeleryQueueBacklog
+         expr: celery_queue_depth{queue="default"} > 100
+         for: 5m
+         severity: warning
+       - alert: CeleryWorkerDown
+         expr: celery_workers_active == 0
+         for: 2m
+         severity: critical
+       - alert: CeleryHighFailureRate
+         expr: rate(celery_tasks_failed_total[5m]) /
+               rate(celery_tasks_sent_total[5m]) > 0.01
+         for: 5m
+         severity: high
+    3. Flower for operational dashboard: celery -A app flower --port=5555
+    4. Secure Flower with authentication in production (it exposes task internals).
+  severity: medium
+  technologies:
+    lang: [python, yaml]
+    framework: [celery, flower, prometheus, grafana]
+  domains:
+    domain: [architecture, background_tasks, observability]
+    concern: [monitoring, alerting, visibility]
+  example_good: |
+    # tasks/metrics.py — custom Prometheus metrics for Celery
+    from celery.signals import (
+        task_prerun, task_postrun, task_failure, worker_ready, worker_shutdown
+    )
+    from prometheus_client import Counter, Gauge, Histogram
+
+    TASK_STARTED = Counter("celery_task_started_total", "Tasks started", ["task_name"])
+    TASK_SUCCEEDED = Counter("celery_task_succeeded_total", "Tasks succeeded", ["task_name"])
+    TASK_FAILED = Counter("celery_task_failed_total", "Tasks failed", ["task_name", "exception"])
+    TASK_DURATION = Histogram(
+        "celery_task_duration_seconds", "Task execution time",
+        ["task_name"], buckets=[0.1, 0.5, 1.0, 5.0, 30.0, 120.0]
+    )
+    WORKERS_ONLINE = Gauge("celery_workers_online", "Number of online workers")
+
+    @task_prerun.connect
+    def on_task_start(task_id, task, args, kwargs, **kw):
+        TASK_STARTED.labels(task_name=task.name).inc()
+
+    @task_postrun.connect
+    def on_task_complete(task_id, task, args, kwargs, retval, state, **kw):
+        if state == "SUCCESS":
+            TASK_SUCCEEDED.labels(task_name=task.name).inc()
+
+    @task_failure.connect
+    def on_task_failure(task_id, exception, traceback, sender, **kw):
+        TASK_FAILED.labels(
+            task_name=sender.name,
+            exception=type(exception).__name__
+        ).inc()
+  example_bad: |
+    # WRONG: no monitoring — failures are invisible until users complain
+    @shared_task
+    def process_upload(file_id: str) -> None:
+        file_data = load_entire_file_into_memory(file_id)  # OOM risk
+        process(file_data)
+    # Worker crashes with OOM at 2am Saturday
+    # No alerting, no queue depth metric
+    # 50,000 tasks queue up over the weekend
+    # Monday: users report uploads not processing
+  when_applies: "Any production Celery deployment. Monitoring is not optional for async task infrastructure."
+  sources:
+    - "https://flower.readthedocs.io/en/latest/"
+    - "https://github.com/zerok/celery-prometheus-exporter"
+
+- id: BTQ-008
+  text: >
+    Prevent duplicate task execution using Redis-based task deduplication before enqueuing.
+    Use a fingerprint of task name + arguments as the key. This is distinct from idempotency
+    (which handles concurrent execution of the same task) — deduplication prevents enqueueing
+    the same task twice when the trigger is called multiple times rapidly.
+  why: >
+    A webhook endpoint was called 8 times in 3 seconds for the same payment event (Stripe
+    retries its own webhooks). Without deduplication, 8 identical tasks were enqueued.
+    Idempotency in the task itself handled 7 of them, but each task still started, consumed
+    a worker slot, and logged a skip — wasting resources and creating noise. Deduplication
+    at the enqueue point reduces the 8 webhook invocations to 1 task. The deduplication
+    window (TTL) should match the expected storm window — typically 60-300 seconds.
+  how_to_do_right: |
+    1. Create a deduplication decorator for task enqueueing:
+       def deduplicate_task(ttl: int = 60):
+           def decorator(func):
+               @functools.wraps(func)
+               def wrapper(*args, **kwargs):
+                   key_data = f"{func.__name__}:{json.dumps(args, sort_keys=True)}:{json.dumps(kwargs, sort_keys=True)}"
+                   fingerprint = hashlib.sha256(key_data.encode()).hexdigest()[:16]
+                   dedup_key = f"task:dedup:{fingerprint}"
+                   if redis.set(dedup_key, "1", nx=True, ex=ttl):
+                       return func.apply_async(args=args, kwargs=kwargs)
+                   return None  # duplicate, not enqueued
+               return wrapper
+           return decorator
+    2. Apply at the call site (not the task definition):
+       @deduplicate_task(ttl=300)  # 5-minute dedup window
+       def enqueue_process_payment(payment_id: str): ...
+    3. Use payment_id or event_id as the fingerprint for business-logic deduplication
+       (more reliable than argument hashing).
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [celery, redis]
+  domains:
+    domain: [architecture, background_tasks]
+    concern: [deduplication, resource_efficiency, idempotency]
+  example_good: |
+    # utils/task_dedup.py
+    import hashlib
+    import json
+    import functools
+    from typing import Callable, Optional
+    import redis as redis_lib
+
+    r = redis_lib.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+
+    def deduplicate_enqueue(ttl_seconds: int = 300):
+        """Prevent duplicate task enqueuing within TTL window."""
+        def decorator(enqueue_func: Callable):
+            @functools.wraps(enqueue_func)
+            def wrapper(*args, **kwargs):
+                # Use first positional arg (usually business ID) as dedup key
+                business_id = args[0] if args else kwargs.get("id", "")
+                dedup_key = f"task:dedup:{enqueue_func.__name__}:{business_id}"
+                if r.set(dedup_key, "1", nx=True, ex=ttl_seconds):
+                    return enqueue_func(*args, **kwargs)
+                # Duplicate detected, skip silently
+                return None
+            return wrapper
+        return decorator
+
+    # Usage
+    @deduplicate_enqueue(ttl_seconds=300)
+    def enqueue_process_payment(payment_id: str) -> Optional[str]:
+        job = process_payment_task.apply_async(args=[payment_id])
+        return job.id
+  example_bad: |
+    # WRONG: no deduplication — 8 webhook retries = 8 tasks
+    @app.post("/webhooks/payment")
+    async def handle_payment_webhook(event: dict):
+        payment_id = event["data"]["object"]["id"]
+        # Stripe sends same event 8 times — 8 tasks enqueued
+        process_payment_task.delay(payment_id)
+        return {"received": True}
+  when_applies: "Any task triggered by webhooks, user clicks, or event streams that may fire multiple times for the same logical event."
+  sources:
+    - "https://docs.celeryq.dev/en/stable/userguide/tasks.html#idempotence"
+    - "https://stripe.com/docs/webhooks/best-practices"
+
+- id: BTQ-009
+  text: >
+    Implement graceful worker shutdown using SIGTERM handling: drain current tasks (up to
+    30 seconds), reject new tasks, then exit. Workers that use SIGKILL mid-task lose task
+    progress, may corrupt shared state, and require manual DLQ inspection. Configure
+    Kubernetes termination grace period to match the longest expected task duration + 30s buffer.
+  why: >
+    A Kubernetes rolling update using the default terminationGracePeriodSeconds=30 killed
+    workers mid-task for a data pipeline with 120-second tasks. 40% of tasks in progress
+    during the rolling update were lost. Tasks that were half-complete (data written to DB
+    but not committed) left orphaned partial records that required manual cleanup. SIGTERM
+    with graceful drain gives in-flight tasks time to complete before the process exits.
+  how_to_do_right: |
+    1. Celery handles SIGTERM gracefully by default — but configure warm shutdown:
+       # celeryconfig.py
+       worker_cancel_long_running_tasks_on_connection_loss = True
+       # On SIGTERM: finish current task, then exit
+       # On SIGQUIT: immediately kill, for emergencies only
+    2. Set worker_max_tasks_per_child to prevent memory leaks in long-running workers:
+       worker_max_tasks_per_child = 100  # restart after 100 tasks
+    3. Kubernetes: set terminationGracePeriodSeconds to max_task_duration + 30s:
+       # If longest task runs 120s, set 150s
+       terminationGracePeriodSeconds: 150
+    4. In task code: check for shutdown signal mid-loop:
+       for chunk in large_data_chunks:
+           if should_stop():  # check every N iterations
+               raise SoftTimeLimitExceeded("Graceful shutdown requested")
+           process_chunk(chunk)
+    5. Set task time limits to guarantee bounded completion:
+       task_time_limit = 120     # hard kill after 120s
+       task_soft_time_limit = 100  # SoftTimeLimitExceeded raised at 100s (catchable)
+  severity: high
+  technologies:
+    lang: [python, yaml]
+    framework: [celery, kubernetes]
+  domains:
+    domain: [architecture, background_tasks]
+    concern: [graceful_shutdown, data_integrity, rolling_updates]
+  example_good: |
+    # celeryconfig.py
+    task_time_limit = 120          # hard kill at 120s
+    task_soft_time_limit = 100     # raises SoftTimeLimitExceeded at 100s
+    worker_max_tasks_per_child = 100
+
+    # tasks/data_pipeline.py
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    @shared_task(bind=True, soft_time_limit=100, time_limit=120, max_retries=2)
+    def process_large_dataset(self, dataset_id: str) -> dict:
+        dataset = load_dataset(dataset_id)
+        processed = 0
+        try:
+            for idx, chunk in enumerate(dataset.chunks(size=1000)):
+                process_chunk(chunk)
+                processed += len(chunk)
+                # Allow graceful shutdown between chunks
+                if idx % 10 == 0:
+                    self.update_state(
+                        state="PROGRESS",
+                        meta={"processed": processed, "total": len(dataset)}
+                    )
+        except SoftTimeLimitExceeded:
+            # Save progress, re-queue remainder
+            save_checkpoint(dataset_id, processed)
+            raise self.retry(countdown=5)
+        return {"processed": processed}
+
+    # kubernetes/worker-deployment.yaml
+    # spec:
+    #   template:
+    #     spec:
+    #       terminationGracePeriodSeconds: 150  # task_time_limit + 30s buffer
+  example_bad: |
+    # WRONG: Kubernetes kills worker with default 30s grace, task takes 120s
+    # kubernetes/worker-deployment.yaml
+    # spec:
+    #   template:
+    #     spec:
+    #       terminationGracePeriodSeconds: 30  # DEFAULT — kills 120s tasks mid-execution
+    # result: 40% task loss during rolling updates, partial DB writes, manual cleanup
+  when_applies: "Any Celery worker running tasks with duration > 30 seconds, especially in Kubernetes with rolling deployments."
+  sources:
+    - "https://docs.celeryq.dev/en/stable/userguide/workers.html#stopping-the-worker"
+    - "https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination"
+
+- id: BTQ-010
+  text: >
+    Implement long-running task progress tracking using Celery's update_state with custom
+    PROGRESS state, storing progress in Redis. Expose progress via a polling endpoint or
+    Server-Sent Events. Users waiting for long operations without feedback abandon the page
+    or submit duplicate requests (which triggers the idempotency problem).
+  why: >
+    An export feature taking 2-5 minutes had a 34% abandonment rate when it showed only
+    a spinner. After adding progress tracking (0%→100% with estimated time remaining),
+    abandonment dropped to 8%. More critically: without progress feedback, users clicked
+    "Export" multiple times, creating duplicate export jobs. The duplicate prevention
+    was handled by deduplication (BTQ-008), but the root behavioral cause was absent
+    progress feedback.
+  how_to_do_right: |
+    1. In the long-running task, call update_state with progress metadata:
+       self.update_state(
+           state="PROGRESS",
+           meta={"current": 250, "total": 1000, "percent": 25, "eta_seconds": 90}
+       )
+    2. Expose a polling endpoint:
+       GET /api/tasks/{task_id}/status → {"state": "PROGRESS", "meta": {"percent": 25}}
+    3. Or use Server-Sent Events for real-time (no polling):
+       GET /api/tasks/{task_id}/events → SSE stream of state updates
+    4. Use a unique task_id returned immediately on task creation:
+       POST /api/exports → 202 Accepted, {"task_id": "abc123", "status_url": "/api/tasks/abc123"}
+    5. Heartbeat for very long tasks: update_state every 10-30 seconds even if progress
+       is the same — prevents "is it stuck?" uncertainty for the frontend.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [celery, fastapi, redis]
+  domains:
+    domain: [architecture, background_tasks]
+    concern: [user_experience, progress_tracking, long_running_tasks]
+  example_good: |
+    # tasks/exports.py
+    from celery import shared_task
+    import time
+
+    @shared_task(bind=True, name="export_user_data")
+    def export_user_data(self, user_id: str, format: str = "csv") -> dict:
+        """Long-running export with progress tracking."""
+        records = db.query(UserRecord).filter_by(user_id=user_id).all()
+        total = len(records)
+        output_rows = []
+
+        for idx, record in enumerate(records):
+            output_rows.append(format_record(record, format))
+
+            if idx % 100 == 0:  # Update every 100 records
+                self.update_state(
+                    state="PROGRESS",
+                    meta={
+                        "current": idx,
+                        "total": total,
+                        "percent": int(100 * idx / total),
+                        "eta_seconds": estimate_eta(idx, total, start_time),
+                    }
+                )
+
+        return {"file_url": upload_to_s3(output_rows, format), "record_count": total}
+
+    # api/routes.py
+    @router.get("/tasks/{task_id}/status")
+    async def get_task_status(task_id: str):
+        result = AsyncResult(task_id, app=celery_app)
+        return {
+            "task_id": task_id,
+            "state": result.state,  # PENDING, PROGRESS, SUCCESS, FAILURE
+            "meta": result.info if result.state == "PROGRESS" else None,
+            "result": result.result if result.state == "SUCCESS" else None,
+        }
+  example_bad: |
+    # WRONG: no progress tracking — users get a spinner and give up
+    @shared_task
+    def export_user_data(user_id: str) -> dict:
+        records = db.query(UserRecord).filter_by(user_id=user_id).all()
+        # 3 minutes of silence while processing
+        return {"file_url": upload(format_all(records))}
+    # Frontend: spinner for 3 minutes with no feedback
+    # Users click Export 3 more times, creating duplicate jobs
+  when_applies: "Any task taking more than 10 seconds that is triggered by a user action and has a corresponding UI waiting state."
+  sources:
+    - "https://docs.celeryq.dev/en/stable/userguide/tasks.html#task-states"
+    - "https://docs.celeryq.dev/en/stable/reference/celery.result.html#celery.result.AsyncResult.update_state"
+
+- id: BTQ-011
+  text: >
+    Process webhooks as background tasks with a 200ms maximum synchronous response time.
+    Webhook providers (Stripe, GitHub, Twilio) have strict response timeouts (30s) and
+    will retry if the endpoint is slow. Perform ONLY validation and queuing in the webhook
+    handler — move all business logic to an async task. Validate webhook signatures
+    synchronously before queuing.
+  why: >
+    A webhook endpoint processing business logic synchronously hit 45-second P99 latency
+    during a load spike. Stripe interpreted the timeouts as failures and retried, creating
+    a retry storm that amplified the load 8x. The correct pattern: 200ms to validate
+    signature and queue the task, return 200 immediately, process asynchronously. A webhook
+    that validates the signature synchronously is not vulnerable to replay attacks even
+    though it queues immediately.
+  how_to_do_right: |
+    1. Synchronous webhook handler (200ms budget):
+       - Validate signature (HMAC-SHA256): ~1ms
+       - Parse event type: ~0.1ms
+       - Deduplicate by event ID (Redis SETNX): ~2ms
+       - Enqueue task: ~5ms
+       - Return 200: done
+    2. Never perform DB writes, HTTP calls, or business logic in the webhook handler.
+    3. Validate signature BEFORE queuing — not in the task:
+       payload = await request.body()
+       signature = request.headers.get("X-Signature-256")
+       if not verify_signature(payload, signature, settings.WEBHOOK_SECRET):
+           raise HTTPException(status_code=400, detail="Invalid signature")
+    4. Include raw payload in task args, not parsed objects — avoids parsing errors
+       in the webhook handler that cause webhook provider to retry.
+    5. Set webhook handler timeout at infrastructure level (nginx/ALB): 5 seconds max.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, celery, arq]
+  domains:
+    domain: [architecture, background_tasks]
+    concern: [webhooks, latency, reliability]
+  example_good: |
+    # api/webhooks.py
+    import hashlib
+    import hmac
+    from fastapi import APIRouter, Request, HTTPException
+
+    router = APIRouter()
+
+    @router.post("/webhooks/stripe")
+    async def stripe_webhook(request: Request):
+        """Webhook handler: validates, deduplicates, queues. < 200ms."""
+        payload = await request.body()
+        sig_header = request.headers.get("stripe-signature", "")
+
+        # 1. Validate signature (synchronous — prevents replay attacks)
+        try:
+            event = stripe.Webhook.construct_event(
+                payload, sig_header, settings.STRIPE_WEBHOOK_SECRET
+            )
+        except stripe.error.SignatureVerificationError:
+            raise HTTPException(status_code=400, detail="Invalid signature")
+
+        # 2. Deduplicate (idempotent enqueueing)
+        event_id = event["id"]
+        if not r.set(f"webhook:stripe:{event_id}", "1", nx=True, ex=86400):
+            return {"status": "duplicate", "event_id": event_id}
+
+        # 3. Enqueue async task with raw event data
+        process_stripe_event.delay(event_id=event_id, event_type=event["type"],
+                                   payload=event)
+
+        # 4. Return 200 immediately — processing happens asynchronously
+        return {"status": "queued", "event_id": event_id}
+  example_bad: |
+    # WRONG: business logic in webhook handler — causes timeouts and retry storms
+    @router.post("/webhooks/stripe")
+    async def stripe_webhook(request: Request):
+        event = await parse_stripe_webhook(request)
+        # WRONG: synchronous DB write and email send in webhook handler
+        user = db.query(User).filter_by(stripe_id=event["customer"]).first()
+        user.subscription_status = "active"
+        db.commit()
+        await email_service.send_welcome_email(user.email)  # 500ms external HTTP call
+        return {"status": "processed"}  # If email service is slow, Stripe retries
+  when_applies: "Every webhook handler in any language or framework. The pattern is universal."
+  sources:
+    - "https://stripe.com/docs/webhooks/best-practices"
+    - "https://developer.github.com/webhooks/best-practices/"
+
+- id: BTQ-012
+  text: >
+    Set explicit task time limits (task_time_limit and task_soft_time_limit) on every
+    Celery task. A task without a time limit can run forever, blocking a worker indefinitely.
+    Set soft_time_limit to 80% of hard time_limit to allow graceful cleanup before the
+    forced kill. Default: soft=100s, hard=120s for web-facing tasks; soft=1800s, hard=2100s
+    for batch tasks.
+  why: >
+    A data import task entered an infinite loop due to a malformed input record. Without
+    a time limit, it consumed a worker for 72 hours, reducing batch processing throughput
+    by 25% for 3 days before being noticed. With a 30-minute time limit, the task would
+    have failed after 30 minutes, been routed to the DLQ with the malformed record identified,
+    and the worker would have been available for other tasks within 30 minutes.
+  how_to_do_right: |
+    1. Set global defaults in celeryconfig.py:
+       task_time_limit = 120         # hard kill: SIGKILL to worker process
+       task_soft_time_limit = 100    # soft: SoftTimeLimitExceeded raised in task
+    2. Override per task category (not per task):
+       @shared_task(time_limit=2100, soft_time_limit=1800)  # 35min for batch
+       def process_data_import(import_id: str) -> None: ...
+
+       @shared_task(time_limit=30, soft_time_limit=25)  # 30s for API calls
+       def call_external_api(user_id: str) -> None: ...
+    3. Handle SoftTimeLimitExceeded gracefully in batch tasks:
+       from celery.exceptions import SoftTimeLimitExceeded
+       try:
+           process_loop()
+       except SoftTimeLimitExceeded:
+           save_partial_progress()  # don't lose all work
+           raise  # let Celery know the task ended early
+    4. Monitor task duration histogram: alert on p99 > 80% of time_limit.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [celery]
+  domains:
+    domain: [architecture, background_tasks]
+    concern: [resource_management, reliability, time_limits]
+  example_good: |
+    # celeryconfig.py
+    # Global defaults
+    task_time_limit = 120        # 2 min hard limit for all tasks
+    task_soft_time_limit = 100   # 100s soft limit (20s cleanup window)
+
+    # tasks/imports.py
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    @shared_task(
+        bind=True,
+        time_limit=2100,         # 35 min hard limit for imports
+        soft_time_limit=1800,    # 30 min soft limit — 5 min cleanup window
+        max_retries=1,
+        name="process_data_import",
+    )
+    def process_data_import(self, import_id: str) -> dict:
+        """Import data with graceful timeout handling."""
+        records = load_import_records(import_id)
+        processed_ids = []
+        try:
+            for record in records:
+                process_record(record)
+                processed_ids.append(record.id)
+        except SoftTimeLimitExceeded:
+            # Save how far we got — don't lose all work on timeout
+            mark_import_partial(import_id, processed_ids)
+            return {"status": "partial", "processed": len(processed_ids)}
+        return {"status": "complete", "processed": len(processed_ids)}
+  example_bad: |
+    # WRONG: no time limits — infinite loops block workers forever
+    @shared_task  # No time_limit, no soft_time_limit
+    def process_data_import(import_id: str) -> None:
+        records = load_import_records(import_id)
+        for record in records:
+            process_record(record)  # Infinite loop on malformed record
+    # Worker locked for 72 hours, 25% capacity reduction, nobody notices
+  when_applies: "Every Celery task in any application. No exceptions — every task can theoretically enter an infinite loop."
+  sources:
+    - "https://docs.celeryq.dev/en/stable/userguide/workers.html#time-limits"
+    - "https://docs.celeryq.dev/en/stable/userguide/configuration.html#task-time-limit"
+
+- id: BTQ-013
+  text: >
+    Implement task result cleanup: configure result_expires to 1-24 hours and run
+    celery.backend.cleanup() daily. Celery task results stored in Redis without expiry
+    grow indefinitely and will eventually fill Redis memory, causing ALL Redis operations
+    to fail — not just task results.
+  why: >
+    A production Redis instance was shared between Celery results and application cache.
+    Task results without expiry grew to 8GB over 6 months, triggering Redis's maxmemory
+    policy. Redis started evicting application cache keys to make room for task results,
+    causing cascading cache misses that increased DB load 400%. The fix required emergency
+    Redis flush (briefly clearing the cache for all users) and reconfiguration. result_expires
+    with 1-hour TTL prevents this entirely.
+  how_to_do_right: |
+    1. Set result expiry in celeryconfig.py:
+       result_expires = 3600  # 1 hour for most tasks
+    2. For tasks where results are polled by the UI (long-running exports), set longer:
+       @shared_task(result_expires=86400)  # 24 hours for user-facing tasks
+       def export_user_data(user_id: str) -> dict: ...
+    3. Run cleanup daily to handle manual Celery commands and expired results:
+       # celery_beat schedule or cron
+       celery -A app control purge_expired_results  # or
+       celery.backend.cleanup()
+    4. Use separate Redis DB for Celery results (db=1) vs application cache (db=0):
+       result_backend = "redis://redis:6379/1"  # DB 1
+       CACHE_URL = "redis://redis:6379/0"        # DB 0
+       # This prevents result accumulation from evicting cache keys
+    5. Monitor Redis memory: alert when celery:* keys exceed 20% of Redis maxmemory.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [celery, redis]
+  domains:
+    domain: [architecture, background_tasks]
+    concern: [memory_management, resource_cleanup, reliability]
+  example_good: |
+    # celeryconfig.py
+    # Use separate Redis DB for task results
+    result_backend = "redis://redis:6379/1"  # DB 1 for results
+    result_expires = 3600                    # 1 hour default
+    result_persistent = False                # Don't persist to disk
+
+    # For user-facing tasks, override to longer expiry
+    # tasks/exports.py
+    @shared_task(
+        name="export_user_data",
+        result_expires=86400,  # 24 hours — user may poll later
+    )
+    def export_user_data(user_id: str) -> dict:
+        ...
+
+    # scripts/celery_maintenance.py — run as periodic task
+    from celery import current_app
+
+    def cleanup_expired_results():
+        """Run daily to clean up expired Celery task results."""
+        current_app.backend.cleanup()
+        # Also check memory usage
+        r = redis.Redis.from_url(settings.RESULT_BACKEND_URL)
+        info = r.info("memory")
+        used_mb = info["used_memory"] / (1024 * 1024)
+        if used_mb > settings.REDIS_MEMORY_ALERT_MB:
+            alert(f"Redis result store using {used_mb:.0f}MB — investigate")
+  example_bad: |
+    # WRONG: no result expiry — Redis fills up over months
+    # celeryconfig.py
+    result_backend = "redis://redis:6379/0"  # Same DB as cache!
+    # No result_expires — results accumulate forever
+    # After 6 months: 8GB of task results, Redis evicts cache keys
+    # All cache misses, DB load 4x, emergency Redis flush
+  when_applies: "Every Celery deployment using Redis as result backend. Especially critical when Redis is shared with application cache."
+  sources:
+    - "https://docs.celeryq.dev/en/stable/userguide/configuration.html#result-expires"
+    - "https://docs.celeryq.dev/en/stable/userguide/tasks.html#result-backends"

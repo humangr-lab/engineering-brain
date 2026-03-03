@@ -1,0 +1,359 @@
+layer: rules
+technology: General
+domain: api
+knowledge:
+- id: CR-APIGW-001
+  text: API gateway must implement rate limiting per client and per endpoint — never rely on backend services to self-protect.
+  why: Without gateway-level rate limiting, a single misbehaving client can exhaust backend resources, causing cascading failures
+    across all clients. Backend services should not need to know about rate policies — that is the gateway's job.
+  how_to_do_right: Implement token bucket or sliding window rate limiting at the gateway. Set per-client limits (via API key
+    or JWT sub claim) and per-endpoint limits (stricter for expensive operations). Return 429 Too Many Requests with Retry-After
+    header. Use a distributed store (Redis) for rate limit counters across gateway instances.
+  severity: critical
+  technologies:
+    library: [aws api gateway]
+    platform: [kong, envoy, traefik, nginx]
+  domains:
+    domain: [architecture, api, security, reliability]
+  example_good: "# Kong rate limiting plugin — per-consumer, per-route\nplugins:\n  - name: rate-limiting\n    config:\n \
+    \     minute: 100        # 100 requests/minute per consumer\n      hour: 5000         # 5000 requests/hour per consumer\n\
+    \      policy: redis      # Distributed counter — works across gateway nodes\n      redis_host: redis\n      redis_port:\
+    \ 6379\n    route: orders-api\n\n# Per-endpoint override — expensive search endpoint\nplugins:\n  - name: rate-limiting\n\
+    \    config:\n      minute: 10         # Only 10 searches/minute\n      policy: redis\n    route: search-api\n"
+  example_bad: '# No rate limiting at gateway — every request hits backend
+
+    # Backend has no protection against traffic spikes
+
+    # One client sends 10,000 requests/second → all clients get 503s
+
+    '
+  when_applies: Any project using Kong, Envoy, Traefik, or Nginx reverse proxy/load balancer
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps
+  sources: ["https://docs.konghq.com/hub/kong-inc/rate-limiting/"]
+- id: CR-APIGW-002
+  text: Authenticate requests at the gateway — do not pass unauthenticated traffic to backend services.
+  why: If authentication happens at each backend service, every service must implement token validation, key management, and
+    auth error handling — duplicated logic, inconsistent enforcement, and a larger attack surface. The gateway is the single
+    enforcement point.
+  how_to_do_right: Validate JWT tokens at the gateway (signature, expiration, issuer, audience). Strip or reject requests
+    with invalid tokens before they reach backends. Forward validated claims (user ID, roles) as trusted headers to downstream
+    services. Use API keys for machine-to-machine communication.
+  severity: critical
+  technologies:
+    library: [aws api gateway, oauth2]
+    platform: [kong, envoy, traefik]
+  domains:
+    domain: [architecture, api, security]
+    concern: [authentication]
+  example_good: "# Kong JWT plugin — validates token, forwards claims\nplugins:\n  - name: jwt\n    config:\n      claims_to_verify:\
+    \ [exp, iss]\n      key_claim_name: iss\n      header_names: [Authorization]\n\n# Envoy JWT filter — validates at the\
+    \ proxy level\nhttp_filters:\n  - name: envoy.filters.http.jwt_authn\n    typed_config:\n      providers:\n        auth0:\n\
+    \          issuer: \"https://myapp.auth0.com/\"\n          audiences: [\"api.myapp.com\"]\n          remote_jwks:\n  \
+    \          http_uri:\n              uri: \"https://myapp.auth0.com/.well-known/jwks.json\"\n      rules:\n        - match:\
+    \ { prefix: \"/api/\" }\n          requires: { provider_name: \"auth0\" }\n"
+  example_bad: "# Gateway passes ALL traffic through — auth happens (maybe) in each service\nupstream:\n  url: http://orders-service:8080\n\
+    # orders-service: validates JWT ✓\n# payments-service: forgot to add validation ✗ ← security hole\n# search-service: validates\
+    \ but uses wrong issuer ✗ ← accepts forged tokens\n"
+  when_applies: Any project using Kong, Envoy, Traefik, or AWS API Gateway
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps
+  sources: ["https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/health_checking"]
+- id: CR-APIGW-003
+  text: Implement circuit breaking at the gateway to protect downstream services from cascading failures.
+  why: When a backend service is failing, continuing to send requests makes it worse — the failing service cannot recover
+    under load. Without circuit breaking, one failing service causes timeout cascades that bring down the entire system.
+  how_to_do_right: 'Configure circuit breakers per upstream service: open after N consecutive failures or error rate > threshold.
+    In open state, return 503 immediately (fail fast, don''t wait for timeout). Half-open: send a single probe request to
+    check recovery. Set sensible timeouts (not 30s defaults) — 2-5s for API calls.'
+  severity: high
+  technologies:
+    platform: [kong, envoy, traefik, service_mesh, istio]
+  domains:
+    domain: [architecture, api, reliability]
+    concern: [resilience]
+  example_good: "# Envoy circuit breaker — per-upstream cluster\nclusters:\n  - name: orders-service\n    connect_timeout:\
+    \ 2s\n    circuit_breakers:\n      thresholds:\n        - max_connections: 100\n          max_pending_requests: 50\n \
+    \         max_requests: 200\n          max_retries: 3\n    outlier_detection:\n      consecutive_5xx: 5             #\
+    \ Open after 5 consecutive 5xx\n      interval: 10s                  # Check every 10s\n      base_ejection_time: 30s\
+    \        # Eject for 30s minimum\n      max_ejection_percent: 50       # Never eject more than 50% of hosts\n\n# Kong\
+    \ circuit breaker plugin\nplugins:\n  - name: circuit-breaker\n    config:\n      error_threshold_percentage: 50\n   \
+    \   volume_threshold: 20\n      window_size_in_seconds: 10\n"
+  example_bad: '# No circuit breaking — gateway keeps sending to failing service
+
+    # Timeout: 30s (default) — each request holds a connection for 30s
+
+    # 100 concurrent requests × 30s timeout = 3000 connections exhausted
+
+    # Gateway itself becomes unresponsive → ALL services affected
+
+    '
+  when_applies: Projects using Kong, Envoy, Traefik, or Istio service mesh
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps
+  sources: ["https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/circuit_breaking"]
+- id: CR-APIGW-004
+  text: Use the Backend for Frontend (BFF) pattern — one API gateway configuration per client type.
+  why: 'Mobile apps, web SPAs, and third-party integrations have fundamentally different needs: payload sizes, auth mechanisms,
+    rate limits, and response formats. A single monolithic gateway forces compromises that degrade every client''s experience.'
+  how_to_do_right: 'Create separate gateway routes (or separate gateway instances) per client type. Mobile BFF: compressed
+    responses, pagination, fewer fields. Web BFF: full responses, WebSocket support. Public API: strict rate limits, API key
+    auth, versioned endpoints. Each BFF aggregates exactly what its client needs.'
+  severity: medium
+  technologies:
+    lang: [graphql]
+    library: [aws api gateway]
+    platform: [kong, envoy]
+  domains:
+    domain: [architecture, api]
+    concern: [frontend]
+  example_good: "# Separate routes per client type\nroutes:\n  # Mobile BFF — minimal payloads, aggressive caching\n  - name:\
+    \ mobile-orders\n    paths: [\"/mobile/v1/orders\"]\n    plugins:\n      - name: response-transformer\n        config:\n\
+    \          remove.json: [internal_notes, audit_log, metadata]\n      - name: proxy-cache\n        config:\n          content_type:\
+    \ [\"application/json\"]\n          cache_ttl: 60\n\n  # Web BFF — full payloads, real-time via SSE\n  - name: web-orders\n\
+    \    paths: [\"/web/v1/orders\"]\n    plugins:\n      - name: response-transformer\n        config:\n          add.headers:\
+    \ [\"X-Request-Id:$(uuid)\"]\n\n  # Public API — strict limits, versioned\n  - name: public-orders\n    paths: [\"/api/v2/orders\"\
+    ]\n    plugins:\n      - name: rate-limiting\n        config: { minute: 30 }\n      - name: key-auth\n"
+  example_bad: "# Single endpoint for all clients\nroutes:\n  - name: orders\n    paths: [\"/api/orders\"]\n# Mobile gets\
+    \ 50KB response when it needs 5KB\n# Public API has same rate limits as internal web app\n# Breaking change for web breaks\
+    \ mobile too\n"
+  when_applies: Projects using Kong, Envoy, AWS API Gateway, or GraphQL API layers
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps
+  sources: ["https://samnewman.io/patterns/architectural/bff/"]
+- id: CR-APIGW-005
+  text: Cache responses at the gateway level for read-heavy endpoints — reduces backend load and latency.
+  why: Without gateway caching, every identical request hits the backend. For read-heavy endpoints (product listings, user
+    profiles, configuration), this wastes compute. A 60-second cache at the gateway can reduce backend load by 90%+ for popular
+    endpoints.
+  how_to_do_right: Cache GET responses at the gateway with appropriate TTLs. Use Cache-Control and ETag headers. Vary cache
+    by relevant headers (Accept-Language, Authorization for per-user caching). Invalidate on write operations (POST/PUT/DELETE).
+    Never cache sensitive or user-specific data without proper vary keys.
+  severity: medium
+  technologies:
+    library: [varnish]
+    platform: [kong, envoy, nginx, cloudflare]
+  domains:
+    domain: [architecture, api, performance]
+    concern: [caching]
+  example_good: "# Kong proxy-cache plugin — cache by consumer + path\nplugins:\n  - name: proxy-cache\n    config:\n    \
+    \  response_code: [200]\n      request_method: [GET, HEAD]\n      content_type: [\"application/json\"]\n      cache_ttl:\
+    \ 300                    # 5 minutes\n      strategy: redis                   # Shared cache across gateway nodes\n  \
+    \    cache_control: true               # Respect Cache-Control headers\n      vary_headers: [\"Accept\", \"Authorization\"\
+    ]\n    route: product-catalog\n\n# Backend sets proper cache headers\n@app.get(\"/products\")\ndef list_products():\n\
+    \    products = db.query(Product).all()\n    return JSONResponse(\n        content=products,\n        headers={\n    \
+    \        \"Cache-Control\": \"public, max-age=300\",\n            \"ETag\": compute_etag(products),\n        },\n    )\n"
+  example_bad: "# No caching — 10,000 identical requests/minute all hit the database\n# Or worse: aggressive caching without\
+    \ vary\nplugins:\n  - name: proxy-cache\n    config:\n      cache_ttl: 3600\n      # No vary_headers — user A sees user\
+    \ B's cached data!\n"
+  when_applies: Projects using Kong, Envoy, Nginx reverse proxy/load balancer, or Varnish
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps
+  sources: ["https://docs.konghq.com/hub/kong-inc/proxy-cache/"]
+- id: CR-APIGW-006
+  text: Centralize CORS configuration at the gateway — never configure CORS in individual backend services.
+  why: When each service manages its own CORS, configurations drift. Service A allows *.example.com, Service B allows *, Service
+    C forgot CORS entirely. Inconsistent CORS = security holes (overly permissive) or broken clients (too restrictive). The
+    gateway is the single source of truth.
+  how_to_do_right: Configure CORS at the gateway layer with explicit allowed origins (never wildcard in production). Set appropriate
+    methods, headers, and max-age. Handle preflight OPTIONS requests at the gateway so they never reach backends. Test CORS
+    with multiple origin scenarios.
+  severity: high
+  technologies:
+    library: [aws api gateway]
+    platform: [kong, envoy, traefik, nginx]
+  domains:
+    domain: [architecture, api, security]
+    concern: [frontend]
+  example_good: "# Kong CORS plugin — centralized, explicit origins\nplugins:\n  - name: cors\n    config:\n      origins:\
+    \ [\"https://app.mycompany.com\", \"https://admin.mycompany.com\"]\n      methods: [GET, POST, PUT, DELETE, OPTIONS]\n\
+    \      headers: [Authorization, Content-Type, X-Request-Id]\n      exposed_headers: [X-Request-Id, X-RateLimit-Remaining]\n\
+    \      credentials: true\n      max_age: 3600\n      preflight_continue: false  # Gateway handles OPTIONS, not backends\n\
+    \n# Nginx equivalent\nlocation /api/ {\n    if ($request_method = 'OPTIONS') {\n        add_header 'Access-Control-Allow-Origin'\
+    \ 'https://app.mycompany.com';\n        add_header 'Access-Control-Allow-Methods' 'GET, POST, PUT, DELETE';\n        add_header\
+    \ 'Access-Control-Max-Age' 3600;\n        return 204;\n    }\n}\n"
+  example_bad: "# Backend service — overly permissive, duplicated logic\n@app.middleware(\"http\")\nasync def cors(request,\
+    \ call_next):\n    response = await call_next(request)\n    response.headers[\"Access-Control-Allow-Origin\"] = \"*\"\
+    \  # Allows EVERYTHING\n    response.headers[\"Access-Control-Allow-Credentials\"] = \"true\"  # ← INVALID with *\n  \
+    \  return response\n"
+  when_applies: Projects using Kong, Envoy, Traefik, or Nginx reverse proxy/load balancer
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps
+  sources: ["https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS"]
+- id: CR-APIGW-007
+  text: Gateway must validate request payloads against OpenAPI schemas — reject malformed requests before they reach backends.
+  why: Without request validation, malformed or malicious payloads reach backend services, causing crashes, SQL injection,
+    or unexpected behavior. Validating at the gateway rejects bad requests early, reduces backend error handling complexity,
+    and provides consistent error responses.
+  how_to_do_right: Import your OpenAPI spec into the gateway. Enable request body validation, query parameter validation,
+    and path parameter validation. Return 400 Bad Request with descriptive error messages. Validate content-type headers.
+    Set maximum request body size.
+  severity: high
+  technologies:
+    library: [aws api gateway]
+    platform: [kong, envoy]
+  domains:
+    domain: [architecture, api, security]
+    concern: [data-integrity]
+  example_good: "# Kong request-validator plugin with OpenAPI schema\nplugins:\n  - name: request-validator\n    config:\n\
+    \      body_schema: |\n        {\n          \"type\": \"object\",\n          \"required\": [\"email\", \"name\"],\n  \
+    \        \"properties\": {\n            \"email\": {\"type\": \"string\", \"format\": \"email\", \"maxLength\": 254},\n\
+    \            \"name\": {\"type\": \"string\", \"minLength\": 1, \"maxLength\": 100},\n            \"age\": {\"type\":\
+    \ \"integer\", \"minimum\": 0, \"maximum\": 150}\n          },\n          \"additionalProperties\": false\n        }\n\
+    \      allowed_content_types: [\"application/json\"]\n      verbose_response: true\n\n# Also set max body size at gateway\
+    \ level\n# Kong: client_max_body_size = 1m\n# Nginx: client_max_body_size 1m;\n"
+  example_bad: '# No validation — accept anything, let backend deal with it
+
+    # POST /users with body: {"email": "''; DROP TABLE users;--", "age": -999}
+
+    # Backend: crashes, logs stack trace, maybe executes the SQL
+
+    '
+  when_applies: Projects using Kong, AWS API Gateway, or Envoy
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps
+  sources: ["https://docs.konghq.com/hub/kong-inc/request-validator/"]
+- id: CR-APIGW-008
+  text: Implement request/response transformation at the gateway to decouple API contracts from backend service contracts.
+  why: Backend services evolve independently. If the public API contract is tightly coupled to internal service schemas, any
+    backend refactoring breaks external clients. The gateway acts as an anti-corruption layer — transforming between external
+    and internal representations.
+  how_to_do_right: Use gateway transformation plugins to rename fields, remove internal fields, add default values, and reshape
+    responses. Version your external API at the gateway (v1, v2) while backends remain unversioned. Transform error responses
+    to a consistent external format.
+  severity: medium
+  technologies:
+    library: [aws api gateway]
+    platform: [kong, envoy, traefik]
+  domains:
+    domain: [architecture, api]
+    concern: [evolution]
+  example_good: "# Kong response-transformer — hide internal fields, reshape\nplugins:\n  - name: response-transformer\n \
+    \   config:\n      remove:\n        json:\n          - internal_id       # Internal UUID — expose only public_id\n   \
+    \       - debug_info        # Never expose to clients\n          - _metadata         # Internal tracking\n      rename:\n\
+    \        json:\n          - \"db_created_at:created_at\"  # Rename to public contract\n          - \"user_uuid:id\"  \
+    \            # Simpler external name\n      add:\n        headers:\n          - \"X-API-Version:2\"\n          - \"X-Deprecation-Notice:v1\
+    \ sunset 2026-06-01\"\n\n# Gateway handles API versioning\nroutes:\n  - name: orders-v1\n    paths: [\"/v1/orders\"]\n\
+    \    plugins: [transform-v1]    # Maps to current backend format\n  - name: orders-v2\n    paths: [\"/v2/orders\"]\n \
+    \   plugins: [transform-v2]    # New format\n"
+  example_bad: '# Backend response exposed directly — internal schema is the API contract
+
+    # Client sees: {"_id": "507f1f77bcf86cd799439011", "internal_status": 3,
+
+    #               "debug_trace_id": "abc123", "_version": 42}
+
+    # Now you can never rename _id or change internal_status values
+
+    '
+  when_applies: Projects using Kong, Envoy, AWS API Gateway, or Traefik
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps
+  sources: ["https://docs.konghq.com/hub/kong-inc/response-transformer/"]
+- id: CR-APIGW-009
+  text: Use weighted load balancing and health checks at the gateway — not just round-robin.
+  why: Round-robin distributes requests equally, but not all backend instances are equal. A partially degraded instance processes
+    requests slowly, causing latency spikes for every Nth request. Health checks + weighted balancing route traffic away from
+    unhealthy or slower instances.
+  how_to_do_right: Configure active health checks (HTTP probe every 5-10s) and passive health checks (track error rates from
+    real traffic). Use least-connections or weighted round-robin for unequal instances. Mark unhealthy instances as down automatically.
+    Support canary deployments with weight-based routing.
+  severity: medium
+  technologies:
+    platform: [kong, envoy, traefik, nginx, haproxy]
+  domains:
+    domain: [architecture, api, reliability, infrastructure]
+  example_good: "# Envoy — active + passive health checks with weighted routing\nclusters:\n  - name: orders-service\n   \
+    \ type: STRICT_DNS\n    lb_policy: LEAST_REQUEST     # Route to least-busy instance\n    health_checks:\n      - timeout:\
+    \ 2s\n        interval: 10s\n        unhealthy_threshold: 3   # 3 consecutive failures = unhealthy\n        healthy_threshold:\
+    \ 2     # 2 consecutive successes = healthy\n        http_health_check:\n          path: \"/health\"\n          expected_statuses:\n\
+    \            - start: 200\n              end: 200\n    outlier_detection:\n      consecutive_5xx: 3         # Passive:\
+    \ eject after 3 consecutive 5xx\n      interval: 10s\n    load_assignment:\n      endpoints:\n        - lb_endpoints:\n\
+    \            - endpoint: { address: { socket_address: { address: \"orders-1\", port_value: 8080 }}}\n              load_balancing_weight:\
+    \ 3  # Gets 3x traffic (beefy instance)\n            - endpoint: { address: { socket_address: { address: \"orders-2\"\
+    , port_value: 8080 }}}\n              load_balancing_weight: 1  # Gets 1x traffic (smaller instance)\n"
+  example_bad: "# Round-robin with no health checks\nupstream orders {\n    server orders-1:8080;\n    server orders-2:8080;\n\
+    \    server orders-3:8080;  # This one is OOMing — gets 33% of traffic anyway\n}\n"
+  when_applies: Projects using Kong, Envoy, Traefik, or Nginx reverse proxy/load balancer
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps
+  sources: ["https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/health_checking", "https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers"]
+- id: CR-APIGW-010
+  text: Integrate WAF (Web Application Firewall) at the gateway to protect against OWASP Top 10 attacks.
+  why: SQL injection, XSS, path traversal, and other OWASP Top 10 attacks are automated and constant. Without a WAF, every
+    backend service must independently defend against these attacks — and they will miss edge cases. A gateway-level WAF catches
+    attacks before they reach any service.
+  how_to_do_right: Deploy ModSecurity (OWASP CRS) or cloud WAF (AWS WAF, Cloudflare) at the gateway. Enable OWASP Core Rule
+    Set. Tune rules to reduce false positives (start in detection mode, then switch to blocking). Log all blocked requests
+    for security review. Rate-limit suspicious IPs automatically.
+  severity: high
+  technologies:
+    library: [aws waf, modsecurity]
+    platform: [kong, nginx, cloudflare]
+  domains:
+    domain: [architecture, api, security]
+  example_good: "# Nginx + ModSecurity with OWASP CRS\nhttp {\n    modsecurity on;\n    modsecurity_rules_file /etc/nginx/modsec/main.conf;\n\
+    }\n\n# main.conf\nInclude /etc/nginx/modsec/owasp-crs/crs-setup.conf\nInclude /etc/nginx/modsec/owasp-crs/rules/*.conf\n\
+    \n# Custom rule — block SQL injection patterns\nSecRule ARGS \"@detectSQLi\" \\\n    \"id:1001,\\\n     phase:2,\\\n \
+    \    deny,\\\n     status:403,\\\n     log,\\\n     msg:'SQL Injection Attempt',\\\n     severity:CRITICAL\"\n\n# AWS\
+    \ WAF — managed rule groups\n# aws waf create-web-acl with:\n#   AWSManagedRulesCommonRuleSet\n#   AWSManagedRulesSQLiRuleSet\n\
+    #   AWSManagedRulesKnownBadInputsRuleSet\n"
+  example_bad: '# No WAF — rely on each service to sanitize inputs
+
+    # GET /users?id=1;DROP TABLE users-- → reaches database layer
+
+    # POST /search?q=<script>alert(document.cookie)</script> → stored XSS
+
+    '
+  when_applies: Projects using Kong, Nginx reverse proxy/load balancer, AWS WAF, or Cloudflare
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps
+  sources: ["https://owasp.org/www-project-modsecurity-core-rule-set/"]
+- id: CR-APIGW-011
+  text: Enforce mutual TLS (mTLS) for service-to-service communication behind the gateway.
+  why: Without mTLS, any process on the internal network can call backend services directly, bypassing the gateway's authentication,
+    rate limiting, and WAF. An attacker who compromises one container can freely access all services. mTLS ensures only authorized
+    services can communicate.
+  how_to_do_right: Issue short-lived certificates to each service via a CA (Vault, SPIFFE/SPIRE). Configure the gateway and
+    services to require client certificates. Rotate certificates automatically. Use a service mesh (Istio, Linkerd) for automatic
+    mTLS between all services.
+  severity: high
+  technologies:
+    platform: [envoy, service_mesh, istio, linkerd, kong, vault]
+  domains:
+    domain: [architecture, api, security, infrastructure]
+  example_good: "# Istio — automatic mTLS for all services in the mesh\napiVersion: security.istio.io/v1beta1\nkind: PeerAuthentication\n\
+    metadata:\n  name: default\n  namespace: production\nspec:\n  mtls:\n    mode: STRICT   # All traffic MUST be mTLS — no\
+    \ plaintext\n\n# Envoy — explicit mTLS configuration\nclusters:\n  - name: orders-service\n    transport_socket:\n   \
+    \   name: envoy.transport_sockets.tls\n      typed_config:\n        common_tls_context:\n          tls_certificates:\n\
+    \            - certificate_chain: { filename: \"/certs/client.crt\" }\n              private_key: { filename: \"/certs/client.key\"\
+    \ }\n          validation_context:\n            trusted_ca: { filename: \"/certs/ca.crt\" }\n"
+  example_bad: "# Plaintext HTTP between services — any compromised pod can sniff/spoof\nclusters:\n  - name: orders-service\n\
+    \    type: STRICT_DNS\n    hosts: [{ socket_address: { address: orders, port_value: 8080 }}]\n    # No TLS — traffic is\
+    \ plaintext on the network\n    # Any pod can curl http://orders:8080 directly, bypassing gateway\n"
+  when_applies: Projects using Envoy, Istio service mesh, Linkerd service mesh, or Kong
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps
+  sources: ["https://istio.io/latest/docs/concepts/security/#mutual-tls-authentication", "https://spiffe.io/docs/latest/spiffe-about/overview/"]
+- id: CR-APIGW-012
+  text: Add request IDs and distributed tracing headers at the gateway — every request must be traceable end-to-end.
+  why: Without request IDs, debugging production issues is impossible. A user reports 'my request failed' and you have no
+    way to correlate their request across gateway logs, service A logs, service B logs, and the database. Distributed tracing
+    connects all the pieces.
+  how_to_do_right: Generate a unique request ID (UUID) at the gateway if not already present. Propagate it via X-Request-Id
+    header to all downstream services. Integrate with distributed tracing (OpenTelemetry, Jaeger, Datadog APM) — inject trace
+    context headers (traceparent). Return the request ID to the client in the response.
+  severity: medium
+  technologies:
+    platform: [kong, envoy, traefik, opentelemetry, jaeger]
+  domains:
+    domain: [architecture, api, observability, operations]
+  example_good: "# Kong correlation-id plugin — generates and propagates request IDs\nplugins:\n  - name: correlation-id\n\
+    \    config:\n      header_name: X-Request-Id\n      generator: uuid\n      echo_downstream: true   # Return ID in response\
+    \ headers\n\n# Envoy — OpenTelemetry tracing integration\ntracing:\n  provider:\n    name: envoy.tracers.opentelemetry\n\
+    \    typed_config:\n      grpc_service:\n        envoy_grpc:\n          cluster_name: otel-collector\n      service_name:\
+    \ api-gateway\n  random_sampling:\n    value: 100.0   # Sample 100% in dev, 10-20% in production\n\n# Backend service\
+    \ — propagate the trace context\nfrom opentelemetry.propagate import extract\n\n@app.middleware(\"http\")\nasync def tracing_middleware(request,\
+    \ call_next):\n    ctx = extract(request.headers)\n    with tracer.start_as_current_span(\"handle_request\", context=ctx):\n\
+    \        response = await call_next(request)\n        response.headers[\"X-Request-Id\"] = request.headers.get(\"X-Request-Id\"\
+    , \"\")\n        return response\n"
+  example_bad: '# No request ID — debugging production issues is guesswork
+
+    # User: "My order failed at 2:15 PM"
+
+    # You: search ALL logs for orders around 2:15 PM across 12 services
+
+    # 50 orders were processed at 2:15 PM — which one failed?
+
+    '
+  when_applies: Projects using Kong, Envoy, Traefik, or OpenTelemetry
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps
+  sources: ["https://opentelemetry.io/docs/concepts/context-propagation/"]

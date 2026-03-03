@@ -1,0 +1,259 @@
+layer: rules
+technology: SRE
+domain: resilience
+knowledge:
+- id: CR-SRE-CASCADE-001
+  text: Cascading failures start when one component fails and its load shifts to surviving components, which then also fail under the increased load. The pattern is self-reinforcing — each failure increases
+    load on survivors, causing more failures. Without circuit breakers and load shedding, a single server failure can take down the entire fleet.
+  why: 'Google''s Chapter 22 on Cascading Failures describes the most dangerous failure mode in distributed systems. The sequence: a cluster of 10 servers handles 10,000 RPS (1,000 each). One server dies.
+    The remaining 9 must handle 10,000 RPS (1,111 each — 11% increase). This pushes 2 servers past their capacity threshold and they crash. Now 7 servers handle 10,000 RPS (1,429 each — 43% increase from
+    original). More crash. Within minutes, all servers are down, serving 0 RPS. The original failure (one server) was survivable — the cascade was not. This pattern is universal: it happens with servers,
+    threads, database connections, memory, and any shared resource where failure shifts load to survivors.
+
+    '
+  how_to_do_right: '1. Provision capacity so that N-2 servers can handle peak load (not N-1 — because failures cascade).
+
+    2. Set per-server request limits. When a server reaches its limit, it rejects new requests rather than degrading and crashing.
+
+    3. Implement circuit breakers between services: if downstream is failing, stop sending requests and fail fast.
+
+    4. Use load shedding: when total cluster utilization > 80%, start rejecting low-priority requests.
+
+    5. Test cascade scenarios: kill 2 of 5 servers and verify the remaining 3 survive without cascading.
+
+    6. Never autoscale DOWN during an incident. Removing capacity during elevated load accelerates the cascade.
+
+    '
+  example_good: "# N-2 capacity provisioning with per-server request limits\nclass ClusterCapacityPlanner:\n    def validate_capacity(self, cluster: Cluster):\n        peak_rps = cluster.peak_rps\n        n = cluster.instance_count\n        # N-2 capacity: can lose 2 instances and still serve peak\n        per_instance_capacity = peak_rps / (n - 2)\n        for instance in cluster.instances:\n            instance.max_concurrent_requests = int(per_instance_capacity * 1.1)\n            log.info(\n                f\"{instance.id}: max_concurrent={instance.max_concurrent_requests}\"\n            )\n        if n < 4:\n            log.warning(f\"Cluster {cluster.name} has < 4 instances — cannot tolerate N-2\")\n\n    def test_cascade_resilience(self, cluster: Cluster):\n        \"\"\"Kill 2 of N instances and verify survivors handle load.\"\"\"\n        victims = random.sample(cluster.instances, 2)\n        for v in victims:\n            v.stop()\n        assert cluster.is_serving_all_traffic(), \"Cascade detected!\"\n"
+  example_bad: "# No per-server limits, no cascade protection\nclass Cluster:\n    def __init__(self, instances, peak_rps):\n        self.instances = instances\n        # Provisioned for exactly peak load — 0% headroom\n        # If 1 instance dies: remaining are at 110% → cascade starts\n        # No per-server request limits\n        # No circuit breakers between services\n        # One failure takes down the entire fleet in minutes\n"
+  when_applies: When provisioning capacity for clustered services where the failure of one or more instances shifts load to survivors and risks triggering a cascading failure.
+  severity: critical
+  technologies:
+    lang: [general]
+    platform: [cloud, kubernetes]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, fault_tolerance, circuit_breaker, resilience]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-CASCADE-002
+  text: Server overload from cascading failures manifests as resource exhaustion — CPU, memory, threads, file descriptors, or downstream connections. The FIRST resource to saturate determines the failure
+    mode, and it is almost never the one you expect.
+  why: 'Google catalogs the specific resources that saturate during cascading failures because the failure mode depends on which resource runs out first. CPU saturation causes increased latency (requests
+    queue), which causes client timeouts and retries, which increases CPU demand further. Memory saturation causes garbage collection storms (Go/Java), OOM kills, or thrashing. Thread pool exhaustion causes
+    requests to queue indefinitely. File descriptor exhaustion prevents new connections. Downstream connection pool exhaustion blocks all requests waiting for a connection. Each has different symptoms and
+    different mitigations. The critical insight: engineers often provision for CPU and memory but forget about threads, file descriptors, and connection pools — so these "secondary" resources saturate first,
+    with confusing symptoms (the CPU and memory dashboards look fine while the service is completely unresponsive).
+
+    '
+  how_to_do_right: '1. Monitor ALL scarce resources, not just CPU and memory: thread pool utilization, file descriptors, connection pool usage, queue depth.
+
+    2. Set alarms at 70% utilization for each resource. At 70%, you have time to react. At 90%, you don''t.
+
+    3. Set hard limits on each resource: max threads, max connections, max queue depth. Prefer rejection over exhaustion.
+
+    4. Profile under load: at 80% CPU, what''s the thread pool utilization? The file descriptor count? Know the cascade order.
+
+    5. Use bulkheads: separate connection pools for different downstream services so that one slow service doesn''t exhaust all connections.
+
+    6. In Kubernetes, set resource requests AND limits for CPU and memory. Set connection pool sizes in application config. Don''t rely on defaults.
+
+    '
+  example_good: "# Monitor ALL scarce resources with bulkheads\nimport psutil\nfrom concurrent.futures import ThreadPoolExecutor\n\nclass ResourceMonitor:\n    THRESHOLDS = {\n        \"cpu_percent\": 70,\n        \"memory_percent\": 70,\n        \"thread_pool_percent\": 70,\n        \"connection_pool_percent\": 70,\n        \"file_descriptors_percent\": 70,\n    }\n\n    def check_all(self) -> dict[str, float]:\n        return {\n            \"cpu_percent\": psutil.cpu_percent(),\n            \"memory_percent\": psutil.virtual_memory().percent,\n            \"thread_pool_percent\": self.thread_pool_usage(),\n            \"connection_pool_percent\": self.conn_pool_usage(),\n            \"file_descriptors_percent\": self.fd_usage(),\n        }\n\n    def alert_on_saturation(self):\n        for resource, value in self.check_all().items():\n            if value > self.THRESHOLDS[resource]:\n                alert(f\"{resource} at {value:.0f}% — approaching saturation\")\n\n# Bulkhead: separate connection pools per downstream\ndb_pool = ConnectionPool(max_size=20)      # DB gets 20 connections\ncache_pool = ConnectionPool(max_size=10)   # Cache gets 10\napi_pool = ConnectionPool(max_size=10)     # External API gets 10\n"
+  example_bad: "# Only monitor CPU and memory — miss secondary resource exhaustion\ndef health_check():\n    cpu = psutil.cpu_percent()\n    mem = psutil.virtual_memory().percent\n    if cpu < 80 and mem < 80:\n        return \"healthy\"  # CPU and memory look fine!\n    # But: thread pool is 100% utilized → requests queue indefinitely\n    # But: file descriptors exhausted → can't accept new connections\n    # But: DB connection pool full → all requests blocked waiting\n    # Dashboard shows green while service is completely unresponsive\n"
+  when_applies: When operating services where cascading failures can be triggered by exhaustion of secondary resources like thread pools, file descriptors, or connection pools that are not typically monitored.
+  severity: critical
+  technologies:
+    lang: [general, go, java, python]
+    platform: [kubernetes]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, fault_tolerance, circuit_breaker, resilience]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-CASCADE-003
+  text: Health check failures during overload can CAUSE cascading failures, not just detect them. If the load balancer removes "unhealthy" (actually just overloaded) servers, the remaining servers receive
+    MORE load, fail their health checks, get removed, and the entire fleet goes down.
+  why: 'This is one of the most insidious cascading failure patterns Google describes. The sequence: server A is overloaded and responds slowly. The health check times out. The load balancer marks A as
+    unhealthy and removes it. Traffic shifts to servers B, C, D. Now they are more loaded. Server B''s health check times out. Load balancer removes B. Servers C and D now have 2.5x original load. They
+    fail too. All servers are "unhealthy" and the load balancer has nowhere to send traffic. The irony: the health check system, designed to protect against failures, CAUSED the complete failure. The fix
+    requires distinguishing between "the server is broken" (should be removed) and "the server is overloaded" (should receive less traffic, not zero traffic).
+
+    '
+  how_to_do_right: '1. Separate liveness checks (is the server fundamentally broken?) from load checks (is the server overloaded?).
+
+    2. Liveness failure → remove from pool (server is dead). Load check failure → reduce traffic (server is alive but struggling).
+
+    3. Never remove more than 30% of backends simultaneously. If > 30% fail health checks, the problem is systemic, not per-server.
+
+    4. Implement "panic mode": if > 50% of backends are unhealthy, send traffic to ALL backends (including "unhealthy" ones) rather than overwhelming the remaining ones.
+
+    5. Health check timeouts should be generous during load: 5-10 seconds, not 1 second. An overloaded server that responds in 3 seconds is still functional.
+
+    6. Alert when health check removal rate exceeds normal. Rapid removal of multiple servers is the signature of a health-check-induced cascade.
+
+    '
+  example_good: "# Separate liveness from load checks; panic mode prevents cascade\nclass HealthCheckConfig:\n    def configure_checks(self, service: str):\n        # Liveness: is the server fundamentally broken?\n        liveness = HealthCheck(\n            endpoint=\"/livez\",\n            timeout_sec=10,  # Generous timeout during load\n            failure_action=\"remove_from_pool\",  # Server is dead\n        )\n        # Load check: is the server overloaded?\n        load_check = HealthCheck(\n            endpoint=\"/readyz\",\n            timeout_sec=10,\n            failure_action=\"reduce_traffic\",  # Less traffic, not zero\n        )\n        return liveness, load_check\n\nclass PanicModeController:\n    MAX_REMOVAL_PCT = 0.30  # Never remove > 30% of backends\n\n    def should_remove(self, backend, total_unhealthy_pct: float) -> bool:\n        if total_unhealthy_pct > 0.50:\n            log.critical(\"PANIC MODE: >50% unhealthy — sending to ALL backends\")\n            return False  # Keep all backends, even unhealthy ones\n        if total_unhealthy_pct > self.MAX_REMOVAL_PCT:\n            log.warning(\"Systemic issue — problem is not per-server\")\n            return False\n        return True\n"
+  example_bad: "# Health check removes overloaded servers → cascade\nclass LoadBalancer:\n    def health_check(self, backend):\n        try:\n            resp = http.get(f\"{backend}/health\", timeout=1)  # 1s timeout — too aggressive\n            return resp.status == 200\n        except Timeout:\n            return False  # Overloaded server = \"unhealthy\" = removed\n            # Server A overloaded → removed → B,C,D get more load\n            # Server B overloaded → removed → C,D get even more load\n            # All servers removed → zero capacity\n            # Health checks CAUSED the cascading failure\n"
+  when_applies: When configuring health checks for load balancers where removing overloaded (but functional) servers would shift more load to survivors and trigger a cascading failure.
+  severity: critical
+  technologies:
+    platform: [cloud, kubernetes, load_balancer]
+  domains:
+    domain: [performance, reliability]
+    concern: [scaling, horizontal, fault_tolerance, circuit_breaker, resilience]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-CASCADE-004
+  text: Queue-based cascading failures are the slowest to detect and the hardest to recover from. When a service queues requests faster than it processes them, memory grows linearly, latency grows linearly,
+    and by the time alerts fire, the service has minutes of backlogged work that will take hours to drain.
+  why: 'Google identifies unbounded queues as one of the most dangerous anti-patterns in distributed systems. The failure mode is insidious: the service appears "healthy" (process running, health checks
+    passing, no errors) but is actually dying. Requests enter the queue faster than they leave. Queue depth grows. Memory grows. Latency grows. But the service is still "processing" — it hasn''t crashed,
+    it hasn''t returned errors, it''s just slow. By the time the queue depth alert fires (or worse, by the time OOM kills the process), there are thousands of queued requests that are already past their
+    client''s timeout. Processing them is wasted work. And when the service restarts, the queue is gone but the retry storm from all those timed-out clients hits immediately. Google''s rule: bound all queues
+    with an explicit maximum. When the queue is full, REJECT new requests instead of queuing them. A fast rejection is infinitely better than a slow timeout.
+
+    '
+  how_to_do_right: '1. EVERY queue must have a bounded maximum size. Unbounded queues are unbounded memory consumption waiting to happen.
+
+    2. When the queue is full, reject new items immediately. Return an error to the caller. Do NOT grow the queue.
+
+    3. Drop queued items that have exceeded the client''s timeout. Processing a 30-second-old request when the client timed out at 10 seconds is wasted work.
+
+    4. Monitor queue depth as a primary metric. Alert when queue depth > 50% of maximum — this is the early warning of a queue-based cascade.
+
+    5. Set queue processing rate alarms: if drain rate < arrival rate for > 5 minutes, the queue will eventually fill.
+
+    6. After a queue-based failure, do NOT restart and process the backlog. Drain the queue (discard old items) and accept fresh requests.
+
+    '
+  example_good: "# Bounded queue with TTL and depth monitoring\nimport time\nfrom collections import deque\n\nclass BoundedQueue:\n    def __init__(self, max_size: int, item_ttl_sec: float):\n        self.max_size = max_size\n        self.item_ttl_sec = item_ttl_sec\n        self._queue: deque = deque(maxlen=max_size)\n\n    def put(self, item) -> bool:\n        if len(self._queue) >= self.max_size:\n            metrics.increment(\"queue_rejected_total\")\n            return False  # REJECT — don't grow the queue\n        self._queue.append((time.monotonic(), item))\n        metrics.observe(\"queue_depth\", len(self._queue))\n        return True\n\n    def get(self):\n        while self._queue:\n            enqueue_time, item = self._queue.popleft()\n            age = time.monotonic() - enqueue_time\n            if age > self.item_ttl_sec:\n                metrics.increment(\"queue_expired_total\")  # Drop stale items\n                continue\n            return item\n        return None\n"
+  example_bad: "# Unbounded queue — silent death spiral\nfrom queue import Queue\n\nwork_queue = Queue()  # No max_size! Unbounded!\n\ndef accept_request(request):\n    work_queue.put(request)  # Always accepts, never rejects\n    # Queue grows: 100, 1000, 10000, 100000 items\n    # Memory grows linearly\n    # Latency grows linearly (items wait in queue)\n    # Health check passes (process is running!)\n    # Items in queue are past client timeout — processing them is wasted work\n    # Eventually: OOM kill, restart, retry storm\n"
+  when_applies: When implementing request queues or work queues in services where unbounded queue growth can silently consume memory and increase latency until the system collapses.
+  severity: critical
+  technologies:
+    lang: [general]
+    platform: [redis, kafka, rabbitmq, sqs]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, fault_tolerance, circuit_breaker, resilience]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-CASCADE-005
+  text: Slow startup and cold cache amplify cascading failures. A freshly restarted server at full load with empty caches performs 10-100x worse than a warm server. If restarts are triggered by overload,
+    each restart makes the overload worse.
+  why: 'Google describes a specific cascade pattern around server restarts. When an overloaded server crashes and restarts, it starts with cold caches (every request hits the database instead of cache —
+    10x more expensive), uninitialized connection pools (first requests must establish connections — adding latency), and JIT compilation not yet warm (first requests are slower in JVM/V8). The restarted
+    server is operating at a fraction of its normal capacity precisely when it needs to handle MORE than normal load (because other servers also failed). This creates a death spiral: server crashes from
+    overload → restarts with cold cache → performs 10x worse → crashes again from overload. Google''s mitigations: slow-start traffic ramping after restart, pre-warming caches before accepting traffic,
+    and connection pre-establishment.
+
+    '
+  how_to_do_right: '1. Implement slow-start: after restart, accept 10% of normal traffic, then ramp to 25%, 50%, 100% over 5-10 minutes.
+
+    2. Pre-warm caches during startup: load the top 1000 hot keys from the database before accepting traffic.
+
+    3. Pre-establish connections during startup: connect to all downstream services before marking the instance as "ready."
+
+    4. In Kubernetes, use readiness probes that return 200 only AFTER warmup is complete. Traffic should not arrive before the server is ready.
+
+    5. If using JVM or V8, allow JIT warmup time before exposing to production traffic.
+
+    6. Monitor cold-start performance: track latency and error rate for the first 5 minutes after restart separately from steady-state.
+
+    '
+  example_good: "# Slow-start traffic ramping with cache pre-warming\nclass ServerStartup:\n    RAMP_STAGES = [0.10, 0.25, 0.50, 1.0]  # 10% → 25% → 50% → 100%\n    RAMP_INTERVAL_SEC = 120  # 2 minutes between stages\n\n    async def startup(self):\n        # 1. Pre-warm caches before accepting ANY traffic\n        await self.prewarm_cache(top_keys=1000)\n        # 2. Pre-establish connections to downstream services\n        await self.prewarm_connections()\n        # 3. Slow-start: ramp traffic gradually\n        for pct in self.RAMP_STAGES:\n            self.set_traffic_weight(pct)\n            log.info(f\"Traffic weight: {pct:.0%}\")\n            await asyncio.sleep(self.RAMP_INTERVAL_SEC)\n            if self.error_rate() > 0.01:\n                log.warning(f\"Errors during ramp at {pct:.0%} — holding\")\n                break\n        log.info(\"Startup complete — full traffic\")\n\n    async def prewarm_cache(self, top_keys: int):\n        \"\"\"Load hot keys from DB into cache before serving traffic.\"\"\"\n        hot_keys = await self.db.get_top_keys(top_keys)\n        for key in hot_keys:\n            self.cache.set(key, await self.db.get(key))\n"
+  example_bad: "# Cold start at full load — death spiral\nclass Server:\n    def start(self):\n        # Mark as ready immediately — full traffic hits\n        self.ready = True\n        # Cache is empty: every request hits DB (10x more expensive)\n        # Connection pools empty: first requests must establish connections\n        # JIT not warm: first requests are 3x slower\n        # Server is at 10% of normal capacity when it needs to handle 100% load\n        # Result: server crashes from overload → restarts → cold start again\n"
+  when_applies: When restarting servers in a cluster under load, especially during cascading failure recovery where cold-start performance degradation can trigger further cascading failures.
+  severity: high
+  technologies:
+    lang: [general, java]
+    platform: [redis, kubernetes]
+  domains:
+    domain: [architecture, performance, reliability]
+    concern: [distributed_systems, caching, fault_tolerance, circuit_breaker, resilience]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-CASCADE-006
+  text: To prevent cascading failures, add retries with exponential backoff and jitter at EVERY layer, limit queue sizes, use circuit breakers between services, shed load by priority, and provision for
+    N-2 capacity. These are not optional resilience patterns — they are mandatory infrastructure for any multi-service system.
+  why: 'Google''s Chapter 22 concludes with a comprehensive defense strategy because cascading failures require defense in depth — no single mechanism is sufficient. Retries without backoff cause retry
+    storms. Circuit breakers without load shedding let the cascade reach the client. Load shedding without priority means critical requests are rejected alongside background jobs. N-1 capacity means one
+    failure triggers a cascade. Each mechanism addresses a specific failure mode, and the combination provides layered protection. Google requires ALL of these in production services because they have seen
+    every possible combination of "we thought we didn''t need X" followed by an outage caused by the lack of X.
+
+    '
+  how_to_do_right: '1. Retries: exponential backoff (100ms, 200ms, 400ms), jitter (+/-25%), per-request budget (max 3 attempts), per-client budget (max 10% retry rate).
+
+    2. Circuit breakers: per-backend, open after 5 consecutive failures, half-open after 30 seconds, close after 3 successes. Use Hystrix/resilience4j/Polly patterns.
+
+    3. Load shedding: reject requests when CPU > 80%. Reject low-priority first. Return 503 with Retry-After.
+
+    4. Queue bounds: maximum queue size = (target latency / processing time per request) * concurrency. Drop items exceeding TTL.
+
+    5. Capacity planning: provision for N-2 (can lose 2 instances at peak and still serve all traffic).
+
+    6. Timeout chains: downstream timeout < upstream timeout. If DB timeout is 5s, app timeout to DB must be < 5s, and client timeout to app must be > app-to-DB timeout.
+
+    '
+  example_good: "# Defense in depth: retries + circuit breakers + load shedding + capacity\nimport random\nimport time\n\nclass ResilientServiceClient:\n    def call(self, request):\n        # Layer 1: Circuit breaker per backend\n        if self.circuit_breaker.is_open():\n            raise CircuitOpenError(\"Backend unavailable\")\n\n        # Layer 2: Retry with backoff and jitter\n        for attempt in range(3):\n            try:\n                return self._do_call(request)\n            except RetryableError:\n                if attempt == 2:\n                    raise\n                delay = 0.1 * (2 ** attempt)  # 100ms, 200ms, 400ms\n                jitter = delay * 0.25 * random.uniform(-1, 1)\n                time.sleep(delay + jitter)\n\n        # Layer 3: Client retry budget (checked inside _do_call)\n        # Layer 4: Server-side load shedding (returns 503 + Retry-After)\n        # Layer 5: N-2 capacity provisioning (cluster level)\n"
+  example_bad: "# No resilience layers — single point of failure\ndef call_service(request):\n    response = http.post(BACKEND_URL, request, timeout=30)  # Default 30s timeout\n    return response\n    # No circuit breaker: keeps hammering a dead backend\n    # No retry budget: retries multiply load during outage\n    # No load shedding: server accepts everything until OOM\n    # No capacity margin: N-0 provisioning, any failure cascades\n    # One backend failure → complete service outage\n"
+  when_applies: When building distributed service architectures that need defense-in-depth against cascading failures through multiple resilience layers working together.
+  severity: critical
+  technologies:
+    lang: [general]
+    platform: [kubernetes, grpc, load_balancer, istio]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, fault_tolerance, circuit_breaker, resilience]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-CASCADE-007
+  text: Timeout chains must be configured correctly across service layers — each downstream timeout must be shorter than the upstream timeout that calls it. If the database timeout is 5 seconds and the
+    application timeout to the database is 10 seconds, the application wastes 5 seconds waiting for a response that will never come.
+  why: 'Google highlights timeout misconfiguration as a silent contributor to cascading failures. In a typical three-tier architecture: client → application → database. If the database is overloaded and
+    takes 10 seconds to respond, but the application''s timeout is 30 seconds, the application holds the connection open for 30 seconds — consuming a thread, a connection, and memory — before discovering
+    the database is slow. Meanwhile, the client''s timeout might be 5 seconds, so the client has already timed out and retried. The application is now processing a request that no one is waiting for. Correct
+    timeout configuration: client timeout (10s) > application timeout (5s) > database timeout (3s). Each layer fails fast, releases resources, and allows the upstream to handle the error rather than waiting
+    for a dead-end.
+
+    '
+  how_to_do_right: '1. Map timeout chains for every request path: client → service A (timeout X) → service B (timeout Y) → database (timeout Z). X > Y > Z.
+
+    2. Set timeouts explicitly at every layer. Never rely on defaults — default timeouts are usually 30-60 seconds (too long).
+
+    3. Include network latency in timeout calculations: if network adds 100ms, the downstream timeout must be reduced by 100ms.
+
+    4. Use deadline propagation: pass the remaining time budget with each request. If the client has 5 seconds left, the downstream knows it has at most 5 seconds.
+
+    5. Log timeout events with context: which layer timed out, what was the configured timeout, how long did it actually wait?
+
+    6. Test timeout behavior: inject latency into each downstream and verify that the upstream handles it correctly (fast failure, not hang).
+
+    '
+  example_good: "# Correct timeout chain: client > app > downstream > db\nclass TimeoutChain:\n    \"\"\"Downstream timeout < upstream timeout at every layer.\"\"\"\n    CLIENT_TIMEOUT_SEC = 10.0\n    APP_TO_SERVICE_B_SEC = 5.0\n    SERVICE_B_TO_DB_SEC = 3.0\n\n    def validate_chain(self):\n        assert self.CLIENT_TIMEOUT_SEC > self.APP_TO_SERVICE_B_SEC, \\\n            \"Client must wait longer than app-to-B\"\n        assert self.APP_TO_SERVICE_B_SEC > self.SERVICE_B_TO_DB_SEC, \\\n            \"App-to-B must wait longer than B-to-DB\"\n\n# Deadline propagation: pass remaining budget downstream\ndef call_service_b(request, deadline: float):\n    remaining = deadline - time.monotonic()\n    if remaining <= 0:\n        raise DeadlineExceeded(\"No time budget remaining\")\n    response = http.post(\n        SERVICE_B_URL,\n        request,\n        timeout=min(remaining, 5.0),  # Never exceed layer timeout\n        headers={\"X-Deadline\": str(deadline)},\n    )\n    return response\n"
+  example_bad: "# Timeout misconfiguration: downstream > upstream\ndef call_db(query):\n    return db.execute(query, timeout=30)  # DB timeout: 30 seconds\n\ndef call_app(request):\n    # App timeout to DB: 60 seconds (WRONG — longer than DB timeout?)\n    # Actually: DB returns error at 30s, but app waits 60s\n    result = call_db(request.query)\n    return result\n\ndef call_from_client():\n    # Client timeout: 5 seconds\n    # App holds connection for 30s waiting for DB\n    # Client has already timed out and retried at 5s\n    # App is processing a request no one is waiting for\n    return http.post(APP_URL, timeout=5)  # Gives up after 5s\n"
+  when_applies: When configuring timeouts across service layers where misconfigured timeout chains cause wasted resources processing requests that upstream callers have already abandoned.
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kubernetes, grpc, http, load_balancer]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, fault_tolerance, circuit_breaker, timeout, resilience]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked

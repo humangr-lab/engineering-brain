@@ -1,0 +1,294 @@
+layer: rules
+technology: SRE
+domain: databases
+knowledge:
+- id: CR-SRE-DB-001
+  text: 'Database connection pools must be sized based on Little''s Law: pool_size = avg_concurrent_queries × avg_query_duration. A pool too small causes connection wait timeouts. A pool too large wastes
+    database resources and can overwhelm the database with too many concurrent queries.'
+  why: 'Google''s capacity management applies queuing theory to database connections. Each database connection consumes memory (~5-10MB in PostgreSQL), a process/thread, and kernel resources. With 10 application
+    instances each opening 50 connections, the database handles 500 concurrent connections — each consuming resources even when idle. The common mistake: setting pool size to "a big number" (200) "just
+    in case." Result: 10 instances × 200 = 2000 connections. PostgreSQL default max_connections = 100. Connection refused. The correct approach: measure avg_concurrent_queries (say 5 per instance) × avg_query_duration
+    (say 50ms). Pool size = 5 × 0.05 = 0.25, so minimum 1 — but add headroom for bursts: 2-3× = 10-15 connections per instance. With 10 instances: 100-150 total.
+
+    '
+  how_to_do_right: '1. Measure actual concurrent query load per instance: instrument connection pool metrics (active, idle, waiting).
+
+    2. Apply Little''s Law: pool_size = arrival_rate × service_time × safety_factor (2-3x).
+
+    3. Set both min and max pool size: min = steady state, max = burst handling. Don''t set min = max (wastes idle connections).
+
+    4. Configure connection timeout (how long to wait for a connection from the pool): 5-10 seconds. Fail fast, don''t queue forever.
+
+    5. Enable connection validation: test connections before use (SELECT 1). Stale connections from network issues cause errors.
+
+    6. Use PgBouncer or ProxySQL for connection pooling at the database level — application pools × instances can still overwhelm the database.
+
+    '
+  example_good: "# Calculated connection pool with Little's Law\nimport psycopg2.pool\n\ndef create_pool(avg_concurrent_queries: int = 5, avg_query_ms: float = 50,\n                safety_factor: float = 2.5) -> psycopg2.pool.ThreadedConnectionPool:\n    min_conns = max(1, avg_concurrent_queries)\n    max_conns = int(avg_concurrent_queries * safety_factor)\n    pool = psycopg2.pool.ThreadedConnectionPool(\n        minconn=min_conns,   # steady-state\n        maxconn=max_conns,   # burst handling\n    )\n    return pool\n\n# 5 concurrent queries * 2.5x = 12 connections per instance\n# 10 instances * 12 = 120 total -> set max_connections = 150\npool = create_pool(avg_concurrent_queries=5)\n"
+  example_bad: "# Arbitrary pool size — wastes resources or causes failures\nimport psycopg2.pool\n\npool = psycopg2.pool.ThreadedConnectionPool(\n    minconn=200,  # 200 idle connections per instance\n    maxconn=200,  # 10 instances * 200 = 2000 connections\n)\n# PostgreSQL default max_connections = 100 -> connection refused!\n# Each idle connection: ~10MB of PostgreSQL memory wasted\n"
+  when_applies: "When configuring database connection pools in any application that connects to PostgreSQL, MySQL, or similar relational databases."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [mysql, postgresql]
+  domains:
+    domain: [databases, performance, reliability]
+    concern: [relational, throughput, connection_pooling, capacity]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-DB-002
+  text: Database migrations must be backward-compatible — every migration must work with both the old and new application version running simultaneously. This means no renaming columns, no dropping columns
+    in use, and no changing column types without a multi-step migration.
+  why: 'Google''s release engineering (Chapter 8) and safe deployment practices require that database changes support rolling deployments. During a deployment, both old and new application versions run
+    simultaneously (rolling update, blue-green, canary). If a migration renames column "name" to "full_name", old application instances reading "name" will fail with "column not found." The safe approach
+    is expand-and-contract: Step 1 (expand): add new column, dual-write to both. Step 2 (migrate): backfill old data to new column. Step 3 (contract): remove old column after all application instances use
+    the new one. Each step is a separate deployment, each backward-compatible.
+
+    '
+  how_to_do_right: '1. Never rename columns in a single migration. Instead: add new column → dual-write → backfill → drop old column (3 separate migrations).
+
+    2. Never drop columns that are still referenced by running application code. Drop only after all instances use the new schema.
+
+    3. Never change column types in place. Instead: add new column with new type → migrate data → switch reads → drop old column.
+
+    4. Add new columns as nullable or with defaults. NOT NULL without a default breaks inserts from old application versions.
+
+    5. Test migrations against production-size data: a migration that takes 5 seconds on a dev database may lock a production table for 5 hours.
+
+    6. Always have a rollback plan: every migration should have a corresponding reverse migration tested before deployment.
+
+    '
+  example_good: "# Safe migration: expand-and-contract (3 steps)\n# Step 1: Add new column (backward compatible)\nALTER TABLE users ADD COLUMN full_name TEXT DEFAULT NULL;\n-- Old code still works (reads 'name', ignores 'full_name')\n\n# Step 2: Dual-write + backfill (deploy new code)\n-- New code writes to BOTH columns:\n-- UPDATE users SET name = 'Alice', full_name = 'Alice' WHERE id = 1;\n-- Backfill: UPDATE users SET full_name = name WHERE full_name IS NULL;\n\n# Step 3: Drop old column (after ALL instances use new column)\nALTER TABLE users DROP COLUMN name;\n-- Only after verifying zero reads of 'name' column\n"
+  example_bad: "# Unsafe migration: rename column in single step\nALTER TABLE users RENAME COLUMN name TO full_name;\n-- During rolling deployment:\n-- Old instances (v1): SELECT name FROM users -> ERROR: column 'name' does not exist\n-- New instances (v2): SELECT full_name FROM users -> works\n-- Result: partial outage during entire deployment window\n"
+  when_applies: "When running database schema migrations in production where rolling deployments mean old and new application versions coexist."
+  severity: high
+  technologies:
+    lang: [general]
+    framework: [orm, sqlalchemy]
+    platform: [mysql, postgresql]
+  domains:
+    domain: [databases, deployment, reliability]
+    concern: [relational, database_migrations]
+  sources:
+  - url: https://sre.google/sre-book/release-engineering/
+    title: 'Google SRE Book — Chapter 8: Release Engineering'
+  validation_status: cross_checked
+- id: CR-SRE-DB-003
+  text: Database queries must have explicit timeouts — a query without a timeout can hold a connection indefinitely, block other queries waiting for locks, and eventually exhaust the connection pool. Set
+    statement_timeout at the session or query level, not just at the application level.
+  why: 'Google''s overload management (Chapter 21) treats unbounded operations as the root cause of cascading failures. A query without a timeout that hits a missing index does a full table scan — 10 minutes
+    on a large table. During those 10 minutes: the connection is occupied (pool size -1), any locks held block other queries, the database CPU is consumed (potentially affecting all other queries), and
+    the application thread is blocked (consuming a thread pool slot). If multiple such queries run concurrently, the connection pool is exhausted within minutes, and the entire service becomes unavailable
+    — all because of one bad query.
+
+    '
+  how_to_do_right: '1. Set statement_timeout at the database level: PostgreSQL `SET statement_timeout = ''30s''`. This catches all runaway queries.
+
+    2. Set query-level timeouts for known-expensive queries: reduce timeout for simple lookups (5s), increase for reports (60s).
+
+    3. Application-level timeout should be shorter than database timeout: if app timeout is 10s and DB timeout is 30s, the app returns an error but the query continues consuming DB resources for 20s. Set
+    DB timeout ≤ app timeout.
+
+    4. Log slow queries: PostgreSQL log_min_duration_statement = 1000 (1 second). Review weekly for missing indexes and optimization opportunities.
+
+    5. Use EXPLAIN ANALYZE before deploying new queries to production. Catch full table scans before they hit production traffic.
+
+    6. Set idle_in_transaction_session_timeout to kill sessions that open a transaction and never commit (connection leak pattern).
+
+    '
+  example_good: "# Explicit query timeouts at both DB and application level\nimport psycopg2\n\ndef get_connection(timeout_ms: int = 30000) -> psycopg2.connection:\n    conn = psycopg2.connect(dsn='postgres://localhost/mydb')\n    with conn.cursor() as cur:\n        cur.execute(f\"SET statement_timeout = '{timeout_ms}'\")\n        cur.execute(\"SET idle_in_transaction_session_timeout = '60000'\")\n    return conn\n\n# Per-query timeout for known-fast lookups\ndef get_user(conn, user_id: int) -> dict:\n    with conn.cursor() as cur:\n        cur.execute(\"SET LOCAL statement_timeout = '5000'\")  # 5s for simple lookup\n        cur.execute(\"SELECT * FROM users WHERE id = %s\", (user_id,))\n        return cur.fetchone()\n\n# Log slow queries: SET log_min_duration_statement = 1000;\n"
+  example_bad: "# No query timeout — unbounded queries hold connections forever\nimport psycopg2\n\nconn = psycopg2.connect('postgres://localhost/mydb')\ncur = conn.cursor()\ncur.execute('SELECT * FROM orders WHERE status = %s', ('pending',))\n# Missing index -> full table scan on 100M rows -> 10 minutes\n# Connection held for 10 minutes, locks held, pool slot consumed\n# Multiple concurrent requests -> pool exhaustion -> total outage\n"
+  when_applies: "When executing any database queries in production, especially in services with connection pools and concurrent request handling."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [mysql, postgresql]
+  domains:
+    domain: [databases, performance, reliability]
+    concern: [relational, fault_tolerance, timeout]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-DB-004
+  text: Database indexes must be designed for actual query patterns, not theoretical ones. An unused index consumes disk space, slows writes (every INSERT/UPDATE/DELETE must update all indexes), and wastes
+    memory (indexes compete for buffer pool). Monitor index usage and drop unused indexes.
+  why: 'Google''s efficiency practices treat unused resources as waste. Each index on a table adds overhead to every write operation: a table with 10 indexes makes every INSERT update 10 B-tree structures.
+    On a table with 1000 inserts/second, that''s 10,000 index updates/second. If 5 of those indexes are never used in queries, that''s 5,000 wasted operations/second. PostgreSQL provides pg_stat_user_indexes
+    to track index usage. The common anti-pattern: adding an index "just in case" or creating composite indexes for every possible query combination. The correct approach: create indexes for actual query
+    patterns, monitor usage, and drop indexes with zero or near-zero scans.
+
+    '
+  how_to_do_right: '1. Create indexes based on actual query patterns: EXPLAIN ANALYZE the top 20 queries by frequency and latency. Index those.
+
+    2. Monitor index usage: PostgreSQL pg_stat_user_indexes.idx_scan shows how many times each index was used. Zero scans = unused index.
+
+    3. Drop unused indexes: if an index has zero scans for 30 days, it''s safe to drop. Use CREATE INDEX CONCURRENTLY for re-creation if needed.
+
+    4. Prefer composite indexes over single-column indexes when queries filter on multiple columns. Column order matters: most selective column first.
+
+    5. Use partial indexes for common query patterns: CREATE INDEX ON orders (status) WHERE status = ''pending'' — much smaller than indexing all orders.
+
+    6. Consider covering indexes (INCLUDE clause) to avoid table lookups for frequently accessed columns: the index contains all needed data.
+
+    '
+  example_good: "# Index based on actual query patterns + monitor usage\n-- Top queries by frequency: EXPLAIN ANALYZE each one\n-- Query 1: SELECT * FROM orders WHERE user_id = ? AND status = 'pending'\nCREATE INDEX idx_orders_user_status ON orders (user_id, status)\n  WHERE status = 'pending';  -- partial index: only pending orders\n\n-- Query 2: SELECT id, name, email FROM users WHERE email = ?\nCREATE INDEX idx_users_email_covering ON users (email)\n  INCLUDE (id, name);  -- covering index: no table lookup needed\n\n-- Monitor index usage weekly:\n-- SELECT indexrelname, idx_scan FROM pg_stat_user_indexes\n--   WHERE idx_scan = 0 ORDER BY pg_relation_size(indexrelid) DESC;\n-- Drop indexes with zero scans for 30+ days\n"
+  example_bad: "# Indexes 'just in case' — slows writes, wastes resources\nCREATE INDEX idx_orders_1 ON orders (user_id);\nCREATE INDEX idx_orders_2 ON orders (status);\nCREATE INDEX idx_orders_3 ON orders (created_at);\nCREATE INDEX idx_orders_4 ON orders (user_id, status);\nCREATE INDEX idx_orders_5 ON orders (user_id, created_at);\nCREATE INDEX idx_orders_6 ON orders (status, created_at);\nCREATE INDEX idx_orders_7 ON orders (user_id, status, created_at);\n-- 7 indexes on one table, but only idx_orders_4 is used in queries\n-- Every INSERT/UPDATE/DELETE updates all 7 B-trees\n-- 6 unused indexes waste disk, memory, and write throughput\n"
+  when_applies: "When creating database indexes or reviewing index usage on tables that handle significant write volume."
+  severity: medium
+  technologies:
+    lang: [general]
+    platform: [mysql, postgresql]
+  domains:
+    domain: [databases, performance, reliability]
+    concern: [relational, indexing]
+  sources:
+  - url: https://sre.google/sre-book/software-engineering-in-sre/
+    title: 'Google SRE Book — Chapter 18: Software Engineering in SRE'
+  validation_status: cross_checked
+- id: CR-SRE-DB-005
+  text: Database replication lag must be monitored and accounted for in application logic. A read replica that is 5 seconds behind the primary will serve stale data — causing bugs where a user writes data
+    and immediately reads it back as missing.
+  why: 'Google''s distributed systems experience (Chapters 22-26) teaches that replication is always asynchronous in practice, even when configured as "synchronous" (which just means "acknowledged by at
+    least one replica"). The read-after-write consistency problem: user creates a record (writes to primary), user is redirected to a page that reads the record (reads from replica), replica hasn''t received
+    the write yet → "record not found" error. At 1000 writes/second with 100ms average replication lag, roughly 100 reads per second will see stale data. The solution is not to eliminate replication lag
+    (impossible) but to design application logic to handle it.
+
+    '
+  how_to_do_right: '1. Monitor replication lag: PostgreSQL pg_stat_replication.replay_lag, MySQL SHOW SLAVE STATUS Seconds_Behind_Master. Alert if lag exceeds 5 seconds.
+
+    2. Read-after-write consistency: route reads to the primary for N seconds after a write. Use session-sticky routing or a "read primary until" cookie.
+
+    3. Causal consistency: include a logical timestamp (LSN in PostgreSQL) with the write response. When reading, wait until the replica has reached that LSN.
+
+    4. Design for eventual consistency: if the feature can tolerate stale reads (dashboards, analytics, search), always use replicas to offload the primary.
+
+    5. Monitor replica health independently: a replica that falls too far behind should be removed from the read pool until it catches up.
+
+    6. Test with artificial replication lag in staging: inject 1-5 second delays to find code that assumes instant replication.
+
+    '
+  example_good: "# Read-after-write consistency: route to primary after writes\nimport time\nfrom functools import wraps\n\nclass DBRouter:\n    def __init__(self, primary, replica):\n        self.primary = primary\n        self.replica = replica\n        self._last_write_ts: dict[str, float] = {}  # session_id -> timestamp\n\n    def write(self, session_id: str, query: str, params=None):\n        result = self.primary.execute(query, params)\n        self._last_write_ts[session_id] = time.time()\n        return result\n\n    def read(self, session_id: str, query: str, params=None):\n        # Route to primary for 5 seconds after a write\n        last_write = self._last_write_ts.get(session_id, 0)\n        if time.time() - last_write < 5.0:\n            return self.primary.execute(query, params)  # read from primary\n        return self.replica.execute(query, params)  # read from replica\n"
+  example_bad: "# Always read from replica — stale reads after writes\ndef create_user(primary, replica, user_data):\n    primary.execute('INSERT INTO users ...', user_data)\n    # Immediately read from replica\n    user = replica.execute('SELECT * FROM users WHERE email = %s', (user_data['email'],))\n    return user  # Returns None! Replica hasn't received the write yet\n    # User sees: 'Account created!' then 'User not found' on next page\n"
+  when_applies: "When using database read replicas and the application needs to handle the read-after-write consistency problem."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [mysql, postgresql]
+  domains:
+    domain: [databases, reliability]
+    concern: [relational, replication, data_integrity, consistency]
+  sources:
+  - url: https://sre.google/sre-book/data-integrity/
+    title: 'Google SRE Book — Chapter 26: Data Integrity'
+  validation_status: cross_checked
+- id: CR-SRE-DB-006
+  text: Database backups are worthless unless restore is tested regularly. A backup that cannot be restored is not a backup — it's a false sense of security. Test restore monthly, measure restore time,
+    and verify data integrity after restore.
+  why: 'Google''s data integrity chapter (Chapter 26) mandates regular restore testing because backup failures are silent: the backup process reports success, the files exist, but the data is corrupt, incomplete,
+    or incompatible with the current schema. Common backup failures: backup file is corrupt (storage error, incomplete write), backup is from wrong point-in-time (before critical data was written), restore
+    process fails (schema changes since backup, missing extensions), restore takes 12 hours (exceeds RTO of 4 hours). Without regular testing, these failures are discovered only during an actual incident
+    — the worst possible time.
+
+    '
+  how_to_do_right: '1. Test restore monthly: restore the latest backup to a test environment and verify data integrity.
+
+    2. Measure restore time: if RTO is 4 hours, restore must complete in under 4 hours. If it takes longer, you need a faster restore strategy.
+
+    3. Verify data integrity after restore: count rows in critical tables, check recent timestamps, run application health checks against restored data.
+
+    4. Test point-in-time recovery (PITR): restore to a specific timestamp, not just the latest backup. Verify that the restored state matches expectations.
+
+    5. Automate restore testing: script the entire restore-and-verify process. Run it in CI/CD on a schedule (weekly or monthly).
+
+    6. Keep backup retention aligned with compliance requirements: 30 days for operational recovery, longer for compliance. Test restoring from the oldest retained backup.
+
+    '
+  example_good: "# Automated backup restore test with data integrity verification\nimport subprocess\nimport psycopg2\nfrom datetime import datetime\n\ndef test_backup_restore(backup_path: str, test_db_url: str) -> dict:\n    # 1. Restore to test environment\n    subprocess.run(['pg_restore', '-d', test_db_url, backup_path], check=True)\n\n    # 2. Verify data integrity\n    conn = psycopg2.connect(test_db_url)\n    with conn.cursor() as cur:\n        cur.execute('SELECT COUNT(*) FROM users')\n        user_count = cur.fetchone()[0]\n        cur.execute('SELECT MAX(created_at) FROM users')\n        latest = cur.fetchone()[0]\n        cur.execute('SELECT COUNT(*) FROM orders WHERE total < 0')\n        corrupt = cur.fetchone()[0]\n\n    return {\n        'user_count': user_count,\n        'latest_record': latest,\n        'corrupt_records': corrupt,\n        'restore_time_seconds': elapsed,\n        'passed': corrupt == 0 and user_count > 0,\n    }\n# Run monthly via CI: pytest test_backup_restore.py\n"
+  example_bad: "# Backups exist but never tested — false sense of security\n# crontab: pg_dump mydb > /backups/daily.sql\n\n# 6 months later, during incident:\n# $ pg_restore /backups/daily.sql\n# ERROR: schema mismatch (migrations applied after backup format changed)\n# Backup is corrupt, incomplete, or incompatible with current schema\n# No restore test = no backup\n"
+  when_applies: "When operating any production database where data loss would have business impact and recovery time objectives (RTO/RPO) must be met."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [mysql, postgresql]
+  domains:
+    domain: [databases, reliability]
+    concern: [relational, data_integrity, backup, resilience, disaster_recovery]
+  sources:
+  - url: https://sre.google/sre-book/data-integrity/
+    title: 'Google SRE Book — Chapter 26: Data Integrity'
+  validation_status: cross_checked
+- id: CR-SRE-DB-007
+  text: Database locks must be acquired in a consistent order across all code paths — if transaction A locks table X then Y, and transaction B locks table Y then X, deadlock is inevitable under concurrent
+    load. Document and enforce lock ordering conventions.
+  why: 'Google''s distributed systems practices treat deadlocks as a concurrency design failure, not a runtime anomaly. The deadlock scenario: Transaction A locks row 1, then tries to lock row 2. Transaction
+    B locks row 2, then tries to lock row 1. Both wait forever (or until deadlock detection kills one). PostgreSQL detects deadlocks and kills one transaction (with an error), but this causes a user-visible
+    error and requires retry logic. MySQL''s InnoDB also detects deadlocks but may choose the "wrong" transaction to kill. At high concurrency (100+ transactions/second touching the same rows), deadlocks
+    become frequent and can cascade — each retry creates more contention.
+
+    '
+  how_to_do_right: '1. Always acquire locks in a consistent order: sort resources by ID before locking. If updating rows 5 and 3, lock row 3 first, then row 5.
+
+    2. Document lock ordering conventions in the codebase: "accounts table locked before transfers table" — enforced by code review.
+
+    3. Keep transactions short: acquire locks late, release early. Long transactions increase deadlock probability.
+
+    4. Use advisory locks for application-level coordination: pg_advisory_lock(resource_id) when table-level locks are too coarse.
+
+    5. Implement retry with backoff for deadlock errors: catch the deadlock exception, wait random(100-500ms), retry. Max 3 retries.
+
+    6. Monitor deadlock frequency: PostgreSQL pg_stat_database.deadlocks. Increasing deadlocks indicate a design problem.
+
+    '
+  example_good: "# Consistent lock ordering prevents deadlocks\ndef transfer_funds(conn, from_id: int, to_id: int, amount: float) -> None:\n    # Always lock rows in ascending ID order\n    first_id, second_id = sorted([from_id, to_id])\n    with conn.cursor() as cur:\n        cur.execute('SELECT balance FROM accounts WHERE id = %s FOR UPDATE', (first_id,))\n        cur.execute('SELECT balance FROM accounts WHERE id = %s FOR UPDATE', (second_id,))\n        # Now safe to transfer — no deadlock possible\n        cur.execute('UPDATE accounts SET balance = balance - %s WHERE id = %s',\n                    (amount, from_id))\n        cur.execute('UPDATE accounts SET balance = balance + %s WHERE id = %s',\n                    (amount, to_id))\n    conn.commit()\n\n# Retry on deadlock (defense in depth)\nimport psycopg2\ndef with_deadlock_retry(func, max_retries=3):\n    for attempt in range(max_retries):\n        try:\n            return func()\n        except psycopg2.errors.DeadlockDetected:\n            if attempt == max_retries - 1:\n                raise\n            time.sleep(random.uniform(0.1, 0.5))\n"
+  example_bad: "# Inconsistent lock ordering — deadlock guaranteed under load\ndef transfer_funds(conn, from_id: int, to_id: int, amount: float) -> None:\n    with conn.cursor() as cur:\n        cur.execute('SELECT balance FROM accounts WHERE id = %s FOR UPDATE', (from_id,))\n        cur.execute('SELECT balance FROM accounts WHERE id = %s FOR UPDATE', (to_id,))\n        # Thread A: locks row 1, then row 2\n        # Thread B: locks row 2, then row 1\n        # -> DEADLOCK under concurrent load\n"
+  when_applies: "When writing transactions that lock multiple rows or tables, especially in financial or inventory systems with high concurrency."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [mysql, postgresql]
+  domains:
+    domain: [code_quality, databases, reliability]
+    concern: [concurrency, relational, transactions]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-DB-008
+  text: Database vacuum and maintenance operations must be scheduled and monitored — PostgreSQL's MVCC creates dead tuples that consume disk and slow queries. Autovacuum is necessary but often insufficient
+    for high-write tables. Monitor table bloat and tune autovacuum per-table.
+  why: 'PostgreSQL''s MVCC (Multi-Version Concurrency Control) creates a new tuple for every UPDATE and marks the old one as dead. DELETE marks tuples as dead. These dead tuples consume disk space and slow
+    sequential scans. VACUUM reclaims dead tuples. Autovacuum runs automatically but uses conservative defaults: threshold = 50 + 0.2 × table_size. For a table with 10M rows, autovacuum triggers after 2,000,050
+    dead tuples — by then the table has 20% bloat. For high-write tables (100k updates/hour), autovacuum can''t keep up with default settings. The result: table bloat grows continuously, sequential scans
+    slow down, index bloat increases, and eventually the table is 2-3× its optimal size.
+
+    '
+  how_to_do_right: '1. Monitor table bloat: use pg_stat_user_tables.n_dead_tup and pgstattuple extension. Alert if dead tuples exceed 10% of live tuples.
+
+    2. Tune autovacuum per-table for high-write tables: ALTER TABLE hot_table SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_threshold = 1000).
+
+    3. Monitor autovacuum activity: pg_stat_user_tables.last_autovacuum, autovacuum_count. If autovacuum runs but bloat grows, increase autovacuum_vacuum_cost_limit.
+
+    4. Schedule VACUUM ANALYZE during low-traffic windows for large tables: manual vacuum with higher cost limits runs faster than autovacuum.
+
+    5. Monitor transaction ID wraparound: pg_database.datfrozenxid. If approaching 2 billion, PostgreSQL will shut down to prevent data corruption. This is the most critical vacuum metric.
+
+    6. Consider using pg_repack for zero-downtime table and index rebuild when bloat is already severe (>50% wasted space).
+
+    '
+  example_good: "# Per-table autovacuum tuning for high-write tables\n-- High-write table: tune autovacuum aggressively\nALTER TABLE events SET (\n    autovacuum_vacuum_scale_factor = 0.01,      -- trigger at 1% dead tuples (not 20%)\n    autovacuum_vacuum_threshold = 1000,          -- minimum 1000 dead tuples\n    autovacuum_vacuum_cost_limit = 2000           -- faster vacuum\n);\n\n-- Monitor bloat:\n-- SELECT relname, n_dead_tup, n_live_tup,\n--        ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup, 0), 1) AS dead_pct\n-- FROM pg_stat_user_tables\n-- WHERE n_dead_tup > 10000 ORDER BY n_dead_tup DESC;\n\n-- Monitor XID wraparound (CRITICAL):\n-- SELECT datname, age(datfrozenxid) FROM pg_database\n-- WHERE age(datfrozenxid) > 1000000000;  -- alert threshold\n"
+  example_bad: "# Default autovacuum on high-write table — can't keep up\n-- Table with 10M rows, 100K updates/hour\n-- Default: autovacuum_vacuum_scale_factor = 0.2\n-- Trigger: 50 + 0.2 * 10M = 2,000,050 dead tuples\n-- At 100K updates/hour, that's 20 hours of bloat before vacuum\n-- By then the table has 20% bloat, sequential scans are 20% slower\n-- Eventually: 2-3x table size, XID wraparound risk, PostgreSQL shutdown\n"
+  when_applies: "When operating PostgreSQL databases with high-write tables where autovacuum default settings cannot keep pace with dead tuple accumulation."
+  severity: medium
+  technologies:
+    lang: [general]
+    platform: [postgresql]
+  domains:
+    domain: [databases, operations, performance, reliability]
+    concern: [relational, maintenance]
+  sources:
+  - url: https://sre.google/sre-book/software-engineering-in-sre/
+    title: 'Google SRE Book — Chapter 18: Software Engineering in SRE'
+  validation_status: cross_checked

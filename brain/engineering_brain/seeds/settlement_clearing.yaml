@@ -1,0 +1,1026 @@
+layer: rules
+domain: fintech
+knowledge:
+- id: FIN-SET-001
+  text: "T+0 real-time settlement for prediction markets: settle winning positions immediately upon market resolution. Do not batch settlements — users expect instant payouts in prediction markets, and delayed settlement creates support tickets and trust erosion."
+  why: >
+    Traditional finance settles T+2, but prediction market users expect T+0. A prediction market
+    that batched settlements daily lost 23% of active users in one month because winners had to
+    wait 24 hours to see their balance. Real-time settlement also prevents the 'payout anxiety'
+    that drives chargebacks — users dispute charges when they do not see winnings promptly.
+  how_to_do_right: |
+    1. Trigger settlement immediately when market resolves (event-driven, not cron)
+    2. Calculate payout per position: user_shares / total_winning_shares * prize_pool
+    3. Credit user's internal balance atomically with the resolution transaction
+    4. For external payouts (bank, PIX), queue separately — internal balance is instant
+    5. Use database transactions to ensure resolution + settlement are atomic
+    6. If settlement fails, mark market as SETTLEMENT_FAILED and alert — never leave in limbo
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fintech, architecture]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+
+    async def settle_market(db: AsyncSession, market_id: str, outcome: str):
+        """Settle all positions for a resolved market. T+0, atomic."""
+        async with db.begin():
+            market = await db.get(Market, market_id, with_for_update=True)
+            if market.status != MarketStatus.RESOLVED:
+                raise ValueError(f"Market {market_id} not in RESOLVED state")
+
+            winning_positions = await db.execute(
+                select(Position)
+                .where(Position.market_id == market_id)
+                .where(Position.outcome == outcome)
+                .with_for_update()
+            )
+
+            total_pool_cents = market.total_pool_cents
+            total_winning_shares = sum(p.shares for p in winning_positions)
+
+            for position in winning_positions:
+                payout = int(
+                    Decimal(position.shares)
+                    / Decimal(total_winning_shares)
+                    * Decimal(total_pool_cents)
+                )
+                await credit_user_balance(db, position.user_id, payout)
+                await record_settlement(db, position.id, payout)
+
+            market.status = MarketStatus.SETTLED
+  example_bad: |
+    # WRONG: Batch settlement via cron — users wait hours for winnings
+    @scheduler.cron("0 * * * *")  # Every hour
+    async def batch_settle():
+        markets = await get_resolved_unsettled()
+        for market in markets:
+            await settle_market(market.id)  # Users wait up to 60 minutes
+  when_applies: "Prediction market resolution, any platform requiring instant payout on event completion"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: FIN-SET-002
+  text: "Double-entry bookkeeping: every financial transaction must have a debit entry and a credit entry that sum to zero. Never create a single-sided ledger entry. The ledger must always balance."
+  why: >
+    Single-entry bookkeeping makes it impossible to detect errors or fraud. If you credit a user's
+    balance without debiting a source, money appears from nowhere and your ledger will not reconcile.
+    A prediction market discovered $340K in 'phantom money' after 6 months because deposits were
+    single-entry — they credited user balances without debiting the escrow account.
+  how_to_do_right: |
+    1. Every transaction creates exactly 2 ledger entries: one debit, one credit
+    2. Debits are positive, credits are negative (or use separate columns)
+    3. Sum of all entries must always equal zero — enforce via database constraint or periodic check
+    4. Use account types: ASSET (escrow, bank), LIABILITY (user balances), REVENUE (fees), EXPENSE
+    5. Deposit: debit ESCROW (asset increases), credit USER_BALANCE (liability increases)
+    6. Payout: debit USER_BALANCE (liability decreases), credit BANK (asset decreases)
+    7. Run balance verification hourly: SELECT SUM(amount) FROM ledger — must be 0
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fintech, architecture]
+    concern: [consistency]
+  example_good: |
+    from enum import Enum
+    from dataclasses import dataclass
+
+    class AccountType(str, Enum):
+        ESCROW = "escrow"           # Platform holds funds
+        USER_BALANCE = "user_bal"   # What we owe users
+        REVENUE = "revenue"         # Platform fees
+        BANK = "bank"               # External bank account
+
+    @dataclass
+    class LedgerEntry:
+        account_type: AccountType
+        account_id: str
+        amount_cents: int  # Positive = debit, negative = credit
+        transaction_id: str
+        description: str
+
+    async def record_deposit(
+        db: AsyncSession, user_id: str, amount_cents: int, tx_id: str
+    ):
+        """Double-entry deposit: debit escrow, credit user balance."""
+        entries = [
+            LedgerEntry(
+                account_type=AccountType.ESCROW,
+                account_id="main_escrow",
+                amount_cents=amount_cents,   # Debit (asset increases)
+                transaction_id=tx_id,
+                description=f"Deposit from user {user_id}",
+            ),
+            LedgerEntry(
+                account_type=AccountType.USER_BALANCE,
+                account_id=user_id,
+                amount_cents=-amount_cents,  # Credit (liability increases)
+                transaction_id=tx_id,
+                description=f"Deposit to balance",
+            ),
+        ]
+        assert sum(e.amount_cents for e in entries) == 0, "Ledger must balance!"
+        for entry in entries:
+            await db.insert_ledger_entry(entry)
+  example_bad: |
+    # CATASTROPHIC: Single-entry bookkeeping — money appears from nowhere
+    async def deposit(user_id: str, amount: int):
+        user.balance += amount  # Credit without debit — where did the money come from?
+        db.commit()
+  when_applies: "Any financial system, prediction market ledgers, escrow management"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: FIN-SET-003
+  text: "Payout calculation for prediction markets: distribute the prize pool proportionally to shares held at resolution. Use Decimal arithmetic with explicit rounding, and handle the remainder (dust) by assigning it to the last winner or platform."
+  why: >
+    Integer division creates rounding dust: if pool is 10000 cents and 3 winners each have 1 share,
+    each gets 3333 cents and 1 cent is lost. Over thousands of markets, dust accumulates into real
+    money. A prediction market lost $4.2K in 2 years to unaccounted dust. Worse, using float
+    arithmetic can give one winner more than their fair share.
+  how_to_do_right: |
+    1. Calculate exact payout per winner: shares / total_winning_shares * pool
+    2. Use Decimal with ROUND_DOWN for individual payouts
+    3. Calculate dust: pool - sum(individual_payouts)
+    4. Assign dust to the last winner (or to platform revenue)
+    5. Assert: sum(all_payouts) + dust == pool (conservation of money)
+    6. Log the dust amount per market for auditing
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fintech, architecture]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal, ROUND_DOWN
+
+    def calculate_payouts(
+        pool_cents: int,
+        winners: list[dict],  # [{"user_id": str, "shares": int}]
+    ) -> dict[str, int]:
+        """Calculate proportional payouts. Handles dust."""
+        total_shares = sum(w["shares"] for w in winners)
+        if total_shares == 0:
+            return {}
+
+        pool = Decimal(pool_cents)
+        total = Decimal(total_shares)
+        payouts = {}
+        distributed = 0
+
+        for i, winner in enumerate(winners):
+            share_ratio = Decimal(winner["shares"]) / total
+            payout = int((pool * share_ratio).quantize(Decimal("1"), rounding=ROUND_DOWN))
+            payouts[winner["user_id"]] = payout
+            distributed += payout
+
+        # Assign dust to last winner
+        dust = pool_cents - distributed
+        if dust > 0 and winners:
+            last_user = winners[-1]["user_id"]
+            payouts[last_user] += dust
+
+        assert sum(payouts.values()) == pool_cents, "Money conservation violated!"
+        return payouts
+  example_bad: |
+    # WRONG: Float division — rounding errors accumulate
+    def calculate_payouts(pool: float, winners: list):
+        share = pool / len(winners)  # 10000.0 / 3 = 3333.333...
+        return {w.id: share for w in winners}  # Sum != pool!
+
+    # WRONG: Integer division without dust handling
+    def calculate_payouts(pool: int, winners: list):
+        share = pool // len(winners)  # 10000 // 3 = 3333, 1 cent lost forever
+        return {w.id: share for w in winners}
+  when_applies: "Prediction market resolution, any proportional distribution of funds"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: FIN-SET-004
+  text: "Event-sourced append-only ledger: store every financial mutation as an immutable event. The current balance is always derived by replaying events, never stored as a mutable field. Events cannot be modified or deleted."
+  why: >
+    A mutable balance field is a single point of failure: one bug that sets balance = wrong_value
+    is undetectable and unfixable without an audit trail. Event sourcing provides a complete,
+    tamper-evident history. When a Brazilian fintech had a bug that zeroed 200 user balances,
+    they rebuilt all balances from events in 15 minutes. Without event sourcing, it would have
+    been weeks of manual reconciliation.
+  how_to_do_right: |
+    1. Create an events table: id, aggregate_id, event_type, payload (JSON), created_at, sequence_number
+    2. Every mutation (deposit, withdrawal, bet, win) is an event appended to this table
+    3. Current balance = SUM of all events for that user (or use a materialized view/snapshot)
+    4. Never UPDATE or DELETE events — add compensating events instead (e.g., REVERSAL)
+    5. Use a sequence_number per aggregate to detect concurrency conflicts
+    6. Snapshot the balance periodically for read performance (e.g., every 1000 events)
+    7. Grant only INSERT permission to the application user on the events table
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fintech, architecture]
+    concern: [consistency]
+  example_good: |
+    from enum import Enum
+
+    class LedgerEventType(str, Enum):
+        DEPOSIT = "deposit"
+        WITHDRAWAL = "withdrawal"
+        BET_PLACED = "bet_placed"
+        BET_WON = "bet_won"
+        REFUND = "refund"
+        FEE = "fee"
+        REVERSAL = "reversal"
+
+    async def append_ledger_event(
+        db: AsyncSession,
+        user_id: str,
+        event_type: LedgerEventType,
+        amount_cents: int,
+        metadata: dict,
+    ) -> int:
+        """Append an immutable event. Returns new sequence number."""
+        result = await db.execute(
+            """
+            INSERT INTO ledger_events (user_id, event_type, amount_cents, metadata, created_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            RETURNING sequence_number
+            """,
+            user_id, event_type.value, amount_cents, json.dumps(metadata),
+        )
+        return result.scalar_one()
+
+    async def get_balance(db: AsyncSession, user_id: str) -> int:
+        """Derive balance from events — source of truth."""
+        result = await db.execute(
+            "SELECT COALESCE(SUM(amount_cents), 0) FROM ledger_events WHERE user_id = $1",
+            user_id,
+        )
+        return result.scalar_one()
+  example_bad: |
+    # WRONG: Mutable balance — one bug and you lose the audit trail
+    async def deposit(user_id: str, amount: int):
+        user.balance += amount  # If this goes wrong, no way to reconstruct
+        db.commit()
+
+    # WRONG: Deleting/updating events — destroys audit trail
+    await db.execute("UPDATE ledger_events SET amount = 0 WHERE id = $1", event_id)
+  when_applies: "Any financial ledger, prediction market balance tracking, escrow management"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: FIN-SET-005
+  text: "Ledger reconciliation: run automated consistency checks at least hourly. Verify that the sum of all ledger entries is zero (double-entry balance), that no user has a negative balance (unless margin is allowed), and that escrow matches the sum of user balances."
+  why: >
+    Without reconciliation, bugs silently corrupt financial data. A prediction market had a race
+    condition in their deposit handler that occasionally double-credited users. It took 3 months
+    to detect because no reconciliation was running. By then, $67K in phantom balances had been
+    withdrawn as real money.
+  how_to_do_right: |
+    1. Run 3 checks hourly:
+       a. Balance check: SUM(all ledger entries) == 0
+       b. Negative balance check: No user balance < 0 (unless margin trading)
+       c. Escrow check: escrow_balance == SUM(all positive user balances)
+    2. Alert immediately on any violation — this is a P0 incident
+    3. Run a full reconciliation daily: compare internal ledger vs Stripe vs bank
+    4. Log every reconciliation result (even successes) for audit
+    5. Implement circuit breaker: halt deposits if reconciliation fails
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fintech, reliability]
+    concern: [consistency]
+  example_good: |
+    @dataclass
+    class ReconciliationResult:
+        timestamp: datetime
+        balance_check: bool
+        negative_balance_users: list[str]
+        escrow_mismatch_cents: int
+        passed: bool
+
+    async def run_reconciliation(db: AsyncSession) -> ReconciliationResult:
+        # Check 1: Double-entry balance
+        total = await db.scalar(
+            "SELECT COALESCE(SUM(amount_cents), 0) FROM ledger_entries"
+        )
+        balance_ok = total == 0
+
+        # Check 2: No negative user balances
+        negative_users = await db.execute(
+            """
+            SELECT user_id, SUM(amount_cents) as balance
+            FROM ledger_events
+            GROUP BY user_id
+            HAVING SUM(amount_cents) < 0
+            """
+        )
+        neg_list = [row.user_id for row in negative_users]
+
+        # Check 3: Escrow matches liabilities
+        escrow_balance = await get_account_balance(db, "escrow")
+        user_liabilities = await db.scalar(
+            """
+            SELECT COALESCE(SUM(balance), 0) FROM (
+                SELECT SUM(amount_cents) as balance FROM ledger_events
+                WHERE account_type = 'user_bal'
+                GROUP BY account_id
+                HAVING SUM(amount_cents) > 0
+            ) sub
+            """
+        )
+        escrow_mismatch = abs(escrow_balance - user_liabilities)
+
+        result = ReconciliationResult(
+            timestamp=datetime.utcnow(),
+            balance_check=balance_ok,
+            negative_balance_users=neg_list,
+            escrow_mismatch_cents=escrow_mismatch,
+            passed=balance_ok and not neg_list and escrow_mismatch == 0,
+        )
+
+        if not result.passed:
+            await alert_p0("RECONCILIATION FAILED", result)
+        return result
+  example_bad: |
+    # WRONG: No reconciliation — bugs accumulate silently
+    # "We trust the code" — the code has bugs
+
+    # WRONG: Reconciliation that only logs, never alerts
+    if total != 0:
+        logger.warning(f"Ledger imbalanced by {total}")  # Nobody reads logs
+  when_applies: "Any financial system with a ledger, prediction market balance management"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: FIN-SET-006
+  text: "Idempotent settlement operations: every settlement action must be safe to retry. Use a settlement_id as a deduplication key and check if settlement was already processed before executing."
+  why: >
+    Network failures, timeouts, and retries can cause double settlements — paying a winner twice.
+    This is worse than double charging because the money leaves the platform. A prediction market
+    double-settled a market with a $50K pool due to a timeout retry, paying winners $100K total.
+    The extra $50K came from other users' escrow.
+  how_to_do_right: |
+    1. Generate a deterministic settlement_id: f"settle-{market_id}-{outcome}"
+    2. Before processing, check if settlement_id exists in completed_settlements table
+    3. Use a database unique constraint on settlement_id to prevent race conditions
+    4. Process settlement inside a transaction with the existence check
+    5. Mark settlement as completed only after all transfers succeed
+    6. On retry, return the existing settlement result — do not reprocess
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fintech, reliability]
+    concern: [consistency]
+  example_good: |
+    async def settle_market_idempotent(
+        db: AsyncSession, market_id: str, outcome: str
+    ) -> SettlementResult:
+        settlement_id = f"settle-{market_id}-{outcome}"
+
+        async with db.begin():
+            # Check if already settled (idempotency check)
+            existing = await db.execute(
+                select(Settlement)
+                .where(Settlement.settlement_id == settlement_id)
+            )
+            if existing.scalar_one_or_none():
+                return SettlementResult(status="already_settled", settlement_id=settlement_id)
+
+            # Process settlement
+            payouts = await calculate_payouts(db, market_id, outcome)
+            for user_id, amount in payouts.items():
+                await credit_user_balance(db, user_id, amount)
+
+            # Mark as completed (unique constraint prevents duplicates)
+            await db.execute(
+                insert(Settlement).values(
+                    settlement_id=settlement_id,
+                    market_id=market_id,
+                    outcome=outcome,
+                    total_payout=sum(payouts.values()),
+                    completed_at=datetime.utcnow(),
+                )
+            )
+            return SettlementResult(status="settled", settlement_id=settlement_id)
+  example_bad: |
+    # WRONG: No idempotency — retries double-settle
+    async def settle(market_id: str, outcome: str):
+        payouts = calculate_payouts(market_id, outcome)
+        for user_id, amount in payouts.items():
+            credit_balance(user_id, amount)  # Called twice on retry!
+  when_applies: "Market resolution, any financial operation that transfers funds"
+  sources: ["https://www.postgresql.org/docs/current/tutorial-transactions.html"]
+
+- id: FIN-SET-007
+  text: "Settlement state machine: model the settlement lifecycle as pending, calculating, transferring, completed, failed, reversed. Enforce valid transitions and never allow re-entry into a completed state."
+  why: >
+    Without a state machine, settlements can be re-triggered by duplicate events or manual errors.
+    A prediction market's admin panel had a 'Settle' button that could be clicked multiple times.
+    Without state enforcement, the market was settled 3 times, tripling payouts. A state machine
+    would have rejected the second and third attempts.
+  how_to_do_right: |
+    1. Define settlement states: PENDING, CALCULATING, TRANSFERRING, COMPLETED, FAILED, REVERSED
+    2. Define valid transitions:
+       PENDING -> CALCULATING -> TRANSFERRING -> COMPLETED
+       CALCULATING -> FAILED (calculation error)
+       TRANSFERRING -> FAILED (transfer error)
+       COMPLETED -> REVERSED (only via manual admin action with approval)
+    3. FAILED -> PENDING (retry allowed)
+    4. COMPLETED -> COMPLETED is INVALID (prevents re-settlement)
+    5. Store state in database with updated_at timestamp
+    6. Log every transition with actor and reason
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fintech, architecture]
+    concern: [domain_specific]
+  example_good: |
+    from enum import Enum
+
+    class SettlementState(str, Enum):
+        PENDING = "pending"
+        CALCULATING = "calculating"
+        TRANSFERRING = "transferring"
+        COMPLETED = "completed"
+        FAILED = "failed"
+        REVERSED = "reversed"
+
+    VALID_TRANSITIONS: dict[SettlementState, set[SettlementState]] = {
+        SettlementState.PENDING: {SettlementState.CALCULATING},
+        SettlementState.CALCULATING: {SettlementState.TRANSFERRING, SettlementState.FAILED},
+        SettlementState.TRANSFERRING: {SettlementState.COMPLETED, SettlementState.FAILED},
+        SettlementState.COMPLETED: {SettlementState.REVERSED},  # Admin only
+        SettlementState.FAILED: {SettlementState.PENDING},  # Retry
+        SettlementState.REVERSED: set(),  # Terminal state
+    }
+
+    async def transition_settlement(
+        db: AsyncSession,
+        settlement_id: str,
+        target: SettlementState,
+        actor: str,
+        reason: str,
+    ):
+        settlement = await db.get(Settlement, settlement_id, with_for_update=True)
+        current = SettlementState(settlement.state)
+        if target not in VALID_TRANSITIONS.get(current, set()):
+            raise ValueError(f"Invalid transition: {current} -> {target}")
+        settlement.state = target.value
+        settlement.updated_at = datetime.utcnow()
+        await log_transition(db, settlement_id, current, target, actor, reason)
+  example_bad: |
+    # WRONG: Direct state assignment — no validation
+    settlement.state = "completed"  # Can be set even if already completed
+    db.commit()  # Double settlement!
+  when_applies: "Prediction market settlement, any financial process with multiple stages"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: FIN-SET-008
+  text: "Batch vs real-time settlement tradeoffs: use real-time for user-facing payouts (T+0 experience) and batch for external transfers (bank ACH, PIX batch). Batch reduces API calls and transfer fees but adds latency."
+  why: >
+    Sending individual bank transfers for every $5 payout costs more in fees than the payout itself.
+    ACH batch transfers cost $0.25/batch regardless of size, vs $0.25/transfer individually.
+    A prediction market with 10K daily winners would pay $2,500/day in individual transfer fees
+    vs $25/day in batch fees. But internal balance credits must be instant for UX.
+  how_to_do_right: |
+    1. Real-time: Credit user's internal balance immediately on market resolution
+    2. Batch: Aggregate withdrawal requests into hourly or daily batches
+    3. Minimum batch size: 10 transfers or $500 total, whichever comes first
+    4. Maximum batch delay: 24 hours for user-initiated withdrawals
+    5. Process PIX withdrawals in batches every 15 minutes (PIX is free, but API rate limits apply)
+    6. Send batch status notifications to users: "Your withdrawal is being processed"
+    7. For urgent withdrawals (>$10K), process individually
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fintech, architecture]
+    concern: [domain_specific]
+  example_good: |
+    from datetime import datetime, timedelta
+
+    class SettlementScheduler:
+        async def process_internal_settlement(self, market_id: str, payouts: dict):
+            """Real-time: credit internal balances immediately."""
+            for user_id, amount_cents in payouts.items():
+                await self.ledger.credit(user_id, amount_cents, f"win-{market_id}")
+
+        async def queue_external_withdrawal(self, user_id: str, amount_cents: int):
+            """Queue for batch processing."""
+            await self.withdrawal_queue.add(
+                user_id=user_id,
+                amount_cents=amount_cents,
+                queued_at=datetime.utcnow(),
+                priority="urgent" if amount_cents > 1_000_000 else "normal",
+            )
+
+        async def process_batch_withdrawals(self):
+            """Run every 15 minutes. Batch external transfers."""
+            pending = await self.withdrawal_queue.get_pending(
+                max_age=timedelta(hours=24),
+                min_batch_size=10,
+            )
+            if len(pending) < 10 and not any(w.is_overdue for w in pending):
+                return  # Wait for more to accumulate
+
+            await self.execute_batch_transfer(pending)
+  example_bad: |
+    # WRONG: Individual transfer for every small payout — fees eat the payout
+    async def pay_winner(user_id: str, amount: int):
+        stripe.Transfer.create(amount=amount, destination=user_id)
+        # $0.25 fee for a $5 payout — 5% fee on small amounts
+  when_applies: "Prediction markets, platforms with high volume of small payouts"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: FIN-SET-009
+  text: "Settlement finality: define a clear point after which a settlement is irrevocable. Document and enforce this in code. After finality, the only recourse is a compensating transaction (reversal), never a state rollback."
+  why: >
+    Without defined finality, downstream systems (tax reporting, user dashboards, withdrawal eligibility)
+    cannot trust settlement data. If settlements can be 'undone' by rolling back state, every downstream
+    consumer must handle retroactive changes. A prediction market changed a settlement result 3 days
+    after resolution, causing tax reports to show negative income for affected users.
+  how_to_do_right: |
+    1. Define finality: settlement is final when state = COMPLETED and finalized_at is set
+    2. After finality, the record is immutable — no UPDATE allowed
+    3. Corrections use compensating transactions: create a REVERSAL event, then a new settlement
+    4. Enforce finality in code: transition_settlement() rejects changes to finalized records
+    5. Set finality window: settlement becomes final 1 hour after completion (grace period for bugs)
+    6. Downstream systems only consume finalized settlements
+    7. Document the finality policy in user-facing terms of service
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fintech, architecture]
+    concern: [consistency]
+  example_good: |
+    from datetime import datetime, timedelta
+
+    FINALITY_GRACE_PERIOD = timedelta(hours=1)
+
+    async def finalize_settlement(db: AsyncSession, settlement_id: str):
+        settlement = await db.get(Settlement, settlement_id, with_for_update=True)
+        if settlement.state != SettlementState.COMPLETED:
+            raise ValueError("Only COMPLETED settlements can be finalized")
+        if settlement.completed_at + FINALITY_GRACE_PERIOD > datetime.utcnow():
+            raise ValueError("Grace period not elapsed — wait before finalizing")
+
+        settlement.finalized_at = datetime.utcnow()
+        settlement.is_final = True
+
+    async def reverse_finalized_settlement(
+        db: AsyncSession, settlement_id: str, reason: str, admin_id: str
+    ):
+        """Compensating transaction — does NOT modify original settlement."""
+        original = await db.get(Settlement, settlement_id)
+        if not original.is_final:
+            raise ValueError("Use state machine for non-finalized settlements")
+
+        # Create reversal as a NEW record
+        reversal = Settlement(
+            settlement_id=f"reversal-{settlement_id}",
+            market_id=original.market_id,
+            type="REVERSAL",
+            reference_settlement_id=settlement_id,
+            total_payout=-original.total_payout,  # Negative = reversal
+            reason=reason,
+            admin_id=admin_id,
+        )
+        await db.add(reversal)
+        # Debit users who received the original payout
+        for payout in original.payouts:
+            await debit_user_balance(db, payout.user_id, payout.amount_cents)
+  example_bad: |
+    # WRONG: Rolling back settlement state — destroys audit trail
+    settlement.state = "pending"  # Pretend it never happened
+    settlement.payouts = []       # Delete payout records
+    db.commit()                   # Tax reports are now wrong
+  when_applies: "Any financial settlement, prediction market resolution, regulatory compliance"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: FIN-SET-010
+  text: "Netting: reduce the number of actual fund transfers by offsetting mutual obligations. If User A owes User B $100 and User B owes User A $70, only transfer the net $30. Apply netting at the platform level before executing external transfers."
+  why: >
+    Without netting, a prediction market with 10K daily transactions would execute 10K individual
+    transfers. With netting, the same volume might require only 2K transfers, reducing fees by 80%.
+    A high-volume trading platform reduced their ACH transfer costs from $12K/month to $2.4K/month
+    by implementing daily netting cycles.
+  how_to_do_right: |
+    1. Accumulate all settlement obligations during a netting window (e.g., 1 hour)
+    2. For each user, calculate net position: sum of credits - sum of debits
+    3. Only execute transfers for net positive amounts (user is owed money)
+    4. For net negative amounts, debit from user's platform balance
+    5. Log the full gross amounts and netting calculation for audit
+    6. Apply netting only to external transfers — internal ledger keeps full granularity
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fintech, performance]
+    concern: [domain_specific]
+  example_good: |
+    from collections import defaultdict
+
+    async def calculate_net_positions(
+        obligations: list[dict],
+    ) -> dict[str, int]:
+        """
+        Calculate net position per user from a list of obligations.
+        Positive = user receives, Negative = user pays.
+        """
+        net = defaultdict(int)
+        for ob in obligations:
+            net[ob["creditor"]] += ob["amount_cents"]
+            net[ob["debtor"]] -= ob["amount_cents"]
+
+        # Only return non-zero positions
+        return {user: amount for user, amount in net.items() if amount != 0}
+
+    async def execute_netted_transfers(
+        db: AsyncSession, netting_window_id: str
+    ):
+        obligations = await get_pending_obligations(db, netting_window_id)
+        net_positions = await calculate_net_positions(obligations)
+
+        for user_id, net_amount in net_positions.items():
+            if net_amount > 0:
+                # User is owed money — credit their balance
+                await credit_user_balance(db, user_id, net_amount)
+            else:
+                # User owes money — debit their balance
+                await debit_user_balance(db, user_id, abs(net_amount))
+
+        # Log netting stats
+        gross_volume = sum(ob["amount_cents"] for ob in obligations)
+        net_volume = sum(abs(a) for a in net_positions.values()) // 2
+        logger.info(
+            f"Netting: {len(obligations)} obligations, "
+            f"gross={gross_volume}, net={net_volume}, "
+            f"reduction={1 - net_volume/gross_volume:.0%}"
+        )
+  example_bad: |
+    # WRONG: Individual transfers without netting — fees add up
+    for trade in trades:
+        transfer(trade.buyer, trade.seller, trade.amount)
+        # 10K trades = 10K transfers = $2,500 in fees
+  when_applies: "High-volume trading platforms, prediction markets with frequent position changes"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: FIN-SET-011
+  text: "Settlement failure handling: implement a retry mechanism with exponential backoff for transient failures, and a dead letter queue for permanently failed settlements that require manual intervention."
+  why: >
+    Settlement failures leave users without their winnings and the platform holding funds in limbo.
+    A prediction market had a settlement fail due to a database deadlock, and without retry logic,
+    the market remained in a 'settling' state forever. 47 winners never received their payouts
+    until a manual investigation 2 weeks later.
+  how_to_do_right: |
+    1. On transient failure (timeout, deadlock, temporary API error): retry up to 5 times
+    2. Use exponential backoff: 30s, 2min, 10min, 30min, 2h
+    3. On permanent failure (invalid data, business rule violation): move to dead letter queue
+    4. Dead letter queue alerts the finance team within 15 minutes
+    5. Track retry count and last error per settlement
+    6. After max retries, transition to FAILED state with full error context
+    7. FAILED settlements must be resolved within 24 hours (SLA)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fintech, reliability]
+    concern: [failure]
+  example_good: |
+    TRANSIENT_ERRORS = (TimeoutError, ConnectionError, DeadlockError)
+    MAX_RETRIES = 5
+    BACKOFF_SECONDS = [30, 120, 600, 1800, 7200]
+
+    async def settle_with_retry(
+        market_id: str, outcome: str, attempt: int = 0
+    ):
+        try:
+            await settle_market(market_id, outcome)
+        except TRANSIENT_ERRORS as e:
+            if attempt >= MAX_RETRIES:
+                await dead_letter_queue.push(
+                    market_id=market_id,
+                    outcome=outcome,
+                    error=str(e),
+                    attempts=attempt,
+                )
+                await alert_finance_team(
+                    f"Settlement FAILED after {attempt} retries: {market_id}"
+                )
+                return
+            delay = BACKOFF_SECONDS[attempt]
+            await schedule_retry(
+                settle_with_retry, market_id, outcome, attempt + 1,
+                delay_seconds=delay,
+            )
+        except Exception as e:
+            # Permanent failure — do not retry
+            await dead_letter_queue.push(
+                market_id=market_id, error=str(e), permanent=True
+            )
+            await alert_finance_team(f"PERMANENT settlement failure: {market_id}: {e}")
+  example_bad: |
+    # WRONG: No retry — settlement fails silently
+    try:
+        await settle_market(market_id, outcome)
+    except Exception:
+        logger.error("Settlement failed")  # Users never get paid
+  when_applies: "Any settlement system, prediction market resolution"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: FIN-SET-012
+  text: "Settlement audit trail: log every settlement action with market_id, user_id, amounts, timestamps, actor, and calculation details. Use an append-only table separate from the main ledger."
+  why: >
+    Regulators and auditors require a complete trail of how settlement amounts were calculated.
+    During a dispute, you need to show: who resolved the market, what the payout formula was,
+    which users received how much, and when each step happened. Without this, a $2M dispute
+    took 4 months to resolve because the team had to reconstruct settlement logic from application logs.
+  how_to_do_right: |
+    1. Create a settlement_audit table: id, settlement_id, action, actor, detail_json, created_at
+    2. Log at each phase: INITIATED, CALCULATING (with formula), DISTRIBUTING (with per-user amounts), COMPLETED
+    3. Include calculation details: total_pool, winning_outcome, share_counts, payout_formula
+    4. Include per-user details: user_id, shares, payout_amount, balance_before, balance_after
+    5. Append-only: no UPDATE or DELETE
+    6. Retain for minimum 7 years
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fintech, compliance]
+    concern: [domain_specific]
+  example_good: |
+    async def log_settlement_audit(
+        db: AsyncSession,
+        settlement_id: str,
+        action: str,
+        actor: str,
+        details: dict,
+    ):
+        await db.execute(
+            """
+            INSERT INTO settlement_audit (settlement_id, action, actor, details, created_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            """,
+            settlement_id, action, actor, json.dumps(details),
+        )
+
+    # Usage during settlement
+    await log_settlement_audit(db, settlement_id, "CALCULATING", "system", {
+        "market_id": market_id,
+        "total_pool_cents": 500000,
+        "winning_outcome": "YES",
+        "total_winning_shares": 1500,
+        "payout_formula": "user_shares / total_winning_shares * pool",
+    })
+
+    await log_settlement_audit(db, settlement_id, "DISTRIBUTING", "system", {
+        "payouts": [
+            {"user_id": "u1", "shares": 100, "payout_cents": 33333, "balance_before": 5000, "balance_after": 38333},
+            {"user_id": "u2", "shares": 50, "payout_cents": 16667, "balance_before": 12000, "balance_after": 28667},
+        ],
+    })
+  example_bad: |
+    # WRONG: Logging to application logs — no structure, lost on rotation
+    logger.info(f"Settled market {market_id}")  # No calculation details
+  when_applies: "Any settlement system, required for financial compliance"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: FIN-SET-013
+  text: "Regulatory reporting for settlements: generate periodic reports (daily, monthly) summarizing settlement volumes, user payouts, platform fees, and failed settlements. Format for BACEN (Brazil) or FinCEN (US) as applicable."
+  why: >
+    Financial regulators require periodic reporting of transaction volumes, suspicious activity,
+    and customer payouts. A Brazilian fintech was fined R$500K by BACEN for failing to submit
+    monthly transaction reports for 6 months. Automated reporting prevents human oversight and
+    ensures consistent, timely submission.
+  how_to_do_right: |
+    1. Generate daily settlement summary: total volume, number of settlements, avg payout, max payout
+    2. Generate monthly regulatory report: total user payouts, platform fees, failed settlements
+    3. For Brazil: report to COAF any transaction > R$50K or suspicious patterns
+    4. For US: generate CTRs for transactions > $10K, SARs for suspicious activity
+    5. Store reports as immutable records with generation timestamp
+    6. Automate report generation via cron job — never rely on manual generation
+    7. Send reports to compliance team for review before submission
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fintech, compliance]
+    concern: [domain_specific]
+  example_good: |
+    from datetime import date
+
+    @dataclass
+    class DailySettlementReport:
+        report_date: date
+        total_settlements: int
+        total_volume_cents: int
+        total_platform_fees_cents: int
+        failed_settlements: int
+        avg_payout_cents: int
+        max_payout_cents: int
+        unique_users_paid: int
+
+    async def generate_daily_report(db: AsyncSession, report_date: date) -> DailySettlementReport:
+        stats = await db.execute(
+            """
+            SELECT
+                COUNT(*) as total,
+                COALESCE(SUM(total_payout), 0) as volume,
+                COALESCE(SUM(platform_fee), 0) as fees,
+                COUNT(*) FILTER (WHERE state = 'failed') as failed,
+                COALESCE(AVG(total_payout), 0) as avg_payout,
+                COALESCE(MAX(total_payout), 0) as max_payout,
+                COUNT(DISTINCT user_id) as unique_users
+            FROM settlements
+            WHERE DATE(completed_at) = $1
+            """,
+            report_date,
+        )
+        row = stats.one()
+        return DailySettlementReport(
+            report_date=report_date,
+            total_settlements=row.total,
+            total_volume_cents=row.volume,
+            total_platform_fees_cents=row.fees,
+            failed_settlements=row.failed,
+            avg_payout_cents=row.avg_payout,
+            max_payout_cents=row.max_payout,
+            unique_users_paid=row.unique_users,
+        )
+  example_bad: |
+    # WRONG: No automated reporting — manual process that gets skipped
+    # "We'll generate the report when the regulator asks" — too late, you're fined
+  when_applies: "Any regulated financial platform, prediction markets, payment processors"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: FIN-SET-014
+  text: "Tax implications tracking: record the tax-relevant details of every payout — gross amount, fees deducted, net amount, and classification (prize, income, return of capital). Generate annual tax documents per user."
+  why: >
+    In the US, prediction market winnings are taxable income and platforms must issue 1099 forms for
+    payouts exceeding $600/year. In Brazil, winnings from prediction markets may be subject to IOF
+    or income tax depending on classification. A platform that failed to issue 1099s was fined $250K
+    by the IRS and had to retroactively generate 3 years of tax documents.
+  how_to_do_right: |
+    1. Record per payout: gross_amount, platform_fee, net_amount, tax_classification
+    2. Track cumulative annual payouts per user for threshold-based reporting
+    3. Classify payouts: PRIZE (gambling income), INVESTMENT_RETURN, FEE_REFUND
+    4. For US users: issue 1099-MISC for cumulative payouts > $600/year
+    5. For BR users: track IOF applicability and income tax withholding requirements
+    6. Generate annual tax summary per user, downloadable from their profile
+    7. Retain tax records for 7 years minimum
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fintech, compliance]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+    from enum import Enum
+
+    class TaxClassification(str, Enum):
+        PRIZE = "prize"                  # Prediction market winnings
+        INVESTMENT_RETURN = "inv_return" # Return of initial position
+        FEE_REFUND = "fee_refund"        # Platform fee refund
+        DEPOSIT_RETURN = "deposit_return"
+
+    async def record_taxable_payout(
+        db: AsyncSession,
+        user_id: str,
+        gross_cents: int,
+        fee_cents: int,
+        classification: TaxClassification,
+        market_id: str,
+    ):
+        net_cents = gross_cents - fee_cents
+        await db.execute(
+            """
+            INSERT INTO tax_events (
+                user_id, tax_year, gross_cents, fee_cents, net_cents,
+                classification, market_id, created_at
+            ) VALUES ($1, EXTRACT(YEAR FROM NOW()), $2, $3, $4, $5, $6, NOW())
+            """,
+            user_id, gross_cents, fee_cents, net_cents,
+            classification.value, market_id,
+        )
+
+    async def get_annual_tax_summary(
+        db: AsyncSession, user_id: str, tax_year: int
+    ) -> dict:
+        result = await db.execute(
+            """
+            SELECT classification, SUM(gross_cents) as total_gross,
+                   SUM(fee_cents) as total_fees, SUM(net_cents) as total_net
+            FROM tax_events
+            WHERE user_id = $1 AND tax_year = $2
+            GROUP BY classification
+            """,
+            user_id, tax_year,
+        )
+        return {row.classification: {
+            "gross": row.total_gross,
+            "fees": row.total_fees,
+            "net": row.total_net,
+        } for row in result}
+  example_bad: |
+    # WRONG: No tax tracking — regulatory fine waiting to happen
+    async def pay_winner(user_id: str, amount: int):
+        credit_balance(user_id, amount)
+        # No tax event recorded, no classification, no annual tracking
+  when_applies: "Any platform paying out winnings or returns, prediction markets, regulated fintech"
+  sources: ["https://www.fatf-gafi.org/content/dam/fatf-gafi/recommendations/FATF%20Recommendations%202012.pdf.coredownload.inline.pdf"]
+
+- id: FIN-SET-015
+  text: "Settlement testing strategies: test settlement logic with property-based tests (money conservation: sum of payouts == pool), edge cases (single winner, all winners, zero pool), and integration tests against a real database with concurrent settlements."
+  why: >
+    Settlement bugs have direct financial impact — every cent miscalculated is real money lost or
+    overpaid. Property-based testing catches edge cases that example-based tests miss: what happens
+    with 1 winner? 10,000 winners? A pool of $0.01? A prediction market found a division-by-zero
+    bug in their payout calculator through property testing — it only triggered when a market had
+    exactly 0 winning shares (all losers), which never appeared in their 50 handwritten test cases.
+  how_to_do_right: |
+    1. Property test: for any pool and winners, sum(payouts) == pool (money conservation)
+    2. Property test: no payout is negative
+    3. Property test: payout is proportional to shares (more shares = more payout)
+    4. Edge case: single winner gets entire pool
+    5. Edge case: all participants win (equal split)
+    6. Edge case: zero pool (voided market, no payouts)
+    7. Edge case: very large number of winners (10K+) — test performance and dust handling
+    8. Integration test: concurrent settlement of same market (idempotency)
+    9. Integration test: settlement during deposit (race condition)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fintech, testing]
+    concern: [domain_specific]
+  example_good: |
+    from hypothesis import given, strategies as st
+    import pytest
+
+    @given(
+        pool_cents=st.integers(min_value=0, max_value=100_000_000),
+        num_winners=st.integers(min_value=1, max_value=10_000),
+    )
+    def test_money_conservation(pool_cents: int, num_winners: int):
+        """Sum of all payouts must equal the pool — no money created or destroyed."""
+        winners = [
+            {"user_id": f"u{i}", "shares": random.randint(1, 1000)}
+            for i in range(num_winners)
+        ]
+        payouts = calculate_payouts(pool_cents, winners)
+        assert sum(payouts.values()) == pool_cents, "Money conservation violated!"
+
+    @given(
+        pool_cents=st.integers(min_value=1, max_value=100_000_000),
+        shares=st.lists(st.integers(min_value=1, max_value=10_000), min_size=1, max_size=100),
+    )
+    def test_no_negative_payouts(pool_cents: int, shares: list[int]):
+        winners = [{"user_id": f"u{i}", "shares": s} for i, s in enumerate(shares)]
+        payouts = calculate_payouts(pool_cents, winners)
+        assert all(p >= 0 for p in payouts.values()), "Negative payout detected!"
+
+    def test_single_winner_gets_all():
+        payouts = calculate_payouts(10000, [{"user_id": "u1", "shares": 1}])
+        assert payouts["u1"] == 10000
+
+    def test_zero_pool_no_payouts():
+        payouts = calculate_payouts(0, [{"user_id": "u1", "shares": 1}])
+        assert payouts == {} or all(v == 0 for v in payouts.values())
+
+    @pytest.mark.asyncio
+    async def test_concurrent_settlement_idempotent(db):
+        """Two concurrent settlement attempts — only one should succeed."""
+        import asyncio
+        results = await asyncio.gather(
+            settle_market_idempotent(db, "m1", "YES"),
+            settle_market_idempotent(db, "m1", "YES"),
+        )
+        settled = [r for r in results if r.status == "settled"]
+        already = [r for r in results if r.status == "already_settled"]
+        assert len(settled) == 1 and len(already) == 1
+  example_bad: |
+    # WRONG: Only happy-path tests — misses edge cases
+    def test_settlement():
+        payouts = calculate_payouts(10000, [
+            {"user_id": "u1", "shares": 50},
+            {"user_id": "u2", "shares": 50},
+        ])
+        assert payouts["u1"] == 5000  # Only tests 50/50 split
+  when_applies: "Settlement logic testing, prediction market QA, financial system validation"
+  sources: ["https://hypothesis.readthedocs.io/en/latest/"]

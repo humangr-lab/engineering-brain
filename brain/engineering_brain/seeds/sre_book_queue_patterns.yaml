@@ -1,0 +1,220 @@
+layer: rules
+technology: SRE
+domain: messaging
+knowledge:
+- id: CR-SRE-QUEUE-001
+  text: Queue depth is a leading indicator of system overload — monitor it continuously. A growing queue means consumers are slower than producers. If queue depth doubles in the last 10 minutes, the system
+    is falling behind and will eventually fail.
+  why: 'Google''s overload handling (Chapter 21) and pipeline design (Chapter 25) treat queue depth as the primary capacity signal. Unlike latency (which is a lagging indicator — it increases after the
+    system is already overloaded), queue depth is a leading indicator — it starts growing before latency spikes are visible. The progression: producers outpace consumers → queue grows → processing latency
+    increases (each item waits longer in the queue) → end-to-end latency exceeds SLO → if unchecked, queue fills → new items are rejected or lost → system failure. Monitoring queue depth with rate-of-change
+    alerts enables proactive response: scale consumers before latency is affected.
+
+    '
+  how_to_do_right: '1. Monitor queue depth continuously: current depth, rate of change (depth increasing or decreasing), and maximum depth.
+
+    2. Alert on rate of change: "queue depth increased by 50% in the last 10 minutes" is more actionable than "queue depth is 5000."
+
+    3. Set queue capacity limits: unbounded queues defer failure until memory is exhausted. Set maxlen and handle overflow explicitly.
+
+    4. Calculate consumer capacity: if producers generate 1000 msgs/sec and each consumer processes 100 msgs/sec, you need at least 10 consumers.
+
+    5. Use queue depth to trigger autoscaling: when depth exceeds threshold, add consumers. When depth returns to normal, remove consumers.
+
+    6. Track queue age (time since oldest message was enqueued). A deep but young queue is different from a deep and old queue.
+
+    '
+  example_good: "import time\nfrom prometheus_client import Gauge, Histogram\n\nqueue_depth = Gauge('queue_depth', 'Current queue depth', ['queue_name'])\nqueue_age = Histogram('queue_oldest_msg_age_seconds', 'Age of oldest message')\n\ndef monitor_queue(queue_name: str, redis_client):\n    depth = redis_client.xlen(queue_name)\n    queue_depth.labels(queue_name=queue_name).set(depth)\n    # Alert on rate of change, not absolute value\n    oldest = redis_client.xrange(queue_name, count=1)\n    if oldest:\n        age = time.time() - int(oldest[0][0].split('-')[0]) / 1000\n        queue_age.observe(age)\n"
+  example_bad: "def process_messages(queue):\n    while True:\n        msg = queue.get()  # No monitoring at all\n        process(msg)\n    # No depth tracking, no age tracking\n    # Queue could be growing for hours\n    # No alerting until consumers crash from OOM\n"
+  when_applies: "When operating any production message queue or stream processing system."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [redis, streams, kafka, rabbitmq, sqs]
+  domains:
+    domain: [messaging, observability, reliability, planning]
+    concern: [queues, monitoring, capacity]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-QUEUE-002
+  text: Dead letter queues (DLQ) are mandatory for any production queue — messages that fail processing after N retries must be moved to a DLQ for investigation, not dropped silently and not retried indefinitely.
+    A missing DLQ means either data loss or infinite retry loops.
+  why: 'Google''s pipeline design (Chapter 25) requires explicit handling of unprocessable messages because in any real system, some messages will be unprocessable: malformed data, missing dependencies,
+    bugs in consumer code, or schema mismatches. Without a DLQ, there are two bad outcomes: the message is retried indefinitely (blocking the queue, consuming resources, and never succeeding) or the message
+    is silently dropped (data loss). A DLQ provides a third option: move the message aside for investigation. The original queue continues processing. Engineers can examine DLQ messages, fix the underlying
+    issue, and replay the messages back to the original queue.
+
+    '
+  how_to_do_right: '1. Configure DLQ for every production queue. Set max retry count: 3-5 retries with exponential backoff before moving to DLQ.
+
+    2. DLQ messages must retain: original message body, original headers/metadata, failure reason, retry count, timestamp of each attempt.
+
+    3. Monitor DLQ depth: a growing DLQ indicates a systematic processing failure (not just isolated bad messages).
+
+    4. Alert on DLQ growth: "DLQ received 100 messages in the last hour" — this needs investigation.
+
+    5. Build a replay mechanism: after fixing the root cause, messages from the DLQ can be re-published to the original queue for reprocessing.
+
+    6. Set DLQ retention: keep messages for 7-30 days. After retention, archive or delete. Don''t let the DLQ grow indefinitely.
+
+    '
+  example_good: "import json\nimport logging\n\nlogger = logging.getLogger(__name__)\nMAX_RETRIES = 3\n\ndef consume_with_dlq(consumer, dlq_producer, topic):\n    for msg in consumer:\n        retries = int(msg.headers.get('retry_count', 0))\n        try:\n            process(msg.value)\n            consumer.commit()\n        except Exception as e:\n            if retries >= MAX_RETRIES:\n                dlq_producer.send(f\"{topic}.dlq\", value=msg.value,\n                    headers={**msg.headers, 'error': str(e),\n                             'original_topic': topic})\n                logger.error(\"Message moved to DLQ\", extra={\n                    \"topic\": topic, \"retries\": retries, \"error\": str(e)})\n            else:\n                # Re-enqueue with incremented retry count\n                consumer.seek(msg.offset)\n"
+  example_bad: "def consume_messages(consumer):\n    for msg in consumer:\n        try:\n            process(msg.value)\n        except Exception:\n            pass  # Silently drop failed messages — data loss!\n\n# OR the other extreme:\ndef consume_messages(consumer):\n    for msg in consumer:\n        while True:\n            try:\n                process(msg.value)\n                break\n            except Exception:\n                time.sleep(1)  # Infinite retry — blocks entire queue\n"
+  when_applies: "When building any message consumer that must handle processing failures gracefully."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [redis, streams, kafka, rabbitmq, sqs]
+  domains:
+    domain: [code_quality, messaging, reliability]
+    concern: [error_handling, queues]
+  sources:
+  - url: https://sre.google/sre-book/data-processing-pipelines/
+    title: 'Google SRE Book — Chapter 25: Data Processing Pipelines'
+  validation_status: cross_checked
+- id: CR-SRE-QUEUE-003
+  text: Consumer group rebalancing in Kafka is a stop-the-world event — all consumers in the group stop processing while partitions are reassigned. Long rebalances (caused by slow consumers, network issues,
+    or too many partitions) create processing gaps that can last minutes.
+  why: 'Google''s pipeline management (Chapter 25) addresses consumer coordination as a reliability concern. In Kafka consumer groups: when a consumer joins or leaves, the group coordinator triggers a rebalance.
+    During rebalance, ALL consumers stop processing (not just the affected ones). The rebalance takes: 1-5 seconds for small groups, 10-60 seconds for large groups (100+ consumers, 1000+ partitions), or
+    minutes if consumers are slow to respond. During this window, no messages are processed. For latency-sensitive systems, even a 5-second gap is unacceptable. Causes of unnecessary rebalances: consumer
+    heartbeat timeout (consumer GC pause), consumer processing takes longer than max.poll.interval.ms, consumer crashes, or intentional scaling.
+
+    '
+  how_to_do_right: '1. Use cooperative rebalancing (Kafka 2.4+): only the affected partitions stop processing, not all partitions. Set partition.assignment.strategy=cooperative-sticky.
+
+    2. Tune heartbeat.interval.ms (3s) and session.timeout.ms (30s): heartbeat must be significantly shorter than session timeout.
+
+    3. Tune max.poll.interval.ms: set to the maximum time your consumer needs to process a batch. Too short = unnecessary rebalances. Too long = slow detection of stuck consumers.
+
+    4. Use static group membership (group.instance.id): consumers that restart quickly rejoin without triggering a full rebalance.
+
+    5. Monitor rebalance frequency and duration: frequent rebalances indicate consumer instability. Log: "Consumer group rebalanced, took 12 seconds, 50 partitions reassigned."
+
+    6. Pre-scale consumers before traffic spikes: adding consumers during peak load triggers rebalance during the worst time.
+
+    '
+  example_good: "# Kafka consumer configuration to minimize rebalancing impact\nfrom kafka import KafkaConsumer\n\nconsumer = KafkaConsumer(\n    'orders',\n    group_id='order-processor',\n    # Cooperative rebalancing: only affected partitions stop\n    partition_assignment_strategy=['cooperative-sticky'],\n    # Static membership: quick rejoin without full rebalance\n    group_instance_id=f'order-processor-{hostname}',\n    heartbeat_interval_ms=3000,\n    session_timeout_ms=30000,\n    max_poll_interval_ms=300000,  # 5 min max processing time\n)\n"
+  example_bad: "from kafka import KafkaConsumer\n\nconsumer = KafkaConsumer(\n    'orders',\n    group_id='order-processor',\n    # Default eager rebalancing: ALL consumers stop\n    # No static membership: every restart triggers full rebalance\n    session_timeout_ms=10000,  # Too short: GC pauses trigger rebalance\n    max_poll_interval_ms=30000,  # Too short: slow batches trigger rebalance\n)\n# Result: frequent stop-the-world rebalances during peak load\n"
+  when_applies: "When configuring Kafka consumer groups, especially with multiple consumers or high-throughput topics."
+  severity: medium
+  technologies:
+    lang: [general]
+    platform: [kafka]
+  domains:
+    domain: [messaging, performance, reliability]
+    concern: [queues, streaming]
+  sources:
+  - url: https://sre.google/sre-book/data-processing-pipelines/
+    title: 'Google SRE Book — Chapter 25: Data Processing Pipelines'
+  validation_status: cross_checked
+- id: CR-SRE-QUEUE-004
+  text: Message schema evolution must be backward compatible — a consumer running the old code must be able to read messages produced by the new code, and vice versa. Breaking schema changes cause consumer
+    crashes during rolling deployments.
+  why: 'Google''s release engineering (Chapter 8) applies to message schemas: during a rolling deployment, both old and new versions of producers and consumers run simultaneously. If the new producer sends
+    a message with a new required field, the old consumer (still running during deployment) can''t deserialize it and crashes. If the new consumer expects a field that the old producer (still running) doesn''t
+    send, it crashes or produces incorrect results. The deployment window — where both versions coexist — can last minutes (fast deployment) to hours (canary deployment). Schema compatibility must be maintained
+    throughout this window.
+
+    '
+  how_to_do_right: '1. New fields must be optional with default values. Old consumers ignore unknown fields. New consumers use defaults when fields are missing.
+
+    2. Never remove fields in a new version — old consumers may depend on them. Deprecate (stop writing) but keep the field in the schema.
+
+    3. Never change field types: string→integer breaks all consumers. Add a new field with the new type instead.
+
+    4. Use a schema registry (Confluent Schema Registry, AWS Glue) to enforce compatibility checks on publish: reject schemas that break backward compatibility.
+
+    5. Version your schema: include a schema_version field in every message. Consumers can branch on version if needed.
+
+    6. Test schema compatibility in CI: deserialize messages from the old schema with the new code, and vice versa. Both must work.
+
+    '
+  example_good: "# v2 schema: added optional 'priority' field with default\nfrom pydantic import BaseModel\nfrom typing import Optional\n\nclass OrderEventV2(BaseModel):\n    schema_version: int = 2\n    order_id: str\n    user_id: int\n    amount: float\n    priority: Optional[str] = \"normal\"  # New field, optional with default\n    # Old consumers ignore 'priority' (unknown field)\n    # New consumers use default when reading old messages\n"
+  example_bad: "# BREAKING: renamed field, changed type, removed field\nclass OrderEventV2(BaseModel):\n    schema_version: int = 2\n    order_id: str\n    customer_id: int  # RENAMED from user_id — old consumers crash\n    amount: int       # CHANGED from float — old consumers get wrong values\n    # REMOVED currency field — old consumers crash on missing field\n"
+  when_applies: "When modifying the schema of messages published to a queue during rolling deployments."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kafka, grpc]
+  domains:
+    domain: [architecture, messaging, reliability]
+    concern: [api_design, backward_compatibility, data, schema_evolution, queues]
+  sources:
+  - url: https://sre.google/sre-book/release-engineering/
+    title: 'Google SRE Book — Chapter 8: Release Engineering'
+  validation_status: cross_checked
+- id: CR-SRE-QUEUE-005
+  text: Poison messages — messages that cause the consumer to crash every time they're processed — must be detected and quarantined automatically. Without poison message detection, a single bad message
+    can block an entire partition indefinitely.
+  why: 'Google''s pipeline design (Chapter 25) addresses poison messages as a specific failure mode distinct from transient failures. Transient failure: database is temporarily unavailable → retry after
+    backoff → eventually succeeds. Poison message: message contains malformed data that triggers a NullPointerException → retry after backoff → same exception → retry → same exception → infinite loop. The
+    partition is stuck: no subsequent messages are processed because Kafka delivers in order and the offset can''t advance past the poison message. Common causes: schema change without backward compatibility,
+    serialization bug, unexpected null values, data exceeding size limits, encoding issues (UTF-8 BOM, invisible characters).
+
+    '
+  how_to_do_right: '1. Track per-message retry count. After N retries (3-5), move to DLQ instead of retrying indefinitely.
+
+    2. Differentiate retryable vs non-retryable exceptions: IOException → retry. NullPointerException → DLQ immediately (retrying won''t help).
+
+    3. Wrap message deserialization in try/except: if deserialization fails, the message is malformed → DLQ immediately.
+
+    4. Validate message structure before processing: check required fields are present, types are correct, values are within expected ranges.
+
+    5. Log poison message details: message key, headers, timestamp, partition, offset, and the exception. This enables post-mortem investigation.
+
+    6. Monitor poison message rate: more than 0.1% of messages going to DLQ indicates a systematic problem (producer bug, schema mismatch).
+
+    '
+  example_good: "import json\nimport logging\n\nlogger = logging.getLogger(__name__)\n\nclass PoisonMessageHandler:\n    def __init__(self, max_retries: int = 3):\n        self.max_retries = max_retries\n\n    def process(self, msg, dlq_producer):\n        # Step 1: Validate deserialization\n        try:\n            payload = json.loads(msg.value)\n        except json.JSONDecodeError as e:\n            # Malformed message — DLQ immediately, retry won't help\n            dlq_producer.send('dlq', value=msg.value,\n                headers={'error': f'deserialization: {e}'})\n            return\n        # Step 2: Validate structure\n        if not all(k in payload for k in ['order_id', 'amount']):\n            dlq_producer.send('dlq', value=msg.value,\n                headers={'error': 'missing_required_fields'})\n            return\n        # Step 3: Process with retry tracking\n        self._process_with_retries(payload, msg, dlq_producer)\n"
+  example_bad: "def consume(consumer):\n    for msg in consumer:\n        try:\n            data = json.loads(msg.value)\n            process_order(data)\n        except Exception:\n            # Retry forever — poison message blocks the partition\n            consumer.seek(msg.offset)\n            time.sleep(1)\n            # This message will NEVER succeed\n            # All subsequent messages are stuck behind it\n"
+  when_applies: "When consuming messages that may be malformed, have invalid schemas, or trigger deterministic processing errors."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kafka, rabbitmq]
+  domains:
+    domain: [code_quality, messaging, reliability]
+    concern: [error_handling, queues, resilience]
+  sources:
+  - url: https://sre.google/sre-book/data-processing-pipelines/
+    title: 'Google SRE Book — Chapter 25: Data Processing Pipelines'
+  validation_status: cross_checked
+- id: CR-SRE-QUEUE-006
+  text: Consumer lag (the difference between the latest produced offset and the latest consumed offset) is the definitive measure of consumer health. A consumer with zero lag is keeping up. A consumer with
+    increasing lag is falling behind and will eventually lose data if the retention window passes.
+  why: 'Google''s pipeline monitoring (Chapter 25) treats consumer lag as a primary health metric because it directly measures "how far behind is the consumer?" A consumer can appear healthy (no errors,
+    processing messages) while silently falling behind — processing 900 messages/second while 1000 messages/second are produced. The lag grows by 100 messages/second. In 1 hour, the lag is 360,000 messages.
+    In 1 day, it''s 8.6 million. If Kafka retention is 7 days and the consumer falls 7+ days behind, messages are deleted before they''re consumed — permanent data loss. Consumer lag monitoring catches
+    this before data is lost.
+
+    '
+  how_to_do_right: '1. Monitor consumer lag per partition, not just aggregate: one lagging partition is a different problem than all partitions lagging.
+
+    2. Alert on lag rate of change: "consumer lag increased by 50% in the last hour" is more useful than "consumer lag is 10000."
+
+    3. Set lag thresholds relative to retention: if retention is 7 days and lag reaches 3 days, alert as critical (4 days until data loss).
+
+    4. Investigate lag causes: slow processing (optimize consumer), insufficient consumers (add more), rebalancing (see CR-SRE-QUEUE-003), or backpressure from downstream.
+
+    5. Use Kafka consumer lag tools: Burrow, Kafka-lag-exporter, or Confluent Control Center for real-time lag monitoring.
+
+    6. Track processing rate (messages/second per consumer) alongside lag: if processing rate drops, lag will increase — this is the leading indicator.
+
+    '
+  example_good: "from prometheus_client import Gauge\nfrom kafka import KafkaAdminClient\n\nconsumer_lag = Gauge('kafka_consumer_lag', 'Consumer lag per partition',\n                     ['group', 'topic', 'partition'])\nprocessing_rate = Gauge('kafka_processing_rate', 'Messages/sec per consumer',\n                        ['group', 'consumer'])\n\ndef monitor_consumer_lag(admin_client, group_id, topic):\n    offsets = admin_client.list_consumer_group_offsets(group_id)\n    end_offsets = admin_client.list_offsets(topic)\n    for tp, offset in offsets.items():\n        lag = end_offsets[tp].offset - offset.offset\n        consumer_lag.labels(\n            group=group_id, topic=tp.topic, partition=tp.partition\n        ).set(lag)\n        # Alert if lag > retention threshold\n        if lag > RETENTION_MESSAGES * 0.5:\n            alert_critical(f\"Consumer lag at {lag}, risk of data loss\")\n"
+  example_bad: "# No lag monitoring at all\ndef consume(consumer):\n    for msg in consumer:\n        process(msg)  # Could be falling behind by millions\n    # No visibility into whether consumer keeps up\n    # Data loss when lag exceeds Kafka retention period\n    # Nobody knows until users report missing data\n"
+  when_applies: "When operating Kafka consumer groups where message processing completeness and timeliness matter."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kafka]
+  domains:
+    domain: [messaging, observability, performance, reliability]
+    concern: [queues, monitoring]
+  sources:
+  - url: https://sre.google/sre-book/data-processing-pipelines/
+    title: 'Google SRE Book — Chapter 25: Data Processing Pipelines'
+  validation_status: cross_checked

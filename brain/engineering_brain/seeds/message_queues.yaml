@@ -1,0 +1,401 @@
+layer: rules
+technology: General
+domain: messaging
+knowledge:
+- id: CR-MQ-001
+  text: RabbitMQ queues must be declared durable with TTL and max-length policies.
+  why: Non-durable queues vanish on broker restart — every message in flight is lost. Without TTL, poison messages or stale
+    data accumulate forever, eventually exhausting RAM and crashing the broker.
+  how_to_do_right: Declare queues with durable=True. Set x-message-ttl (e.g. 86400000ms = 24h) and x-max-length (e.g. 100000)
+    via queue arguments or policies. Monitor queue depth and alert when approaching limits.
+  severity: critical
+  technologies:
+    library: [amqp]
+    platform: [rabbitmq]
+  domains:
+    domain: [architecture, messaging, reliability, infrastructure]
+  example_good: "import pika\n\nchannel.queue_declare(\n    queue=\"orders\",\n    durable=True,\n    arguments={\n      \
+    \  \"x-message-ttl\": 86400000,      # 24h TTL\n        \"x-max-length\": 100000,          # Cap at 100k messages\n  \
+    \      \"x-dead-letter-exchange\": \"dlx\", # Route expired/rejected to DLX\n    },\n)\n# Publish with persistent delivery\
+    \ mode\nchannel.basic_publish(\n    exchange=\"\",\n    routing_key=\"orders\",\n    body=json.dumps(order),\n    properties=pika.BasicProperties(delivery_mode=2),\
+    \  # persistent\n)\n"
+  example_bad: "# Non-durable queue — lost on restart, no limits\nchannel.queue_declare(queue=\"orders\")\nchannel.basic_publish(\n\
+    \    exchange=\"\",\n    routing_key=\"orders\",\n    body=json.dumps(order),\n    # delivery_mode=1 (default) — message\
+    \ not persisted to disk\n)\n"
+  when_applies: Any project using RabbitMQ message broker or AMQP
+  when_not_applies: synchronous-only systems, simple CRUD with no async needs. projects not using RabbitMQ or AMQP
+  sources: ["https://www.rabbitmq.com/docs/queues#durability"]
+- id: CR-MQ-002
+  text: Use manual acknowledgment with prefetch count — never auto-ack in production.
+  why: Auto-ack removes the message from the queue the instant it is delivered to the consumer, BEFORE processing completes.
+    If the consumer crashes mid-processing, the message is gone forever — silent data loss.
+  how_to_do_right: Set auto_ack=False (manual ack). Call basic_ack only AFTER successful processing. Set prefetch_count to
+    limit unacknowledged messages per consumer (typically 1-10). Use basic_nack with requeue=False to send failures to the
+    dead letter exchange.
+  severity: critical
+  technologies:
+    library: [amqp]
+    platform: [rabbitmq]
+  domains:
+    domain: [architecture, messaging, reliability]
+  example_good: "channel.basic_qos(prefetch_count=5)  # Process max 5 at a time\n\ndef callback(ch, method, properties, body):\n\
+    \    try:\n        process_order(json.loads(body))\n        ch.basic_ack(delivery_tag=method.delivery_tag)\n    except\
+    \ Exception:\n        # Reject — route to dead letter exchange, don't requeue\n        ch.basic_nack(delivery_tag=method.delivery_tag,\
+    \ requeue=False)\n\nchannel.basic_consume(queue=\"orders\", on_message_callback=callback, auto_ack=False)\n"
+  example_bad: '# Auto-ack — message removed BEFORE processing finishes
+
+    channel.basic_consume(queue="orders", on_message_callback=callback, auto_ack=True)
+
+    # If callback crashes, message is GONE
+
+    '
+  when_applies: Any project using RabbitMQ message broker or AMQP
+  when_not_applies: synchronous-only systems, simple CRUD with no async needs. projects not using RabbitMQ or AMQP
+  sources: ["https://www.rabbitmq.com/docs/confirms"]
+- id: CR-MQ-003
+  text: Configure dead letter exchanges (DLX) to capture failed and expired messages.
+  why: Without a DLX, messages that are rejected, expire, or exceed queue length limits are silently discarded. You lose visibility
+    into failures and cannot retry or investigate poisoned messages.
+  how_to_do_right: Create a dedicated DLX exchange and DLQ queue. Bind the DLQ to the DLX. Set x-dead-letter-exchange on all
+    production queues. Monitor DLQ depth — non-zero means something is failing. Process DLQ messages with a separate consumer
+    for investigation or retry.
+  severity: high
+  technologies:
+    library: [amqp]
+    platform: [rabbitmq]
+  domains:
+    domain: [architecture, messaging, reliability, observability]
+  example_good: "# 1. Declare the dead letter infrastructure\nchannel.exchange_declare(exchange=\"dlx\", exchange_type=\"\
+    fanout\", durable=True)\nchannel.queue_declare(queue=\"dead_letters\", durable=True, arguments={\n    \"x-message-ttl\"\
+    : 604800000,  # Keep DLQ messages for 7 days\n})\nchannel.queue_bind(queue=\"dead_letters\", exchange=\"dlx\")\n\n# 2.\
+    \ Production queue routes failures to DLX\nchannel.queue_declare(queue=\"orders\", durable=True, arguments={\n    \"x-dead-letter-exchange\"\
+    : \"dlx\",\n    \"x-dead-letter-routing-key\": \"orders.dead\",\n})\n"
+  example_bad: '# No DLX — rejected/expired messages vanish silently
+
+    channel.queue_declare(queue="orders", durable=True)
+
+    # basic_nack with requeue=False → message disappears forever
+
+    '
+  when_applies: Projects using RabbitMQ message broker or AMQP
+  when_not_applies: synchronous-only systems, simple CRUD with no async needs. projects not using RabbitMQ or AMQP
+  sources: ["https://www.rabbitmq.com/docs/dlx"]
+- id: CR-MQ-004
+  text: 'Choose the correct RabbitMQ exchange type: direct for routing keys, topic for wildcards, fanout for broadcast.'
+  why: 'Using the wrong exchange type leads to either messages not reaching consumers (too restrictive) or flooding all consumers
+    with irrelevant messages (too broad). Direct = exact match, Topic = pattern match with * and #, Fanout = all bound queues.'
+  how_to_do_right: Use direct for simple point-to-point routing (e.g. task queues). Use topic for hierarchical event routing
+    (e.g. orders.created.eu, orders.*.us). Use fanout for broadcasting events to all interested services. Use headers only
+    for complex multi-attribute routing.
+  severity: high
+  technologies:
+    library: [amqp]
+    platform: [rabbitmq]
+  domains:
+    domain: [architecture, messaging]
+  example_good: '# Topic exchange — flexible routing with wildcards
+
+    channel.exchange_declare(exchange="events", exchange_type="topic", durable=True)
+
+
+    # EU order service gets only EU events
+
+    channel.queue_bind(queue="orders_eu", exchange="events", routing_key="orders.*.eu")
+
+
+    # Audit service gets ALL order events
+
+    channel.queue_bind(queue="audit", exchange="events", routing_key="orders.#")
+
+
+    # Publish
+
+    channel.basic_publish(exchange="events", routing_key="orders.created.eu", body=data)
+
+    '
+  example_bad: '# Fanout for targeted routing — EVERY consumer gets EVERY message
+
+    channel.exchange_declare(exchange="events", exchange_type="fanout")
+
+    # Now the EU service receives US orders too — wasted processing
+
+    '
+  when_applies: Projects using RabbitMQ message broker or AMQP
+  when_not_applies: synchronous-only systems, simple CRUD with no async needs. projects not using RabbitMQ or AMQP
+  sources: ["https://www.rabbitmq.com/tutorials/amqp-concepts#exchanges"]
+- id: CR-MQ-005
+  text: RabbitMQ clusters must use quorum queues (not classic mirrored queues) for high availability.
+  why: 'Classic mirrored queues are deprecated since RabbitMQ 3.13 and have known issues: split-brain scenarios, synchronization
+    blocking, and data loss during network partitions. Quorum queues use Raft consensus — they are data-safe by design.'
+  how_to_do_right: Declare queues with x-queue-type=quorum. Deploy odd-number clusters (3 or 5 nodes). Use quorum queues for
+    all durable queues. Keep classic queues only for transient/temporary queues where data loss is acceptable.
+  severity: high
+  technologies:
+    platform: [rabbitmq]
+  domains:
+    domain: [architecture, messaging, reliability, infrastructure]
+  example_good: "# Quorum queue — Raft consensus, data-safe\nchannel.queue_declare(\n    queue=\"orders\",\n    durable=True,\n\
+    \    arguments={\n        \"x-queue-type\": \"quorum\",\n        \"x-quorum-initial-group-size\": 3,  # Replicate to 3\
+    \ nodes\n        \"x-dead-letter-exchange\": \"dlx\",\n    },\n)\n"
+  example_bad: '# Classic mirrored queue — deprecated, split-brain risk
+
+    # Set via policy (not queue args) — fragile
+
+    # rabbitmqctl set_policy ha-all "^" ''{"ha-mode":"all","ha-sync-mode":"automatic"}''
+
+    channel.queue_declare(queue="orders", durable=True)
+
+    '
+  when_applies: Projects using RabbitMQ message broker
+  when_not_applies: synchronous-only systems, simple CRUD with no async needs. projects not using RabbitMQ
+  sources: ["https://www.rabbitmq.com/docs/quorum-queues"]
+- id: CR-MQ-006
+  text: Use NATS JetStream for persistent messaging — core NATS is fire-and-forget with no delivery guarantees.
+  why: Core NATS is a pure pub/sub system with at-most-once delivery. If no subscriber is listening when a message is published,
+    it is silently dropped. JetStream adds persistence, replay, exactly-once semantics, and consumer acknowledgment.
+  how_to_do_right: Enable JetStream on the NATS server. Create streams for topics that need persistence. Use consumers with
+    explicit ack policy. Use core NATS only for ephemeral events where message loss is acceptable (e.g. live metrics, heartbeats).
+  severity: critical
+  technologies:
+    library: [jetstream]
+    platform: [nats]
+  domains:
+    domain: [architecture, messaging, reliability]
+  example_good: "import nats\nfrom nats.js.api import StreamConfig, ConsumerConfig, AckPolicy\n\nnc = await nats.connect(\"\
+    nats://localhost:4222\")\njs = nc.jetstream()\n\n# Create persistent stream\nawait js.add_stream(StreamConfig(\n    name=\"\
+    ORDERS\",\n    subjects=[\"orders.>\"],\n    retention=\"limits\",\n    max_msgs=1_000_000,\n    max_age=86400 * 7,  #\
+    \ 7 days\n))\n\n# Durable consumer with explicit ack\nsub = await js.subscribe(\"orders.created\", durable=\"order-processor\"\
+    ,\n                          config=ConsumerConfig(ack_policy=AckPolicy.EXPLICIT))\nmsg = await sub.next_msg(timeout=5)\n\
+    await process_order(msg.data)\nawait msg.ack()\n"
+  example_bad: '# Core NATS — fire-and-forget, no persistence
+
+    nc = await nats.connect("nats://localhost:4222")
+
+    await nc.publish("orders.created", data)
+
+    # If no subscriber is listening RIGHT NOW, message is gone forever
+
+    '
+  when_applies: Any project using NATS or JetStream
+  when_not_applies: synchronous-only systems, simple CRUD with no async needs. projects not using NATS or JetStream
+  sources: ["https://docs.nats.io/nats-concepts/jetstream"]
+- id: CR-MQ-007
+  text: NATS queue groups distribute messages across subscribers — use them for load balancing, not regular subscriptions.
+  why: Without queue groups, every subscriber receives every message (fan-out). With queue groups, each message goes to exactly
+    one subscriber in the group — automatic load balancing without external tooling.
+  how_to_do_right: Subscribe with a queue group name for worker-style processing. All subscribers with the same queue group
+    name share the load. Use regular subscriptions only when every subscriber needs every message (e.g. cache invalidation).
+  severity: medium
+  technologies:
+    library: [jetstream]
+    platform: [nats]
+  domains:
+    domain: [architecture, messaging, performance]
+    concern: [scalability]
+  example_good: "# Queue group — each message goes to ONE subscriber\n# Scale by adding more subscribers with same group name\n\
+    await nc.subscribe(\"orders.created\", queue=\"order-workers\", cb=process_order)\n\n# JetStream equivalent — deliver\
+    \ group\nsub = await js.subscribe(\n    \"orders.created\",\n    durable=\"order-workers\",\n    config=ConsumerConfig(deliver_group=\"\
+    order-workers\"),\n)\n"
+  example_bad: '# Every subscriber gets EVERY message — duplicate processing
+
+    await nc.subscribe("orders.created", cb=process_order)  # Worker 1
+
+    await nc.subscribe("orders.created", cb=process_order)  # Worker 2
+
+    # Both workers process the SAME order → double-charge customer
+
+    '
+  when_applies: Projects using NATS or JetStream
+  when_not_applies: synchronous-only systems, simple CRUD with no async needs. projects not using NATS or JetStream
+  sources: ["https://docs.nats.io/nats-concepts/core-nats/queue"]
+- id: CR-MQ-008
+  text: Every message consumer must be idempotent — use deduplication keys to handle at-least-once delivery.
+  why: At-least-once delivery means the broker may deliver the same message more than once (network hiccup after ack, consumer
+    restart, rebalance). If the consumer is not idempotent, duplicate processing causes double charges, duplicate records,
+    or corrupted state.
+  how_to_do_right: Include a unique message_id (UUID) in every published message. Store processed message_ids in a deduplication
+    store (Redis SET with TTL, or database unique constraint). Check before processing. Use idempotency keys for external
+    API calls.
+  severity: critical
+  technologies:
+    platform: [rabbitmq, nats, kafka, sqs]
+  domains:
+    domain: [architecture, messaging, reliability]
+    concern: [data-integrity]
+  example_good: "import redis\nimport uuid\n\ndedup = redis.Redis()\nDEDUP_TTL = 86400  # 24 hours\n\ndef process_message(msg):\n\
+    \    msg_id = msg.get(\"message_id\")\n    if not msg_id:\n        raise ValueError(\"Message missing message_id\")\n\n\
+    \    # Atomic check-and-set\n    if not dedup.set(f\"dedup:{msg_id}\", \"1\", nx=True, ex=DEDUP_TTL):\n        logger.info(f\"\
+    Duplicate message {msg_id}, skipping\")\n        return  # Already processed\n\n    # Safe to process — first time seeing\
+    \ this message\n    create_order(msg[\"payload\"])\n\n# Publisher side — always include message_id\npublish({\"message_id\"\
+    : str(uuid.uuid4()), \"payload\": order_data})\n"
+  example_bad: "def process_message(msg):\n    # No deduplication — if delivered twice, order is created twice\n    create_order(msg[\"\
+    payload\"])\n"
+  when_applies: Any project using RabbitMQ message broker, NATS, Apache Kafka event streaming, or AWS SQS message queues
+  when_not_applies: synchronous-only systems, simple CRUD with no async needs
+  sources: ["https://www.rabbitmq.com/docs/reliability"]
+- id: CR-MQ-009
+  text: Implement poison message handling with a retry counter — do not requeue indefinitely.
+  why: A message that consistently fails processing (bad format, missing dependency, bug in handler) will be requeued and
+    retried in an infinite loop — consuming CPU, flooding logs, and blocking the queue for healthy messages.
+  how_to_do_right: Track retry count in message headers (x-retry-count). On failure, increment and requeue. After max retries
+    (typically 3-5), route to dead letter queue for manual investigation. Log the failure reason with the message body.
+  severity: high
+  technologies:
+    platform: [rabbitmq, nats, kafka, sqs]
+  domains:
+    domain: [architecture, messaging, reliability]
+  example_good: "MAX_RETRIES = 3\n\ndef callback(ch, method, properties, body):\n    headers = properties.headers or {}\n\
+    \    retry_count = headers.get(\"x-retry-count\", 0)\n\n    try:\n        process_order(json.loads(body))\n        ch.basic_ack(delivery_tag=method.delivery_tag)\n\
+    \    except Exception as e:\n        if retry_count >= MAX_RETRIES:\n            logger.error(f\"Poison message after\
+    \ {MAX_RETRIES} retries: {e}\")\n            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)  # → DLX\n\
+    \        else:\n            # Republish with incremented retry count\n            ch.basic_publish(\n                exchange=\"\
+    \", routing_key=\"orders\",\n                body=body,\n                properties=pika.BasicProperties(\n          \
+    \          headers={\"x-retry-count\": retry_count + 1},\n                    delivery_mode=2,\n                ),\n \
+    \           )\n            ch.basic_ack(delivery_tag=method.delivery_tag)\n"
+  example_bad: "def callback(ch, method, properties, body):\n    try:\n        process_order(json.loads(body))\n        ch.basic_ack(delivery_tag=method.delivery_tag)\n\
+    \    except Exception:\n        # Infinite retry loop — poison message blocks the queue\n        ch.basic_nack(delivery_tag=method.delivery_tag,\
+    \ requeue=True)\n"
+  when_applies: Projects using RabbitMQ message broker, NATS, Apache Kafka event streaming, or AWS SQS message queues
+  when_not_applies: synchronous-only systems, simple CRUD with no async needs
+  sources: ["https://www.rabbitmq.com/docs/ttl#per-message-ttl-in-publishers"]
+- id: CR-MQ-010
+  text: Use correlation IDs for request-reply patterns over message queues.
+  why: In async request-reply, the reply queue receives responses from multiple concurrent requests. Without a correlation
+    ID, you cannot match responses to their original requests — leading to crossed responses, timeouts on already-completed
+    requests, and data corruption.
+  how_to_do_right: Generate a unique correlation_id per request. Include it in the message properties. Set reply_to to a dedicated
+    or exclusive reply queue. The responder copies correlation_id to the reply. The requester matches replies by correlation_id
+    with a timeout.
+  severity: high
+  technologies:
+    library: [amqp]
+    platform: [rabbitmq, nats]
+  domains:
+    domain: [architecture, messaging]
+    concern: [patterns]
+  example_good: "import uuid\n\n# Requester\ncorr_id = str(uuid.uuid4())\nreply_queue = channel.queue_declare(queue=\"\",\
+    \ exclusive=True).method.queue\n\nchannel.basic_publish(\n    exchange=\"\",\n    routing_key=\"rpc_queue\",\n    body=json.dumps(request),\n\
+    \    properties=pika.BasicProperties(\n        reply_to=reply_queue,\n        correlation_id=corr_id,\n    ),\n)\n\n#\
+    \ Responder — echo correlation_id back\ndef on_request(ch, method, props, body):\n    result = handle_rpc(json.loads(body))\n\
+    \    ch.basic_publish(\n        exchange=\"\",\n        routing_key=props.reply_to,\n        body=json.dumps(result),\n\
+    \        properties=pika.BasicProperties(correlation_id=props.correlation_id),\n    )\n    ch.basic_ack(delivery_tag=method.delivery_tag)\n"
+  example_bad: '# No correlation ID — responses get mixed up
+
+    channel.basic_publish(exchange="", routing_key="rpc_queue", body=request)
+
+    # Which response belongs to which request? Nobody knows
+
+    '
+  when_applies: Projects using RabbitMQ message broker, NATS, or AMQP
+  when_not_applies: synchronous-only systems, simple CRUD with no async needs
+  sources: ["https://www.rabbitmq.com/tutorials/tutorial-six-python"]
+- id: CR-MQ-011
+  text: Use message schemas (Avro, Protobuf, or JSON Schema) with a schema registry for safe evolution.
+  why: Without schemas, producers and consumers drift apart silently. A producer adds a field, renames one, or changes a type
+    — consumers crash or silently drop data. Schema registries enforce compatibility checks BEFORE deployment.
+  how_to_do_right: Define message schemas in Avro or Protobuf. Register schemas in a schema registry (Confluent, AWS Glue,
+    Apicurio). Set compatibility mode to BACKWARD (consumers can read old + new). Validate messages against the schema before
+    publishing. Version schemas explicitly.
+  severity: high
+  technologies:
+    lang: [protobuf]
+    platform: [rabbitmq, kafka, nats, avro]
+  domains:
+    domain: [architecture, messaging]
+    concern: [data-integrity]
+  example_good: "# Protobuf schema — typed, versioned, backward-compatible\n# order.proto\nsyntax = \"proto3\";\nmessage OrderCreated\
+    \ {\n  string order_id = 1;\n  string customer_id = 2;\n  double amount = 3;\n  string currency = 4;       // Added in\
+    \ v2 — backward-compatible\n  repeated Item items = 5;   // Added in v3 — backward-compatible\n}\n\n# Python usage\nfrom\
+    \ generated import order_pb2\nmsg = order_pb2.OrderCreated(order_id=\"123\", customer_id=\"456\", amount=99.99)\nchannel.basic_publish(exchange=\"\
+    events\", routing_key=\"orders.created\",\n                      body=msg.SerializeToString())\n"
+  example_bad: "# Untyped JSON — no validation, no evolution guarantees\nchannel.basic_publish(\n    exchange=\"events\",\n\
+    \    routing_key=\"orders.created\",\n    body=json.dumps({\"id\": 123, \"amt\": \"99.99\"}),  # string or float? Who\
+    \ knows\n)\n# Next week: producer renames \"id\" to \"order_id\" — all consumers break\n"
+  when_applies: Projects using RabbitMQ message broker, Apache Kafka event streaming, NATS, or Protobuf
+  when_not_applies: synchronous-only systems, simple CRUD with no async needs
+  sources: ["https://docs.confluent.io/platform/current/schema-registry/index.html"]
+- id: CR-MQ-012
+  text: Implement backpressure — consumers must signal the broker when overwhelmed, not silently drop messages.
+  why: Without backpressure, a fast producer overwhelms a slow consumer. Messages pile up in memory, the broker runs out of
+    RAM, and the entire messaging system crashes — affecting ALL queues, not just the overloaded one.
+  how_to_do_right: Set prefetch_count on consumers to limit unacknowledged messages. Use queue max-length policies to apply
+    backpressure to publishers. Monitor consumer lag and queue depth. Scale consumers horizontally when lag increases. Set
+    publisher confirms to block publishers when the broker is overloaded.
+  severity: high
+  technologies:
+    platform: [rabbitmq, nats, kafka]
+  domains:
+    domain: [architecture, messaging, reliability, performance]
+  example_good: "# Consumer-side: prefetch limits in-flight messages\nchannel.basic_qos(prefetch_count=10)\n\n# Queue-side:\
+    \ reject-publish when full (backpressure to producer)\nchannel.queue_declare(queue=\"orders\", durable=True, arguments={\n\
+    \    \"x-max-length\": 50000,\n    \"x-overflow\": \"reject-publish\",  # Producer gets error, can retry\n})\n\n# Producer-side:\
+    \ publisher confirms — know if broker accepted\nchannel.confirm_delivery()\ntry:\n    channel.basic_publish(exchange=\"\
+    \", routing_key=\"orders\", body=data,\n                          mandatory=True)\nexcept pika.exceptions.UnroutableError:\n\
+    \    logger.warning(\"Broker rejected message — backpressure active\")\n    time.sleep(1)  # Back off\n"
+  example_bad: '# No prefetch, no limits, no confirms
+
+    channel.basic_consume(queue="orders", on_message_callback=slow_handler)
+
+    # Consumer processes 1 msg/sec, producer sends 1000 msg/sec
+
+    # Queue grows unbounded → broker OOM → ALL queues affected
+
+    '
+  when_applies: Projects using RabbitMQ message broker, NATS, or Apache Kafka event streaming
+  when_not_applies: synchronous-only systems, simple CRUD with no async needs
+  sources: ["https://www.rabbitmq.com/docs/consumer-prefetch"]
+- id: CR-MQ-013
+  text: Monitor queue depth and consumer lag — alert before queues become critical.
+  why: 'Queue buildup is the #1 early warning of messaging system failure. By the time the broker runs out of memory or consumers
+    fall days behind, recovery is painful — data loss, manual intervention, and cascading service failures.'
+  how_to_do_right: 'Export queue metrics to your monitoring system (Prometheus, Datadog). Alert on: queue depth > threshold,
+    consumer count = 0, message age > acceptable latency, DLQ depth > 0. Set up dashboards showing queue depth, publish rate,
+    consume rate, and ack rate.'
+  severity: medium
+  technologies:
+    platform: [rabbitmq, nats, kafka, sqs]
+  domains:
+    domain: [architecture, messaging, observability, operations]
+  example_good: "# Prometheus alerts for RabbitMQ (via rabbitmq_prometheus plugin)\n# alerting_rules.yml\ngroups:\n  - name:\
+    \ rabbitmq\n    rules:\n      - alert: QueueDepthHigh\n        expr: rabbitmq_queue_messages > 10000\n        for: 5m\n\
+    \        labels:\n          severity: warning\n        annotations:\n          summary: \"Queue {{ $labels.queue }} has\
+    \ {{ $value }} messages\"\n\n      - alert: ConsumerDown\n        expr: rabbitmq_queue_consumers == 0\n        for: 1m\n\
+    \        labels:\n          severity: critical\n        annotations:\n          summary: \"Queue {{ $labels.queue }} has\
+    \ zero consumers\"\n\n      - alert: DLQNotEmpty\n        expr: rabbitmq_queue_messages{queue=\"dead_letters\"} > 0\n\
+    \        for: 1m\n        labels:\n          severity: warning\n"
+  example_bad: '# No monitoring — discover problems when customers complain
+
+    # "Why haven''t orders been processed for 6 hours?"
+
+    # Queue has 2 million messages, broker using 95% memory
+
+    # Nobody knew until the on-call got a page at 3 AM
+
+    '
+  when_applies: Projects using RabbitMQ message broker, NATS, Apache Kafka event streaming, or AWS SQS message queues
+  when_not_applies: synchronous-only systems, simple CRUD with no async needs
+  sources: ["https://www.rabbitmq.com/docs/monitoring"]
+- id: CR-MQ-014
+  text: Use priority queues sparingly — urgent messages should use separate queues, not priority levels.
+  why: Priority queues add complexity to the broker (separate internal queues per priority level, changed ordering guarantees).
+    In practice, high-priority messages still wait behind other high-priority messages. A dedicated express queue with its
+    own consumers is simpler, faster, and easier to monitor.
+  how_to_do_right: Create a separate high-priority queue (e.g. orders.urgent) with dedicated consumers. Route urgent messages
+    at publish time. If you must use broker-level priority, limit to 2-3 levels (not 10) and set x-max-priority on the queue.
+    Monitor both queues independently.
+  severity: medium
+  technologies:
+    platform: [rabbitmq, nats, sqs]
+  domains:
+    domain: [architecture, messaging, performance]
+  example_good: "# Separate queues — simple, observable, independently scalable\nchannel.queue_declare(queue=\"orders.standard\"\
+    , durable=True)\nchannel.queue_declare(queue=\"orders.urgent\", durable=True)\n\n# Publisher decides routing\ndef publish_order(order,\
+    \ urgent=False):\n    queue = \"orders.urgent\" if urgent else \"orders.standard\"\n    channel.basic_publish(exchange=\"\
+    \", routing_key=queue, body=json.dumps(order))\n\n# Separate consumer pools — scale independently\n# 2 workers on urgent,\
+    \ 10 workers on standard\n"
+  example_bad: "# 10 priority levels — complex, hard to reason about\nchannel.queue_declare(queue=\"orders\", durable=True,\
+    \ arguments={\n    \"x-max-priority\": 10,\n})\n# Priority 7 vs priority 8 — what's the difference? Nobody remembers\n\
+    # All messages compete in one queue — hard to monitor \"urgent\" separately\n"
+  when_applies: Projects using RabbitMQ message broker, NATS, or AWS SQS message queues
+  when_not_applies: synchronous-only systems, simple CRUD with no async needs
+  sources: ["https://www.rabbitmq.com/docs/priority"]

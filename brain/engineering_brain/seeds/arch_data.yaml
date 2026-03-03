@@ -1,0 +1,1000 @@
+layer: patterns
+technology: General
+domain: data_engineering
+knowledge:
+- id: CR-ARCH-EDA-001
+  text: Event Notification — Publish a minimal event (entity ID + event type) when something changes. Subscribers fetch full
+    details via a callback to the publisher's API.
+  why: 'Event notification is the simplest form of event-driven architecture. The publisher emits a lightweight signal (''Order
+    123 was updated'') and subscribers call back to get the details they need. This keeps events small, avoids data coupling
+    (subscribers choose which fields to fetch), and reduces bandwidth. The tradeoff: subscribers must make an additional API
+    call, creating temporal coupling (publisher must be available when subscriber processes the event). Use event notification
+    when events are frequent, subscribers need different subsets of data, and the publisher is highly available.'
+  how_to_do_right: '1. Event contains: entity_id, event_type, timestamp. No business data.
+
+    2. Subscriber calls back to publisher''s API to fetch needed details.
+
+    3. Publisher API is versioned — different subscribers may need different versions.
+
+    4. Subscriber must handle publisher unavailability (retry with backoff).
+
+    5. Use when: high-frequency events, diverse subscriber data needs, low coupling priority.
+
+    6. Avoid when: publisher might be down when subscribers process events.
+
+    '
+  severity: medium
+  technologies:
+    lang: [python, java, go]
+    platform: [kafka, rabbitmq]
+  domains:
+    domain: [architecture]
+    concern: [data, engineering, events]
+  example_good: "# Publisher — emits minimal notification\nclass OrderService:\n    async def update_order(self, order_id:\
+    \ str, status: str):\n        await self.repo.update_status(order_id, status)\n        # Lightweight event — just the\
+    \ ID and type\n        await self.event_bus.publish(\"orders\", {\n            \"event_type\": \"OrderStatusChanged\"\
+    ,\n            \"order_id\": order_id,\n            \"timestamp\": datetime.utcnow().isoformat(),\n        })\n\n# Subscriber\
+    \ — fetches what it needs via callback\nclass ShippingSubscriber:\n    async def on_order_status_changed(self, event:\
+    \ dict):\n        # Callback to get shipping-relevant details\n        order = await self.order_api.get_shipping_info(event[\"\
+    order_id\"])\n        if order[\"status\"] == \"ready_to_ship\":\n            await self.create_shipment(order)\n\nclass\
+    \ AnalyticsSubscriber:\n    async def on_order_status_changed(self, event: dict):\n        # Different callback — analytics\
+    \ needs different fields\n        order = await self.order_api.get_analytics_info(event[\"order_id\"])\n        await\
+    \ self.record_status_change(order)\n"
+  example_bad: "# Direct coupling — no events, just synchronous calls\nclass OrderService:\n    async def update_order(self,\
+    \ order_id: str, status: str):\n        await self.repo.update_status(order_id, status)\n        # Direct calls — publisher\
+    \ knows all subscribers\n        await self.shipping_service.notify(order_id, status)\n        await self.analytics_service.record(order_id,\
+    \ status)\n        await self.notification_service.send(order_id, status)\n        # Adding a new subscriber requires\
+    \ modifying OrderService\n        # If shipping service is down, order update fails\n"
+  sources: ["https://martinfowler.com/articles/201701-event-driven.html"]
+  when_applies: "When designing event-driven communication between services that need loose coupling"
+- id: CR-ARCH-EDA-002
+  text: Event-Carried State Transfer — Publish events containing ALL the data subscribers need, eliminating callback dependencies.
+    Subscribers maintain local copies of the data they need.
+  why: 'Unlike event notification (which requires a callback), event-carried state transfer includes the full payload in the
+    event. Subscribers build local projections from events and query their own data — no callbacks, no temporal coupling with
+    the publisher. The tradeoff: events are larger (more bandwidth), and subscribers may have stale data (eventual consistency).
+    Use this pattern when: publisher availability is unreliable, subscribers need fast queries without network calls, or you
+    want maximum decoupling.'
+  how_to_do_right: '1. Events carry enough data for ALL known subscribers to act without callbacks.
+
+    2. Subscribers build local read models (projections) from the event stream.
+
+    3. Events are immutable — if data changes, publish a new event.
+
+    4. Include a version/sequence number for ordering and deduplication.
+
+    5. Schema evolution: use Avro/Protobuf with schema registry for forward/backward compatibility.
+
+    6. Monitor consumer lag — growing lag means subscribers are falling behind.
+
+    '
+  severity: high
+  technologies:
+    lang: [python, java, go]
+    platform: [kafka, rabbitmq]
+  domains:
+    domain: [architecture]
+    concern: [data, engineering, events]
+  example_good: "# Publisher — full data in event, subscribers need no callback\n@dataclass(frozen=True)\nclass CustomerUpdated:\n\
+    \    event_id: str\n    customer_id: str\n    name: str\n    email: str\n    tier: str\n    shipping_address: dict\n \
+    \   billing_address: dict\n    version: int\n    timestamp: datetime\n\n# Subscriber — builds local copy, no API calls\
+    \ needed\nclass OrderServiceSubscriber:\n    \"\"\"Maintains local customer cache from events.\"\"\"\n    async def on_customer_updated(self,\
+    \ event: CustomerUpdated):\n        await self.local_db.upsert(\"customer_cache\", {\n            \"customer_id\": event.customer_id,\n\
+    \            \"name\": event.name,\n            \"shipping_address\": event.shipping_address,\n            \"version\"\
+    : event.version,\n        })\n\n    async def get_shipping_address(self, customer_id: str) -> dict:\n        # Query LOCAL\
+    \ data — no network call to Customer Service\n        row = await self.local_db.get(\"customer_cache\", customer_id)\n\
+    \        return row[\"shipping_address\"]\n"
+  example_bad: "# Events with no data — forces synchronous callback\nawait event_bus.publish(\"customers\", {\"customer_id\"\
+    : \"C123\", \"type\": \"updated\"})\n\n# Subscriber must call back — temporal coupling with publisher\nclass OrderServiceSubscriber:\n\
+    \    async def on_customer_updated(self, event: dict):\n        # If Customer Service is down, this fails\n        customer\
+    \ = await self.customer_api.get(event[\"customer_id\"])\n        await self.update_local_cache(customer)\n        # Under\
+    \ load: N events = N API calls to Customer Service\n        # Customer Service becomes bottleneck for all subscribers\n"
+  sources: ["https://martinfowler.com/articles/201701-event-driven.html"]
+  when_applies: "When services need to share full state changes without requiring callback APIs"
+- id: CR-ARCH-OBX-001
+  text: Outbox Pattern with Change Data Capture — Use the database transaction log (WAL) to capture changes to the outbox
+    table and stream them to a message broker, avoiding polling latency.
+  why: The polling-based outbox pattern introduces latency (events are delayed by the poll interval) and database load (constant
+    SELECT queries). Change Data Capture (CDC) with Debezium reads the database's write-ahead log (WAL) directly, capturing
+    changes with sub-second latency and zero additional database queries. This is the production-grade approach used by companies
+    like Shopify, Uber, and Netflix for reliable event publishing. The only requirement is database access to the WAL (logical
+    replication in PostgreSQL).
+  how_to_do_right: '1. Enable logical replication on PostgreSQL (wal_level = logical).
+
+    2. Debezium connector reads the WAL and publishes changes to Kafka.
+
+    3. Configure the connector to watch only the outbox table (not all tables).
+
+    4. Use the outbox event router SMT (Single Message Transform) to route events by aggregate type.
+
+    5. Tombstone events: publish delete markers for compacted topics.
+
+    6. Monitor connector lag — if WAL reading falls behind, events are delayed.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    library: [debezium]
+    platform: [postgresql, kafka]
+  domains:
+    domain: [architecture, reliability]
+    concern: [data, engineering]
+  example_good: "# 1. Application writes to outbox table (same transaction as business data)\nasync def save_order(self, order:\
+    \ Order):\n    async with self.db.transaction():\n        await self.db.execute(\"INSERT INTO orders ...\", order.to_dict())\n\
+    \        await self.db.execute(\n            \"\"\"INSERT INTO outbox (id, aggregate_type, aggregate_id,\n           \
+    \    event_type, payload)\n               VALUES ($1, 'Order', $2, $3, $4)\"\"\",\n            uuid4(), order.id, \"OrderPlaced\"\
+    , order.to_json(),\n        )\n\n# 2. Debezium connector (JSON config) reads WAL, publishes to Kafka\n# {\n#   \"connector.class\"\
+    : \"io.debezium.connector.postgresql.PostgresConnector\",\n#   \"database.hostname\": \"orders-db\",\n#   \"table.include.list\"\
+    : \"public.outbox\",\n#   \"transforms\": \"outbox\",\n#   \"transforms.outbox.type\": \"io.debezium.transforms.outbox.EventRouter\"\
+    ,\n#   \"transforms.outbox.table.field.event.type\": \"event_type\",\n#   \"transforms.outbox.table.field.event.payload\"\
+    : \"payload\",\n#   \"transforms.outbox.route.by.field\": \"aggregate_type\"\n# }\n# Events appear on Kafka topic \"outbox.event.Order\"\
+    \ within milliseconds\n"
+  example_bad: "# Polling-based outbox — high latency, unnecessary DB load\nasync def outbox_poller():\n    while True:\n\
+    \        # Polls every 5 seconds — events delayed up to 5 seconds\n        rows = await db.fetch(\n            \"SELECT\
+    \ * FROM outbox WHERE published = false ORDER BY created_at LIMIT 100\"\n        )\n        for row in rows:\n       \
+    \     await kafka.publish(row[\"event_type\"], row[\"payload\"])\n            await db.execute(\"UPDATE outbox SET published\
+    \ = true WHERE id = $1\", row[\"id\"])\n        await asyncio.sleep(5)  # 5-second latency for every event\n        #\
+    \ Under load: 1000 events/second, polling 100 at a time\n        # → always behind, growing lag\n        # → constant\
+    \ SELECT queries on outbox table (lock contention)\n"
+  sources: ["https://microservices.io/patterns/data/transactional-outbox.html"]
+  when_applies: "When publishing events from services that use relational databases as their primary store"
+- id: CR-ARCH-CDC-001
+  text: Change Data Capture (CDC) — Capture row-level changes from a database and stream them as events. Log-based CDC reads
+    the WAL for low-latency, low-overhead capture.
+  why: When two systems need the same data (e.g., operational DB + analytics warehouse), traditional approaches are ETL batch
+    jobs (stale by hours) or dual writes (inconsistent). CDC captures every INSERT, UPDATE, DELETE from the source database's
+    transaction log and streams them as events. This provides near-real-time data synchronization with zero impact on the
+    source database's performance (reads the log, not the tables). It is the foundation for real-time data pipelines, cache
+    invalidation, and search index updates.
+  how_to_do_right: '1. Log-based CDC (preferred): reads the database WAL — zero performance impact on source DB.
+
+    2. Debezium: the industry standard for log-based CDC (PostgreSQL, MySQL, MongoDB, SQL Server).
+
+    3. Snapshot phase: initial full table snapshot, then switches to streaming changes.
+
+    4. Schema evolution: Debezium publishes schema changes as events — consumers must handle them.
+
+    5. Avoid query-based CDC (polling): high latency, misses deletes, impacts source DB performance.
+
+    6. Use for: real-time analytics, cache invalidation, search index updates, cross-service sync.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    library: [debezium]
+    platform: [postgresql, kafka]
+  domains:
+    domain: [architecture]
+    concern: [data, engineering, analytics]
+  example_good: '# Log-based CDC with Debezium — zero impact on source DB
+
+    #
+
+    # Source: PostgreSQL orders table
+
+    # Sink: Elasticsearch (for full-text search) + Redis (for cache)
+
+    #
+
+    # 1. Debezium reads PostgreSQL WAL
+
+    # 2. Publishes change events to Kafka topic "cdc.public.orders"
+
+    # 3. Kafka Connect sink connectors update Elasticsearch and Redis
+
+    #
+
+    # Change event example:
+
+    # {
+
+    #   "op": "u",  // update
+
+    #   "before": {"id": "123", "status": "pending"},
+
+    #   "after": {"id": "123", "status": "shipped"},
+
+    #   "source": {"ts_ms": 1706000000000, "txId": 42}
+
+    # }
+
+    #
+
+    # Elasticsearch sink: updates search index within 500ms
+
+    # Redis sink: invalidates cache key "order:123"
+
+    #
+
+    # Zero code changes in the order service
+
+    # Zero performance impact on PostgreSQL (reads WAL, not tables)
+
+    '
+  example_bad: "# Query-based CDC — polling for changes\nasync def sync_to_search():\n    last_updated = load_checkpoint()\n\
+    \    while True:\n        # Polls source DB every 10 seconds — impacts query performance\n        rows = await db.fetch(\n\
+    \            \"SELECT * FROM orders WHERE updated_at > $1 ORDER BY updated_at\",\n            last_updated\n        )\n\
+    \        for row in rows:\n            await elasticsearch.index(\"orders\", row)\n            last_updated = row[\"updated_at\"\
+    ]\n        save_checkpoint(last_updated)\n        await asyncio.sleep(10)\n        # Problems:\n        # - 10-second\
+    \ latency (stale search results)\n        # - Misses DELETEs (soft delete required)\n        # - \"updated_at\" not set\
+    \ on all changes (triggers, bulk updates)\n        # - Constant SELECT query impacts source DB under load\n"
+  sources: ["https://debezium.io/documentation/reference/stable/connectors/index.html"]
+  when_applies: "When capturing data changes from legacy databases or integrating systems without modifying source code"
+- id: CR-ARCH-PPE-001
+  text: Polyglot Persistence — Use the optimal database technology for each service's access pattern instead of forcing one
+    database for all use cases.
+  why: PostgreSQL is excellent for transactional data with complex queries, but terrible for full-text search (Elasticsearch
+    is 100x faster). Redis is excellent for cache and sessions (sub-millisecond), but has no ACID transactions. DynamoDB handles
+    100K writes/second for key-value access, but cannot do JOINs. Forcing all use cases into PostgreSQL means the search feature
+    is slow, the cache hits the database, and high-throughput writes overwhelm the single instance. Polyglot persistence lets
+    each service choose the optimal tool.
+  how_to_do_right: '1. Choose database by primary access pattern, not by team familiarity.
+
+    2. Key-value (Redis, DynamoDB): sessions, cache, counters, rate limiting.
+
+    3. Relational (PostgreSQL): transactions, complex queries, referential integrity.
+
+    4. Document (MongoDB): schema flexibility, nested data, rapid prototyping.
+
+    5. Search (Elasticsearch): full-text search, faceted filtering, log analytics.
+
+    6. Time series (InfluxDB, TimescaleDB): metrics, IoT data, financial ticks.
+
+    7. Graph (Neo4j, FalkorDB): relationships, recommendations, fraud detection.
+
+    8. Keep data in sync via CDC or domain events — no shared database access.
+
+    '
+  severity: high
+  technologies:
+    platform: [postgresql, redis, elasticsearch, dynamodb, mongodb]
+  domains:
+    domain: [architecture, databases]
+    concern: [data, engineering]
+  example_good: '# Each service uses the optimal database for its access pattern
+
+    #
+
+    # Order Service → PostgreSQL
+
+    #   Access pattern: ACID transactions, complex queries (JOIN order + items + customer)
+
+    #   Why PG: referential integrity, transactional consistency
+
+    #
+
+    # Search Service → Elasticsearch
+
+    #   Access pattern: full-text search, faceted filtering, fuzzy matching
+
+    #   Why ES: inverted index, 100x faster than LIKE queries in PG
+
+    #
+
+    # Session Service → Redis
+
+    #   Access pattern: key-value lookup by session ID, TTL-based expiry
+
+    #   Why Redis: sub-millisecond reads, built-in TTL, no schema needed
+
+    #
+
+    # Analytics Service → ClickHouse
+
+    #   Access pattern: aggregate queries over billions of events (SUM, COUNT, GROUP BY)
+
+    #   Why ClickHouse: columnar storage, 100x faster than PG for analytics
+
+    #
+
+    # Recommendation Service → Neo4j
+
+    #   Access pattern: "users who bought X also bought Y" (graph traversal)
+
+    #   Why Neo4j: graph queries in milliseconds vs minutes in relational DB
+
+    '
+  example_bad: '# One database for everything — PostgreSQL for all use cases
+
+    #
+
+    # Search: SELECT * FROM products WHERE name ILIKE ''%wireless headphones%''
+
+    #   → Full table scan, 3.2 seconds for 1M products (ES would be 15ms)
+
+    #
+
+    # Sessions: SELECT data FROM sessions WHERE id = ''abc123''
+
+    #   → 5ms round-trip (Redis would be 0.3ms)
+
+    #
+
+    # Analytics: SELECT date, COUNT(*) FROM events GROUP BY date
+
+    #   → 45 seconds for 100M rows (ClickHouse would be 200ms)
+
+    #
+
+    # Recommendations: 6-level JOIN across purchase_history, users, products
+
+    #   → 12 seconds (Neo4j graph traversal would be 50ms)
+
+    #
+
+    # All hitting the same PostgreSQL instance — connection pool exhausted
+
+    '
+  sources: ["https://martinfowler.com/articles/data-monolith-to-mesh.html"]
+  when_applies: "When building data pipelines that require exactly-once delivery and ordered processing"
+- id: CR-ARCH-DME-001
+  text: Data Mesh — Decentralize data ownership to domain teams. Each team publishes their data as a product with SLAs, discoverability,
+    and self-serve access. A federated governance layer ensures interoperability.
+  why: 'Centralized data teams become bottlenecks: every domain team requests ETL pipelines from the same data engineering
+    team. The backlog grows to 6 months. Data quality is poor because the central team does not understand domain semantics
+    (what does ''active user'' mean in the billing context vs the marketing context?). Data mesh flips this: each domain team
+    owns their data end-to-end, publishes it as a data product with documented schemas and SLAs, and a self-serve platform
+    handles infrastructure. The central team shifts from building pipelines to building the platform.'
+  how_to_do_right: '1. Domain ownership: the team that produces data is responsible for its quality and availability.
+
+    2. Data as a product: published data has schema documentation, SLA (freshness, availability), versioning.
+
+    3. Self-serve platform: data infrastructure (storage, cataloging, access control) provided as a platform.
+
+    4. Federated governance: global standards (naming conventions, security policies) + local autonomy (schema choices).
+
+    5. Discoverability: data catalog where consumers find available data products.
+
+    6. Interoperability: agreed-upon standards for data formats, metadata, and access patterns.
+
+    '
+  severity: medium
+  technologies:
+    lang: [python]
+    library: [datahub]
+    platform: [kafka, snowflake, dbt]
+  domains:
+    domain: [architecture]
+    concern: [data, engineering, organization]
+  example_good: "# Data product published by the Orders team\n# data_products/orders/manifest.yaml\nname: orders-fact\nowner:\
+    \ team-orders\ndomain: sales\ndescription: \"Immutable order events with denormalized customer and product data\"\nschema:\n\
+    \  format: avro\n  registry: schema-registry.internal:8081\n  subject: orders-fact-value\nsla:\n  freshness: \"< 5 minutes\
+    \ from order placement\"\n  availability: \"99.9%\"\n  quality:\n    completeness: \"> 99.5% (no null order_ids)\"\n \
+    \   uniqueness: \"order_id is globally unique\"\naccess:\n  read: \"self-serve via data catalog\"\n  request: \"Jira ticket\
+    \ to team-orders for write access\"\noutput_ports:\n  - type: kafka_topic\n    name: \"sales.orders-fact.v2\"\n  - type:\
+    \ snowflake_table\n    name: \"sales_db.public.orders_fact_v2\"\n\n# Consumers discover this in the data catalog and self-serve\
+    \ access\n"
+  example_bad: '# Centralized data team bottleneck
+
+    #
+
+    # Marketing team: "We need user engagement data for our campaign"
+
+    # Data team: "Added to backlog. ETA: 4 months."
+
+    # Marketing team: "We need it next week."
+
+    # Data team: "Sorry, we have 47 requests ahead of you."
+
+    #
+
+    # Marketing builds their own pipeline (shadow IT):
+
+    # - Queries production database directly (performance impact)
+
+    # - Misinterprets "active_user" field (different from billing''s definition)
+
+    # - Pipeline breaks silently when schema changes (no SLA)
+
+    # - Nobody knows this pipeline exists (no catalog)
+
+    # - 6 months later: "Why does our report show 3x more active users than billing?"
+
+    '
+  sources: ["https://www.datamesh-architecture.com/"]
+  when_applies: "When data architecture grows beyond what a centralized data team can manage effectively"
+- id: CR-ARCH-DPP-001
+  text: Idempotent Data Processing — Design every step in a data pipeline to produce the same result when executed multiple
+    times with the same input. Essential for exactly-once semantics in at-least-once delivery systems.
+  why: 'Message brokers guarantee at-least-once delivery: if a consumer crashes after processing a message but before acknowledging
+    it, the message is redelivered. Without idempotency, redelivery causes duplicate processing: a payment charged twice,
+    an inventory reservation doubled, an analytics counter inflated. Idempotency ensures that processing the same message
+    1 time or 100 times produces identical results. This is the foundation of reliable distributed data processing.'
+  how_to_do_right: '1. Use a unique event_id for deduplication: store processed event_ids, skip duplicates.
+
+    2. Upsert instead of insert: INSERT ... ON CONFLICT DO UPDATE (same result on retry).
+
+    3. Use deterministic computation: same input → same output (no random(), no now()).
+
+    4. Idempotency key for API calls: include a client-generated ID, server returns same response for same key.
+
+    5. Use database constraints (unique keys) as a safety net for dedup failures.
+
+    6. Test idempotency explicitly: process the same event twice, verify identical result.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python]
+    platform: [postgresql, kafka, redis]
+  domains:
+    domain: [architecture, reliability]
+    concern: [data, engineering, distributed_systems]
+  example_good: "# Idempotent event processing with dedup + upsert\nclass PaymentEventProcessor:\n    async def process(self,\
+    \ event: PaymentReceived):\n        # Dedup: check if already processed\n        if await self.dedup_store.exists(event.event_id):\n\
+    \            logger.info(f\"Skipping duplicate event {event.event_id}\")\n            return\n\n        # Upsert: same\
+    \ result whether first or repeated execution\n        await self.db.execute(\"\"\"\n            INSERT INTO payment_ledger\
+    \ (payment_id, order_id, amount, status)\n            VALUES ($1, $2, $3, $4)\n            ON CONFLICT (payment_id) DO\
+    \ UPDATE\n            SET status = EXCLUDED.status\n        \"\"\", event.payment_id, event.order_id, event.amount, \"\
+    completed\")\n\n        # Mark as processed AFTER successful upsert\n        await self.dedup_store.mark_processed(event.event_id,\
+    \ ttl=86400 * 7)\n\n# API with idempotency key\n@router.post(\"/payments\")\nasync def create_payment(body: PaymentRequest):\n\
+    \    existing = await db.get(\"payments\", idempotency_key=body.idempotency_key)\n    if existing:\n        return existing\
+    \  # Return SAME response for same key\n    payment = await process_payment(body)\n    return payment\n"
+  example_bad: "# Non-idempotent processing — duplicates cause data corruption\nclass PaymentEventProcessor:\n    async def\
+    \ process(self, event: PaymentReceived):\n        # INSERT without dedup — duplicate event = double charge\n        await\
+    \ self.db.execute(\n            \"INSERT INTO payment_ledger (order_id, amount) VALUES ($1, $2)\",\n            event.order_id,\
+    \ event.amount,\n        )\n        # If event is redelivered (consumer crash + retry):\n        # → Two rows in ledger\
+    \ for same payment\n        # → Customer charged twice\n        # → Financial reconciliation nightmare\n"
+  sources: ["https://kafka.apache.org/documentation/streams/"]
+  when_applies: "When designing real-time data pipelines with streaming platforms like Kafka or Flink"
+- id: CR-ARCH-DPP-002
+  text: Batch vs Stream Processing — Use batch for high-throughput historical data (ETL, reports) and stream for low-latency
+    real-time reactions (alerts, dashboards). Kappa architecture unifies both with a single stream.
+  why: 'Lambda architecture runs both batch and stream layers, producing the same result via different code paths — maintaining
+    two codebases for one computation. Kappa architecture simplifies this: everything is a stream. Historical data is reprocessed
+    by replaying the event log. Real-time data is processed as it arrives. One codebase, one computation model. However, not
+    all workloads fit streaming: massive batch joins (petabyte-scale data warehouse queries) are still more efficient as batch.
+    Choose based on latency requirements: if minutes of staleness are OK, batch is simpler. If seconds matter, stream.'
+  how_to_do_right: '1. Stream processing: use when latency matters (< 1 minute). Kafka Streams, Flink, Spark Structured Streaming.
+
+    2. Batch processing: use when throughput matters, latency is flexible (hourly/daily). Spark, dbt, Airflow.
+
+    3. Kappa architecture: stream-only. Replay event log for historical reprocessing.
+
+    4. Lambda architecture: batch + stream. Use only when stream cannot handle historical volume.
+
+    5. Exactly-once semantics: Kafka Streams provides exactly-once via transactions.
+
+    6. Backfill strategy: when adding a new consumer, replay historical events from the beginning.
+
+    '
+  severity: medium
+  technologies:
+    lang: [python]
+    platform: [kafka, spark, flink, dbt]
+  domains:
+    domain: [architecture]
+    concern: [data, engineering, analytics]
+  example_good: "# Kappa architecture — single stream processing for real-time + historical\n#\n# Event log: Kafka topic with\
+    \ infinite retention (or long retention + compaction)\n#\n# Real-time consumer: processes events as they arrive\nclass\
+    \ OrderMetricsConsumer:\n    async def process(self, event: OrderPlaced):\n        await self.metrics_db.increment(\n\
+    \            f\"daily_orders:{event.timestamp.date()}\",\n            amount=1,\n        )\n        await self.metrics_db.increment(\n\
+    \            f\"daily_revenue:{event.timestamp.date()}\",\n            amount=float(event.total),\n        )\n#\n# Historical\
+    \ reprocessing: reset consumer offset to beginning\n# → Same code processes ALL historical events\n# → Rebuilds metrics\
+    \ from scratch (idempotent upserts)\n#\n# One codebase, one computation model\n# Adding new metric: deploy new consumer,\
+    \ replay from beginning\n"
+  example_bad: '# Lambda architecture — two codebases for the same computation
+
+    #
+
+    # Batch layer (Spark job, runs nightly):
+
+    # daily_orders = orders_table.groupBy("date").count()
+
+    # daily_revenue = orders_table.groupBy("date").agg(sum("total"))
+
+    #
+
+    # Stream layer (Kafka consumer, runs real-time):
+
+    # Same logic but different code, different language, different bugs
+
+    #
+
+    # Serving layer: merges batch + stream results
+
+    # result = batch_result.merge(stream_result)
+
+    #
+
+    # Problems:
+
+    # - Two codebases computing the same thing (double maintenance)
+
+    # - Merge logic is complex (dedup, reconcile discrepancies)
+
+    # - Batch and stream disagree → which is correct?
+
+    # - Bug fix must be applied to BOTH codebases
+
+    '
+  sources: ["https://kafka.apache.org/documentation/#semantics"]
+  when_applies: "When implementing stream processing that must handle late-arriving or out-of-order events"
+- id: CR-ARCH-SCE-001
+  text: Schema Evolution — Design event and API schemas to evolve without breaking existing consumers. Use forward and backward
+    compatibility rules with Avro or Protobuf.
+  why: In a microservices environment, producers and consumers are deployed independently. When the Order Service adds a 'priority'
+    field to OrderPlaced events, existing consumers (deployed weeks ago) must still process the new events. When the Order
+    Service removes the 'legacy_status' field, old events in the topic must still be readable. Forward compatibility (new
+    producers, old consumers) and backward compatibility (new consumers, old producers) ensure independent deployability.
+    Without schema evolution, every schema change requires synchronized deployment of all producers and consumers.
+  how_to_do_right: '1. Forward compatible: new producers can add optional fields — old consumers ignore unknown fields.
+
+    2. Backward compatible: new consumers can handle old events missing new fields — use defaults.
+
+    3. Full compatible: both directions — new and old producers/consumers interoperate.
+
+    4. Avro rules: add fields with defaults, never remove required fields, never rename fields.
+
+    5. Protobuf rules: add fields with new field numbers, never reuse field numbers, use optional.
+
+    6. Schema Registry: validate compatibility at publish time — reject breaking changes.
+
+    7. Breaking changes: create a new topic/endpoint version (v1, v2), migrate consumers gradually.
+
+    '
+  severity: critical
+  technologies:
+    lang: [protobuf, python]
+    platform: [avro, kafka]
+  domains:
+    domain: [architecture, api]
+    concern: [data, engineering, compatibility]
+  example_good: "# Avro schema evolution — backward + forward compatible\n# V1 schema (original)\n{\n  \"type\": \"record\"\
+    ,\n  \"name\": \"OrderPlaced\",\n  \"fields\": [\n    {\"name\": \"order_id\", \"type\": \"string\"},\n    {\"name\":\
+    \ \"customer_id\", \"type\": \"string\"},\n    {\"name\": \"total\", \"type\": \"double\"},\n    {\"name\": \"timestamp\"\
+    , \"type\": \"long\"}\n  ]\n}\n\n# V2 schema (evolved — added optional field with default)\n{\n  \"type\": \"record\"\
+    ,\n  \"name\": \"OrderPlaced\",\n  \"fields\": [\n    {\"name\": \"order_id\", \"type\": \"string\"},\n    {\"name\":\
+    \ \"customer_id\", \"type\": \"string\"},\n    {\"name\": \"total\", \"type\": \"double\"},\n    {\"name\": \"timestamp\"\
+    , \"type\": \"long\"},\n    {\"name\": \"priority\", \"type\": \"string\", \"default\": \"normal\"}  # New field with\
+    \ default\n  ]\n}\n\n# Forward compatible: old consumer reads V2 event — ignores \"priority\" field\n# Backward compatible:\
+    \ new consumer reads V1 event — uses default \"normal\" for priority\n# No deployment coordination required\n"
+  example_bad: '# Breaking schema change — requires synchronized deployment
+
+    # V1: {"order_id": "123", "status": "pending", "total": 99.99}
+
+    # V2: {"order_id": "123", "state": "PENDING", "amount": 99.99}
+
+    #
+
+    # Breaking changes:
+
+    # 1. "status" renamed to "state" — old consumers crash on missing "status"
+
+    # 2. "total" renamed to "amount" — old consumers crash on missing "total"
+
+    # 3. Value changed from lowercase to uppercase — old consumers'' switch statements break
+
+    #
+
+    # Deployment order matters:
+
+    # Deploy consumer first → crashes reading V1 events (no "state" field)
+
+    # Deploy producer first → V2 events crash old consumers (no "status" field)
+
+    # Only safe option: deploy BOTH simultaneously → defeats purpose of microservices
+
+    '
+  sources: ["https://martinfowler.com/eaaDev/EventSourcing.html"]
+  when_applies: "When building event-driven systems that evolve schemas over time while maintaining backward compatibility"
+- id: CR-ARCH-PRJ-001
+  text: CQRS Projections — Event handlers that build read-optimized data models from domain events. Multiple projections serve
+    different query needs from the same event stream.
+  why: 'A normalized write model (3NF) is terrible for read queries: a dashboard showing order summaries requires JOINs across
+    5 tables. A search feature needs full-text indexing. A real-time counter needs sub-millisecond reads. Instead of one model
+    trying to serve all, projections build purpose-built read models: a denormalized dashboard table, an Elasticsearch search
+    index, and a Redis counter — all from the same event stream. When a new read requirement appears, add a new projection,
+    replay events, and the new read model is ready.'
+  how_to_do_right: '1. Each projection handles specific event types and builds a specific read model.
+
+    2. Projections are idempotent: processing the same event twice produces the same result.
+
+    3. Rebuilding: replay ALL events from the beginning to reconstruct a projection from scratch.
+
+    4. Multiple projections from same events: dashboard projection, search projection, analytics projection.
+
+    5. Eventual consistency: projections may lag behind the write side by seconds.
+
+    6. Snapshot + catch-up: for large event stores, start from a snapshot and replay recent events.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    platform: [postgresql, elasticsearch, redis]
+  domains:
+    domain: [architecture]
+    concern: [data, engineering, cqrs]
+  example_good: "# Multiple projections from the same event stream\nclass DashboardProjection:\n    \"\"\"Builds denormalized\
+    \ dashboard rows — fast reads, no JOINs.\"\"\"\n    async def handle(self, event: DomainEvent):\n        if isinstance(event,\
+    \ OrderPlaced):\n            await self.db.upsert(\"dashboard_orders\", {\n                \"order_id\": event.order_id,\n\
+    \                \"customer_name\": event.customer_name,  # Denormalized!\n                \"total\": event.total,\n \
+    \               \"item_count\": len(event.items),\n                \"status\": \"placed\",\n            })\n        elif\
+    \ isinstance(event, OrderShipped):\n            await self.db.update(\"dashboard_orders\",\n                {\"order_id\"\
+    : event.order_id},\n                {\"status\": \"shipped\", \"tracking\": event.tracking_number},\n            )\n\n\
+    class SearchProjection:\n    \"\"\"Builds Elasticsearch search index from same events.\"\"\"\n    async def handle(self,\
+    \ event: DomainEvent):\n        if isinstance(event, OrderPlaced):\n            await self.es.index(\"orders\", {\n  \
+    \              \"id\": event.order_id,\n                \"customer_name\": event.customer_name,\n                \"items\"\
+    : [i[\"name\"] for i in event.items],\n                \"total\": event.total,\n            })\n\nclass MetricsProjection:\n\
+    \    \"\"\"Builds real-time counters in Redis.\"\"\"\n    async def handle(self, event: DomainEvent):\n        if isinstance(event,\
+    \ OrderPlaced):\n            await self.redis.incr(f\"orders:count:{event.order_date}\")\n            await self.redis.incrbyfloat(f\"\
+    orders:revenue:{event.order_date}\", event.total)\n\n# New requirement: \"show top customers\" → add CustomerRankingProjection\n\
+    # Replay all events → ranking is built from historical data\n"
+  example_bad: "# One read model for everything — slow, coupled, inflexible\ndef get_dashboard_data():\n    # 5-table JOIN\
+    \ for dashboard — 2.3 seconds\n    return db.execute(\"\"\"\n        SELECT o.id, c.name, SUM(oi.price), COUNT(oi.id),\
+    \ s.status\n        FROM orders o\n        JOIN customers c ON ...\n        JOIN order_items oi ON ...\n        JOIN shipments\
+    \ s ON ...\n        JOIN payments p ON ...\n        GROUP BY o.id, c.name, s.status\n    \"\"\")\n\ndef search_orders(query:\
+    \ str):\n    # ILIKE for search — 4.1 seconds on 1M rows\n    return db.execute(\"SELECT * FROM orders WHERE description\
+    \ ILIKE %s\", f\"%{query}%\")\n\ndef get_daily_metrics():\n    # Full table scan for metrics — 8.7 seconds\n    return\
+    \ db.execute(\"SELECT date, COUNT(*), SUM(total) FROM orders GROUP BY date\")\n\n# All hitting the same normalized tables\
+    \ — slow and getting slower\n"
+  sources: ["https://martinfowler.com/bliki/CQRS.html"]
+  when_applies: "When persisting domain state as a sequence of immutable events rather than mutable rows"
+- id: CR-ARCH-DQA-001
+  text: Data Quality Contracts — Define explicit quality expectations (completeness, uniqueness, freshness, validity) for
+    every data product. Validate in the pipeline, not in dashboards.
+  why: 'Without data quality contracts, bad data propagates silently until a VP asks ''why does the revenue dashboard show
+    -$50M?'' By then, the corrupted data has affected reports, ML models, and automated decisions for days. Data quality contracts
+    shift validation left: every pipeline step validates data BEFORE passing it downstream. A freshness contract catches stale
+    data within minutes. A uniqueness contract catches duplicate records before they reach the warehouse. The cost of catching
+    bad data at ingestion is 100x cheaper than catching it in a board meeting.'
+  how_to_do_right: '1. Completeness: required fields are never null (e.g., order_id NOT NULL).
+
+    2. Uniqueness: no duplicate records for the same entity (e.g., order_id is unique).
+
+    3. Freshness: data is no older than SLA (e.g., events processed within 5 minutes).
+
+    4. Validity: values are within expected ranges (e.g., amount > 0, status in [''pending'', ''shipped'']).
+
+    5. Referential integrity: foreign keys reference existing entities.
+
+    6. Validate in the pipeline: dbt tests, Great Expectations, Soda, or custom checks.
+
+    7. Alert and block: failing checks stop the pipeline and alert the owning team.
+
+    '
+  severity: high
+  technologies:
+    lang: [python, sql]
+    library: [great expectations]
+    platform: [dbt]
+  domains:
+    domain: [architecture, quality, governance]
+    concern: [data, engineering]
+  example_good: "# dbt data quality tests — validated on every pipeline run\n# models/orders/schema.yml\nversion: 2\nmodels:\n\
+    \  - name: orders_fact\n    description: \"Order events — one row per order\"\n    columns:\n      - name: order_id\n\
+    \        tests:\n          - not_null          # Completeness\n          - unique            # Uniqueness\n      - name:\
+    \ total\n        tests:\n          - not_null\n          - dbt_utils.accepted_range:\n              min_value: 0    #\
+    \ Validity: no negative totals\n              max_value: 100000  # Validity: no unreasonable totals\n      - name: status\n\
+    \        tests:\n          - accepted_values:\n              values: ['placed', 'paid', 'shipped', 'delivered', 'cancelled']\n\
+    \      - name: customer_id\n        tests:\n          - not_null\n          - relationships:   # Referential integrity\n\
+    \              to: ref('customers_dim')\n              field: customer_id\n\n# Freshness check — alert if data is stale\n\
+    sources:\n  - name: raw_orders\n    freshness:\n      warn_after: {count: 15, period: minute}\n      error_after: {count:\
+    \ 60, period: minute}\n"
+  example_bad: '# No data quality checks — bad data discovered in production
+
+    #
+
+    # Pipeline: raw events → transform → warehouse → dashboard
+
+    # No validation at any step.
+
+    #
+
+    # Day 1: Duplicate events from Kafka redelivery → double-counted revenue
+
+    # Day 3: VP sees revenue dashboard showing 2x actual → emergency investigation
+
+    # Day 4: Root cause found (duplicates), but they''ve propagated to:
+
+    #   - ML model (trained on inflated data)
+
+    #   - Financial reports (sent to investors)
+
+    #   - Automated pricing (set prices based on wrong demand)
+
+    # Day 5-10: Manual data cleanup across 4 systems
+
+    # Cost: 5 engineer-weeks + reputational damage
+
+    '
+  sources: ["https://www.greatexpectations.io/expectations/"]
+  when_applies: "When building data pipelines that feed analytics, ML models, or regulatory reports"
+- id: CR-ARCH-DLW-001
+  text: Data Lake vs Data Warehouse vs Data Lakehouse — Choose the right storage paradigm based on data variety, query patterns,
+    and governance needs.
+  why: 'A data warehouse (Snowflake, BigQuery) stores structured, curated data optimized for SQL analytics — but cannot handle
+    unstructured data (logs, images, JSON). A data lake (S3, GCS) stores raw data of any format at low cost — but without
+    governance, becomes a data swamp where nobody can find or trust anything. A data lakehouse (Databricks, Delta Lake) combines
+    both: raw storage with warehouse-like features (ACID transactions, schema enforcement, SQL access). The choice depends
+    on data variety, team maturity, and query patterns.'
+  how_to_do_right: '1. Data Warehouse: use for structured, business-critical analytics (revenue reports, KPIs). Schema-on-write.
+    SQL-first.
+
+    2. Data Lake: use for raw data archival, ML training data, unstructured data (logs, images). Schema-on-read.
+
+    3. Data Lakehouse: use when you need both — ACID transactions on raw files, SQL over semi-structured data.
+
+    4. Medallion architecture (Bronze/Silver/Gold): raw → cleaned → business-ready. Applicable to all three.
+
+    5. Data catalog: always catalog datasets with owners, schemas, and quality metrics.
+
+    6. Avoid data swamp: enforce naming conventions, access controls, and retention policies in the lake.
+
+    '
+  severity: medium
+  technologies:
+    platform: [snowflake, databricks, delta_lake, aws, s3, gcp, bigquery]
+  domains:
+    domain: [architecture]
+    concern: [data, engineering, analytics]
+  example_good: '# Medallion architecture in a data lakehouse
+
+    #
+
+    # Bronze (raw): raw event JSON as-is, append-only, no transformations
+
+    # s3://data-lake/bronze/orders/2026/02/17/events.json
+
+    # Schema: raw JSON, no enforcement
+
+    # Retention: 2 years
+
+    #
+
+    # Silver (cleaned): parsed, deduplicated, typed
+
+    # delta://data-lake/silver/orders/
+
+    # Schema: enforced (order_id STRING NOT NULL, total DECIMAL(10,2), ...)
+
+    # Dedup: exactly one row per order_id
+
+    # Quality: dbt tests validate completeness, uniqueness, freshness
+
+    #
+
+    # Gold (business-ready): aggregated, denormalized for specific use cases
+
+    # delta://data-lake/gold/daily_revenue/
+
+    # Schema: date DATE, revenue DECIMAL, order_count INT
+
+    # SLA: refreshed within 15 minutes of source
+
+    # Consumers: BI dashboards, executive reports
+
+
+    # Each layer has clear ownership, quality gates, and retention policy
+
+    '
+  example_bad: '# Data swamp — raw data dumped with no governance
+
+    # s3://company-data/
+
+    #   uploads/           # What is this?
+
+    #   data_2025/         # Whose data? What format?
+
+    #   backup_old/        # How old? Can we delete?
+
+    #   johns_analysis/    # Personal folder — no ownership
+
+    #   ml_training_v2/    # Is v1 deprecated?
+
+    #   logs/              # Application logs? Access logs? Both?
+
+    #     2026-01-15.csv   # CSV? I thought it was JSON
+
+    #
+
+    # No catalog, no schema, no quality checks, no access controls
+
+    # Nobody trusts the data → everyone builds their own pipeline from source
+
+    # 5 teams building 5 copies of the same transformation
+
+    '
+  sources: ["https://www.databricks.com/glossary/medallion-architecture"]
+  when_applies: "When designing a data lake or lakehouse architecture with Bronze/Silver/Gold layers"
+- id: CR-ARCH-SCD-001
+  text: Slowly Changing Dimensions (SCD) — Track how dimension data changes over time. Type 1 overwrites (no history), Type
+    2 adds rows (full history), Type 3 adds columns (limited history).
+  why: When a customer changes their address, the orders they placed at the OLD address should still show the old address
+    (for shipping audits, tax compliance). SCD Type 1 overwrites the address — losing the history forever. SCD Type 2 adds
+    a new row with the new address (with valid_from/valid_to dates), preserving the full history. Joining orders to the customer
+    dimension using the order date correctly returns the address that was active at the time of the order. Without SCD Type
+    2, historical reports are inaccurate — a tax audit shows the CURRENT address, not the address at the time of the transaction.
+  how_to_do_right: '1. Type 1 (overwrite): use when history does not matter (user preferences, display name).
+
+    2. Type 2 (add row): use when full history is required (customer address for tax, employee department for HR).
+
+    3. Type 2 columns: surrogate_key, natural_key, valid_from, valid_to, is_current.
+
+    4. Query pattern: JOIN ON natural_key WHERE valid_from <= order_date AND valid_to > order_date.
+
+    5. Snapshot tables as alternative: full table copy on each load (simpler, higher storage cost).
+
+    6. dbt snapshots: automated SCD Type 2 with check strategy or timestamp strategy.
+
+    '
+  severity: medium
+  technologies:
+    lang: [python]
+    platform: [postgresql, snowflake, dbt]
+  domains:
+    domain: [architecture]
+    concern: [data, engineering, analytics, warehousing]
+  example_good: "# SCD Type 2 — full history of customer addresses\n# customers_dim table:\n# | sk  | customer_id | name \
+    \ | city    | valid_from | valid_to   | is_current |\n# | 1   | C001        | Alice | NYC     | 2024-01-01 | 2025-06-15\
+    \ | false      |\n# | 2   | C001        | Alice | Boston  | 2025-06-15 | 9999-12-31 | true       |\n\n# Order from 2024-03-15\
+    \ → joins to sk=1 (NYC address, correct for tax)\n# Order from 2025-08-01 → joins to sk=2 (Boston address, correct for\
+    \ tax)\n\n# dbt snapshot (automated SCD Type 2)\n# models/snapshots/customers_snapshot.sql\n{% snapshot customers_snapshot\
+    \ %}\n{{ config(\n    target_schema='snapshots',\n    unique_key='customer_id',\n    strategy='timestamp',\n    updated_at='updated_at',\n\
+    ) }}\nSELECT * FROM {{ source('raw', 'customers') }}\n{% endsnapshot %}\n"
+  example_bad: '# SCD Type 1 (overwrite) used where history is required
+
+    # Customer changes address from NYC to Boston
+
+    # UPDATE customers SET city = ''Boston'' WHERE customer_id = ''C001''
+
+    #
+
+    # Now:
+
+    # | customer_id | name  | city   |
+
+    # | C001        | Alice | Boston |
+
+    #
+
+    # Order from 2024-03-15 → JOIN → shows Boston (WRONG — was NYC at order time)
+
+    # Tax audit: "Alice''s order was shipped to Boston"
+
+    # Reality: order was shipped to NYC — tax was calculated for NYC
+
+    # Compliance failure: incorrect address in tax records
+
+    '
+  sources: ["https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/type-1-dimension/"]
+  when_applies: "When tracking historical changes to dimension tables in a data warehouse"
+- id: CR-ARCH-DLQ-001
+  text: Dead Letter Queue (DLQ) — Route messages that cannot be processed after maximum retries to a separate queue for investigation.
+    Prevents poison messages from blocking the entire pipeline.
+  why: A 'poison message' is a message that causes the consumer to crash every time it tries to process it (malformed JSON,
+    unexpected null, schema mismatch). Without a DLQ, the consumer crashes, restarts, picks up the same message, crashes again
+    — infinite restart loop. Every message behind the poison message is blocked. With a DLQ, after N failed attempts, the
+    message is moved to a separate queue. The consumer continues processing other messages. An operator investigates the DLQ,
+    fixes the issue (or discards the message), and reprocesses.
+  how_to_do_right: '1. Configure max retries per message (e.g., 3-5 attempts with exponential backoff).
+
+    2. After max retries, move to DLQ with metadata: original topic, error message, attempt count, timestamp.
+
+    3. Alert on DLQ depth: non-zero DLQ = something is wrong (schema mismatch, bug, data issue).
+
+    4. DLQ consumer: manual or automated processing — fix-and-replay or discard.
+
+    5. Retain DLQ messages for investigation (7-30 day TTL).
+
+    6. Monitor: DLQ growth rate, message age, top error reasons.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    platform: [kafka, rabbitmq, sqs]
+  domains:
+    domain: [architecture, reliability]
+    concern: [data, engineering, events]
+  example_good: "# Consumer with DLQ integration\nclass OrderEventConsumer:\n    MAX_RETRIES = 3\n\n    async def consume(self,\
+    \ message: Message):\n        attempt = message.headers.get(\"retry_count\", 0)\n        try:\n            event = OrderPlaced.parse(message.value)\n\
+    \            await self.process_order(event)\n            await message.ack()\n        except ValidationError as e:\n\
+    \            # Permanent failure (bad data) — send to DLQ immediately\n            await self.send_to_dlq(message, error=str(e),\
+    \ reason=\"validation_error\")\n            await message.ack()  # Remove from main queue\n        except TransientError\
+    \ as e:\n            # Transient failure — retry with backoff\n            if attempt >= self.MAX_RETRIES:\n         \
+    \       await self.send_to_dlq(message, error=str(e), reason=\"max_retries_exceeded\")\n                await message.ack()\n\
+    \            else:\n                await message.nack(delay=2 ** attempt)  # Exponential backoff\n\n    async def send_to_dlq(self,\
+    \ message: Message, error: str, reason: str):\n        await self.dlq_producer.publish(DLQEntry(\n            original_topic=message.topic,\n\
+    \            original_key=message.key,\n            original_value=message.value,\n            error=error,\n        \
+    \    reason=reason,\n            attempt_count=message.headers.get(\"retry_count\", 0),\n            failed_at=datetime.utcnow(),\n\
+    \        ))\n        metrics.increment(\"dlq.messages.total\", tags={\"reason\": reason})\n"
+  example_bad: "# No DLQ — poison message blocks entire pipeline\nclass OrderEventConsumer:\n    async def consume(self, message:\
+    \ Message):\n        event = OrderPlaced.parse(message.value)  # Crashes on malformed JSON!\n        await self.process_order(event)\n\
+    \        await message.ack()\n\n# Poison message arrives: {\"order_id\": null, \"items\": \"not_a_list\"}\n# Consumer\
+    \ crashes → restarts → picks up same message → crashes again\n# Restart loop: 100 times in 10 minutes\n# All messages\
+    \ behind the poison message are blocked\n# 10,000 orders waiting to be processed\n# On-call paged at 2 AM: \"consumer\
+    \ crash loop\"\n# Manual intervention: skip the message by hand, then investigate\n"
+  sources: ["https://aws.amazon.com/what-is/dead-letter-queue/"]
+  when_applies: "When handling messages that fail processing in event-driven or queue-based systems"
+- id: CR-ARCH-MVW-001
+  text: Materialized Views — Precompute and store query results for expensive aggregations. Refresh periodically or on-demand.
+    Trade storage for query performance.
+  why: 'An analytics dashboard that runs a 5-table JOIN with GROUP BY across 100M rows takes 45 seconds per page load. No
+    user will wait 45 seconds. A materialized view precomputes this query and stores the result as a table. Querying the materialized
+    view is a simple table scan — milliseconds instead of seconds. The tradeoff: the data is stale between refreshes. For
+    most dashboards, data that is 5-15 minutes old is perfectly acceptable. PostgreSQL supports REFRESH MATERIALIZED VIEW
+    CONCURRENTLY — no lock, no downtime during refresh.'
+  how_to_do_right: '1. Identify slow, frequently-executed queries (dashboard queries, report queries).
+
+    2. Create a materialized view with the precomputed result.
+
+    3. Refresh strategy: periodic (every 5-15 minutes), on-demand (after data load), or CDC-triggered.
+
+    4. CONCURRENTLY refresh: no table lock during refresh (requires unique index).
+
+    5. Monitor refresh time: if refresh takes longer than the refresh interval, the view is always stale.
+
+    6. Alternatives: CQRS projections (event-driven, sub-second freshness), Redis cache (simpler, less structured).
+
+    '
+  severity: medium
+  technologies:
+    lang: [python]
+    platform: [postgresql, snowflake, dbt]
+  domains:
+    domain: [architecture, performance, databases]
+    concern: [data, engineering]
+  example_good: "# Materialized view for dashboard query\nCREATE MATERIALIZED VIEW daily_order_summary AS\nSELECT\n    date_trunc('day',\
+    \ o.created_at) AS order_date,\n    COUNT(DISTINCT o.id) AS order_count,\n    SUM(oi.price * oi.quantity) AS revenue,\n\
+    \    COUNT(DISTINCT o.customer_id) AS unique_customers,\n    AVG(oi.price * oi.quantity) AS avg_order_value\nFROM orders\
+    \ o\nJOIN order_items oi ON oi.order_id = o.id\nWHERE o.status != 'cancelled'\nGROUP BY 1;\n\n-- Unique index required\
+    \ for CONCURRENTLY refresh\nCREATE UNIQUE INDEX ON daily_order_summary (order_date);\n\n-- Refresh every 10 minutes (cron\
+    \ job or pg_cron)\nREFRESH MATERIALIZED VIEW CONCURRENTLY daily_order_summary;\n\n-- Dashboard query: milliseconds instead\
+    \ of 45 seconds\nSELECT * FROM daily_order_summary\nWHERE order_date >= CURRENT_DATE - INTERVAL '30 days'\nORDER BY order_date\
+    \ DESC;\n"
+  example_bad: "# Raw query on every dashboard page load\ndef get_dashboard_data():\n    return db.execute(\"\"\"\n      \
+    \  SELECT date_trunc('day', o.created_at) AS order_date,\n               COUNT(DISTINCT o.id), SUM(oi.price * oi.quantity),\n\
+    \               COUNT(DISTINCT o.customer_id), AVG(oi.price * oi.quantity)\n        FROM orders o\n        JOIN order_items\
+    \ oi ON oi.order_id = o.id\n        WHERE o.status != 'cancelled'\n        GROUP BY 1\n        ORDER BY 1 DESC LIMIT 30\n\
+    \    \"\"\")\n    # 100M rows scanned, 5-table JOIN, 45 seconds\n    # 50 concurrent dashboard users = 50 * 45s = 2,250\
+    \ seconds of DB CPU\n    # Database CPU at 100% — write operations start queuing\n    # User experience: \"Loading...\"\
+    \ spinner for 45 seconds → user closes tab\n"
+  sources: ["https://martinfowler.com/articles/data-monolith-to-mesh.html"]
+  when_applies: "When querying denormalized read models from event-sourced or CQRS write models"
+- id: CR-ARCH-DPT-001
+  text: Data Partitioning — Split large tables into smaller, manageable partitions based on a key (time, geography, tenant).
+    Queries that include the partition key scan only relevant partitions.
+  why: A 2-billion-row events table takes 120 seconds to query even with indexes. Inserting new rows contends with readers.
+    Archiving old data requires DELETE operations that lock the table for hours. Partitioning by time (monthly) means a query
+    for 'last 7 days' scans only the current partition (30M rows) instead of the full table (2B rows). Archiving old data
+    is a partition drop — instant, no lock, no IO. Insert performance improves because the active partition fits in memory.
+    PostgreSQL declarative partitioning handles this transparently.
+  how_to_do_right: '1. Choose partition key based on query patterns: time (most common), tenant_id (multi-tenant), geography.
+
+    2. Include partition key in all queries (WHERE created_at >= ...) for partition pruning.
+
+    3. Create new partitions ahead of time (automate with pg_partman or cron).
+
+    4. Archival: detach old partitions, move to cold storage (S3), or drop entirely.
+
+    5. Partition size: aim for 10M-100M rows per partition (small enough to scan quickly).
+
+    6. Index per partition: local indexes are smaller and faster than a global index on 2B rows.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    platform: [postgresql, mysql, snowflake]
+  domains:
+    domain: [architecture, performance, databases]
+    concern: [data, engineering]
+  example_good: "# Time-based partitioning in PostgreSQL\nCREATE TABLE events (\n    id BIGSERIAL,\n    event_type TEXT NOT\
+    \ NULL,\n    payload JSONB NOT NULL,\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n) PARTITION BY RANGE (created_at);\n\
+    \n-- Monthly partitions\nCREATE TABLE events_2026_01 PARTITION OF events\n    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');\n\
+    CREATE TABLE events_2026_02 PARTITION OF events\n    FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');\n\n-- Query scans\
+    \ ONLY events_2026_02 (partition pruning)\nSELECT * FROM events\nWHERE created_at >= '2026-02-10' AND created_at < '2026-02-17';\n\
+    -- Explain shows: \"Scan on events_2026_02\" (30M rows, not 2B)\n\n-- Archive old data: instant, no lock\nALTER TABLE\
+    \ events DETACH PARTITION events_2025_01;\n-- Optional: move to cold storage, then DROP TABLE events_2025_01;\n"
+  example_bad: "# Single unpartitioned table — 2 billion rows\nCREATE TABLE events (\n    id BIGSERIAL PRIMARY KEY,\n    event_type\
+    \ TEXT,\n    payload JSONB,\n    created_at TIMESTAMPTZ DEFAULT NOW()\n);\n\n-- Query scans ALL 2 billion rows even for\
+    \ last 7 days\nSELECT * FROM events WHERE created_at >= NOW() - INTERVAL '7 days';\n-- Seq Scan: 2,000,000,000 rows, 120\
+    \ seconds\n-- Even with index: 120M rows in range, 30 seconds (random IO)\n\n-- Archiving requires DELETE — locks table\
+    \ for hours\nDELETE FROM events WHERE created_at < '2025-01-01';\n-- 1.5B rows deleted, 4 hours, table locked, all queries\
+    \ blocked\n-- VACUUM afterwards: another 2 hours\n-- Total maintenance window: 6 hours of degraded performance\n"
+  sources: ["https://www.datamesh-architecture.com/#data-product"]
+  when_applies: "When defining ownership and quality contracts for data products in a data mesh"

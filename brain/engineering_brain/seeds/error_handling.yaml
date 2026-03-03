@@ -1,0 +1,321 @@
+layer: patterns
+technology: General
+domain: reliability
+knowledge:
+- id: CR-ERR-BOUND-001
+  text: Catch exceptions at system boundaries (API handlers, message consumers, task runners) — never inside business logic.
+  why: Business logic should throw errors upward — it doesn't know the right recovery strategy. Only the boundary knows whether
+    to retry, return 500, send to DLQ, or log and continue.
+  how_to_do_right: try/except at the outermost handler (Flask route, Celery task, WebSocket handler). Business functions raise
+    specific exceptions. Boundary decides response.
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [flask, fastapi]
+  domains:
+    domain: [reliability, architecture]
+  example_good: "# Business logic — raises, doesn't catch\ndef transfer_funds(from_id, to_id, amount):\n    if amount <= 0:\n\
+    \        raise ValueError(\"Amount must be positive\")\n    sender = get_account(from_id)  # raises AccountNotFound\n\
+    \    if sender.balance < amount:\n        raise InsufficientFunds(sender.balance, amount)\n    # ... transfer logic\n\n\
+    # Boundary — catches and decides response\n@app.route(\"/transfer\", methods=[\"POST\"])\ndef handle_transfer():\n   \
+    \ try:\n        result = transfer_funds(data[\"from\"], data[\"to\"], data[\"amount\"])\n        return jsonify(result),\
+    \ 200\n    except (ValueError, InsufficientFunds) as e:\n        return jsonify({\"error\": str(e)}), 400\n    except\
+    \ AccountNotFound:\n        return jsonify({\"error\": \"Account not found\"}), 404\n    except Exception:\n        logger.exception(\"\
+    Unexpected error in transfer\")\n        return jsonify({\"error\": \"Internal error\"}), 500\n"
+  example_bad: "def transfer_funds(from_id, to_id, amount):\n    try:\n        # ... entire function wrapped in try/except\n\
+    \        sender = get_account(from_id)\n    except Exception:\n        return {\"error\": \"Something went wrong\"}  #\
+    \ Swallowed!\n"
+  sources: ["https://docs.python.org/3/tutorial/errors.html"]
+  when_applies: "When designing error handling strategy for API handlers, message consumers, or task runners"
+- id: CR-ERR-BOUND-002
+  text: Never use bare except or catch Exception without re-raising or logging.
+  why: Bare except catches SystemExit, KeyboardInterrupt, and MemoryError — you're hiding fatal errors. Catching Exception
+    without logging means bugs disappear silently.
+  how_to_do_right: Catch specific exceptions when you can handle them. If you must catch Exception, always log the traceback
+    and consider re-raising.
+  severity: critical
+  technologies:
+    lang: [python]
+  domains:
+    domain: [reliability, quality]
+    concern: [debugging]
+  example_good: "try:\n    result = external_api.call()\nexcept requests.Timeout:\n    logger.warning(\"API timeout, using\
+    \ cached value\")\n    result = cache.get(\"fallback\")\nexcept requests.RequestException:\n    logger.exception(\"API\
+    \ call failed\")\n    raise\n"
+  example_bad: "try:\n    result = external_api.call()\nexcept:  # Catches EVERYTHING — even Ctrl+C\n    pass   # Silent failure\
+    \ — bug is invisible\n"
+  sources: ["https://docs.python.org/3/library/exceptions.html#exception-hierarchy"]
+  when_applies: "When writing try/except blocks in Python, especially catching broad exception types"
+- id: CR-ERR-RETRY-001
+  text: Retries must use exponential backoff with jitter — never fixed-interval retries.
+  why: Fixed-interval retries create thundering herd — 1000 clients all retrying at exactly 5s intervals hammer the recovering
+    server. Exponential backoff + jitter spreads load over time.
+  how_to_do_right: Base delay × 2^attempt + random jitter. Cap at max_delay. Limit total attempts. Only retry transient errors
+    (timeouts, 503), not permanent ones (400, 404).
+  severity: high
+  technologies:
+    lang: [python, javascript]
+  domains:
+    domain: [reliability, performance, architecture, api]
+  example_good: "import random\nimport time\n\ndef retry_with_backoff(fn, max_retries=3, base_delay=1.0, max_delay=30.0):\n\
+    \    for attempt in range(max_retries):\n        try:\n            return fn()\n        except TransientError:\n     \
+    \       if attempt == max_retries - 1:\n                raise\n            delay = min(base_delay * (2 ** attempt), max_delay)\n\
+    \            jitter = random.uniform(0, delay * 0.3)\n            time.sleep(delay + jitter)\n"
+  example_bad: "for i in range(10):\n    try:\n        return api.call()\n    except Exception:\n        time.sleep(5)  #\
+    \ Fixed interval, no jitter, catches ALL errors\n"
+  sources: ["https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/"]
+  when_applies: "When implementing retry logic for network calls, API requests, or any transient failure scenario"
+- id: CR-ERR-RETRY-002
+  text: Only retry idempotent operations and transient failures — never retry non-idempotent writes or permanent errors.
+  why: Retrying a non-idempotent POST can create duplicate records. Retrying a 400 Bad Request will never succeed — you're
+    just wasting resources and delaying the error response.
+  how_to_do_right: 'Classify errors: transient (timeout, 503, connection reset) → retry. Permanent (400, 401, 404, validation
+    error) → fail immediately. Non-idempotent writes → fail or use idempotency keys.'
+  severity: high
+  technologies:
+    lang: [python, javascript]
+  domains:
+    domain: [reliability, architecture, api]
+  example_good: "TRANSIENT_ERRORS = (requests.Timeout, requests.ConnectionError, HTTPError503)\nPERMANENT_ERRORS = (HTTPError400,\
+    \ HTTPError401, HTTPError404, ValidationError)\n\ntry:\n    response = api.call()\nexcept TRANSIENT_ERRORS:\n    return\
+    \ retry_with_backoff(api.call)  # Safe to retry\nexcept PERMANENT_ERRORS as e:\n    raise  # Will never succeed — fail\
+    \ fast\n"
+  example_bad: "# Retrying everything blindly\ntry:\n    response = api.call()\nexcept Exception:\n    time.sleep(1)\n    response = api.call()  # Retries 404, auth errors, validation errors — all hopeless\n"
+  sources: ["https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/"]
+  when_applies: "When adding retry logic to operations that modify state or when classifying errors as transient vs permanent"
+- id: CR-ERR-CIRCUIT-001
+  text: External service calls should use circuit breaker pattern — fail fast when the service is down.
+  why: Without circuit breaker, every request waits for timeout (30s) when a service is down. 100 concurrent requests × 30s
+    timeout = thread pool exhaustion. Circuit breaker fails instantly after detecting the outage.
+  how_to_do_right: Track failure count. After N consecutive failures, open the circuit (fail instantly for M seconds). After
+    M seconds, allow one probe request. If it succeeds, close circuit. If not, stay open.
+  severity: medium
+  technologies:
+    lang: [python, javascript]
+  domains:
+    domain: [reliability, architecture]
+  example_good: "class CircuitBreaker:\n    def __init__(self, failure_threshold=5, recovery_timeout=30):\n        self.failures\
+    \ = 0\n        self.threshold = failure_threshold\n        self.recovery_timeout = recovery_timeout\n        self.last_failure_time\
+    \ = 0\n        self.state = \"closed\"  # closed, open, half-open\n\n    def call(self, fn):\n        if self.state ==\
+    \ \"open\":\n            if time.time() - self.last_failure_time > self.recovery_timeout:\n                self.state\
+    \ = \"half-open\"\n            else:\n                raise CircuitOpenError(\"Service unavailable, circuit open\")\n\
+    \        try:\n            result = fn()\n            self._on_success()\n            return result\n        except TransientError:\n\
+    \            self._on_failure()\n            raise\n"
+  example_bad: "# No circuit breaker — every request waits for timeout\ndef call_service():\n    return requests.get(url, timeout=30)  # 100 threads × 30s = pool exhaustion\n"
+  sources: ["https://martinfowler.com/bliki/CircuitBreaker.html"]
+  when_applies: "When calling external services that may become slow or unresponsive under load"
+- id: CR-ERR-TIMEOUT-001
+  text: Every external call (HTTP, database, subprocess) must have an explicit timeout.
+  why: Without timeout, a hung external service blocks your thread/process forever. One slow endpoint can exhaust your entire
+    thread pool, taking down unrelated endpoints.
+  how_to_do_right: 'Set timeouts at call site: requests.get(url, timeout=10), asyncio.wait_for(coro, timeout=5), subprocess.run(cmd,
+    timeout=30). Use separate connect and read timeouts.'
+  severity: critical
+  technologies:
+    lang: [python, javascript]
+  domains:
+    domain: [reliability, performance]
+  example_good: '# HTTP — separate connect and read timeouts
+
+    response = requests.get(url, timeout=(3, 10))  # 3s connect, 10s read
+
+
+    # Subprocess — hard timeout
+
+    result = subprocess.run(cmd, timeout=30, capture_output=True)
+
+
+    # Async — wrapped with timeout
+
+    result = await asyncio.wait_for(slow_operation(), timeout=5.0)
+
+    '
+  example_bad: 'response = requests.get(url)  # No timeout — hangs forever if server is slow
+
+    result = subprocess.run(cmd)   # No timeout — process can run indefinitely
+
+    '
+  sources: ["https://docs.python.org/3/library/socket.html#socket.socket.settimeout"]
+  when_applies: "When making any external call including HTTP requests, database queries, or subprocess invocations"
+- id: CR-ERR-TIMEOUT-002
+  text: Timeout values should be configurable via environment variables, not hardcoded.
+  why: Optimal timeouts vary by environment (dev vs prod vs CI). A 30s timeout is fine for prod with fast networks but too
+    long for CI tests and too short for slow dev databases.
+  how_to_do_right: 'Use env vars with sensible defaults: int(os.getenv(''API_TIMEOUT'', ''10'')). Document expected ranges.
+    Group related timeouts.'
+  severity: medium
+  technologies:
+    lang: [python]
+  domains:
+    domain: [reliability, operations, devops]
+  example_good: 'API_TIMEOUT = int(os.getenv("API_TIMEOUT", "10"))
+
+    DB_TIMEOUT = int(os.getenv("DB_TIMEOUT", "5"))
+
+    SUBPROCESS_TIMEOUT = int(os.getenv("SUBPROCESS_TIMEOUT", "30"))
+
+
+    response = requests.get(url, timeout=API_TIMEOUT)
+
+    '
+  example_bad: "response = requests.get(url, timeout=10)  # Hardcoded — too long for CI, too short for slow dev DB\n"
+  sources: ["https://12factor.net/config"]
+  when_applies: "When configuring timeout values for services that run across different environments (dev, staging, prod)"
+- id: CR-ERR-STRUCT-001
+  text: API error responses must be structured JSON with error code, message, and details — never plain strings.
+  why: Plain text errors ('Something went wrong') are unparseable by frontends, untranslatable, and give no actionable information.
+    Structured errors enable programmatic handling, i18n, and debugging.
+  how_to_do_right: 'Return {error: {code: ''INSUFFICIENT_FUNDS'', message: ''human-readable'', details: {balance: 50, requested:
+    100}}}. Use consistent envelope. Include request_id for debugging.'
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [flask, fastapi]
+  domains:
+    domain: [architecture, api, ui, reliability]
+    concern: [frontend]
+  example_good: "@app.errorhandler(InsufficientFunds)\ndef handle_insufficient_funds(e):\n    return jsonify({\n        \"\
+    error\": {\n            \"code\": \"INSUFFICIENT_FUNDS\",\n            \"message\": f\"Balance ({e.balance}) is less than\
+    \ requested ({e.amount})\",\n            \"details\": {\"balance\": e.balance, \"requested\": e.amount},\n           \
+    \ \"request_id\": g.request_id,\n        }\n    }), 400\n"
+  example_bad: 'return "Error: not enough money", 400  # Unparseable, no details
+
+    '
+  sources: ["https://tools.ietf.org/html/rfc7807"]
+  when_applies: "When designing API error response formats for REST or GraphQL endpoints"
+- id: CR-ERR-STRUCT-002
+  text: Define a hierarchy of custom exception classes — one per error category, not one per error.
+  why: Too few exception types (just Exception) prevents specific handling. Too many (one per function) creates unmaintainable
+    code. One per category (AuthError, ValidationError, NotFoundError) is the sweet spot.
+  how_to_do_right: 'Base AppError with code+message. Subclasses per domain: AuthError, NotFoundError, ValidationError, ConflictError,
+    ExternalServiceError. Each maps to an HTTP status.'
+  severity: medium
+  technologies:
+    lang: [python]
+  domains:
+    domain: [architecture, reliability]
+  example_good: "class AppError(Exception):\n    status_code = 500\n    code = \"INTERNAL_ERROR\"\n    def __init__(self,\
+    \ message, details=None):\n        self.message = message\n        self.details = details or {}\n\nclass NotFoundError(AppError):\n\
+    \    status_code = 404\n    code = \"NOT_FOUND\"\n\nclass ValidationError(AppError):\n    status_code = 400\n    code\
+    \ = \"VALIDATION_ERROR\"\n\nclass AuthError(AppError):\n    status_code = 401\n    code = \"AUTH_REQUIRED\"\n"
+  example_bad: "# One exception per function — unmaintainable\nclass UserNotFoundError(Exception): pass\nclass UserInvalidEmailError(Exception): pass\nclass UserDuplicateError(Exception): pass  # 50 more...\n"
+  sources: ["https://docs.python.org/3/tutorial/errors.html#user-defined-exceptions"]
+  when_applies: "When designing exception hierarchies for application-level error handling"
+- id: CR-ERR-DEGRADE-001
+  text: Non-critical services should degrade gracefully — return cached/default values instead of failing.
+  why: If recommendations service is down, the product page should still work — just without recommendations. Failing the
+    entire page because of a non-critical sidebar is disproportionate.
+  how_to_do_right: 'Classify dependencies as critical (must work) vs non-critical (nice to have). Non-critical: try/except
+    → return fallback. Log degradation for monitoring. Show user a subtle indicator, not an error page.'
+  severity: high
+  technologies:
+    lang: [python, javascript]
+  domains:
+    domain: [reliability, architecture, ui]
+    concern: [frontend]
+  example_good: "def get_recommendations(user_id):\n    try:\n        return recommendation_service.get(user_id, timeout=2)\n\
+    \    except (Timeout, ServiceUnavailable):\n        logger.warning(\"Recommendations unavailable, using popular items\"\
+    )\n        return get_popular_items()  # Graceful fallback\n"
+  example_bad: "def get_product_page(product_id):\n    product = product_service.get(product_id)\n    recommendations = recommendation_service.get(product_id)  # If this fails, entire page 500s\n    analytics = analytics_service.track(product_id)  # Same — non-critical kills everything\n    return render(product, recommendations, analytics)\n"
+  sources: ["https://aws.amazon.com/builders-library/avoiding-fallback-in-distributed-systems/"]
+  when_applies: "When integrating non-critical services like recommendations, analytics, or feature flags into a main workflow"
+- id: CR-ERR-DEGRADE-002
+  text: Health check endpoints must distinguish between healthy, degraded, and unhealthy states.
+  why: Binary healthy/unhealthy misses the middle ground. A service with degraded recommendations but working core should
+    be marked degraded, not unhealthy — load balancers should keep sending traffic.
+  how_to_do_right: 'Return status: healthy/degraded/unhealthy. Include component checks. healthy = all critical deps up. degraded
+    = non-critical deps down. unhealthy = critical deps down.'
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [flask, fastapi]
+  domains:
+    domain: [reliability, operations, devops]
+  example_good: "@app.route(\"/health\")\ndef health():\n    checks = {\n        \"database\": check_db(),       # critical\n\
+    \        \"redis\": check_redis(),        # critical\n        \"recommendations\": check_recs(), # non-critical\n    }\n\
+    \    critical_ok = checks[\"database\"] and checks[\"redis\"]\n    all_ok = all(checks.values())\n    status = \"healthy\"\
+    \ if all_ok else (\"degraded\" if critical_ok else \"unhealthy\")\n    code = 200 if critical_ok else 503\n    return\
+    \ jsonify({\"status\": status, \"checks\": checks}), code\n"
+  example_bad: "@app.route(\"/health\")\ndef health():\n    try:\n        check_db()\n        check_redis()\n        check_recs()\n        return jsonify({\"status\": \"ok\"}), 200\n    except Exception:\n        return jsonify({\"status\": \"error\"}), 503  # Binary — no degraded state, no component detail\n"
+  sources: ["https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/"]
+  when_applies: "When implementing health check endpoints for services behind load balancers or orchestrators"
+- id: CR-ERR-LOG-001
+  text: Error logs must include context (request_id, user_id, input data) — not just the traceback.
+  why: A traceback says WHERE it failed but not WHY or FOR WHOM. Without context, reproducing the error requires guessing
+    which request triggered it among millions.
+  how_to_do_right: Use structured logging. Include request_id, user_id, relevant input data (sanitized), timestamp. Never
+    log passwords, tokens, or PII.
+  severity: high
+  technologies:
+    lang: [python]
+  domains:
+    domain: [reliability, quality, observability]
+    concern: [debugging]
+  example_good: "logger.exception(\n    \"Transfer failed\",\n    extra={\n        \"request_id\": g.request_id,\n       \
+    \ \"user_id\": current_user.id,\n        \"from_account\": from_id,\n        \"to_account\": to_id,\n        \"amount\"\
+    : amount,\n        # Never log: password, token, card_number\n    }\n)\n"
+  example_bad: 'logger.error("Error!")  # No context — useless for debugging
+
+    logger.error(f"Error: {e}")  # No traceback, no context
+
+    '
+  sources: ["https://docs.python.org/3/howto/logging-cookbook.html#using-a-context-manager-for-selective-logging"]
+  when_applies: "When adding error logging to production services, especially in request-handling or background-job contexts"
+- id: CR-ERR-LOG-002
+  text: Use appropriate log levels — ERROR for failures that need attention, WARNING for recoverable issues, INFO for normal
+    operations.
+  why: If everything is ERROR, nothing is ERROR. Alert fatigue causes real errors to be ignored. If transient retries are
+    ERROR, the on-call engineer gets paged for something that self-healed.
+  how_to_do_right: 'ERROR: something broke and needs human attention. WARNING: something unusual happened but was handled
+    (retry succeeded, fallback used). INFO: normal operations (request received, task completed). DEBUG: detailed internal
+    state.'
+  severity: medium
+  technologies:
+    lang: [python]
+  domains:
+    domain: [reliability, observability]
+  example_good: "# Correct log levels\nlogger.info(\"Request received\", extra={\"endpoint\": path})\nlogger.warning(\"Cache miss, falling back to DB\", extra={\"key\": cache_key})\nlogger.error(\"Payment failed after 3 retries\", extra={\"order_id\": oid, \"error\": str(e)})\nlogger.debug(\"Query plan: %s\", query.explain())\n"
+  example_bad: "# Everything is ERROR — alert fatigue guaranteed\nlogger.error(f\"User {uid} logged in\")  # This is INFO\nlogger.error(f\"Cache miss for {key}\")  # This is WARNING\nlogger.error(f\"Retry succeeded on attempt 2\")  # This is WARNING/INFO\nlogger.error(f\"DB query took 50ms\")  # This is DEBUG\n"
+  sources: ["https://docs.python.org/3/howto/logging.html#when-to-use-logging"]
+  when_applies: "When configuring log levels and alerting thresholds for application logging"
+- id: CR-ERR-PREVENT-001
+  text: Validate inputs at system boundaries — never trust external data.
+  why: External data (user input, API responses, file contents) can be anything — malformed, malicious, or simply wrong. Validating
+    at the boundary means your internal code can trust its inputs.
+  how_to_do_right: Use Pydantic models or JSON Schema at API boundaries. Validate type, range, format, length. Return 400
+    with specific field errors. Internal functions can skip validation.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [flask, fastapi, pydantic]
+  domains:
+    domain: [reliability, security, architecture, api]
+  example_good: "from pydantic import BaseModel, Field\n\nclass TransferRequest(BaseModel):\n    from_account: str = Field(min_length=1,\
+    \ max_length=50)\n    to_account: str = Field(min_length=1, max_length=50)\n    amount: float = Field(gt=0, le=1_000_000)\n\
+    \n@app.post(\"/transfer\")\ndef transfer(data: TransferRequest):  # Auto-validated\n    return transfer_funds(data.from_account,\
+    \ data.to_account, data.amount)\n"
+  example_bad: "@app.post(\"/transfer\")\ndef transfer():\n    data = request.json  # Could be None, could be anything\n \
+    \   transfer_funds(data[\"from\"], data[\"to\"], data[\"amount\"])  # KeyError? TypeError?\n"
+  sources: ["https://docs.pydantic.dev/latest/concepts/validators/"]
+  when_applies: "When handling user input, external API responses, or file uploads at system boundaries"
+- id: CR-ERR-PREVENT-002
+  text: Use guard clauses (early returns) instead of deeply nested if/else — fail fast on invalid state.
+  why: Deep nesting makes error paths hard to follow. Guard clauses make the happy path obvious — all error cases are handled
+    and returned early at the top of the function.
+  how_to_do_right: Check preconditions at the start of the function. Return/raise immediately for each invalid case. The main
+    logic is the last block, not nested inside 4 ifs.
+  severity: medium
+  technologies:
+    lang: [python, javascript]
+  domains:
+    domain: [architecture, reliability]
+  example_good: "def process_order(order):\n    if not order:\n        raise ValueError(\"Order is required\")\n    if order.status\
+    \ != \"pending\":\n        raise InvalidState(f\"Order is {order.status}, not pending\")\n    if not order.items:\n  \
+    \      raise ValueError(\"Order has no items\")\n    # Happy path — no nesting\n    total = sum(item.price for item in\
+    \ order.items)\n    order.status = \"processing\"\n    return charge_payment(order, total)\n"
+  example_bad: "def process_order(order):\n    if order:\n        if order.status == \"pending\":\n            if order.items:\n\
+    \                total = sum(item.price for item in order.items)\n                # ... deeply nested happy path\n   \
+    \         else:\n                return None  # What does None mean?\n        else:\n            return None\n    else:\n\
+    \        return None\n"
+  sources: ["https://refactoring.guru/replace-nested-conditional-with-guard-clauses"]
+  when_applies: "When writing functions with multiple preconditions or validation checks before the main logic"

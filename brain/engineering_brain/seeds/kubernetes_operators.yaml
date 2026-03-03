@@ -1,0 +1,529 @@
+layer: rules
+technology: Kubernetes
+domain: architecture
+knowledge:
+- id: CR-K8S-OPS-001
+  text: Custom Resource Definitions must have comprehensive OpenAPI v3 schema validation — never use x-kubernetes-preserve-unknown-fields.
+  why: Without schema validation, users can submit any YAML as your custom resource — typos, wrong types, missing required
+    fields all get accepted silently. Your controller then crashes or behaves unexpectedly when it encounters malformed input.
+    x-kubernetes-preserve-unknown-fields disables validation entirely, meaning anything goes. This is the CRD equivalent of
+    accepting raw user input without validation in a web app.
+  how_to_do_right: Define complete OpenAPI v3 schema in the CRD spec with types, required fields, enum values, patterns, min/max,
+    and descriptions. Use the status subresource for controller-managed state. Add structural schema markers (x-kubernetes-validations
+    for CEL-based validation in K8s 1.25+). Test with invalid inputs to verify rejection. Use controller-gen (kubebuilder)
+    to generate CRD schemas from Go struct tags.
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [architecture]
+  example_good: "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: databases.example.com\n\
+    spec:\n  group: example.com\n  names:\n    kind: Database\n    listKind: DatabaseList\n    plural: databases\n    singular:\
+    \ database\n    shortNames: [\"db\"]\n  scope: Namespaced\n  versions:\n    - name: v1alpha1\n      served: true\n   \
+    \   storage: true\n      schema:\n        openAPIV3Schema:\n          type: object\n          required: [\"spec\"]\n \
+    \         properties:\n            spec:\n              type: object\n              required: [\"engine\", \"version\"\
+    , \"storage\"]\n              properties:\n                engine:\n                  type: string\n                 \
+    \ enum: [\"postgres\", \"mysql\", \"redis\"]\n                version:\n                  type: string\n             \
+    \     pattern: \"^\\\\d+\\\\.\\\\d+$\"\n                storage:\n                  type: string\n                  pattern:\
+    \ \"^\\\\d+(Gi|Ti)$\"\n                replicas:\n                  type: integer\n                  minimum: 1\n    \
+    \              maximum: 7\n                  default: 1\n            status:\n              type: object\n           \
+    \   properties:\n                phase:\n                  type: string\n                  enum: [\"Pending\", \"Running\"\
+    , \"Failed\"]\n                message:\n                  type: string\n      subresources:\n        status: {}\n   \
+    \   additionalPrinterColumns:\n        - name: Engine\n          type: string\n          jsonPath: .spec.engine\n    \
+    \    - name: Status\n          type: string\n          jsonPath: .status.phase\n"
+  example_bad: "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nspec:\n  versions:\n    - name: v1\n\
+    \      schema:\n        openAPIV3Schema:\n          type: object\n          x-kubernetes-preserve-unknown-fields: true\n\
+    \          # Accepts ANY YAML — no validation at all\n          # Typos silently accepted, controller crashes on bad input\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definitions/#specifying-a-structural-schema"]
+- id: CR-K8S-OPS-002
+  text: CRDs must use versioning with conversion webhooks for breaking changes — never modify a served version's schema.
+  why: Modifying a CRD schema in a served version breaks existing resources in etcd — field removals cause data loss, type
+    changes cause deserialization errors, and renamed fields are silently ignored. Users with existing CRs find their resources
+    corrupted or rejected. Versioning (v1alpha1 -> v1beta1 -> v1) with conversion webhooks provides safe migration paths,
+    just like database schema migrations.
+  how_to_do_right: 'Start with v1alpha1 for experimental APIs. Promote to v1beta1 when API stabilizes. Promote to v1 for production
+    stability. Use conversion webhooks to transform between versions. Keep old versions served until all resources are migrated.
+    Use ''storage: true'' on exactly one version (the one etcd stores). Set deprecated: true and deprecation warning on old
+    versions.'
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [architecture]
+  example_good: "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nspec:\n  versions:\n    - name: v1\n\
+    \      served: true\n      storage: true         # Stored in etcd\n      schema:\n        openAPIV3Schema:\n         \
+    \ # New schema with breaking changes\n          type: object\n          properties:\n            spec:\n             \
+    \ properties:\n                replicas:\n                  type: integer   # Changed from string\n    - name: v1alpha1\n\
+    \      served: true             # Still serving for migration\n      storage: false\n      deprecated: true\n      deprecationWarning:\
+    \ \"v1alpha1 is deprecated, use v1\"\n      schema:\n        openAPIV3Schema:\n          type: object\n          properties:\n\
+    \            spec:\n              properties:\n                replicas:\n                  type: string  # Old schema\n\
+    \  conversion:\n    strategy: Webhook\n    webhook:\n      conversionReviewVersions: [\"v1\"]\n      clientConfig:\n \
+    \       service:\n          name: db-operator-webhook\n          namespace: db-operator\n          path: /convert\n"
+  example_bad: "# Modifying v1 schema directly — breaking existing resources\nversions:\n  - name: v1\n    served: true\n\
+    \    storage: true\n    schema:\n      openAPIV3Schema:\n        properties:\n          spec:\n            properties:\n\
+    \              replicas:\n                type: integer     # Was \"string\" — existing CRs break\n              # \"\
+    size\" field removed — existing CRs lose data\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definition-versioning/"]
+- id: CR-K8S-OPS-003
+  text: Controllers must be level-triggered (reconcile desired vs actual) — never edge-triggered (react to events).
+  why: Edge-triggered controllers react to specific events (create, update, delete) — if an event is missed (controller restart,
+    network partition, watch timeout), the system is permanently out of sync. Level-triggered controllers periodically reconcile
+    the desired state (CR spec) against the actual state (what's running), fixing any drift regardless of how it occurred.
+    This is the fundamental principle of Kubernetes controllers.
+  how_to_do_right: Implement a single Reconcile function that reads the CR spec, reads the actual state, computes the diff,
+    and applies changes to converge. The reconciler should be idempotent — calling it twice with the same state produces the
+    same result. Use informer/cache watches only as triggers to call Reconcile, not as the source of truth. Always re-read
+    the resource at the start of Reconcile. Requeue on transient errors.
+  severity: critical
+  technologies:
+    lang: [go]
+    platform: [kubernetes]
+  domains:
+    domain: [architecture]
+  example_good: "# Level-triggered reconciler (Go + controller-runtime)\n# func (r *DatabaseReconciler) Reconcile(ctx context.Context,\
+    \ req ctrl.Request) (ctrl.Result, error) {\n#     // 1. Read desired state from CR\n#     var db v1.Database\n#     if\
+    \ err := r.Get(ctx, req.NamespacedName, &db); err != nil {\n#         return ctrl.Result{}, client.IgnoreNotFound(err)\n\
+    #     }\n#     // 2. Read actual state\n#     actual, err := r.getActualState(ctx, &db)\n#     // 3. Compute diff and\
+    \ apply\n#     if actual.Replicas != db.Spec.Replicas {\n#         r.scaleStatefulSet(ctx, &db, db.Spec.Replicas)\n# \
+    \    }\n#     // 4. Update status\n#     db.Status.Phase = \"Running\"\n#     r.Status().Update(ctx, &db)\n#     // 5.\
+    \ Requeue for periodic sync\n#     return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil\n# }\n# Idempotent: same input\
+    \ always produces same output\n# Requeues: handles missed events\n# Reads actual state: not relying on event history\n\
+    apiVersion: example.com/v1\nkind: Database\nmetadata:\n  name: mydb\nspec:\n  replicas: 3\nstatus:\n  phase: Running\n\
+    \  currentReplicas: 3\n"
+  example_bad: '# Edge-triggered controller (wrong pattern)
+
+    # func (r *DatabaseReconciler) OnCreate(db *v1.Database) {
+
+    #     r.createStatefulSet(db)
+
+    # }
+
+    # func (r *DatabaseReconciler) OnUpdate(old, new *v1.Database) {
+
+    #     if old.Spec.Replicas != new.Spec.Replicas {
+
+    #         r.scaleStatefulSet(new)
+
+    #     }
+
+    # }
+
+    # Problem: If controller restarts and misses OnCreate,
+
+    # StatefulSet is never created. No way to recover.
+
+    '
+  when_applies: Any project using Kubernetes-orchestrated deployments or Go services and tools
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using Kubernetes or Go
+  sources: ["https://kubernetes.io/docs/concepts/architecture/controller/"]
+- id: CR-K8S-OPS-004
+  text: Controller reconciliation must be idempotent — applying the same state twice must produce the same result.
+  why: 'Reconcile is called multiple times for the same state: on requeue, on cache resync, on status updates, and on concurrent
+    events. If Reconcile creates a resource without checking if it exists first, you get duplicates. If it updates without
+    comparing, you get unnecessary writes that trigger more events (infinite loop). Non-idempotent controllers cause resource
+    duplication, flickering status, and API server load spikes.'
+  how_to_do_right: Always check if a resource exists before creating it (Get then Create, not just Create). Use server-side
+    apply (SSA) for updates — it handles conflict detection. Compare desired state with actual state before updating. Use
+    hash annotations to detect when the desired spec has changed. Handle 'already exists' and 'not found' errors gracefully.
+    Use GenerateName only for truly unique resources.
+  severity: critical
+  technologies:
+    lang: [go]
+    platform: [kubernetes]
+  domains:
+    domain: [architecture]
+  example_good: "# Idempotent resource creation pattern\n# func (r *Reconciler) ensureStatefulSet(ctx context.Context, db\
+    \ *v1.Database) error {\n#     desired := r.buildStatefulSet(db)\n#     existing := &appsv1.StatefulSet{}\n#     err :=\
+    \ r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)\n#     if err != nil {\n\
+    #         if apierrors.IsNotFound(err) {\n#             return r.Create(ctx, desired)  // Create only if not found\n#\
+    \         }\n#         return err\n#     }\n#     // Compare and update only if different\n#     if !reflect.DeepEqual(existing.Spec,\
+    \ desired.Spec) {\n#         existing.Spec = desired.Spec\n#         return r.Update(ctx, existing)\n#     }\n#     return\
+    \ nil  // Already in desired state — no-op\n# }\n#\n# Called 100 times = same result as called once\napiVersion: example.com/v1\n\
+    kind: Database\nmetadata:\n  name: mydb\n"
+  example_bad: '# Non-idempotent: creates duplicate on every reconcile
+
+    # func (r *Reconciler) Reconcile(ctx, req) {
+
+    #     r.Create(ctx, buildStatefulSet(db))  // No existence check!
+
+    #     // Result: multiple StatefulSets created
+
+    # }
+
+    '
+  when_applies: Any project using Kubernetes-orchestrated deployments or Go services and tools
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using Kubernetes or Go
+  sources: ["https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/#custom-controllers"]
+- id: CR-K8S-OPS-005
+  text: 'Choose the right Operator SDK type: Go for complex logic, Helm for existing charts, Ansible for simple orchestration.'
+  why: Building an operator from scratch in Go is powerful but requires deep Kubernetes API knowledge and 2-3 months of development
+    for a production-quality operator. Helm operators wrap existing Helm charts with zero Go code — if your chart already
+    works, use it. Ansible operators are good for teams with Ansible expertise who need simple create/update/delete lifecycle.
+    Choosing wrong means either over-engineering (Go for a simple chart) or hitting limitations (Helm for complex reconciliation).
+  how_to_do_right: 'Use Go operator for: custom reconciliation logic, complex status management, multi-resource coordination,
+    performance-critical paths. Use Helm operator for: wrapping existing Helm charts as operators with minimal customization.
+    Use Ansible operator for: teams with Ansible expertise, simple lifecycle management, when you need Ansible modules for
+    external resources. Start with Helm/Ansible and migrate to Go only if you hit limitations.'
+  severity: medium
+  technologies:
+    lang: [go]
+    library: [operator sdk]
+    platform: [kubernetes, helm, ansible]
+  domains:
+    domain: [architecture]
+  example_good: "# Go operator — complex database lifecycle\n# operator-sdk init --domain example.com --repo github.com/org/db-operator\n\
+    # operator-sdk create api --group db --version v1 --kind Database --resource --controller\n#\n# Handles: provisioning,\
+    \ scaling, backup, restore, failover,\n# minor version upgrades, connection pooling, monitoring\n#\n# Helm operator —\
+    \ wrapping existing Redis chart\n# operator-sdk init --plugins helm --domain example.com\n# operator-sdk create api --group\
+    \ cache --version v1 --kind Redis --helm-chart bitnami/redis\n#\n# Done! Redis CR deploys the Helm chart\napiVersion:\
+    \ cache.example.com/v1\nkind: Redis\nmetadata:\n  name: my-redis\nspec:\n  architecture: replication\n  replica:\n   \
+    \ replicaCount: 3\n"
+  example_bad: '# Writing a Go operator to deploy a Helm chart unchanged
+
+    # 3 months of development for what operator-sdk does in 5 minutes
+
+    # Or: Helm operator for complex database with custom failover logic
+
+    # Hits limitations immediately — can''t implement reconciliation
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments, Operator SDK, Go services and tools, or Helm chart deployments
+  when_not_applies: small scripts under 100 lines, single-purpose utilities
+  sources: ["https://sdk.operatorframework.io/docs/overview/"]
+- id: CR-K8S-OPS-006
+  text: Use finalizers for cleanup logic — but always implement deadlock prevention with timeout.
+  why: When a CR is deleted, Kubernetes sets deletionTimestamp but doesn't actually delete until all finalizers are removed.
+    If your finalizer fails (external API down, bug in cleanup code), the CR is stuck in Terminating forever — it blocks namespace
+    deletion, prevents resource recreation, and confuses users. This is the most common operator bug and can make entire namespaces
+    undeletable.
+  how_to_do_right: 'Add the finalizer only when external resources exist. In the finalizer handler: attempt cleanup with a
+    timeout, log failures, and remove the finalizer even if cleanup partially fails (orphaned external resources are better
+    than stuck CRs). Use a background goroutine for long cleanups with a maximum deadline. Document how to manually remove
+    a stuck finalizer with kubectl patch.'
+  severity: high
+  technologies:
+    lang: [go]
+    platform: [kubernetes]
+  domains:
+    domain: [architecture]
+  example_good: "# Finalizer pattern with timeout\n# const finalizerName = \"db.example.com/cleanup\"\n#\n# func (r *Reconciler)\
+    \ Reconcile(ctx context.Context, req ctrl.Request) {\n#     var db v1.Database\n#     r.Get(ctx, req.NamespacedName, &db)\n\
+    #\n#     if db.DeletionTimestamp != nil {\n#         // Being deleted — run cleanup\n#         if containsString(db.Finalizers,\
+    \ finalizerName) {\n#             ctx, cancel := context.WithTimeout(ctx, 30*time.Second)\n#             defer cancel()\n\
+    #             if err := r.cleanupExternalResources(ctx, &db); err != nil {\n#                 log.Error(err, \"cleanup\
+    \ failed, removing finalizer anyway\")\n#             }\n#             // ALWAYS remove finalizer to prevent stuck resources\n\
+    #             db.Finalizers = removeString(db.Finalizers, finalizerName)\n#             r.Update(ctx, &db)\n#        \
+    \ }\n#         return\n#     }\n#     // Not being deleted — ensure finalizer exists\n#     if !containsString(db.Finalizers,\
+    \ finalizerName) {\n#         db.Finalizers = append(db.Finalizers, finalizerName)\n#         r.Update(ctx, &db)\n#  \
+    \   }\n# }\napiVersion: example.com/v1\nkind: Database\nmetadata:\n  finalizers:\n    - db.example.com/cleanup\n"
+  example_bad: '# Finalizer without timeout — stuck forever if cleanup fails
+
+    # if err := r.cleanupExternalResources(ctx, &db); err != nil {
+
+    #     return ctrl.Result{}, err  // Retries forever, CR stuck in Terminating
+
+    # }
+
+    # r.removeFinalizer(&db)  // Never reached if cleanup fails
+
+    #
+
+    # Manual fix required:
+
+    # kubectl patch database mydb -p ''{"metadata":{"finalizers":null}}'' --type=merge
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments or Go services and tools
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using Kubernetes or Go
+  sources: ["https://kubernetes.io/docs/concepts/workloads/controllers/garbage-collection/#owners-dependents"]
+- id: CR-K8S-OPS-007
+  text: Set owner references on all resources created by your operator for automatic garbage collection.
+  why: 'Without owner references, deleting a CR leaves behind orphaned resources (StatefulSets, Services, ConfigMaps, PVCs)
+    that consume cluster resources, confuse operators, and require manual cleanup. Owner references tell Kubernetes to automatically
+    delete child resources when the parent is deleted (cascading delete). This is the #1 source of resource leaks in Kubernetes
+    clusters.'
+  how_to_do_right: 'Use controllerutil.SetControllerReference (controller-runtime) to set the owner reference when creating
+    child resources. This sets: ownerReferences with controller=true and blockOwnerDeletion=true. Only one controller owner
+    is allowed per resource. For cross-namespace ownership (not supported by Kubernetes), use finalizers instead. Verify with
+    ''kubectl get <resource> -o json | jq .metadata.ownerReferences''.'
+  severity: high
+  technologies:
+    lang: [go]
+    platform: [kubernetes]
+  domains:
+    domain: [architecture]
+  example_good: "# Setting owner reference (Go + controller-runtime)\n# func (r *Reconciler) createStatefulSet(ctx context.Context,\
+    \ db *v1.Database) error {\n#     sts := &appsv1.StatefulSet{\n#         ObjectMeta: metav1.ObjectMeta{\n#           \
+    \  Name:      db.Name,\n#             Namespace: db.Namespace,\n#         },\n#         Spec: buildStatefulSetSpec(db),\n\
+    #     }\n#     // Set owner reference — auto-cleanup on CR deletion\n#     if err := controllerutil.SetControllerReference(db,\
+    \ sts, r.Scheme); err != nil {\n#         return err\n#     }\n#     return r.Create(ctx, sts)\n# }\n\n# Result: StatefulSet\
+    \ has ownerReference pointing to Database CR\n# When Database CR is deleted, StatefulSet is garbage collected\napiVersion:\
+    \ apps/v1\nkind: StatefulSet\nmetadata:\n  ownerReferences:\n    - apiVersion: example.com/v1\n      kind: Database\n\
+    \      name: mydb\n      uid: abc-123\n      controller: true\n      blockOwnerDeletion: true\n"
+  example_bad: '# No owner reference — orphaned on CR deletion
+
+    # func (r *Reconciler) createStatefulSet(ctx, db) {
+
+    #     sts := buildStatefulSet(db)
+
+    #     r.Create(ctx, sts)  // No SetControllerReference!
+
+    # }
+
+    # Delete Database CR → StatefulSet remains running
+
+    # Months later: "what is this StatefulSet? who owns it?"
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments or Go services and tools
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using Kubernetes or Go
+  sources: ["https://kubernetes.io/docs/concepts/workloads/controllers/garbage-collection/#ownership-and-finalizers"]
+- id: CR-K8S-OPS-008
+  text: Enable leader election for operator deployments with multiple replicas.
+  why: Running multiple replicas of a controller without leader election means all replicas reconcile simultaneously — creating
+    duplicate resources, conflicting updates, and race conditions. But a single replica means zero availability during upgrades
+    or pod evictions. Leader election ensures only one replica is active (the leader) while others are on standby, providing
+    HA without the coordination problems.
+  how_to_do_right: 'Use the built-in leader election in controller-runtime (LeaderElection: true in manager options). Set
+    LeaseDuration, RenewDeadline, and RetryPeriod appropriately (defaults are usually fine). Deploy with 2 replicas. The leader
+    acquires a Lease (or ConfigMap) lock. On leader failure, a standby takes over within LeaseDuration. Set RBAC to allow
+    the operator to create/update Leases.'
+  severity: high
+  technologies:
+    lang: [go]
+    platform: [kubernetes]
+  domains:
+    domain: [architecture, reliability]
+  example_good: "# Manager with leader election (Go + controller-runtime)\n# mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(),\
+    \ ctrl.Options{\n#     LeaderElection:          true,\n#     LeaderElectionID:        \"db-operator-leader\",\n#     LeaderElectionNamespace:\
+    \ \"db-operator-system\",\n#     LeaseDuration:          15 * time.Second,\n#     RenewDeadline:          10 * time.Second,\n\
+    #     RetryPeriod:            2 * time.Second,\n# })\n\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: db-operator\n\
+    spec:\n  replicas: 2    # HA — one leader, one standby\n  template:\n    spec:\n      containers:\n        - name: operator\n\
+    \          args: [\"--leader-elect=true\"]\n"
+  example_bad: "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: db-operator\nspec:\n  replicas: 2\n  template:\n\
+    \    spec:\n      containers:\n        - name: operator\n          # No leader election — both replicas reconcile\n  \
+    \        # Duplicate resources, conflicting updates, race conditions\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments or Go services and tools
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using Kubernetes or Go
+  sources: ["https://kubernetes.io/docs/concepts/architecture/leases/"]
+- id: CR-K8S-OPS-009
+  text: Use established operators for common infrastructure — do not build custom operators for solved problems.
+  why: Building a PostgreSQL operator from scratch takes 6-12 months of engineering time and results in an operator with fewer
+    features, less testing, and more bugs than CloudNativePG (which has thousands of production deployments). Custom operators
+    for common infrastructure are technical debt — you must maintain them forever, handle every edge case, and keep up with
+    upstream changes. Use proven operators and focus your engineering on unique business logic.
+  how_to_do_right: 'For PostgreSQL: CloudNativePG or Zalando postgres-operator. For TLS: cert-manager. For GitOps: ArgoCD
+    or FluxCD. For monitoring: Prometheus Operator (kube-prometheus-stack). For Kafka: Strimzi. For Redis: Redis Operator
+    (Spotahome) or Redis Enterprise Operator. Evaluate operators on: maintenance activity, community size, CRD stability,
+    documentation quality. Check OperatorHub.io for certified operators.'
+  severity: high
+  technologies:
+    library: [cloudnativepg]
+    platform: [kubernetes, certmanager, argocd]
+  domains:
+    domain: [architecture, operations, devops]
+  example_good: "# CloudNativePG — production PostgreSQL in 10 lines\napiVersion: postgresql.cnpg.io/v1\nkind: Cluster\nmetadata:\n\
+    \  name: postgres\nspec:\n  instances: 3\n  storage:\n    size: 100Gi\n    storageClass: fast-ssd\n  postgresql:\n   \
+    \ parameters:\n      shared_buffers: \"256MB\"\n      max_connections: \"200\"\n  backup:\n    barmanObjectStore:\n  \
+    \    destinationPath: s3://backups/postgres\n---\n# cert-manager — automatic TLS in 5 lines\napiVersion: cert-manager.io/v1\n\
+    kind: ClusterIssuer\nmetadata:\n  name: letsencrypt-prod\nspec:\n  acme:\n    server: https://acme-v02.api.letsencrypt.org/directory\n\
+    \    email: admin@example.com\n    privateKeySecretRef:\n      name: letsencrypt-prod\n    solvers:\n      - http01:\n\
+    \          ingress:\n            ingressClassName: nginx\n"
+  example_bad: '# Building a custom PostgreSQL operator from scratch
+
+    # 6 months later: handles create/delete but not:
+
+    # - Automated failover
+
+    # - Point-in-time recovery
+
+    # - Backup to S3
+
+    # - Connection pooling
+
+    # - Monitoring integration
+
+    # - Rolling upgrades
+
+    # CloudNativePG does all of this out of the box
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments, CloudNativePG, cert-manager, or ArgoCD
+  when_not_applies: small scripts under 100 lines, single-purpose utilities
+  sources: ["https://kubernetes.io/docs/concepts/extend-kubernetes/operator/", "https://operatorhub.io/"]
+- id: CR-K8S-OPS-010
+  text: Test operators with envtest for unit tests and kind/k3s for integration tests — never test only with mocks.
+  why: 'Mocking the Kubernetes API hides real-world issues: API version differences, field validation, status subresource
+    behavior, finalizer timing, and admission webhook interactions. envtest provides a real API server without a full cluster
+    — fast enough for unit tests. kind/k3s provide a full cluster in containers — realistic enough for integration tests.
+    Without real API testing, your operator works in tests but fails in production.'
+  how_to_do_right: 'Use envtest (controller-runtime) for: reconciler unit tests, webhook tests, RBAC verification. Use kind/k3s
+    for: end-to-end tests, upgrade tests, multi-resource scenarios, chaos testing. Test the full lifecycle: create, update,
+    scale, backup, restore, delete. Test error scenarios: external API failures, timeout, invalid CR, concurrent modifications.
+    Run in CI with GitHub Actions or similar.'
+  severity: medium
+  technologies:
+    lang: [go]
+    library: [envtest, kind]
+    platform: [kubernetes]
+  domains:
+    domain: [architecture, testing]
+  example_good: "# envtest setup for operator tests (Go)\n# var testEnv *envtest.Environment\n#\n# func TestMain(m *testing.M)\
+    \ {\n#     testEnv = &envtest.Environment{\n#         CRDDirectoryPaths: []string{filepath.Join(\"..\", \"config\", \"\
+    crd\", \"bases\")},\n#     }\n#     cfg, _ := testEnv.Start()\n#     k8sClient, _ := client.New(cfg, client.Options{})\n\
+    #     // Run tests with real API server\n#     code := m.Run()\n#     testEnv.Stop()\n#     os.Exit(code)\n# }\n#\n# func\
+    \ TestDatabaseReconciler(t *testing.T) {\n#     db := &v1.Database{Spec: v1.DatabaseSpec{Engine: \"postgres\", Replicas:\
+    \ 3}}\n#     k8sClient.Create(ctx, db)\n#     // Wait for reconciliation\n#     Eventually(func() string {\n#        \
+    \ k8sClient.Get(ctx, key, db)\n#         return db.Status.Phase\n#     }).Should(Equal(\"Running\"))\n# }\n\n# kind cluster\
+    \ for integration tests\n# kind create cluster --config kind-config.yaml\n# make deploy IMG=operator:test\n# kubectl apply\
+    \ -f test/e2e/fixtures/\n# go test ./test/e2e/ -v\napiVersion: kind.x-k8s.io/v1alpha4\nkind: Cluster\nnodes:\n  - role:\
+    \ control-plane\n  - role: worker\n  - role: worker\n"
+  example_bad: '# Only mock tests — miss real API behavior
+
+    # func TestReconcile(t *testing.T) {
+
+    #     mockClient := &MockClient{}
+
+    #     mockClient.On("Get", mock.Anything).Return(nil)
+
+    #     mockClient.On("Create", mock.Anything).Return(nil)
+
+    #     // Passes in test, fails in production because:
+
+    #     // - Status subresource requires separate Update call
+
+    #     // - Finalizer timing is different
+
+    #     // - Field validation rejects the resource
+
+    # }
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments, Go services and tools, envtest, or kind
+  when_not_applies: small scripts under 100 lines, single-purpose utilities
+  sources: ["https://book.kubebuilder.io/reference/envtest"]
+- id: CR-K8S-OPS-011
+  text: Operator upgrades must be backward compatible — never change CR schemas or behavior in minor versions.
+  why: 'Users have existing CRs running in production. A non-backward-compatible operator upgrade can: break existing resources
+    (schema change), cause data loss (behavior change), or crash the controller (API mismatch). This is equivalent to a database
+    migration that drops tables — except it happens automatically on operator upgrade. Operators must follow the same compatibility
+    guarantees as Kubernetes itself.'
+  how_to_do_right: 'Follow semantic versioning strictly: patch (bug fixes), minor (new features, backward compatible), major
+    (breaking changes with migration guide). Add new optional fields with defaults. Never remove fields — deprecate them first.
+    Test upgrade path from N-1 to N. Provide migration documentation for major versions. Use conversion webhooks for CRD version
+    changes. Include upgrade tests in CI.'
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [architecture]
+  example_good: "# v1.2.0 -> v1.3.0: New optional field with default\napiVersion: example.com/v1\nkind: Database\nspec:\n\
+    \  engine: postgres\n  replicas: 3\n  # New in v1.3.0 — optional with default\n  connectionPooling:\n    enabled: true\
+    \    # default: true\n    maxConnections: 100\n  # Existing CRs without connectionPooling work fine\n  # Controller uses\
+    \ default values\n"
+  example_bad: "# v1.2.0 -> v1.3.0: Breaking change!\n# \"replicas\" renamed to \"instanceCount\"\n# Existing CRs with \"\
+    replicas\" field silently ignored\n# All databases scale to default 1 replica\napiVersion: example.com/v1\nkind: Database\n\
+    spec:\n  engine: postgres\n  instanceCount: 3   # Was \"replicas\" — existing CRs break\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/#advanced-features-and-flexibility"]
+- id: CR-K8S-OPS-012
+  text: 'Admission webhooks must have failurePolicy: Fail for security and Ignore for non-critical validation.'
+  why: 'failurePolicy determines what happens when the webhook is unreachable. With Fail (default): if the webhook pod is
+    down, ALL matched API requests are rejected — including deployments, scaling, and even kubectl operations. This can lock
+    you out of your cluster. With Ignore: webhook failures are silently skipped — resources are created without validation.
+    Choose based on the criticality of your validation.'
+  how_to_do_right: 'Use failurePolicy: Fail for: security policies (image validation, RBAC enforcement, secret scanning).
+    Use failurePolicy: Ignore for: optional mutations, non-critical defaults, advisory logging. Always set timeoutSeconds
+    to 5-10s (default 10s is often too long). Match only the specific resources you need (not *). Exclude kube-system and
+    the webhook''s own namespace to prevent self-deadlock. Use namespaceSelector to scope.'
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [architecture, security]
+  example_good: "apiVersion: admissionregistration.k8s.io/v1\nkind: ValidatingWebhookConfiguration\nmetadata:\n  name: security-policy\n\
+    webhooks:\n  - name: validate.security.example.com\n    failurePolicy: Fail        # Security must always run\n    timeoutSeconds:\
+    \ 5\n    namespaceSelector:\n      matchExpressions:\n        - key: kubernetes.io/metadata.name\n          operator:\
+    \ NotIn\n          values: [\"kube-system\", \"security-system\"]  # Avoid self-deadlock\n    rules:\n      - apiGroups:\
+    \ [\"\"]\n        apiVersions: [\"v1\"]\n        operations: [\"CREATE\", \"UPDATE\"]\n        resources: [\"pods\"]\n\
+    \        scope: Namespaced\n    clientConfig:\n      service:\n        name: security-webhook\n        namespace: security-system\n\
+    \        path: /validate\n"
+  example_bad: "webhooks:\n  - name: validate.example.com\n    failurePolicy: Fail\n    # No namespace exclusion — webhook\
+    \ validates its own pods\n    # Webhook pod restarts → can't create new pod → cluster locked\n    rules:\n      - apiGroups:\
+    \ [\"*\"]\n        resources: [\"*\"]       # Matches EVERYTHING — too broad\n        operations: [\"*\"]\n    timeoutSeconds:\
+    \ 30         # Too long — slows all API requests\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/"]
+- id: CR-K8S-OPS-013
+  text: Use the status subresource for controller-managed state and conditions for multi-phase status tracking.
+  why: Without the status subresource, any user with update permission on the CR can modify status, and any status update
+    triggers a full object update (including generation increment). The status subresource separates spec (user-managed) and
+    status (controller-managed) with different RBAC and update paths. Conditions provide a standardized way to track multiple
+    aspects of resource state (Ready, Progressing, Degraded) that tools like kubectl and UIs understand.
+  how_to_do_right: 'Enable the status subresource in CRD. Use status.conditions with type, status, reason, message, and lastTransitionTime.
+    Follow the metav1.Condition format for compatibility with kubectl and kstatus. Common conditions: Ready (overall health),
+    Progressing (in transition), Degraded (partial failure), Available (serving traffic). Update status with the Status().Update()
+    client.'
+  severity: medium
+  technologies:
+    lang: [go]
+    platform: [kubernetes]
+  domains:
+    domain: [architecture]
+  example_good: "# CRD with status subresource\n# subresources:\n#   status: {}\n\n# Status with conditions\napiVersion: example.com/v1\n\
+    kind: Database\nmetadata:\n  name: mydb\nstatus:\n  phase: Running\n  currentReplicas: 3\n  conditions:\n    - type: Ready\n\
+    \      status: \"True\"\n      reason: AllReplicasRunning\n      message: \"3/3 replicas are running and accepting connections\"\
+    \n      lastTransitionTime: \"2026-02-17T10:00:00Z\"\n    - type: BackupReady\n      status: \"True\"\n      reason: BackupScheduleActive\n\
+    \      message: \"Last backup: 2026-02-17T02:00:00Z, next: 2026-02-18T02:00:00Z\"\n      lastTransitionTime: \"2026-02-17T02:00:00Z\"\
+    \n"
+  example_bad: "# No status subresource — status updates trigger reconciliation\n# No conditions — single \"phase\" string\
+    \ is ambiguous\nstatus:\n  status: \"OK\"    # What does \"OK\" mean? Ready? Progressing?\n  # No lastTransitionTime —\
+    \ when did this happen?\n  # No reason — why is it \"OK\"?\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments or Go services and tools
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using Kubernetes or Go
+  sources: ["https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definitions/#status-subresource"]
+- id: CR-K8S-OPS-014
+  text: Watch only the resources your controller owns — use field selectors and label selectors to reduce cache size.
+  why: By default, controller-runtime caches ALL instances of every watched resource type cluster-wide. If your operator watches
+    Pods, it caches every pod in the cluster — potentially gigabytes of memory in large clusters. If it watches Secrets, it
+    caches all secrets (security risk and memory waste). Scoped watches reduce memory usage by 90%+ and improve reconciliation
+    performance.
+  how_to_do_right: Use Owns() instead of Watches() for resources your controller creates (automatically filters by owner reference).
+    Use label selectors in cache configuration to watch only your operator's resources. Use namespace-scoped cache for namespace-scoped
+    operators. For Secrets/ConfigMaps, use field selectors to cache only the specific ones you need. Monitor controller memory
+    usage and cache size.
+  severity: medium
+  technologies:
+    lang: [go]
+    platform: [kubernetes]
+  domains:
+    domain: [architecture, performance]
+  example_good: "# Scoped controller setup (Go + controller-runtime)\n# ctrl.NewControllerManagedBy(mgr).\n#     For(&v1.Database{}).\n\
+    #     Owns(&appsv1.StatefulSet{}).     // Only watches owned STS\n#     Owns(&corev1.Service{}).          // Only watches\
+    \ owned Services\n#     WithEventFilter(predicate.GenerationChangedPredicate{}).\n#     Complete(r)\n\n# Namespace-scoped\
+    \ cache\n# mgr, _ := ctrl.NewManager(cfg, ctrl.Options{\n#     Cache: cache.Options{\n#         DefaultNamespaces: map[string]cache.Config{\n\
+    #             \"production\": {},\n#             \"staging\": {},\n#         },\n#     },\n# })\napiVersion: apps/v1\n\
+    kind: Deployment\nmetadata:\n  name: db-operator\nspec:\n  template:\n    spec:\n      containers:\n        - name: operator\n\
+    \          resources:\n            requests:\n              memory: \"128Mi\"   # Small cache footprint\n"
+  example_bad: '# Watches ALL pods cluster-wide
+
+    # ctrl.NewControllerManagedBy(mgr).
+
+    #     For(&v1.Database{}).
+
+    #     Watches(&corev1.Pod{}, handler.EnqueueRequestForOwner(...)).
+
+    #     // Caches every pod in the cluster — gigabytes of memory
+
+    #     // In a 5000-pod cluster: 2-4GB RAM just for pod cache
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments or Go services and tools
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using Kubernetes or Go
+  sources: ["https://book.kubebuilder.io/reference/watching-resources"]

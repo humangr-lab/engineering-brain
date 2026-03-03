@@ -1,0 +1,1318 @@
+layer: rules
+domain: api_design
+knowledge:
+- id: GQL-001
+  text: Use Strawberry for new Python 3.10+ GraphQL APIs — it is the only code-first framework with native type safety, dataclass integration, and active maintenance. Avoid Graphene (legacy, poor typing) and Ariadne (schema-first, loses Python type safety).
+  why: >
+    Strawberry leverages Python type hints and dataclasses to generate the GraphQL schema at runtime, meaning your
+    Python types ARE the schema — no separate SDL files to keep in sync, no string-based resolver registration.
+    Graphene (the historically dominant Python GraphQL library) uses a custom metaclass-based type system that
+    predates Python 3.10 typing features, has poor IDE support, and its maintainer activity has slowed significantly.
+    Ariadne is schema-first (you write SDL then bind resolvers), which is fine for JavaScript but loses the
+    compile-time type safety that makes Python 3.10+ powerful. Strawberry supports ASGI natively, integrates with
+    FastAPI/Django/Flask, has built-in federation support, and is the only Python GraphQL framework with first-class
+    Pydantic v2 integration.
+  how_to_do_right: |
+    1. Install strawberry-graphql with your framework integration: pip install 'strawberry-graphql[fastapi]'
+    2. Define types as Python dataclasses with strawberry.type decorator — they become GraphQL types automatically
+    3. Use strawberry.input for input types (mutations), strawberry.enum for enums
+    4. Define Query/Mutation/Subscription as decorated classes with resolver methods
+    5. Use strawberry.Schema(query=Query, mutation=Mutation) to create the schema
+    6. Mount on FastAPI with strawberry.fastapi.GraphQLRouter
+    7. Use strawberry.experimental.pydantic to convert existing Pydantic models
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+    library: [strawberry-graphql]
+  domains:
+    domain: [api_design, architecture]
+    concern: [backend, graphql]
+  example_good: |
+    import strawberry
+    from strawberry.fastapi import GraphQLRouter
+    from fastapi import FastAPI
+    from datetime import datetime
+
+    @strawberry.type
+    class User:
+        id: strawberry.ID
+        name: str
+        email: str
+        created_at: datetime
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        async def user(self, id: strawberry.ID) -> User | None:
+            return await UserRepository.get_by_id(id)
+
+        @strawberry.field
+        async def users(self, limit: int = 10) -> list[User]:
+            return await UserRepository.list(limit=limit)
+
+    @strawberry.input
+    class CreateUserInput:
+        name: str
+        email: str
+
+    @strawberry.type
+    class Mutation:
+        @strawberry.mutation
+        async def create_user(self, input: CreateUserInput) -> User:
+            return await UserRepository.create(name=input.name, email=input.email)
+
+    schema = strawberry.Schema(query=Query, mutation=Mutation)
+    app = FastAPI()
+    app.include_router(GraphQLRouter(schema), prefix="/graphql")
+  example_bad: |
+    # Graphene — custom metaclasses, no native type hints, poor IDE support
+    import graphene
+
+    class UserType(graphene.ObjectType):
+        class Meta:
+            interfaces = (graphene.relay.Node,)
+        name = graphene.String()  # Not a real Python type hint
+        email = graphene.String()
+
+    class Query(graphene.ObjectType):
+        user = graphene.Field(UserType, id=graphene.ID(required=True))
+
+        def resolve_user(self, info, id):  # No type safety on return
+            return get_user(id)  # Could return anything — no validation
+
+    # Ariadne — schema-first, SDL string separate from Python code
+    from ariadne import QueryType, make_executable_schema
+    type_defs = """
+        type User { id: ID!, name: String!, email: String! }
+        type Query { user(id: ID!): User }
+    """
+    query = QueryType()
+
+    @query.field("user")
+    def resolve_user(_, info, id):  # No type hints, no validation
+        return get_user(id)
+  when_applies: Any new Python API project that needs GraphQL, especially with Python 3.10+ and FastAPI
+  sources:
+    - "https://strawberry.rocks/docs"
+    - "https://strawberry.rocks/docs/integrations/fastapi"
+    - "https://github.com/strawberry-graphql/strawberry"
+
+- id: GQL-002
+  text: Use the DataLoader pattern to eliminate N+1 queries in GraphQL resolvers. Every relationship resolver that hits a database or external service MUST use a DataLoader — batch multiple individual lookups into a single query per request cycle.
+  why: >
+    The N+1 problem is GraphQL's most critical performance pitfall. When a query requests a list of 50 users
+    with their posts, a naive resolver calls get_posts(user_id) 50 times — 1 query for users + 50 queries for
+    posts = 51 database round-trips. DataLoader solves this by collecting all requested keys within a single
+    event loop tick, then executing one batched query: SELECT * FROM posts WHERE user_id IN (1,2,3,...,50).
+    This reduces 51 queries to 2. DataLoader also caches within the request scope, so if the same user_id is
+    resolved multiple times in one query, the database is only hit once. Without DataLoader, GraphQL APIs
+    become unusably slow at any meaningful nesting depth. Facebook invented DataLoader specifically to solve
+    this problem at scale.
+  how_to_do_right: |
+    1. Create a DataLoader for each relationship that hits a data source (DB, API, cache)
+    2. The batch function receives a list of keys, returns results in the SAME ORDER as keys
+    3. Create DataLoader instances per-request (not global) to scope the cache to the request lifecycle
+    4. Pass DataLoaders via the GraphQL context (info.context) — Strawberry supports this natively
+    5. For database: use IN queries (SELECT * FROM posts WHERE user_id = ANY($1))
+    6. For external APIs: use batch endpoints or concurrent requests
+    7. Always return results aligned with input keys — use a dict to map, then preserve order
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [strawberry-graphql, aiodataloader, sqlalchemy]
+  domains:
+    domain: [api_design, performance]
+    concern: [backend, graphql, database]
+  example_good: |
+    import strawberry
+    from strawberry.dataloader import DataLoader
+    from sqlalchemy import select
+    from typing import Optional
+
+    # Batch function: receives list of user_ids, returns list of list[Post]
+    async def load_posts_by_user(user_ids: list[int]) -> list[list["Post"]]:
+        async with get_session() as session:
+            result = await session.execute(
+                select(PostModel).where(PostModel.user_id.in_(user_ids))
+            )
+            posts = result.scalars().all()
+            # Group by user_id, preserving input order
+            posts_by_user: dict[int, list[Post]] = {uid: [] for uid in user_ids}
+            for post in posts:
+                posts_by_user[post.user_id].append(Post.from_orm(post))
+            return [posts_by_user[uid] for uid in user_ids]
+
+    @strawberry.type
+    class User:
+        id: int
+        name: str
+
+        @strawberry.field
+        async def posts(self, info: strawberry.types.Info) -> list["Post"]:
+            return await info.context["post_loader"].load(self.id)
+
+    @strawberry.type
+    class Post:
+        id: int
+        title: str
+        user_id: int
+
+    # Create loaders per request via context_getter
+    async def get_context():
+        return {
+            "post_loader": DataLoader(load_fn=load_posts_by_user),
+        }
+
+    schema = strawberry.Schema(query=Query)
+    graphql_router = GraphQLRouter(schema, context_getter=get_context)
+  example_bad: |
+    @strawberry.type
+    class User:
+        id: int
+        name: str
+
+        @strawberry.field
+        async def posts(self) -> list["Post"]:
+            # N+1 PROBLEM: this runs once PER USER in the parent list
+            # Query: { users { posts { title } } } with 100 users = 101 DB queries
+            async with get_session() as session:
+                result = await session.execute(
+                    select(PostModel).where(PostModel.user_id == self.id)
+                )
+                return [Post.from_orm(p) for p in result.scalars().all()]
+    # With 100 users: 1 query for users + 100 individual queries for posts
+    # With 100 users each having comments: 1 + 100 + (100 * avg_posts) queries
+    # Exponential degradation with nesting depth
+  when_applies: Any GraphQL API with relationship resolvers that access databases, caches, or external services
+  sources:
+    - "https://strawberry.rocks/docs/guides/dataloaders"
+    - "https://github.com/graphql/dataloader"
+    - "https://engineering.fb.com/2015/09/14/core-infra/dataloader-source-code/"
+
+- id: GQL-003
+  text: Implement GraphQL subscriptions over WebSocket using the graphql-ws protocol (graphql-transport-ws). Never use the legacy subscriptions-transport-ws protocol — it is unmaintained and has known security issues.
+  why: >
+    GraphQL subscriptions enable real-time data push from server to client. The original subscriptions-transport-ws
+    protocol (by Apollo) has been deprecated since 2021 and has known issues: no proper connection acknowledgment
+    timeout, no ping/pong keepalive, and ambiguous close semantics. The newer graphql-ws protocol (graphql-transport-ws)
+    is the community standard, supported by Strawberry, Apollo Client 3+, urql, and all modern GraphQL clients.
+    It has proper lifecycle management (ConnectionInit -> ConnectionAck with timeout), built-in ping/pong,
+    and clear error semantics. Strawberry has built-in support for both ASGI WebSocket and the graphql-ws
+    subprotocol, making implementation straightforward.
+  how_to_do_right: |
+    1. Define subscription resolvers as async generators in Strawberry
+    2. Use the graphql-transport-ws subprotocol (Strawberry default)
+    3. Implement connection_init authentication — validate tokens before allowing subscriptions
+    4. Use an async broadcast mechanism (Redis pub/sub, asyncio.Queue, or broadcast library)
+    5. Handle client disconnection gracefully — clean up subscriptions and resources
+    6. Set connection timeout for ConnectionInit (default 5 seconds in Strawberry)
+    7. Implement keepalive ping/pong to detect stale connections
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi]
+    library: [strawberry-graphql, graphql-ws, broadcast]
+  domains:
+    domain: [api_design, realtime]
+    concern: [backend, graphql, websocket]
+  example_good: |
+    import strawberry
+    import asyncio
+    from typing import AsyncGenerator
+    from strawberry.fastapi import GraphQLRouter
+    from strawberry.subscriptions import GRAPHQL_TRANSPORT_WS_PROTOCOL
+
+    # In-memory pub/sub (use Redis pub/sub in production)
+    class PubSub:
+        def __init__(self):
+            self._subscribers: dict[str, list[asyncio.Queue]] = {}
+
+        async def subscribe(self, channel: str) -> AsyncGenerator[dict, None]:
+            queue: asyncio.Queue = asyncio.Queue()
+            self._subscribers.setdefault(channel, []).append(queue)
+            try:
+                while True:
+                    data = await queue.get()
+                    yield data
+            finally:
+                self._subscribers[channel].remove(queue)
+
+        async def publish(self, channel: str, data: dict):
+            for queue in self._subscribers.get(channel, []):
+                await queue.put(data)
+
+    pubsub = PubSub()
+
+    @strawberry.type
+    class Notification:
+        message: str
+        channel: str
+
+    @strawberry.type
+    class Subscription:
+        @strawberry.subscription
+        async def notifications(
+            self, info: strawberry.types.Info, channel: str
+        ) -> AsyncGenerator[Notification, None]:
+            # Auth check via context
+            user = info.context.get("user")
+            if not user:
+                raise PermissionError("Authentication required")
+            async for data in pubsub.subscribe(channel):
+                yield Notification(message=data["message"], channel=channel)
+
+    schema = strawberry.Schema(
+        query=Query,
+        mutation=Mutation,
+        subscription=Subscription,
+    )
+    graphql_router = GraphQLRouter(
+        schema,
+        subscription_protocols=[GRAPHQL_TRANSPORT_WS_PROTOCOL],
+    )
+  example_bad: |
+    # Using legacy subscriptions-transport-ws — DEPRECATED, security issues
+    # pip install graphql-ws  # Old package, not the new protocol
+    from graphql_ws import GeventSubscriptionServer  # Legacy, blocking
+
+    subscription_server = GeventSubscriptionServer(schema)
+
+    @app.route("/subscriptions")
+    def subscriptions():
+        # No auth on connection, no timeout, no keepalive
+        ws = get_websocket()
+        subscription_server.handle(ws)
+        return []
+
+    # Problems:
+    # 1. No ConnectionInit/ConnectionAck lifecycle
+    # 2. No ping/pong keepalive — stale connections consume resources
+    # 3. No connection timeout — unauthenticated WS stays open forever
+    # 4. Uses gevent (blocking) instead of asyncio
+    # 5. subscriptions-transport-ws protocol unmaintained since 2021
+  when_applies: Any GraphQL API requiring real-time data push (notifications, live updates, streaming results)
+  sources:
+    - "https://strawberry.rocks/docs/general/subscriptions"
+    - "https://github.com/enisdenjo/graphql-ws/blob/master/PROTOCOL.md"
+    - "https://the-guild.dev/blog/graphql-over-websockets"
+
+- id: GQL-004
+  text: Enforce query complexity analysis and depth limiting on every GraphQL endpoint to prevent recursive query DoS attacks. Without these limits, a single malicious query can exhaust server CPU and memory in seconds.
+  why: >
+    GraphQL's flexibility is a double-edged sword: clients can construct arbitrarily deep and complex queries.
+    A classic attack is a recursive query on circular relationships: { user { friends { friends { friends { ... } } } } }
+    nested 10 levels deep. With 100 friends per user, this is 100^10 = 10^20 nodes to resolve — the server
+    runs out of memory before completing. Even non-malicious clients can accidentally create expensive queries
+    through deeply nested fragments. Unlike REST (where each endpoint has bounded cost), GraphQL queries have
+    unbounded cost by default. Production GraphQL APIs MUST enforce: (1) maximum query depth, (2) maximum
+    query complexity (weighted cost per field), and (3) rate limiting by complexity cost, not just request count.
+    GitHub's GraphQL API, Shopify, and Yelp all enforce complexity limits.
+  how_to_do_right: |
+    1. Set max_depth to 10-15 (most legitimate queries are < 8 levels deep)
+    2. Assign complexity weights to fields: scalar = 1, list = 10 * child_complexity, connection = 50
+    3. Set max_complexity to 1000-5000 depending on your server capacity
+    4. Use Strawberry extensions for validation: QueryDepthLimiter and custom complexity calculator
+    5. Return clear error messages: "Query depth 12 exceeds maximum of 10"
+    6. Log blocked queries for monitoring and tuning thresholds
+    7. Rate limit by total complexity per time window, not just request count
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [strawberry-graphql]
+  domains:
+    domain: [api_design, security]
+    concern: [backend, graphql, dos_prevention]
+  example_good: |
+    import strawberry
+    from strawberry.extensions import QueryDepthLimiter
+    from strawberry.schema import Schema
+    from strawberry.extensions.base_extension import SchemaExtension
+    from graphql import DocumentNode
+    from graphql.language import FieldNode
+
+    # Custom complexity calculator extension
+    class QueryComplexityLimiter(SchemaExtension):
+        MAX_COMPLEXITY = 2000
+
+        def on_operation(self):
+            query = self.execution_context.graphql_document
+            complexity = self._calculate_complexity(query)
+            if complexity > self.MAX_COMPLEXITY:
+                raise ValueError(
+                    f"Query complexity {complexity} exceeds maximum of {self.MAX_COMPLEXITY}"
+                )
+            yield
+
+        def _calculate_complexity(self, document: DocumentNode) -> int:
+            total = 0
+            for definition in document.definitions:
+                total += self._node_complexity(definition, depth=0)
+            return total
+
+        def _node_complexity(self, node, depth: int) -> int:
+            cost = 0
+            if hasattr(node, "selection_set") and node.selection_set:
+                for selection in node.selection_set.selections:
+                    if isinstance(selection, FieldNode):
+                        field_cost = 10 if self._is_list_field(selection) else 1
+                        cost += field_cost + self._node_complexity(selection, depth + 1)
+            return cost
+
+        def _is_list_field(self, node: FieldNode) -> bool:
+            return node.name.value in {"friends", "posts", "comments", "edges"}
+
+    schema = strawberry.Schema(
+        query=Query,
+        extensions=[
+            QueryDepthLimiter(max_depth=10),
+            QueryComplexityLimiter,
+        ],
+    )
+  example_bad: |
+    # No depth or complexity limits — vulnerable to query DoS
+    schema = strawberry.Schema(query=Query)
+    app.include_router(GraphQLRouter(schema), prefix="/graphql")
+
+    # An attacker sends:
+    # query {
+    #   users {
+    #     friends {
+    #       friends {
+    #         friends {
+    #           friends {
+    #             friends { name email posts { comments { author { friends { ... } } } } }
+    #           }
+    #         }
+    #       }
+    #     }
+    #   }
+    # }
+    # Result: server OOM or 100% CPU for minutes
+    # One query can take down the entire API
+  when_applies: Any production GraphQL API exposed to external clients or untrusted internal clients
+  sources:
+    - "https://strawberry.rocks/docs/extensions/query-depth-limiter"
+    - "https://www.howtographql.com/advanced/4-security/"
+    - "https://docs.github.com/en/graphql/overview/resource-limitations"
+
+- id: GQL-005
+  text: Use persisted queries (APQ or static allowlist) for production GraphQL APIs to eliminate arbitrary query execution, reduce bandwidth, and improve security. Clients send a hash instead of the full query string.
+  why: >
+    In production, allowing arbitrary query strings has three problems: (1) Security — attackers can craft
+    malicious queries even with complexity limits; (2) Bandwidth — large queries with fragments can be 5-50KB
+    per request; (3) Caching — CDNs and reverse proxies can cache GET requests with query hashes but not
+    arbitrary POST bodies. Persisted queries solve all three: the client sends a SHA-256 hash of the query,
+    the server looks up the pre-registered query by hash. Automatic Persisted Queries (APQ) are a middle
+    ground: the client sends the hash first; if the server does not recognize it, the client sends the full
+    query once, and the server registers it. For maximum security, use a static allowlist: only pre-approved
+    queries can execute (no ad-hoc queries in production). Shopify, GitHub, and most enterprise GraphQL
+    deployments use persisted queries.
+  how_to_do_right: |
+    1. For APQ: enable automatic persisted queries on your GraphQL server and client
+    2. The client generates SHA-256 hash of the query document and sends it in the extensions field
+    3. Server checks its cache (Redis/in-memory) for the hash; if found, executes the cached query
+    4. If not found: client sends full query + hash; server caches and executes
+    5. For strict security: build a query allowlist at build time (extract all queries from client code)
+    6. In production strict mode: reject any query not in the allowlist
+    7. Use GET requests with query hash for CDN caching of read queries
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi]
+    library: [strawberry-graphql, redis]
+  domains:
+    domain: [api_design, security, performance]
+    concern: [backend, graphql, caching]
+  example_good: |
+    import hashlib
+    import strawberry
+    from strawberry.extensions.base_extension import SchemaExtension
+
+    class PersistedQueriesExtension(SchemaExtension):
+        """Automatic Persisted Queries (APQ) with Redis backend."""
+
+        def __init__(self, *, execution_context=None):
+            super().__init__(execution_context=execution_context)
+
+        def on_operation(self):
+            request = self.execution_context
+            extensions = request.extensions or {}
+            persisted = extensions.get("persistedQuery", {})
+            sha256_hash = persisted.get("sha256Hash")
+
+            if sha256_hash:
+                cached_query = redis_client.get(f"apq:{sha256_hash}")
+                if cached_query and not request.query:
+                    request.query = cached_query.decode()
+                elif request.query:
+                    computed_hash = hashlib.sha256(
+                        request.query.encode()
+                    ).hexdigest()
+                    if computed_hash == sha256_hash:
+                        redis_client.setex(
+                            f"apq:{sha256_hash}", 86400, request.query
+                        )
+                    else:
+                        raise ValueError("Hash mismatch")
+                else:
+                    raise ValueError("PersistedQueryNotFound")
+            yield
+
+    schema = strawberry.Schema(
+        query=Query,
+        extensions=[PersistedQueriesExtension],
+    )
+  example_bad: |
+    # No persisted queries — every request sends full query text
+    # POST /graphql
+    # {
+    #   "query": "query GetUserWithPosts($id: ID!) { user(id: $id) { id name email
+    #     posts { id title body createdAt comments { id body author { name } } }
+    #     followers { id name avatar } following { id name avatar }
+    #   } }",
+    #   "variables": { "id": "123" }
+    # }
+    # Problems:
+    # 1. 500+ bytes of query text per request (multiply by millions of requests)
+    # 2. Any client can send any query — no allowlist
+    # 3. Cannot cache with CDN — POST body is opaque
+    # 4. Attack surface: arbitrary queries bypass complexity analysis edge cases
+  when_applies: Production GraphQL APIs with external clients, mobile apps, or high-traffic web apps
+  sources:
+    - "https://www.apollographql.com/docs/apollo-server/performance/apq/"
+    - "https://relay.dev/docs/guides/persisted-queries/"
+
+- id: GQL-006
+  text: Use Strawberry Federation for GraphQL microservice composition — each service owns its subgraph and contributes types to the unified supergraph. Never build a monolithic GraphQL gateway that proxies to REST microservices.
+  why: >
+    Apollo Federation (and its open-source implementations) solves the fundamental problem of GraphQL in
+    microservice architectures: how do you have a single unified schema when data is owned by different services?
+    Without federation, teams build a monolithic gateway that manually stitches schemas — this becomes a
+    bottleneck and single point of failure. With federation, each microservice defines its own subgraph
+    (the types it owns), and a router/gateway automatically composes them into a supergraph. Strawberry has
+    native federation support: you annotate types with @strawberry.federation.type and use federation
+    directives (@key, @shareable, @external) to declare ownership and relationships. The key principle is
+    separation of concerns: the Users service owns the User type, the Orders service extends User with orders.
+  how_to_do_right: |
+    1. Each microservice defines its own Strawberry schema with federation decorators
+    2. Use @strawberry.federation.type(keys=["id"]) for entity types resolvable by other services
+    3. Implement __resolve_reference class method for cross-service entity resolution
+    4. Use @strawberry.federation.type(extend=True) to extend types owned by other services
+    5. Deploy Apollo Router or graphql-mesh as the federation gateway
+    6. Each subgraph publishes its schema to a registry (Apollo Studio or schema registry)
+    7. The gateway composes subgraphs automatically — no manual stitching
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [strawberry-graphql, apollo-router]
+  domains:
+    domain: [api_design, architecture]
+    concern: [backend, graphql, microservices]
+  example_good: |
+    # === Users Service (subgraph) ===
+    import strawberry
+    from strawberry.federation import Schema
+
+    @strawberry.federation.type(keys=["id"])
+    class User:
+        id: strawberry.ID
+        name: str
+        email: str
+
+        @classmethod
+        async def resolve_reference(cls, id: strawberry.ID) -> "User":
+            """Called by gateway when another service references this User."""
+            user = await UserRepository.get_by_id(id)
+            return cls(id=user.id, name=user.name, email=user.email)
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        async def user(self, id: strawberry.ID) -> User | None:
+            return await UserRepository.get_by_id(id)
+
+    schema = Schema(query=Query, enable_federation_2=True)
+
+    # === Orders Service (subgraph) — extends User ===
+    @strawberry.federation.type(keys=["id"])
+    class User:
+        id: strawberry.ID = strawberry.federation.field(external=True)
+
+        @strawberry.field
+        async def orders(self, info: strawberry.types.Info) -> list["Order"]:
+            return await OrderRepository.get_by_user_id(self.id)
+
+    @strawberry.federation.type(keys=["id"])
+    class Order:
+        id: strawberry.ID
+        total: float
+        user: User
+  example_bad: |
+    # Monolithic gateway that manually proxies to REST microservices
+    import httpx
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        async def user(self, id: str) -> User:
+            resp = await httpx.get(f"http://users-service/api/users/{id}")
+            user_data = resp.json()
+            resp2 = await httpx.get(f"http://orders-service/api/orders?user_id={id}")
+            orders_data = resp2.json()
+            # Manually stitching data — becomes unmaintainable at 10+ services
+            return User(
+                id=user_data["id"],
+                name=user_data["name"],
+                orders=[Order(**o) for o in orders_data],
+            )
+    # Problems:
+    # 1. Gateway team becomes bottleneck for all schema changes
+    # 2. No type safety between services — REST responses are untyped dicts
+    # 3. Gateway duplicates business logic from each service
+    # 4. Single point of failure — gateway owns all resolvers
+  when_applies: GraphQL APIs spanning multiple microservices or teams, especially with 3+ services contributing to the schema
+  sources:
+    - "https://strawberry.rocks/docs/guides/federation"
+    - "https://www.apollographql.com/docs/federation/"
+    - "https://www.apollographql.com/docs/federation/federation-spec"
+
+- id: GQL-007
+  text: Use strawberry.input types with Pydantic integration for mutation input validation. Never validate inputs manually inside resolvers — use the type system to enforce constraints at the schema boundary.
+  why: >
+    GraphQL's type system validates structure (required fields, correct types) but not business constraints
+    (email format, string length, numeric ranges). Without proper validation, invalid data passes through
+    GraphQL's type check and fails deep inside business logic with cryptic errors. Strawberry's Pydantic
+    integration lets you define validation rules as Pydantic validators that run BEFORE the resolver executes.
+    This means: (1) invalid input never reaches your business logic, (2) error messages are structured and
+    client-friendly, (3) validation rules are defined once in the type, not scattered across resolvers.
+    The pattern is: Pydantic model defines validation, strawberry.experimental.pydantic converts it to a
+    GraphQL input type.
+  how_to_do_right: |
+    1. Define Pydantic models with validators for all mutation inputs
+    2. Use strawberry.experimental.pydantic.input to convert Pydantic models to GraphQL input types
+    3. Call .to_pydantic() in the resolver to trigger validation
+    4. Catch ValidationError and return structured GraphQL errors
+    5. Use Pydantic's field validators for format (email, URL), range (min/max), and custom rules
+    6. Define a union return type for mutations: Success | ValidationError for type-safe error handling
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [strawberry-graphql, pydantic]
+  domains:
+    domain: [api_design, validation]
+    concern: [backend, graphql]
+  example_good: |
+    import strawberry
+    from pydantic import BaseModel, field_validator, EmailStr
+    from strawberry.experimental.pydantic import input as pydantic_input
+
+    class CreateUserModel(BaseModel):
+        name: str
+        email: EmailStr
+
+        @field_validator("name")
+        @classmethod
+        def name_must_be_reasonable(cls, v: str) -> str:
+            if len(v.strip()) < 2:
+                raise ValueError("Name must be at least 2 characters")
+            if len(v) > 100:
+                raise ValueError("Name must be at most 100 characters")
+            return v.strip()
+
+    @pydantic_input(model=CreateUserModel, all_fields=True)
+    class CreateUserInput:
+        pass
+
+    @strawberry.type
+    class ValidationFieldError:
+        field: str
+        message: str
+
+    @strawberry.type
+    class CreateUserSuccess:
+        user: User
+
+    @strawberry.type
+    class CreateUserValidationError:
+        errors: list[ValidationFieldError]
+
+    CreateUserResult = strawberry.union(
+        "CreateUserResult", [CreateUserSuccess, CreateUserValidationError]
+    )
+
+    @strawberry.type
+    class Mutation:
+        @strawberry.mutation
+        async def create_user(self, input: CreateUserInput) -> CreateUserResult:
+            try:
+                validated = input.to_pydantic()
+            except Exception as e:
+                return CreateUserValidationError(
+                    errors=[
+                        ValidationFieldError(field=err["loc"][0], message=err["msg"])
+                        for err in e.errors()
+                    ]
+                )
+            user = await UserRepository.create(validated)
+            return CreateUserSuccess(user=user)
+  example_bad: |
+    @strawberry.input
+    class CreateUserInput:
+        name: str
+        email: str  # No format validation
+
+    @strawberry.type
+    class Mutation:
+        @strawberry.mutation
+        async def create_user(self, input: CreateUserInput) -> User:
+            # Manual validation scattered in resolver — error-prone, inconsistent
+            if not input.name or len(input.name) < 2:
+                raise ValueError("Invalid name")  # Raw exception — bad client UX
+            if "@" not in input.email:  # Terrible email validation
+                raise ValueError("Invalid email")
+            return await UserRepository.create(input.name, input.email)
+    # Problems:
+    # 1. Validation logic mixed with business logic in resolver
+    # 2. No structured error response — clients get opaque errors
+    # 3. Easy to forget validation for new fields
+    # 4. Duplicated across every mutation that takes similar input
+  when_applies: Any GraphQL API with mutations that accept user input, especially with business validation rules
+  sources:
+    - "https://strawberry.rocks/docs/integrations/pydantic"
+    - "https://docs.pydantic.dev/latest/concepts/validators/"
+    - "https://productionreadygraphql.com/2020-08-01-guide-to-graphql-errors"
+
+- id: GQL-008
+  text: Use structured error handling with GraphQL error extensions — never raise raw Python exceptions from resolvers. Distinguish between client errors (validation, auth) and server errors (bugs, infrastructure). Client errors go in the errors array with extensions; server errors are masked.
+  why: >
+    GraphQL has a specific error format defined in the spec: { errors: [{ message, locations, path, extensions }] }.
+    If you raise raw Python exceptions, the framework converts them to generic "Internal Server Error" messages
+    (losing context) or leaks implementation details (stack traces, SQL queries, internal paths). Proper error
+    handling distinguishes: (1) Client errors — the client did something wrong (invalid input, unauthorized,
+    not found) — return in errors[] with a machine-readable error code in extensions; (2) Server errors — a bug
+    or infrastructure failure — log with full details server-side, return a generic "Internal error" with a
+    correlation ID to the client. Strawberry supports custom error types and error extensions natively.
+  how_to_do_right: |
+    1. Define custom exception classes with error codes: NotFoundError, AuthorizationError, ValidationError
+    2. Use Strawberry's error handling to convert exceptions to GraphQL errors with extensions
+    3. Include machine-readable error codes in extensions: { code: "NOT_FOUND", field: "user_id" }
+    4. For mutations, prefer union return types (Success | Error) over exceptions for expected errors
+    5. Mask server errors: replace internal exception messages with "Internal server error" + correlation ID
+    6. Log full server errors with correlation ID for debugging
+    7. Never expose stack traces, SQL queries, file paths, or internal service names to clients
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [strawberry-graphql]
+  domains:
+    domain: [api_design, security]
+    concern: [backend, graphql, error_handling]
+  example_good: |
+    import strawberry
+    import uuid
+    import logging
+    from enum import Enum
+
+    logger = logging.getLogger(__name__)
+
+    @strawberry.enum
+    class ErrorCode(Enum):
+        NOT_FOUND = "NOT_FOUND"
+        UNAUTHORIZED = "UNAUTHORIZED"
+        VALIDATION_ERROR = "VALIDATION_ERROR"
+        INTERNAL_ERROR = "INTERNAL_ERROR"
+
+    class GraphQLClientError(Exception):
+        def __init__(self, message: str, code: ErrorCode, field: str | None = None):
+            self.message = message
+            self.extensions = {"code": code.value}
+            if field:
+                self.extensions["field"] = field
+            super().__init__(message)
+
+    def process_errors(errors, execution_context):
+        processed = []
+        for error in errors:
+            original = error.original_error
+            if isinstance(original, GraphQLClientError):
+                processed.append(
+                    strawberry.types.ExecutionError(
+                        message=original.message,
+                        path=error.path,
+                        extensions=original.extensions,
+                    )
+                )
+            elif original:
+                correlation_id = str(uuid.uuid4())[:8]
+                logger.error(
+                    f"Internal error [{correlation_id}]: {original}",
+                    exc_info=original,
+                )
+                processed.append(
+                    strawberry.types.ExecutionError(
+                        message=f"Internal server error (ref: {correlation_id})",
+                        path=error.path,
+                        extensions={"code": "INTERNAL_ERROR", "ref": correlation_id},
+                    )
+                )
+            else:
+                processed.append(error)
+        return processed
+
+    schema = strawberry.Schema(query=Query, process_errors=process_errors)
+  example_bad: |
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        async def user(self, id: strawberry.ID) -> User:
+            user = await db.get_user(id)
+            if not user:
+                raise Exception("User not found")  # Generic exception — no error code
+
+        @strawberry.field
+        async def secret_data(self) -> str:
+            try:
+                return await db.query("SELECT * FROM secrets WHERE...")
+            except Exception as e:
+                raise Exception(str(e))  # LEAKS: SQL query, table names, DB errors
+    # Client receives:
+    # { "errors": [{ "message": "relation 'secrets' does not exist" }] }
+    # Attacker now knows: PostgreSQL, table name "secrets", and that it doesn't exist
+  when_applies: All production GraphQL APIs, especially those exposed to external clients
+  sources:
+    - "https://spec.graphql.org/October2021/#sec-Errors"
+    - "https://strawberry.rocks/docs/types/schema#handling-execution-errors"
+    - "https://productionreadygraphql.com/2020-08-01-guide-to-graphql-errors"
+
+- id: GQL-009
+  text: Implement authentication and authorization with Strawberry's permission classes and context. Authentication happens once at the transport layer (HTTP/WS). Authorization is enforced per-field using strawberry.permission.
+  why: >
+    Authentication (who are you?) and authorization (what can you access?) are distinct concerns in GraphQL.
+    Authentication should happen ONCE at the transport layer — extract and validate the JWT/session from the
+    HTTP header or WebSocket connection_init, then store the user in the context. Authorization must be
+    enforced per-field because different fields in the same query may have different access requirements:
+    a User's public profile fields are open, but their email requires authentication, and admin_notes
+    requires admin role. Strawberry's permission_classes decorator provides declarative, composable
+    authorization that runs before the resolver. This is far safer than manual if-checks in each resolver,
+    which are easy to forget.
+  how_to_do_right: |
+    1. Extract auth token in context_getter (runs once per request)
+    2. Validate token and store user object in context
+    3. Define permission classes extending strawberry.BasePermission
+    4. Apply permission_classes to fields/types that require authorization
+    5. Use composable permissions: IsAuthenticated, HasRole("admin"), OwnsResource
+    6. Permission.has_permission receives info with context — check user, roles, resource ownership
+    7. Return clear error messages: "Authentication required" or "Admin access required"
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [strawberry-graphql, pyjwt]
+  domains:
+    domain: [api_design, security]
+    concern: [backend, graphql, authentication, authorization]
+  example_good: |
+    import strawberry
+    from strawberry.permission import BasePermission
+    from strawberry.types import Info
+    from fastapi import Request
+    import jwt
+
+    class IsAuthenticated(BasePermission):
+        message = "Authentication required"
+
+        def has_permission(self, source, info: Info, **kwargs) -> bool:
+            return info.context.get("user") is not None
+
+    class IsAdmin(BasePermission):
+        message = "Admin access required"
+
+        def has_permission(self, source, info: Info, **kwargs) -> bool:
+            user = info.context.get("user")
+            return user is not None and user.get("role") == "admin"
+
+    class IsOwner(BasePermission):
+        message = "You can only access your own data"
+
+        def has_permission(self, source, info: Info, **kwargs) -> bool:
+            user = info.context.get("user")
+            return user is not None and str(source.id) == str(user.get("sub"))
+
+    @strawberry.type
+    class User:
+        id: strawberry.ID
+        name: str  # Public — no permission needed
+
+        @strawberry.field(permission_classes=[IsAuthenticated])
+        async def email(self) -> str:
+            return self._email
+
+        @strawberry.field(permission_classes=[IsAdmin])
+        async def admin_notes(self) -> str | None:
+            return self._admin_notes
+
+        @strawberry.field(permission_classes=[IsOwner])
+        async def payment_methods(self) -> list["PaymentMethod"]:
+            return await PaymentRepository.get_by_user(self.id)
+
+    async def get_context(request: Request) -> dict:
+        auth_header = request.headers.get("Authorization", "")
+        user = None
+        if auth_header.startswith("Bearer "):
+            try:
+                token = auth_header.split(" ")[1]
+                user = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+            except jwt.InvalidTokenError:
+                pass
+        return {"user": user, "request": request}
+  example_bad: |
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        async def user(self, info: Info, id: str) -> User:
+            token = info.context["request"].headers.get("Authorization")
+            if not token:
+                raise Exception("Not authenticated")
+            user = await get_user(id)
+            # Forgot to check authorization — any authenticated user sees any data
+            return user
+
+        @strawberry.field
+        async def admin_dashboard(self, info: Info) -> AdminData:
+            # Forgot auth check entirely — endpoint is public!
+            return await get_admin_data()
+    # Problems:
+    # 1. Auth logic duplicated in every resolver
+    # 2. Easy to forget auth on new fields
+    # 3. No role-based access — all-or-nothing
+    # 4. Error handling inconsistent
+  when_applies: Any GraphQL API with authenticated users and role-based or resource-based access control
+  sources:
+    - "https://strawberry.rocks/docs/guides/permissions"
+    - "https://graphql.org/learn/authorization/"
+    - "https://www.apollographql.com/docs/apollo-server/security/authentication/"
+
+- id: GQL-010
+  text: Use Relay-style cursor-based pagination for real-time or frequently-updated data. Use offset-based pagination only for static or rarely-changing datasets. Never return unbounded lists without pagination.
+  why: >
+    Offset pagination (LIMIT 20 OFFSET 40) breaks when data changes between pages: if a new item is inserted
+    at position 5, page 3 (offset 40) will repeat the last item from page 2. For real-time data (feeds,
+    notifications, search results), this causes duplicates and missing items. Cursor-based pagination uses
+    an opaque cursor (typically base64-encoded ID or timestamp) to mark the position — "give me 20 items
+    after cursor X." This is stable regardless of insertions/deletions because the cursor points to a
+    specific item, not a position. The Relay specification defines a standard connection pattern:
+    edges (with node + cursor), pageInfo (hasNextPage, endCursor), and totalCount. Strawberry has built-in
+    Relay support with strawberry.relay.ListConnection.
+  how_to_do_right: |
+    1. For real-time/dynamic data: use cursor-based pagination with the Relay connection spec
+    2. For static data with known total count: offset pagination is acceptable
+    3. Use Strawberry's relay integration: strawberry.relay.Node and ListConnection
+    4. Cursors should be opaque (base64-encoded) — clients must not parse or construct them
+    5. Always include pageInfo with hasNextPage and endCursor in the response
+    6. Set a maximum page size (e.g., 100) and enforce it server-side
+    7. Default page size should be reasonable (10-25) — never default to "all"
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [strawberry-graphql]
+  domains:
+    domain: [api_design, performance]
+    concern: [backend, graphql, pagination]
+  example_good: |
+    import strawberry
+    from base64 import b64encode, b64decode
+    from typing import Optional
+
+    @strawberry.type
+    class UserEdge:
+        node: "User"
+        cursor: str
+
+    @strawberry.type
+    class PageInfo:
+        has_next_page: bool
+        has_previous_page: bool
+        start_cursor: str | None
+        end_cursor: str | None
+
+    @strawberry.type
+    class UserConnection:
+        edges: list[UserEdge]
+        page_info: PageInfo
+        total_count: int
+
+    def encode_cursor(id: int) -> str:
+        return b64encode(f"user:{id}".encode()).decode()
+
+    def decode_cursor(cursor: str) -> int:
+        decoded = b64decode(cursor.encode()).decode()
+        return int(decoded.split(":")[1])
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        async def users(
+            self,
+            first: int = 20,
+            after: Optional[str] = None,
+        ) -> UserConnection:
+            if first > 100:
+                first = 100  # Enforce max page size
+
+            after_id = decode_cursor(after) if after else 0
+            users = await UserRepository.list(after_id=after_id, limit=first + 1)
+            has_next = len(users) > first
+            users = users[:first]
+
+            return UserConnection(
+                edges=[
+                    UserEdge(node=u, cursor=encode_cursor(u.id)) for u in users
+                ],
+                page_info=PageInfo(
+                    has_next_page=has_next,
+                    has_previous_page=after is not None,
+                    start_cursor=encode_cursor(users[0].id) if users else None,
+                    end_cursor=encode_cursor(users[-1].id) if users else None,
+                ),
+                total_count=await UserRepository.count(),
+            )
+  example_bad: |
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        async def users(self) -> list[User]:
+            # NO PAGINATION — returns ALL users. 1M users = OOM
+            return await UserRepository.list_all()
+
+        @strawberry.field
+        async def users_paged(self, page: int = 1, size: int = 20) -> list[User]:
+            offset = (page - 1) * size
+            # Offset pagination — if new user inserted between page requests:
+            # page 2 repeats the last item from page 1 (shifted by 1)
+            return await UserRepository.list(offset=offset, limit=size)
+            # Also: no hasNextPage info, no totalCount, no standardized format
+  when_applies: GraphQL APIs with lists that clients paginate through, especially real-time or frequently-updated data
+  sources:
+    - "https://relay.dev/graphql/connections.htm"
+    - "https://strawberry.rocks/docs/guides/relay"
+    - "https://graphql.org/learn/pagination/"
+
+- id: GQL-011
+  text: Implement GraphQL file uploads using the graphql-multipart-request-spec. Use a dedicated upload scalar type and handle files as multipart form data — never base64-encode files in GraphQL variables.
+  why: >
+    GraphQL's transport is JSON, which cannot natively represent binary data. The naive approach is base64-encoding
+    files into JSON strings, but this increases file size by 33%, prevents streaming, holds the entire file in
+    memory, and blocks the event loop during encoding/decoding. The graphql-multipart-request-spec (used by Apollo,
+    Relay, and most GraphQL clients) solves this by sending files as multipart form data alongside the GraphQL
+    operation. The file is mapped to a variable using a JSON path. Strawberry supports this natively with the
+    Upload scalar type. For large files (>10MB), consider pre-signed URLs instead: the client uploads directly
+    to S3/GCS and sends the URL to the GraphQL mutation.
+  how_to_do_right: |
+    1. Use Strawberry's Upload scalar for file arguments in mutations
+    2. The client sends a multipart form request with the file mapped to a variable
+    3. For small files (<10MB): accept via Upload scalar directly
+    4. For large files (>10MB): return a pre-signed upload URL, client uploads to storage directly
+    5. Validate file type (MIME type check) and size server-side before processing
+    6. Stream file to storage — never load entire file into memory
+    7. Return file metadata (URL, size, content type) after successful upload
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [strawberry-graphql, boto3]
+  domains:
+    domain: [api_design]
+    concern: [backend, graphql, file_upload]
+  example_good: |
+    import strawberry
+    from strawberry.file_uploads import Upload
+
+    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+    ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
+
+    @strawberry.type
+    class FileInfo:
+        url: str
+        filename: str
+        size: int
+        content_type: str
+
+    @strawberry.type
+    class UploadError:
+        message: str
+
+    UploadResult = strawberry.union("UploadResult", [FileInfo, UploadError])
+
+    @strawberry.type
+    class Mutation:
+        @strawberry.mutation
+        async def upload_avatar(self, file: Upload) -> UploadResult:
+            content = await file.read()
+            if len(content) > MAX_FILE_SIZE:
+                return UploadError(
+                    message=f"File exceeds {MAX_FILE_SIZE // 1024 // 1024}MB limit"
+                )
+
+            content_type = file.content_type or "application/octet-stream"
+            if content_type not in ALLOWED_TYPES:
+                return UploadError(message=f"File type {content_type} not allowed")
+
+            url = await storage.upload(
+                content=content,
+                filename=file.filename,
+                content_type=content_type,
+            )
+            return FileInfo(
+                url=url,
+                filename=file.filename,
+                size=len(content),
+                content_type=content_type,
+            )
+
+        @strawberry.mutation
+        async def get_upload_url(self, filename: str, content_type: str) -> str:
+            """For large files: return pre-signed URL for direct upload."""
+            return await storage.generate_presigned_url(
+                filename=filename,
+                content_type=content_type,
+                expires_in=3600,
+            )
+  example_bad: |
+    @strawberry.type
+    class Mutation:
+        @strawberry.mutation
+        async def upload_avatar(self, file_base64: str, filename: str) -> str:
+            import base64
+            content = base64.b64decode(file_base64)  # 33% larger in transit
+            # Entire file held in memory as string + decoded bytes
+            # No content type validation, no file size validation
+            path = f"/uploads/{filename}"  # Path traversal vulnerability!
+            with open(path, "wb") as f:
+                f.write(content)
+            return path
+    # Problems:
+    # 1. Base64 adds 33% overhead — 10MB file becomes 13.3MB in JSON
+    # 2. Entire file must be in memory as JSON string AND decoded bytes
+    # 3. No streaming — blocks event loop for large files
+    # 4. No type/size validation — accept anything
+    # 5. Path traversal vulnerability (filename="../../etc/passwd")
+  when_applies: GraphQL APIs that accept file uploads (avatars, documents, media)
+  sources:
+    - "https://strawberry.rocks/docs/guides/file-upload"
+    - "https://github.com/jaydenseric/graphql-multipart-request-spec"
+    - "https://www.apollographql.com/docs/apollo-server/data/file-uploads/"
+
+- id: GQL-012
+  text: Test GraphQL APIs using Strawberry's test client for schema-level tests and httpx for integration tests. Test the schema directly — do not test resolvers in isolation without the GraphQL execution layer.
+  why: >
+    Testing resolvers as plain Python functions misses critical behavior: type coercion, permission checks,
+    DataLoader batching, error formatting, input validation, and middleware execution. A resolver test that
+    calls resolve_user(id="123") directly skips all of these. Strawberry's test client executes queries
+    against the actual schema, including all extensions, permissions, and type serialization. This catches
+    issues like: (1) a field returning None when the schema says non-nullable, (2) a permission class
+    blocking access unexpectedly, (3) a DataLoader not being available in context, (4) an input type
+    not matching the expected Pydantic validation. For integration tests, use httpx.AsyncClient with
+    the mounted FastAPI app to test the full HTTP stack (headers, authentication, multipart uploads).
+  how_to_do_right: |
+    1. Use strawberry.test for schema-level tests (fast, no HTTP overhead)
+    2. Use httpx.AsyncClient with FastAPI TestClient for full integration tests
+    3. Test queries, mutations, and subscriptions through the schema — not as raw functions
+    4. Test error cases: unauthorized access, validation errors, not found
+    5. Test DataLoader batching: assert that N items result in 1 batch query, not N queries
+    6. Use snapshot testing for complex response structures
+    7. Test schema evolution: assert deprecated fields still work, new fields have defaults
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, pytest]
+    library: [strawberry-graphql, httpx, pytest-asyncio]
+  domains:
+    domain: [api_design, testing]
+    concern: [backend, graphql]
+  example_good: |
+    import pytest
+    from strawberry.test import BaseGraphQLTestClient
+    from httpx import AsyncClient, ASGITransport
+
+    @pytest.fixture
+    def graphql_client():
+        return BaseGraphQLTestClient(schema)
+
+    @pytest.mark.asyncio
+    async def test_get_user(graphql_client):
+        result = await graphql_client.query(
+            """
+            query GetUser($id: ID!) {
+                user(id: $id) {
+                    id
+                    name
+                    email
+                }
+            }
+            """,
+            variables={"id": "1"},
+            context_value={"user": {"sub": "1", "role": "admin"}},
+        )
+        assert result.errors is None
+        assert result.data["user"]["name"] == "Alice"
+        assert result.data["user"]["email"] == "alice@example.com"
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_access(graphql_client):
+        result = await graphql_client.query(
+            "{ user(id: \"1\") { email } }",
+            context_value={},  # No user in context
+        )
+        assert result.errors is not None
+        assert "Authentication required" in result.errors[0]["message"]
+
+    @pytest.mark.asyncio
+    async def test_create_user_validation(graphql_client):
+        result = await graphql_client.query(
+            """
+            mutation CreateUser($input: CreateUserInput!) {
+                createUser(input: $input) {
+                    ... on CreateUserSuccess { user { id name } }
+                    ... on CreateUserValidationError { errors { field message } }
+                }
+            }
+            """,
+            variables={"input": {"name": "", "email": "not-an-email"}},
+            context_value={"user": {"sub": "1"}},
+        )
+        assert result.errors is None
+        data = result.data["createUser"]
+        assert "errors" in data  # Validation error returned, not exception
+
+    # Full integration test with httpx
+    @pytest.mark.asyncio
+    async def test_full_http_stack():
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/graphql",
+                json={"query": "{ users(first: 5) { edges { node { name } } } }"},
+                headers={"Authorization": "Bearer valid-jwt-token"},
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert "errors" not in data
+  example_bad: |
+    # Testing resolvers directly — misses schema behavior
+    async def test_get_user():
+        query = Query()
+        user = await query.user(id="1")
+        assert user.name == "Alice"
+        # This passes even if:
+        # - The schema declares user as User! (non-nullable) but resolver returns None
+        # - Permission class would deny access
+        # - DataLoader isn't in context (crashes in real execution)
+        # - The field returns datetime but schema expects String
+
+    # Testing with string matching on raw responses
+    async def test_with_string():
+        result = schema.execute_sync("{ user(id: 1) { name } }")
+        assert "Alice" in str(result)  # Fragile, matches error messages too
+  when_applies: Any GraphQL API that needs automated testing, especially APIs with permissions, DataLoaders, and validation
+  sources:
+    - "https://strawberry.rocks/docs/general/testing"
+    - "https://fastapi.tiangolo.com/advanced/async-tests/"
+    - "https://docs.pytest.org/en/stable/"
+
+- id: GQL-013
+  text: Evolve GraphQL schemas with additive changes only — use the @deprecated directive for field removal, never delete fields without a deprecation period. Treat the schema as a public API contract.
+  why: >
+    Unlike REST where you can version the entire API (/v1 vs /v2), GraphQL typically has a single evolving
+    schema. Removing or renaming a field is a breaking change that immediately breaks every client using
+    that field. The GraphQL spec includes a @deprecated directive specifically for this: it marks a field
+    as deprecated with a reason, clients see a warning in their IDE, and tools like GraphQL Inspector can
+    detect usage. The migration path is: (1) add new field, (2) deprecate old field with reason pointing
+    to new field, (3) monitor old field usage, (4) remove old field only when usage reaches zero.
+    GitHub's GraphQL API has fields deprecated for years that still work because some clients depend on them.
+    Schema evolution must be additive — you can always add fields, types, and enum values; you should never
+    remove or change existing ones without the deprecation lifecycle.
+  how_to_do_right: |
+    1. SAFE changes (no deprecation needed): add field, add type, add enum value, add optional argument
+    2. BREAKING changes (require deprecation): remove field, rename field, change type, make nullable non-nullable
+    3. Use @deprecated(reason: "Use newField instead") for fields being phased out
+    4. Monitor deprecated field usage with Strawberry extensions or observability tools
+    5. Set a deprecation timeline: minimum 3-6 months for external APIs
+    6. Use schema diffing tools (graphql-inspector, rover) in CI to detect accidental breaking changes
+    7. Never change the meaning of an existing field — add a new field instead
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [strawberry-graphql, graphql-inspector]
+  domains:
+    domain: [api_design, architecture]
+    concern: [backend, graphql, versioning]
+  example_good: |
+    import strawberry
+
+    @strawberry.type
+    class User:
+        id: strawberry.ID
+        name: str
+        email: str
+
+        # v1: original field — being phased out
+        @strawberry.field(
+            deprecation_reason="Use 'fullName' instead. Will be removed 2026-09-01."
+        )
+        def display_name(self) -> str:
+            return self._display_name
+
+        # v2: new field with better semantics
+        @strawberry.field
+        def full_name(self) -> str:
+            return f"{self._first_name} {self._last_name}"
+
+        # v1: was a string, now we need structured data
+        @strawberry.field(
+            deprecation_reason="Use 'addressInfo' which returns structured AddressInfo type."
+        )
+        def address(self) -> str:
+            return f"{self._street}, {self._city}"
+
+        # v2: structured replacement
+        @strawberry.field
+        def address_info(self) -> "AddressInfo":
+            return AddressInfo(
+                street=self._street, city=self._city, country=self._country
+            )
+
+    # CI check: graphql-inspector diff old-schema.graphql new-schema.graphql
+    # Output: Field 'User.displayName' was deprecated
+    # Output: Field 'User.fullName' was added (non-breaking)
+  example_bad: |
+    # v1 schema (Monday)
+    @strawberry.type
+    class User:
+        id: strawberry.ID
+        name: str
+        display_name: str  # Clients use this
+
+    # v2 schema (Tuesday) — BREAKING CHANGE, no deprecation
+    @strawberry.type
+    class User:
+        id: strawberry.ID
+        name: str
+        full_name: str  # Renamed without deprecation — every client breaks
+        # display_name: DELETED — queries with display_name now return errors
+
+    # Result: Every mobile app, web client, and integration that queries
+    # display_name gets an error: "Cannot query field display_name on type User"
+    # Users see broken apps until they update — which could be weeks for mobile
+  when_applies: Any GraphQL API with external consumers, multiple client teams, or mobile apps that cannot be force-updated
+  sources:
+    - "https://spec.graphql.org/October2021/#sec--deprecated"
+    - "https://the-guild.dev/graphql/inspector"
+    - "https://www.apollographql.com/docs/graphos/delivery/schema-checks"

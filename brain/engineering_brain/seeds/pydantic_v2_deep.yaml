@@ -1,0 +1,1139 @@
+layer: rules
+domain: code_quality
+knowledge:
+- id: PYDV2-001
+  text: >
+    In Pydantic v2, use @field_validator with the correct mode for your use case: mode="before"
+    for normalization/coercion before type validation (strip whitespace, lowercase emails),
+    mode="after" for business logic validation on the already-typed value (length, format),
+    and mode="wrap" when you need to control the entire validation lifecycle including whether
+    the inner validator runs. Default mode is "after" — use it unless you have a specific reason
+    for "before".
+  why: >
+    Choosing the wrong mode causes subtle bugs. mode="after" validators receive typed values
+    (str already validated) — trying to handle None or non-string values raises confusing
+    errors. mode="before" validators receive raw input (dict values, JSON strings, anything)
+    — they must handle invalid types explicitly. A team that used mode="after" for email
+    normalization had case-sensitive email lookups failing because validation happened after
+    type assignment, but the ORM stored unnormalized values from direct model instantiation
+    paths that bypassed the validator. mode="before" catches all paths.
+  how_to_do_right: |
+    1. mode="before": normalization (strip, lowercase, format), type coercion, None → default
+    2. mode="after": business rules on typed value (length check, regex, range)
+    3. mode="wrap": custom error messages, overriding error type, conditional validation skip
+    4. @field_validator("field_name", mode="before") def normalize(cls, v): return v.strip()
+    5. @classmethod required on validators in Pydantic v2 (unlike v1)
+    6. Use @field_validator("*", mode="before") to apply to all fields
+    7. Return the (possibly modified) value — do NOT return None unless None is valid
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pydantic]
+  domains:
+    domain: [code_quality, backend, api]
+    concern: [validation, field_validators, data_normalization]
+  example_good: |
+    from pydantic import BaseModel, field_validator
+    import re
+
+    class UserCreate(BaseModel):
+        email: str
+        username: str
+        age: int
+
+        @field_validator("email", mode="before")  # Before type validation
+        @classmethod
+        def normalize_email(cls, v: object) -> str:
+            if not isinstance(v, str):
+                raise ValueError("email must be a string")
+            return v.strip().lower()  # Normalize before storage
+
+        @field_validator("username", mode="after")  # After type validation (str guaranteed)
+        @classmethod
+        def validate_username_format(cls, v: str) -> str:
+            if not re.match(r"^[a-zA-Z0-9_]{3,30}$", v):
+                raise ValueError("username must be 3-30 alphanumeric chars or underscores")
+            return v
+
+        @field_validator("age", mode="after")
+        @classmethod
+        def validate_age_range(cls, v: int) -> int:
+            if not 0 <= v <= 150:
+                raise ValueError(f"age {v} is outside valid range 0-150")
+            return v
+  example_bad: |
+    from pydantic import BaseModel, field_validator
+
+    class UserCreate(BaseModel):
+        email: str
+
+        @field_validator("email", mode="after")  # WRONG mode for normalization
+        @classmethod
+        def normalize_email(cls, v: str) -> str:
+            return v.strip().lower()
+            # Issue: if input is "  JOHN@EXAMPLE.COM  ", after mode receives
+            # " JOHN@EXAMPLE.COM " (str, not yet stripped) — but validation
+            # order means other validators ran first on unnormalized value
+            # More importantly: validator doesn't run on direct model construction
+            # via dict in non-validation code paths
+  when_applies: "Every @field_validator definition. Choosing the wrong mode is the most common validator bug in Pydantic v2."
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/validators/#field-validators"
+    - "https://docs.pydantic.dev/latest/concepts/validators/#field-validator-decorator"
+
+- id: PYDV2-002
+  text: >
+    Use @model_validator(mode="after") for cross-field validation that requires accessing
+    multiple fields simultaneously (XOR patterns, conditional required fields, inter-field
+    constraints). Use mode="before" only when you need to normalize or transform the raw
+    dict before per-field validation runs. Never re-implement cross-field logic in multiple
+    @field_validators — one @model_validator is cleaner and more efficient.
+  why: >
+    Cross-field validation in @field_validator requires using @model_validator or dirty
+    hacks with values argument (v1 style, removed in v2). A common pattern: "either email
+    or phone must be provided, not both, not neither" — this XOR constraint touches two
+    fields simultaneously and belongs in @model_validator. Duplicating this logic in two
+    field validators creates maintenance risk: one gets updated, the other doesn't.
+    Additionally, @model_validator(mode="after") receives the fully-validated model instance,
+    giving access to all typed fields including those with complex types.
+  how_to_do_right: |
+    1. @model_validator(mode="after") receives self: the validated model instance
+    2. Access fields via self.field_name — all are typed and validated at this point
+    3. For mutual exclusivity (XOR): if (a is None) == (b is None): raise ValueError
+    4. For conditional required: if self.type == "premium" and not self.subscription_id: raise
+    5. @model_validator(mode="before") receives data: dict[str, Any] — raw input
+    6. Return self from mode="after" validators (or modified model)
+    7. Return dict/Any from mode="before" validators
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pydantic]
+  domains:
+    domain: [code_quality, backend, api]
+    concern: [cross_field_validation, model_validators, business_rules]
+  example_good: |
+    from pydantic import BaseModel, model_validator
+    from typing import Optional
+
+    class PaymentCreate(BaseModel):
+        amount: float
+        card_token: Optional[str] = None
+        bank_account_id: Optional[int] = None
+        payment_type: str  # "card" or "bank"
+
+        @model_validator(mode="after")
+        def validate_payment_method_consistency(self) -> "PaymentCreate":
+            if self.payment_type == "card":
+                if self.card_token is None:
+                    raise ValueError("card_token required for payment_type='card'")
+                if self.bank_account_id is not None:
+                    raise ValueError("bank_account_id must be None for payment_type='card'")
+            elif self.payment_type == "bank":
+                if self.bank_account_id is None:
+                    raise ValueError("bank_account_id required for payment_type='bank'")
+                if self.card_token is not None:
+                    raise ValueError("card_token must be None for payment_type='bank'")
+            return self
+
+    # mode="before" for data transformation
+    class LegacyImport(BaseModel):
+        name: str
+        age: int
+
+        @model_validator(mode="before")
+        @classmethod
+        def handle_legacy_format(cls, data: dict) -> dict:
+            if "full_name" in data and "name" not in data:
+                data["name"] = data.pop("full_name")
+            if "years_old" in data and "age" not in data:
+                data["age"] = data.pop("years_old")
+            return data
+  example_bad: |
+    class PaymentCreate(BaseModel):
+        card_token: Optional[str] = None
+        bank_account_id: Optional[int] = None
+
+        @field_validator("card_token", mode="after")
+        @classmethod
+        def check_card(cls, v, values):  # values removed in v2!
+            # This is v1 syntax — doesn't work in v2
+            if v and values.get("bank_account_id"):
+                raise ValueError("Cannot provide both card and bank account")
+            return v
+        # Cross-field in field_validator is hacky and fragile
+  when_applies: "Any validation rule that involves two or more fields simultaneously. Mutual exclusivity, conditional requirements, sum constraints."
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/validators/#model-validators"
+    - "https://docs.pydantic.dev/latest/concepts/validators/#model-validator-decorator"
+
+- id: PYDV2-003
+  text: >
+    Use discriminated unions with Literal type discriminators for polymorphic payloads where
+    one field determines the shape of the entire object. This is 10-50x faster than smart
+    union (default) validation for large union types, and produces clear error messages
+    indicating which discriminator value was unrecognized rather than a wall of union errors.
+  why: >
+    Pydantic's default "smart" union mode tries each union member in left-to-right order,
+    collecting all errors. For 10 union members, a single invalid payload produces 10 sets
+    of errors and runs 10 full validations. With a discriminated union, Pydantic looks at
+    the discriminator field first (e.g., type="card") and validates ONLY the matching member.
+    A webhook handler with 12 event types that used untagged unions produced 400ms validation
+    times under load. Switching to discriminated unions reduced it to 8ms. Error messages went
+    from 200 lines of "not matching any of 12 models" to "unknown event type: 'invalid_event'".
+  how_to_do_right: |
+    1. Add a Literal discriminator field to each union member: type: Literal["card"]
+    2. Build the union: Union[CardEvent, BankEvent] with Annotated[..., Field(discriminator="type")]
+    3. Or use model-level: model_config = ConfigDict(discriminator_field="type")
+    4. Use Annotated for type annotation: Annotated[Union[CardEvent, BankEvent], Field(discriminator="type")]
+    5. Each member's discriminator must be unique and a Literal type
+    6. For nested discriminators: use nested Annotated with Field
+    7. TypeAdapter for validation without model: TypeAdapter(Annotated[Union[...], Field(discriminator="kind")])
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pydantic]
+  domains:
+    domain: [code_quality, backend, api, performance]
+    concern: [discriminated_unions, polymorphism, validation_performance]
+  example_good: |
+    from pydantic import BaseModel, Field
+    from typing import Annotated, Literal, Union
+
+    class CardPayment(BaseModel):
+        type: Literal["card"]
+        card_token: str
+        amount: float
+        currency: str = "USD"
+
+    class BankPayment(BaseModel):
+        type: Literal["bank"]
+        account_id: int
+        routing_number: str
+        amount: float
+
+    class CryptoPayment(BaseModel):
+        type: Literal["crypto"]
+        wallet_address: str
+        coin: Literal["BTC", "ETH", "USDC"]
+        amount: float
+
+    # Discriminated union — O(1) validation regardless of union size
+    Payment = Annotated[
+        Union[CardPayment, BankPayment, CryptoPayment],
+        Field(discriminator="type"),
+    ]
+
+    # Usage: 8ms vs 400ms for smart union
+    payment = TypeAdapter(Payment).validate_python({"type": "card", "card_token": "tok_123", "amount": 99.99})
+    assert isinstance(payment, CardPayment)
+
+    # Clear error on unknown discriminator:
+    # ValidationError: Input should be 'card', 'bank' or 'crypto' [type=literal_error]
+  example_bad: |
+    # Untagged union — smart mode, tries all members
+    Payment = Union[CardPayment, BankPayment, CryptoPayment]  # No discriminator
+    # For 10 event types: 10 validations run per unknown input
+    # Error: "Input should be a valid CardPayment OR BankPayment OR CryptoPayment"
+    # 200 lines of nested errors — impossible to debug from logs
+  when_applies: >
+    Any polymorphic payload with a type/kind/event_type discriminator field: webhooks,
+    event sourcing, command patterns, API responses with multiple shapes.
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions"
+    - "https://blog.dataengineerthings.org/pydantic-for-experts-discriminated-unions-in-pydantic-v2-2d9ca965b22f"
+
+- id: PYDV2-004
+  text: >
+    Use @computed_field for properties that should be included in model serialization
+    (model_dump(), model_dump_json()). Without @computed_field, @property attributes are
+    excluded from serialization silently — they appear in Python access but disappear in
+    JSON output, causing downstream bugs in APIs and serialized data.
+  why: >
+    In Pydantic v1, @property appeared in .dict() output if the ORM model had it. In Pydantic
+    v2, plain @property is excluded from model_dump() by design. Teams that migrated from v1
+    to v2 found that API responses were missing computed fields because they were @property
+    instead of @computed_field. A user's full_name, is_premium status, and display_avatar_url
+    silently disappeared from API responses after v2 migration. @computed_field restores this
+    while making the intent explicit.
+  how_to_do_right: |
+    1. @computed_field makes property appear in model_dump() and model_dump_json()
+    2. Add return type annotation: @computed_field @property def full_name(self) -> str:
+    3. For exclude: computed_field(repr=False) to hide from repr while keeping in dump
+    4. For alias: @computed_field(alias="display_name")
+    5. Cannot depend on @computed_field from other @computed_field — access self.first_name directly
+    6. For read-only external API fields: use @computed_field instead of Annotated[str, Field(exclude=False)]
+    7. Computed fields are NOT stored — recalculated on every model_dump() call
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pydantic]
+  domains:
+    domain: [code_quality, backend, api]
+    concern: [serialization, computed_fields, api_responses]
+  example_good: |
+    from pydantic import BaseModel, computed_field
+    from typing import Optional
+
+    class UserResponse(BaseModel):
+        first_name: str
+        last_name: str
+        email: str
+        subscription_tier: Optional[str] = None
+        avatar_url: Optional[str] = None
+
+        @computed_field
+        @property
+        def full_name(self) -> str:
+            return f"{self.first_name} {self.last_name}"
+
+        @computed_field
+        @property
+        def is_premium(self) -> bool:
+            return self.subscription_tier in ("premium", "enterprise")
+
+        @computed_field
+        @property
+        def display_avatar(self) -> str:
+            if self.avatar_url:
+                return self.avatar_url
+            initials = f"{self.first_name[0]}{self.last_name[0]}".upper()
+            return f"https://avatars.example.com/initials/{initials}"
+
+    user = UserResponse(first_name="John", last_name="Doe", email="john@example.com")
+    data = user.model_dump()
+    assert "full_name" in data       # "John Doe"
+    assert "is_premium" in data      # False
+    assert "display_avatar" in data  # "https://avatars.example.com/initials/JD"
+  example_bad: |
+    class UserResponse(BaseModel):
+        first_name: str
+        last_name: str
+
+        @property  # NOT a computed_field — silently excluded from serialization
+        def full_name(self) -> str:
+            return f"{self.first_name} {self.last_name}"
+
+    user = UserResponse(first_name="John", last_name="Doe")
+    print(user.full_name)       # "John Doe" — works in Python
+    data = user.model_dump()
+    print(data.get("full_name"))  # None — silently missing from JSON response!
+  when_applies: "Any Pydantic model with @property attributes that need to appear in JSON serialization output."
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/fields/#computed-fields"
+    - "https://docs.pydantic.dev/latest/api/fields/#pydantic.fields.computed_field"
+
+- id: PYDV2-005
+  text: >
+    Use Generic[T] with Pydantic BaseModel for reusable container types: API responses with
+    pagination, result wrappers (Success[T]/Failure), and typed event envelopes. This
+    eliminates copy-paste model definitions and makes TypeVar constraints enforceable by
+    type checkers.
+  why: >
+    Without Generic models, teams define PaginatedUserResponse, PaginatedOrderResponse,
+    PaginatedProductResponse — identical except for the items field type. When the pagination
+    metadata adds a new field (next_cursor), all three models must be updated. A codebase had
+    14 duplicated "paginated response" models that drifted out of sync: some had next_cursor,
+    others didn't, causing inconsistent API behavior. Generic[T] centralizes the structure
+    once. Pydantic v2 fully supports Generic models with proper validation — T is instantiated
+    at validation time with concrete types.
+  how_to_do_right: |
+    1. Define generic base: class PaginatedResponse(BaseModel, Generic[T]):
+    2. Use T as field type: items: list[T]
+    3. Instantiate with concrete type: PaginatedResponse[UserOut]
+    4. TypeAdapter for validation: TypeAdapter(PaginatedResponse[UserOut]).validate_python(data)
+    5. model_validate with concrete type: PaginatedResponse[UserOut].model_validate(data)
+    6. Multiple TypeVars: class Result(BaseModel, Generic[T, E]): data: Optional[T], error: Optional[E]
+    7. Constrained TypeVar: T = TypeVar("T", UserOut, OrderOut) for limited variants
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [pydantic]
+  domains:
+    domain: [code_quality, backend, api]
+    concern: [generic_models, reusability, type_safety]
+  example_good: |
+    from pydantic import BaseModel
+    from typing import Generic, TypeVar, Optional
+
+    T = TypeVar("T")
+
+    class PaginatedResponse(BaseModel, Generic[T]):
+        items: list[T]
+        total: int
+        page: int
+        page_size: int
+        next_cursor: Optional[str] = None
+        has_more: bool
+
+        @classmethod
+        def from_queryset(cls, items: list[T], total: int, page: int, page_size: int):
+            return cls(
+                items=items,
+                total=total,
+                page=page,
+                page_size=page_size,
+                has_more=page * page_size < total,
+            )
+
+    # Used for ALL paginated endpoints — consistent schema everywhere
+    def get_users(...) -> PaginatedResponse[UserOut]: ...
+    def get_orders(...) -> PaginatedResponse[OrderOut]: ...
+
+    # Result wrapper
+    E = TypeVar("E")
+    class Result(BaseModel, Generic[T, E]):
+        success: bool
+        data: Optional[T] = None
+        error: Optional[E] = None
+  example_bad: |
+    # 14 copy-pasted models — maintenance nightmare
+    class PaginatedUserResponse(BaseModel):
+        items: list[UserOut]
+        total: int
+        page: int
+        page_size: int
+        # Missing next_cursor — drifted out of sync
+
+    class PaginatedOrderResponse(BaseModel):
+        items: list[OrderOut]
+        total: int
+        page: int
+        page_size: int
+        next_cursor: Optional[str] = None  # Added here but not to UserResponse
+  when_applies: "Designing API response models with shared structure (pagination, results, envelopes). Define Generic base before the second copy-paste."
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/postponed_annotations/#generic-models"
+    - "https://docs.pydantic.dev/latest/api/types/#pydantic.types"
+
+- id: PYDV2-006
+  text: >
+    Enable strict mode per-field (not globally) for fields where type coercion is dangerous.
+    Global strict mode is too aggressive for API endpoints that receive JSON (where "123" must
+    coerce to int). Per-field strict mode targets specific fields where coercion would hide
+    bugs, like boolean fields that should not coerce from 0/1/yes/no.
+  why: >
+    In lax mode (default), Pydantic coerces "true" → True, 1 → True, "yes" → True for
+    boolean fields. This means an API endpoint that expects {"is_active": true} silently
+    accepts {"is_active": "yes"} and {"is_active": 1}. For most APIs this is acceptable.
+    For internal service calls where you control the client, accepting "yes" as a boolean
+    hides a bug in the caller. For financial flags (is_authorized, is_verified), silent
+    coercion can hide a caller sending the wrong type. Per-field strict mode catches these
+    precisely without making the entire model reject normal JSON.
+  how_to_do_right: |
+    1. Per-field strict: field: Annotated[bool, Field(strict=True)]
+    2. Per-model strict: model_config = ConfigDict(strict=True)  # All fields
+    3. Prefer per-field for API models — JSON clients may send "123" for int fields
+    4. Use strict globally for internal Python-to-Python models where no coercion should occur
+    5. Strict int: rejects float 1.0, str "1", bool True (which is int subclass in Python)
+    6. Strict str: rejects bytes, non-str types
+    7. Strict list: rejects tuple (unlike lax which accepts any Sequence)
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [pydantic]
+  domains:
+    domain: [code_quality, backend, api]
+    concern: [strict_mode, type_safety, validation]
+  example_good: |
+    from pydantic import BaseModel, Field
+    from typing import Annotated
+
+    class FinancialTransaction(BaseModel):
+        amount: float  # Lax — accept "99.99" from JSON
+        currency: str  # Lax — accept str from JSON
+
+        # Strict for safety-critical boolean flags
+        is_authorized: Annotated[bool, Field(strict=True)]
+        is_test_mode: Annotated[bool, Field(strict=True)]
+
+        # Strict for ID fields where coercion hides caller bugs
+        account_id: Annotated[int, Field(strict=True)]
+
+    # Accepted: {"amount": "99.99", "currency": "USD", "is_authorized": true, "account_id": 42}
+    # Rejected: {"amount": "99.99", "is_authorized": "yes"}  → ValidationError on is_authorized
+    # Rejected: {"account_id": "42"}  → ValidationError on account_id (str rejected)
+  example_bad: |
+    class FinancialTransaction(BaseModel):
+        is_authorized: bool  # Lax — accepts "yes", 1, "true", "1", True
+
+    # Caller bug: sends {"is_authorized": "authorized"} — coerces to True!
+    # "authorized" is a non-empty string → truthy → True in lax mode
+    # Transaction authorized with wrong data type — bug hidden by coercion
+  when_applies: >
+    Safety-critical boolean flags, ID fields in internal service models, any field where
+    silent coercion could hide a bug in the calling code.
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/strict_mode/"
+    - "https://docs.pydantic.dev/latest/api/config/#pydantic.config.ConfigDict.strict"
+
+- id: PYDV2-007
+  text: >
+    Use pydantic-settings with BaseSettings for all application configuration. Never read
+    os.environ directly in application code — it bypasses validation, type conversion, and
+    documentation. Use nested settings with env_nested_delimiter for hierarchical config,
+    and define sensible defaults with Field(description=...) for self-documenting settings.
+  why: >
+    Direct os.getenv("DATABASE_URL") returns a string or None with no validation. A missing
+    DATABASE_URL causes AttributeError 500ms into app startup when the first query runs, not
+    at startup. A DATABASE_URL="not-a-url" causes a cryptic database driver error deep in
+    the stack. With BaseSettings, missing required settings and invalid URLs are caught at
+    import time with clear error messages. Additionally, settings defined as a Pydantic model
+    are self-documenting: type, default, and description in one place.
+  how_to_do_right: |
+    1. pip install pydantic-settings
+    2. class Settings(BaseSettings): db_url: PostgresDsn
+    3. Settings reads from environment automatically (os.environ, .env file)
+    4. Validation at import: settings = Settings() fails immediately with clear errors
+    5. For .env files: model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    6. Nested config: class DatabaseSettings(BaseModel): pool_size: int = 10
+       Then in Settings: database: DatabaseSettings = DatabaseSettings()
+       Env var: DATABASE__POOL_SIZE=20 (with env_nested_delimiter="__")
+    7. Singleton: use @lru_cache on get_settings() function for test override support
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pydantic, pydantic-settings, fastapi]
+  domains:
+    domain: [code_quality, backend, infrastructure]
+    concern: [configuration, settings, validation]
+  example_good: |
+    from pydantic import PostgresDsn, Field, SecretStr
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+    from functools import lru_cache
+
+    class DatabaseSettings(BaseModel):
+        url: PostgresDsn
+        pool_size: int = Field(default=10, ge=1, le=100)
+        pool_recycle: int = Field(default=1800, description="Seconds before recycling connections")
+
+    class AppSettings(BaseSettings):
+        model_config = SettingsConfigDict(
+            env_file=".env",
+            env_nested_delimiter="__",
+            case_sensitive=False,
+        )
+        database: DatabaseSettings
+        secret_key: SecretStr = Field(description="JWT signing key — must be 32+ bytes")
+        debug: bool = False
+        log_level: str = Field(default="INFO", pattern="^(DEBUG|INFO|WARNING|ERROR)$")
+
+    @lru_cache()
+    def get_settings() -> AppSettings:
+        return AppSettings()
+
+    # Usage: settings = get_settings()
+    # Env: DATABASE__URL=postgresql://... DATABASE__POOL_SIZE=20 SECRET_KEY=...
+    # Missing DATABASE__URL → ValidationError at startup with clear message
+  example_bad: |
+    import os
+
+    DATABASE_URL = os.getenv("DATABASE_URL")  # None if missing — no error until first query
+    SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")  # Weak default in production?
+    DEBUG = os.getenv("DEBUG", "false") == "true"  # Manual bool conversion
+    POOL_SIZE = int(os.getenv("POOL_SIZE", "10"))  # ValueError if POOL_SIZE="ten"
+    # No documentation, no validation, errors at runtime not startup
+  when_applies: "Every application with configuration. Replace all os.getenv() calls with BaseSettings before first production deployment."
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/pydantic_settings/"
+    - "https://docs.pydantic.dev/latest/api/pydantic_settings/"
+
+- id: PYDV2-008
+  text: >
+    Use model_dump(mode="json") instead of model_dump() when the output is destined for JSON
+    serialization. model_dump() returns Python objects (datetime, UUID, Decimal) that are
+    not JSON-serializable. model_dump(mode="json") converts them to JSON-compatible types
+    (str, str, float) automatically, eliminating the need for custom json.dumps() encoders.
+  why: >
+    json.dumps(model.model_dump()) fails with TypeError: Object of type datetime is not
+    JSON serializable if the model has datetime fields. Teams implement custom json encoders
+    (json.dumps(data, default=str)) which work but lose type specificity — UUID becomes
+    a string without validation, datetime becomes a string without format guarantee. The
+    correct approach: model_dump(mode="json") uses Pydantic's schema-aware serialization,
+    applying the correct JSON type per field (ISO 8601 for datetime, string for UUID, correct
+    precision for Decimal).
+  how_to_do_right: |
+    1. For JSON output: model.model_dump(mode="json") — all types JSON-compatible
+    2. For Python consumption: model.model_dump() — returns native Python types
+    3. For JSON string: model.model_dump_json() — directly returns str (fastest)
+    4. Exclude fields: model.model_dump(exclude={"password", "internal_id"})
+    5. Include specific fields: model.model_dump(include={"id", "name", "email"})
+    6. Nested exclude: model.model_dump(exclude={"address": {"zip_code"}})
+    7. By alias: model.model_dump(by_alias=True) — uses alias in output
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pydantic, fastapi]
+  domains:
+    domain: [code_quality, backend, api]
+    concern: [serialization, json, type_conversion]
+  example_good: |
+    from pydantic import BaseModel
+    from datetime import datetime
+    from decimal import Decimal
+    import uuid, json
+
+    class Invoice(BaseModel):
+        id: uuid.UUID
+        created_at: datetime
+        amount: Decimal
+        customer_email: str
+
+    invoice = Invoice(
+        id=uuid.uuid4(),
+        created_at=datetime.now(),
+        amount=Decimal("99.99"),
+        customer_email="customer@example.com",
+    )
+
+    # For JSON: use mode="json" or model_dump_json()
+    data = invoice.model_dump(mode="json")
+    # data["id"] is str, data["created_at"] is str (ISO), data["amount"] is float
+    json_str = json.dumps(data)  # Works! No TypeError
+
+    # Even faster — direct JSON string:
+    json_str = invoice.model_dump_json()  # Rust-powered, no intermediate dict
+
+    # For API response exclude:
+    safe_data = invoice.model_dump(mode="json", exclude={"customer_email"})
+  example_bad: |
+    invoice = Invoice(id=uuid.uuid4(), created_at=datetime.now(), amount=Decimal("99.99"), ...)
+    data = invoice.model_dump()        # Contains datetime object, UUID object, Decimal object
+    json_str = json.dumps(data)        # TypeError: Object of type UUID is not JSON serializable
+
+    # "Fix" with default=str — loses type info
+    json_str = json.dumps(data, default=str)  # Works but UUID format not guaranteed
+    # Recipient: str "12345" could be interpreted as a number, not UUID
+  when_applies: "Every time model data is destined for JSON output: API responses, message queues, cache, file serialization."
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/serialization/#modelmodel_dump"
+    - "https://docs.pydantic.dev/latest/api/base_model/#pydantic.BaseModel.model_dump"
+
+- id: PYDV2-009
+  text: >
+    Use frozen=True (via model_config) for value objects and DTOs that should be immutable
+    after creation. Frozen models are hashable, can be used as dictionary keys, cached safely,
+    and stored in sets. Never mutate Pydantic models in-place after validation — it bypasses
+    validators and creates inconsistent state.
+  why: >
+    Pydantic models are mutable by default — any attribute can be changed after validation,
+    bypassing all validators. model.email = "invalid" succeeds silently. This breaks the
+    guarantee that a validated model is always valid. In functional pipelines where models are
+    passed through multiple stages, in-place mutation creates hard-to-trace bugs where stage 3
+    modifies a model that stage 4 expects to be unchanged. frozen=True enforces immutability
+    at the Python level (raises ValidationError on attribute assignment), and enables hashing
+    for use as cache keys and set members.
+  how_to_do_right: |
+    1. model_config = ConfigDict(frozen=True) for immutable value objects
+    2. For updates: use model.model_copy(update={"field": new_value}) — returns new instance
+    3. Frozen models are hashable: can be dict keys, set members, lru_cache arguments
+    4. Use frozen for: command objects, event objects, cache keys, DTOs between services
+    5. Do NOT use frozen for: ORM models (need mutation for ORM tracking), form models
+    6. model_copy() runs validators on the new values — mutation with validation
+    7. model_copy(deep=True) for deep-copying nested models
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [pydantic]
+  domains:
+    domain: [code_quality, backend]
+    concern: [immutability, value_objects, functional_programming]
+  example_good: |
+    from pydantic import BaseModel, ConfigDict
+
+    class Money(BaseModel):
+        model_config = ConfigDict(frozen=True)  # Immutable value object
+
+        amount: float
+        currency: str
+
+        def add(self, other: "Money") -> "Money":
+            if self.currency != other.currency:
+                raise ValueError(f"Cannot add {self.currency} and {other.currency}")
+            return Money(amount=self.amount + other.amount, currency=self.currency)
+
+    price = Money(amount=99.99, currency="USD")
+    # price.amount = 0.01  → ValidationError: Instance is frozen
+
+    # Correct update pattern:
+    discounted = price.model_copy(update={"amount": price.amount * 0.9})
+
+    # Hashable — usable as cache key
+    cache: dict[Money, str] = {}
+    cache[price] = "formatted_price_string"
+
+    # As command object — guaranteed immutable through entire pipeline
+    class CreateOrderCommand(BaseModel):
+        model_config = ConfigDict(frozen=True)
+        user_id: int
+        items: tuple[int, ...]  # tuple, not list — immutable collection
+  example_bad: |
+    class Money(BaseModel):  # Mutable — default
+        amount: float
+        currency: str
+
+    price = Money(amount=99.99, currency="USD")
+    price.amount = -1.0   # Silently bypasses any amount validator
+    price.currency = ""   # Validator not called — invalid state
+    # Model is now in an invalid state despite being "validated"
+  when_applies: >
+    Value objects (Money, Address, DateRange), command/event objects, cache keys, any model
+    that should represent an immutable fact rather than a mutable entity.
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/models/#model-methods-and-properties"
+    - "https://docs.pydantic.dev/latest/api/config/#pydantic.config.ConfigDict.frozen"
+
+- id: PYDV2-010
+  text: >
+    Define custom types using __get_pydantic_core_schema__ for reusable validated types
+    (PositiveDecimal, EmailStr, PhoneNumber, Slug) instead of repeating validation logic
+    in multiple models. Custom types participate in JSON Schema generation, work with
+    TypeAdapter, and are compatible with all Pydantic v2 features.
+  why: >
+    Without custom types, email validation logic is duplicated across 12 models: UserCreate,
+    UserUpdate, InviteCreate, NotificationRecipient, ContactForm, etc. When the email
+    validation rule changes (add TLD check, reject plus signs), all 12 models must be updated.
+    One was missed, allowing invalid emails through. Custom types centralize the rule once.
+    Additionally, custom types appear correctly in OpenAPI schema with descriptions and
+    examples, rather than generic "string" with no constraints visible to API consumers.
+  how_to_do_right: |
+    1. Define custom type as a class with __get_pydantic_core_schema__ classmethod
+    2. Use core_schema.no_info_after_validator_function for simple validation
+    3. Or annotate existing types: SlugStr = Annotated[str, Field(pattern=r"^[a-z0-9-]+$")]
+    4. For complex custom types: inherit from str/int and implement schema method
+    5. Register JSON schema metadata: json_schema_extra={"example": "hello-world"}
+    6. Use Annotated for composable constraints: PositiveInt = Annotated[int, Field(gt=0)]
+    7. Test custom types with TypeAdapter(CustomType).validate_python(value)
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [pydantic]
+  domains:
+    domain: [code_quality, backend, api]
+    concern: [custom_types, reusability, validation]
+  example_good: |
+    from pydantic import BaseModel, Field
+    from typing import Annotated
+    import re
+
+    # Annotated custom types — simple and composable
+    PositiveDecimal = Annotated[float, Field(gt=0, description="Must be greater than 0")]
+    Slug = Annotated[str, Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$", min_length=1, max_length=100)]
+    EmailStr = Annotated[str, Field(pattern=r"^[^@]+@[^@]+\.[^@]+$", to_lower=True)]
+
+    # Complex custom type with __get_pydantic_core_schema__
+    from pydantic_core import core_schema
+    from typing import Any
+
+    class PhoneNumber(str):
+        @classmethod
+        def __get_pydantic_core_schema__(cls, source_type: Any, handler: Any):
+            return core_schema.no_info_after_validator_function(
+                cls._validate,
+                core_schema.str_schema(),
+                serialization=core_schema.plain_serializer_function_ser_schema(str),
+            )
+
+        @classmethod
+        def _validate(cls, v: str) -> "PhoneNumber":
+            cleaned = re.sub(r"[\s\-\(\)]", "", v)
+            if not re.match(r"^\+?[1-9]\d{9,14}$", cleaned):
+                raise ValueError(f"Invalid phone number: {v}")
+            return cls(cleaned)
+
+    class UserProfile(BaseModel):
+        email: EmailStr           # Reused across all models
+        price: PositiveDecimal    # Reused across all pricing models
+        slug: Slug                # Reused across all URL-friendly identifiers
+        phone: PhoneNumber        # Reused with full validation logic
+  example_bad: |
+    class UserCreate(BaseModel):
+        email: str
+
+        @field_validator("email")
+        @classmethod
+        def validate_email(cls, v):
+            if "@" not in v or "." not in v.split("@")[-1]:
+                raise ValueError("invalid email")
+            return v.lower()
+
+    class InviteCreate(BaseModel):
+        email: str
+
+        @field_validator("email")  # DUPLICATED — will drift
+        @classmethod
+        def validate_email(cls, v):
+            if "@" not in v:          # Slightly different logic — bug waiting to happen
+                raise ValueError("invalid")
+            return v
+  when_applies: >
+    Any validation rule that appears in 2+ models. Extract to custom type before the third
+    copy. Common candidates: email, phone, URL, slug, positive amounts, percentage (0-100).
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/types/#custom-types"
+    - "https://docs.pydantic.dev/latest/concepts/postponed_annotations/#handling-third-party-types"
+
+- id: PYDV2-011
+  text: >
+    Use model_config = ConfigDict(from_attributes=True) to enable ORM mode, allowing Pydantic
+    to read from SQLAlchemy model attributes. Set this only on response/serialization schemas,
+    never on input/request schemas — mixing read and write schemas is a security vulnerability
+    that exposes internal fields to user input.
+  why: >
+    Using the same Pydantic schema for input and output violates the command-query separation
+    principle. A UserSchema with from_attributes=True that is also used as input allows
+    attackers to send {"id": 1, "is_admin": true, "created_at": "..."} in a create request,
+    potentially overwriting protected fields if input validation is incomplete. Separate
+    schemas (UserCreate for input, UserResponse for output) make it impossible to accept
+    internal fields as input — the field literally doesn't exist on the input schema.
+    This is called the "mass assignment" vulnerability.
+  how_to_do_right: |
+    1. UserCreate (input): no id, no is_admin, no created_at, no from_attributes
+    2. UserUpdate (input): subset of mutable fields, Optional for partial updates
+    3. UserResponse (output): from_attributes=True, includes id and computed fields
+    4. UserAdminResponse (output): extends UserResponse, adds admin-only fields
+    5. Never reuse input schemas as output schemas or vice versa
+    6. from_attributes=True works with SQLAlchemy ORM models, dataclasses, named tuples
+    7. UserResponse.model_validate(sqlalchemy_user) — reads from ORM attributes directly
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [pydantic, sqlalchemy, fastapi]
+  domains:
+    domain: [code_quality, security, api, backend]
+    concern: [orm_mode, mass_assignment, schema_separation]
+  example_good: |
+    from pydantic import BaseModel, ConfigDict, computed_field
+    from typing import Optional
+
+    # Input schema — no from_attributes, no internal fields
+    class UserCreate(BaseModel):
+        email: str
+        name: str
+        password: str  # Hashed in service layer
+
+    class UserUpdate(BaseModel):
+        name: Optional[str] = None  # Only mutable fields
+        bio: Optional[str] = None
+
+    # Output schema — reads from ORM, exposes safe fields only
+    class UserResponse(BaseModel):
+        model_config = ConfigDict(from_attributes=True)  # Reads SQLAlchemy ORM attributes
+        id: int
+        email: str
+        name: str
+        is_active: bool
+        # password EXCLUDED — never expose hash
+        # is_admin EXCLUDED — use separate AdminUserResponse
+
+        @computed_field
+        @property
+        def display_name(self) -> str:
+            return self.name or self.email.split("@")[0]
+
+    # Usage:
+    orm_user = session.scalars(select(User).where(User.id == user_id)).one()
+    response = UserResponse.model_validate(orm_user)  # from_attributes reads ORM attrs
+  example_bad: |
+    class UserSchema(BaseModel):
+        model_config = ConfigDict(from_attributes=True)
+        id: Optional[int] = None  # Should not be in input schema!
+        email: str
+        name: str
+        is_admin: bool = False    # Mass assignment vulnerability!
+        created_at: Optional[datetime] = None
+
+    # POST /users with body {"email": "hacker@test.com", "is_admin": true}
+    # If service does: user = UserSchema(**request_body); db_user.is_admin = user.is_admin
+    # Attacker becomes admin.
+  when_applies: >
+    All API schemas. Enforce separate input/output schemas as a code review requirement.
+    from_attributes=True on input schema is always a red flag.
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/models/#arbitrary-class-instances"
+    - "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/20-Testing_for_Mass_Assignment"
+
+- id: PYDV2-012
+  text: >
+    Use model_config = ConfigDict(extra="forbid") on input/request schemas to reject
+    unexpected fields, and extra="ignore" (default) on output schemas. extra="forbid" catches
+    API versioning mismatches early (client sending fields from a newer/older API version)
+    and prevents mass assignment attacks. Never use extra="allow" on any schema that touches
+    a database.
+  why: >
+    extra="allow" silently accepts any field from the client. A schema with extra="allow"
+    for a UserCreate endpoint accepts {"email": "...", "is_verified": true, "internal_flags": {...}}.
+    Even if the service layer doesn't use extra fields, attackers probe for cases where extras
+    propagate to ORM objects via **schema.model_dump(). extra="forbid" returns a clear 422
+    error: "unexpected field 'is_verified'" — fails fast, prevents probing. It also catches
+    typos: {"emial": "test@test.com"} fails with "unexpected field 'emial'" instead of
+    silently using an empty email.
+  how_to_do_right: |
+    1. All request/input schemas: model_config = ConfigDict(extra="forbid")
+    2. All response/output schemas: model_config = ConfigDict(extra="ignore") (default)
+    3. Internal service-to-service schemas: extra="forbid" catches interface drift
+    4. Configuration schemas: extra="forbid" catches typos in YAML/env files
+    5. When adding a new field: add to schema first, deploy, then update clients
+    6. For backward compatibility: Optional[T] = None for new fields during migration
+    7. Test: assert POST with extra field returns 422, not 200
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pydantic, fastapi]
+  domains:
+    domain: [code_quality, security, api]
+    concern: [input_validation, extra_fields, security]
+  example_good: |
+    from pydantic import BaseModel, ConfigDict
+
+    class CreateOrderRequest(BaseModel):
+        model_config = ConfigDict(extra="forbid")  # Reject unexpected fields
+        customer_id: int
+        items: list[int]
+        coupon_code: str | None = None
+
+    # POST /orders with body {"customer_id": 1, "items": [1,2], "is_test": true}
+    # → ValidationError: Extra inputs are not permitted [type=extra_forbidden, input_url=/is_test]
+    # → 422 response — caught before touching database
+
+    # POST /orders with body {"custmer_id": 1}  (typo)
+    # → ValidationError: Extra inputs are not permitted (custmer_id) + Field required (customer_id)
+    # → Typo caught immediately
+
+    class AppConfig(BaseSettings):
+        model_config = SettingsConfigDict(extra="forbid")  # Catch config typos
+        database_url: str
+        secret_key: str
+    # DATBASE_URL=... → ValidationError: Extra inputs not permitted (catches typo in .env)
+  example_bad: |
+    class CreateOrderRequest(BaseModel):
+        # extra="allow" is default if not specified (actually extra="ignore" is default)
+        # But explicitly allowing extras is dangerous:
+        model_config = ConfigDict(extra="allow")
+        customer_id: int
+        items: list[int]
+
+    # POST /orders with {"customer_id": 1, "items": [], "is_admin": true}
+    # Accepted silently — extra fields stored in model.__pydantic_extra__
+    # If service does: ORM(**request.model_dump()) → is_admin=True propagates
+  when_applies: >
+    All request/input schemas. Set extra="forbid" as the default in a base input class
+    that all request schemas inherit from.
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/models/#extra-fields"
+    - "https://docs.pydantic.dev/latest/api/config/#pydantic.config.ConfigDict.extra"
+
+- id: PYDV2-013
+  text: >
+    Use model_dump(exclude_none=True) or exclude_unset=True for PATCH endpoint payloads
+    to distinguish "field not provided" from "field explicitly set to null". Never implement
+    partial updates by checking if a field is None — that prevents legitimately setting a
+    field to null.
+  why: >
+    A PATCH endpoint that updates only provided fields cannot use model.field is None as the
+    check, because the client may intentionally want to clear a field (set it to null). With
+    exclude_none=True, null fields are excluded from the update dict — but this prevents
+    clearing optional fields. With exclude_unset=True, only fields that the client explicitly
+    included in the request body are present in the update dict. Setting bio=null is included.
+    Not providing bio at all is excluded. This is the correct semantic for partial updates
+    and is what clients expect from a properly designed PATCH endpoint.
+  how_to_do_right: |
+    1. PATCH schema: all fields Optional with default=None
+    2. Pydantic tracks which fields were explicitly set vs defaulted: model.model_fields_set
+    3. update_dict = model.model_dump(exclude_unset=True) — only provided fields
+    4. Apply to ORM: for field, value in update_dict.items(): setattr(orm_obj, field, value)
+    5. Distinguish: PATCH {} → empty dict, no update
+    6. Distinguish: PATCH {"bio": null} → {"bio": None} — clears the field
+    7. Distinguish: PATCH {"name": "John"} → {"name": "John"} — updates only name
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pydantic, fastapi, sqlalchemy]
+  domains:
+    domain: [code_quality, api, backend]
+    concern: [partial_updates, patch_semantics, serialization]
+  example_good: |
+    from pydantic import BaseModel
+    from typing import Optional
+
+    class UserPatch(BaseModel):
+        name: Optional[str] = None
+        bio: Optional[str] = None
+        avatar_url: Optional[str] = None
+
+    async def patch_user(
+        user_id: int, patch: UserPatch, session: AsyncSession
+    ) -> User:
+        user = await session.get(User, user_id)
+        if user is None:
+            raise HTTPException(status_code=404)
+
+        # model_fields_set: only fields explicitly included in request body
+        update_data = patch.model_dump(exclude_unset=True)
+        # PATCH {} → update_data = {} (no changes)
+        # PATCH {"bio": null} → update_data = {"bio": None} (clears bio)
+        # PATCH {"name": "Alice"} → update_data = {"name": "Alice"} (updates only name)
+
+        for field, value in update_data.items():
+            setattr(user, field, value)
+        await session.commit()
+        return user
+  example_bad: |
+    async def patch_user_broken(user_id: int, patch: UserPatch, session: AsyncSession):
+        user = await session.get(User, user_id)
+        # WRONG: None check prevents clearing fields intentionally
+        if patch.name is not None:    # Client sends {"bio": null} → name skipped (correct)
+            user.name = patch.name    # But client sends {"name": null} → cannot clear name!
+        if patch.bio is not None:     # Cannot distinguish "not provided" from "set to null"
+            user.bio = patch.bio
+        await session.commit()
+  when_applies: "All PATCH endpoints. Design PATCH schemas with model_dump(exclude_unset=True) from the beginning."
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/serialization/#model_dump_json"
+    - "https://docs.pydantic.dev/latest/api/base_model/#pydantic.BaseModel.model_fields_set"
+
+- id: PYDV2-014
+  text: >
+    Use Pydantic's ValidationError with rich error formatting for API error responses.
+    Never raise HTTP 500 on validation errors — catch ValidationError and return 422.
+    Expose error details in a consistent format so API clients can display field-specific
+    error messages without parsing free-form error strings.
+  why: >
+    FastAPI automatically converts Pydantic ValidationError to 422 responses for request
+    body validation. But ValidationError from manual model_validate() calls or service layer
+    validation raises uncaught exceptions that become 500 Internal Server Error responses.
+    Clients cannot distinguish between "your email is invalid" (user error) and "database
+    is down" (server error) if both return 500. Standardized error format enables frontend
+    to map field-path → error message for form validation UI without screen-scraping error text.
+  how_to_do_right: |
+    1. Catch ValidationError from service layer and re-raise as HTTPException(422)
+    2. Include error detail from e.errors() in the response body
+    3. Format: {"errors": [{"field": "email", "message": "invalid email format"}]}
+    4. Map Pydantic's loc tuple to dot-separated field path: ("address", "zip_code") → "address.zip_code"
+    5. Use custom error messages: Field(validation_alias="email", description="...")
+    6. For API response schema: define ErrorResponse(BaseModel) with errors field
+    7. Middleware: catch ValidationError globally and return consistent 422 format
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [pydantic, fastapi]
+  domains:
+    domain: [code_quality, api, backend]
+    concern: [error_handling, validation_errors, api_design]
+  example_good: |
+    from pydantic import ValidationError, BaseModel
+    from fastapi import HTTPException
+
+    class FieldError(BaseModel):
+        field: str
+        message: str
+        code: str
+
+    class ErrorResponse(BaseModel):
+        errors: list[FieldError]
+
+    def format_validation_error(e: ValidationError) -> ErrorResponse:
+        errors = []
+        for error in e.errors():
+            field_path = ".".join(str(loc) for loc in error["loc"])
+            errors.append(FieldError(
+                field=field_path,
+                message=error["msg"],
+                code=error["type"],
+            ))
+        return ErrorResponse(errors=errors)
+
+    @router.post("/orders")
+    async def create_order(data: dict, session: AsyncSession = Depends(get_session)):
+        try:
+            order_data = CreateOrderSchema.model_validate(data)
+        except ValidationError as e:
+            raise HTTPException(
+                status_code=422,
+                detail=format_validation_error(e).model_dump(),
+            )
+        # {"errors": [{"field": "items", "message": "List should have at least 1 item", "code": "too_short"}]}
+  example_bad: |
+    @router.post("/orders")
+    async def create_order(data: dict, session: AsyncSession):
+        try:
+            order_data = CreateOrderSchema.model_validate(data)
+        except ValidationError:
+            raise  # Becomes 500 Internal Server Error — client sees "Internal Server Error"
+            # Frontend cannot show field-specific error message
+            # Logs look like production bugs when they're really user input errors
+  when_applies: >
+    Any endpoint that performs manual Pydantic validation (outside of FastAPI's automatic
+    request body parsing). Also: service layer validation that clients need to handle gracefully.
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/models/#error-handling"
+    - "https://docs.pydantic.dev/latest/api/pydantic_core/#pydantic_core.InitErrorDetails"
+
+- id: PYDV2-015
+  text: >
+    Use TypeAdapter for validating data without creating a full model instance: lists,
+    dicts, Union types, and raw type validation. TypeAdapter is 3-5x faster than wrapping
+    data in a BaseModel just for validation, and enables reuse of Pydantic's validation
+    for non-model types.
+  why: >
+    Teams that need to validate a list[UserOut] from a database result often create a
+    WrapperModel(items: list[UserOut]) just to call model.items — unnecessary overhead.
+    TypeAdapter(list[UserOut]).validate_python(data) does the same validation without
+    wrapper model overhead. More critically, TypeAdapter is the correct tool for validating
+    raw JSON from external sources (webhooks, message queues) against complex types without
+    defining a full model, and for validating function return types in tests.
+  how_to_do_right: |
+    1. ta = TypeAdapter(list[UserOut]) then ta.validate_python(data)
+    2. For repeated validation: create TypeAdapter once at module level (it's a class)
+    3. For JSON bytes: ta.validate_json(json_bytes) — skips JSON parsing overhead
+    4. For JSON schema: ta.json_schema() — works for any type, not just models
+    5. For serialization: ta.dump_python(obj, mode="json")
+    6. Combine with Union: TypeAdapter(Union[CardEvent, BankEvent]) with discriminator
+    7. For function signatures: TypeAdapter(Annotated[int, Field(gt=0)]).validate_python(value)
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [pydantic]
+  domains:
+    domain: [code_quality, backend, performance]
+    concern: [type_adapter, validation, performance]
+  example_good: |
+    from pydantic import TypeAdapter
+    from typing import Union, Annotated
+    from pydantic import Field
+
+    # Module-level TypeAdapter (created once, reused many times)
+    UserListAdapter = TypeAdapter(list[UserOut])
+    PositiveInt = TypeAdapter(Annotated[int, Field(gt=0, lt=1000)])
+
+    # Validate list result from ORM
+    async def get_users(session: AsyncSession) -> list[UserOut]:
+        result = await session.execute(select(User))
+        orm_users = result.scalars().all()
+        return UserListAdapter.validate_python(
+            [{"id": u.id, "email": u.email, "name": u.name} for u in orm_users]
+        )
+
+    # Validate single value in a function
+    def set_priority(task_id: int, priority: int) -> None:
+        validated_priority = PositiveInt.validate_python(priority)  # Raises if invalid
+        update_task_priority(task_id, validated_priority)
+
+    # Validate webhook payload as discriminated union (no wrapper model needed)
+    WebhookEvent = Annotated[Union[PaymentEvent, RefundEvent], Field(discriminator="type")]
+    WebhookAdapter = TypeAdapter(WebhookEvent)
+    event = WebhookAdapter.validate_python(request.body)
+  example_bad: |
+    # Wrapper model just for validation — unnecessary overhead
+    class UserList(BaseModel):
+        items: list[UserOut]
+
+    def validate_user_list(data: list) -> list[UserOut]:
+        wrapper = UserList(items=data)  # Creates model instance just to get .items
+        return wrapper.items
+        # TypeAdapter(list[UserOut]).validate_python(data) is cleaner and faster
+  when_applies: >
+    Validating non-model types (lists, dicts, primitives), webhook payloads, message queue
+    messages, or any data where creating a wrapper BaseModel would be boilerplate.
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/type_adapter/"
+    - "https://docs.pydantic.dev/latest/api/type_adapter/#pydantic.TypeAdapter"

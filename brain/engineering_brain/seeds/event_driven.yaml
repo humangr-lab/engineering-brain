@@ -1,0 +1,1172 @@
+layer: rules
+domain: realtime
+knowledge:
+- id: RT-EVT-001
+  text: "Event-driven architecture must decouple producers from consumers through a message broker. Producers must never know about consumers, and adding a new consumer must require zero changes to the producer."
+  why: >
+    A platform started with direct function calls between services: OrderService called
+    InventoryService, then NotificationService, then AnalyticsService. Adding each new consumer
+    required modifying OrderService, creating a deployment dependency chain. When AnalyticsService
+    was slow (2s response), it blocked order processing for all users. Switching to events took
+    3 weeks of refactoring that would have been unnecessary if events were used from the start.
+  how_to_do_right: |
+    1. Producer publishes events to a topic/channel (Kafka, Redis Streams)
+    2. Each consumer subscribes independently — producer is unaware
+    3. Events are immutable facts: "OrderPlaced", not "ProcessOrder" (past tense, not imperative)
+    4. Use fan-out: one event, multiple independent consumers
+    5. New consumer = new subscription, zero producer changes
+    6. Test producer and consumers independently using event contracts
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, architecture]
+    concern: [message_broker]
+  example_good: |
+    # Producer: publishes event, knows nothing about consumers
+    class OrderService:
+        async def place_order(self, order: Order) -> Order:
+            saved = await self.repo.save(order)
+            await self.event_bus.publish("orders", OrderPlaced(
+                order_id=saved.id,
+                user_id=saved.user_id,
+                total=saved.total,
+                items=saved.items,
+                occurred_at=datetime.utcnow(),
+            ))
+            return saved
+
+    # Consumer 1: Inventory — independent deployment
+    @event_handler("orders", "OrderPlaced")
+    async def update_inventory(event: OrderPlaced):
+        for item in event.items:
+            await inventory_repo.decrement(item.sku, item.quantity)
+
+    # Consumer 2: Notifications — added later, zero changes to OrderService
+    @event_handler("orders", "OrderPlaced")
+    async def send_confirmation(event: OrderPlaced):
+        await email_service.send_order_confirmation(event.user_id, event.order_id)
+  example_bad: |
+    # BAD: Direct coupling — producer knows all consumers
+    class OrderService:
+        async def place_order(self, order):
+            saved = await self.repo.save(order)
+            await self.inventory_service.update(saved)  # Coupled
+            await self.notification_service.notify(saved)  # Coupled
+            await self.analytics_service.track(saved)  # Slow, blocks order
+            return saved
+  when_applies: Any system with more than 2 services that react to the same business event
+  sources: ["https://martinfowler.com/articles/201701-event-driven.html"]
+
+- id: RT-EVT-002
+  text: "Event schemas must follow the CloudEvents specification (version 1.0). Every event must include id, source, type, specversion, time, and datacontenttype as required attributes."
+  why: >
+    A team used ad-hoc event formats: some had "timestamp", others "created_at", others "ts".
+    Some used "event_type", others "type", others "kind". When building a unified event store
+    for debugging, they spent 2 weeks writing format converters for 47 different event shapes.
+    CloudEvents eliminates this by standardizing the envelope while leaving the payload flexible.
+  how_to_do_right: |
+    1. Use CloudEvents spec 1.0: https://cloudevents.io/
+    2. Required attributes: id (UUID), source (URI), type (reverse-DNS), specversion ("1.0")
+    3. Optional but recommended: time (RFC 3339), datacontenttype ("application/json")
+    4. Business data goes in "data" field — the envelope is standard, payload is domain-specific
+    5. Type naming: "com.forekast.order.placed", "com.veritas.claim.submitted"
+    6. Validate all events against schema before publishing
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, architecture]
+    concern: [message_broker]
+  example_good: |
+    from datetime import datetime, timezone
+    from uuid import uuid4
+    from pydantic import BaseModel
+
+    class CloudEvent(BaseModel):
+        specversion: str = "1.0"
+        id: str
+        source: str
+        type: str
+        time: str
+        datacontenttype: str = "application/json"
+        data: dict
+
+    def create_event(source: str, event_type: str, data: dict) -> CloudEvent:
+        return CloudEvent(
+            id=str(uuid4()),
+            source=source,
+            type=event_type,
+            time=datetime.now(timezone.utc).isoformat(),
+            data=data,
+        )
+
+    # Usage
+    event = create_event(
+        source="/services/order-service",
+        event_type="com.forekast.order.placed",
+        data={"order_id": "123", "total": 99.99},
+    )
+  example_bad: |
+    # BAD: Ad-hoc format — no standard envelope
+    event = {
+        "kind": "order_placed",  # Non-standard field name
+        "ts": time.time(),  # Unix timestamp, not ISO 8601
+        "order_id": "123",  # Data mixed with metadata
+        "total": 99.99,
+    }
+    # Another service uses completely different format:
+    event2 = {
+        "event_type": "ORDER_CREATED",
+        "created_at": "2024-01-01",
+        "payload": {"id": "123"},
+    }
+  when_applies: Any event-driven system producing events consumed by multiple services
+  sources: ["https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/spec.md"]
+
+- id: RT-EVT-003
+  text: "Event ordering must be guaranteed within a partition key (e.g., order_id, user_id), not globally. Use the entity ID as the partition key to ensure all events for one entity are processed in order."
+  why: >
+    A team configured Kafka with 3 partitions but used random partitioning. Events for the same
+    order arrived out of order: "OrderShipped" was processed before "OrderPaid". The shipping
+    service sent a package for an unpaid order. When they switched to order_id as partition key,
+    all events for the same order went to the same partition, guaranteeing order within that entity.
+  how_to_do_right: |
+    1. Use entity ID as partition key: order_id, user_id, claim_id
+    2. All events for entity X go to same partition -> guaranteed order for X
+    3. Different entities can be processed in parallel across partitions
+    4. Never use random or round-robin partitioning for ordered events
+    5. If you need global ordering: use single partition (sacrifices throughput)
+    6. Kafka: specify key in ProducerRecord. Redis Streams: use stream-per-entity or XADD with ID
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, architecture]
+    concern: [message_broker, consistency]
+  example_good: |
+    from aiokafka import AIOKafkaProducer
+
+    producer = AIOKafkaProducer(bootstrap_servers="kafka:9092")
+
+    async def publish_order_event(event: CloudEvent, order_id: str):
+        # Partition by order_id — all events for same order are in order
+        await producer.send(
+            topic="orders",
+            key=order_id.encode(),  # Partition key = order_id
+            value=json.dumps(event.dict()).encode(),
+        )
+
+    # Events for order-123 always arrive in order:
+    # 1. OrderCreated -> 2. OrderPaid -> 3. OrderShipped
+    # Events for order-456 may interleave with order-123 (different partition)
+  example_bad: |
+    # BAD: No partition key — events for same order may arrive out of order
+    await producer.send(
+        topic="orders",
+        value=json.dumps(event).encode(),
+        # No key! Random partition assignment
+    )
+    # OrderShipped for order-123 might arrive before OrderPaid
+  when_applies: Any event stream where processing order matters for correctness, especially financial transactions
+  sources: ["https://kafka.apache.org/documentation/#design_guarantees"]
+
+- id: RT-EVT-004
+  text: "Event versioning must use semantic versioning in the event type and support backward-compatible evolution. Never break existing consumers when changing event schemas."
+  why: >
+    A team added a required field "currency" to the OrderPlaced event. All existing consumers
+    crashed because they didn't expect the field and their deserialization failed on missing
+    validation for the old format. 3 services went down simultaneously, causing a 2-hour outage.
+    The fix required coordinated deployment of all consumers before the producer — the exact
+    coupling events were supposed to eliminate.
+  how_to_do_right: |
+    1. Include version in event type: "com.forekast.order.placed.v1"
+    2. Backward-compatible changes (safe): add optional fields with defaults
+    3. Breaking changes: create new version "v2", keep publishing "v1" for 30 days
+    4. Consumer must ignore unknown fields (open-closed principle)
+    5. Use schema registry (Confluent, AWS Glue) to enforce compatibility
+    6. Test: old consumer must process new event without crashing
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, architecture]
+    concern: [message_broker, migration]
+  example_good: |
+    # V1: Original schema
+    class OrderPlacedV1(BaseModel):
+        order_id: str
+        user_id: str
+        total: float
+        items: list[dict]
+
+    # V2: Added currency (optional with default for backward compat)
+    class OrderPlacedV2(BaseModel):
+        order_id: str
+        user_id: str
+        total: float
+        currency: str = "USD"  # Default makes it backward compatible
+        items: list[dict]
+        metadata: dict = {}  # Optional, ignored by old consumers
+
+    # Producer publishes both during migration period
+    async def publish_order_placed(order: Order):
+        v2_event = create_event(
+            type="com.forekast.order.placed.v2",
+            data=OrderPlacedV2.from_order(order).dict(),
+        )
+        await bus.publish("orders", v2_event)
+
+    # Old consumer: ignores unknown fields, still works
+    @event_handler("orders", "com.forekast.order.placed.*")
+    async def handle_order(event):
+        data = OrderPlacedV1(**{k: v for k, v in event.data.items() if k in OrderPlacedV1.model_fields})
+  example_bad: |
+    # BAD: Breaking change without versioning
+    class OrderPlaced(BaseModel):
+        order_id: str
+        user_id: str
+        total: float
+        currency: str  # REQUIRED — breaks all existing consumers instantly
+        items: list[dict]
+  when_applies: Any event schema that may evolve over time (which is all of them)
+  sources: ["https://microservices.io/patterns/data/event-versioning.html"]
+
+- id: RT-EVT-005
+  text: "Exactly-once event processing requires idempotent consumers. Store processed event IDs and check before processing. The broker guarantees at-least-once delivery; your consumer must handle duplicates."
+  why: >
+    Kafka delivered an OrderPaid event twice (consumer crashed after processing but before committing
+    offset). The payment service charged the customer twice: $49.99 x 2. The refund process took
+    5 business days and the customer filed a chargeback. The real cost: $49.99 refund + $15
+    chargeback fee + lost customer trust. All because the consumer assumed exactly-once delivery.
+  how_to_do_right: |
+    1. Accept that brokers provide at-least-once delivery (Kafka, Redis, RabbitMQ)
+    2. Store processed event IDs in a deduplication table (event_id + consumer_name)
+    3. Check dedup table BEFORE processing: if exists, skip (already processed)
+    4. Use database transaction: process + insert dedup record atomically
+    5. Set TTL on dedup records: 7 days (events older than 7 days won't be redelivered)
+    6. Alternative: make operations naturally idempotent (SET instead of INCREMENT)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, reliability]
+    concern: [consistency]
+  example_good: |
+    class IdempotentConsumer:
+        def __init__(self, consumer_name: str, db: AsyncSession):
+            self.consumer_name = consumer_name
+            self.db = db
+
+        async def process(self, event: CloudEvent, handler: Callable):
+            # Check if already processed
+            exists = await self.db.execute(
+                select(ProcessedEvent).where(
+                    ProcessedEvent.event_id == event.id,
+                    ProcessedEvent.consumer == self.consumer_name,
+                )
+            )
+            if exists.scalar_one_or_none():
+                logger.info(f"Duplicate event {event.id}, skipping")
+                return
+
+            # Process + record in single transaction
+            async with self.db.begin():
+                await handler(event)
+                self.db.add(ProcessedEvent(
+                    event_id=event.id,
+                    consumer=self.consumer_name,
+                    processed_at=datetime.utcnow(),
+                ))
+
+    # Usage
+    consumer = IdempotentConsumer("payment-service", db)
+    await consumer.process(event, charge_customer)
+  example_bad: |
+    # BAD: No idempotency check — duplicate events cause duplicate charges
+    @event_handler("orders", "OrderPaid")
+    async def charge_customer(event):
+        await payment_gateway.charge(event.data["user_id"], event.data["amount"])
+        # If this crashes AFTER charging but BEFORE offset commit,
+        # the event will be redelivered and customer charged twice
+  when_applies: Any event consumer that triggers side effects (payments, emails, inventory changes, state mutations)
+  sources: ["https://microservices.io/patterns/data/idempotent-consumer.html"]
+
+- id: RT-EVT-006
+  text: "Event sourcing for financial audit trails must store every state change as an immutable event. The current state is derived by replaying events. Never mutate events after storage."
+  why: >
+    A financial platform used CRUD with UPDATE statements. During an audit, regulators asked
+    "what was the account balance at 3:47 PM on January 15th?" The team couldn't answer because
+    UPDATE overwrites previous values. With event sourcing, you replay events up to that timestamp
+    and get the exact state. The audit finding cost $250,000 in fines and 6 months of remediation.
+  how_to_do_right: |
+    1. Store every state change as an immutable event in append-only store
+    2. Events: AccountOpened, FundsDeposited, FundsWithdrawn, TransferInitiated
+    3. Current state = replay all events for that aggregate
+    4. Use snapshots every 100 events to avoid slow replay
+    5. Never DELETE or UPDATE events — append corrections as new events (FundsDepositReversed)
+    6. Include metadata: user_id, timestamp, correlation_id, reason
+    7. Retention: financial events must be retained for 7+ years (regulatory)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, fintech, compliance]
+    concern: [consistency]
+  example_good: |
+    from dataclasses import dataclass
+    from decimal import Decimal
+
+    @dataclass(frozen=True)
+    class AccountEvent:
+        event_id: str
+        account_id: str
+        event_type: str
+        amount: Decimal
+        balance_after: Decimal
+        occurred_at: datetime
+        user_id: str
+        reason: str
+
+    class EventSourcedAccount:
+        def __init__(self, account_id: str):
+            self.account_id = account_id
+            self.balance = Decimal("0")
+            self.events: list[AccountEvent] = []
+
+        def deposit(self, amount: Decimal, user_id: str, reason: str) -> AccountEvent:
+            new_balance = self.balance + amount
+            event = AccountEvent(
+                event_id=str(uuid4()),
+                account_id=self.account_id,
+                event_type="FundsDeposited",
+                amount=amount,
+                balance_after=new_balance,
+                occurred_at=datetime.utcnow(),
+                user_id=user_id,
+                reason=reason,
+            )
+            self.balance = new_balance
+            self.events.append(event)
+            return event
+
+        @classmethod
+        def from_events(cls, account_id: str, events: list[AccountEvent]) -> "EventSourcedAccount":
+            account = cls(account_id)
+            for event in events:
+                account.balance = event.balance_after
+            account.events = events
+            return account
+
+        def balance_at(self, timestamp: datetime) -> Decimal:
+            """Audit query: what was the balance at a specific time?"""
+            balance = Decimal("0")
+            for event in self.events:
+                if event.occurred_at <= timestamp:
+                    balance = event.balance_after
+            return balance
+  example_bad: |
+    # BAD: CRUD — no audit trail, previous state lost forever
+    async def deposit(account_id, amount):
+        await db.execute(
+            "UPDATE accounts SET balance = balance + :amount WHERE id = :id",
+            {"amount": amount, "id": account_id},
+        )
+        # Previous balance is gone forever. Cannot answer "balance at time X"
+  when_applies: Financial systems, trading platforms, any system requiring audit trails or regulatory compliance
+  sources: ["https://microservices.io/patterns/data/event-sourcing.html"]
+
+- id: RT-EVT-007
+  text: "CQRS separates the write model (commands) from the read model (queries). Use separate databases optimized for each: normalized for writes, denormalized for reads. Synchronize via events."
+  why: >
+    A prediction market had a single PostgreSQL database for both writes and reads. The leaderboard
+    query (join users + bets + markets + settlements, aggregate, sort) took 3.2 seconds and was
+    called 500 times/minute. The heavy reads caused lock contention on the writes, slowing down
+    bet placement to 800ms (from 50ms). After CQRS: writes to normalized PostgreSQL (50ms),
+    reads from denormalized Redis/Elasticsearch (8ms). Write performance returned to normal.
+  how_to_do_right: |
+    1. Command side: normalized database, optimized for writes, enforces invariants
+    2. Query side: denormalized view, optimized for specific read patterns
+    3. Sync via events: command side publishes events, query side consumes and updates views
+    4. Accept eventual consistency: read model may be 100ms-1s behind write model
+    5. Common read stores: Redis (leaderboards), Elasticsearch (search), materialized views
+    6. Keep it simple: only apply CQRS to domains with mismatched read/write patterns
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, architecture]
+    concern: [consistency]
+  example_good: |
+    # Command side: normalized writes
+    class BetCommandService:
+        async def place_bet(self, cmd: PlaceBetCommand) -> Bet:
+            async with self.db.begin():
+                bet = Bet(user_id=cmd.user_id, market_id=cmd.market_id, amount=cmd.amount)
+                self.db.add(bet)
+            await self.event_bus.publish("bets", BetPlaced(
+                bet_id=bet.id, user_id=bet.user_id, amount=bet.amount,
+            ))
+            return bet
+
+    # Query side: denormalized reads
+    class LeaderboardQueryService:
+        def __init__(self, redis_client):
+            self.redis = redis_client
+
+        async def get_leaderboard(self, market_id: str, limit: int = 50) -> list[dict]:
+            # Pre-computed, O(log N) read from sorted set
+            return await self.redis.zrevrange(f"leaderboard:{market_id}", 0, limit - 1, withscores=True)
+
+    # Event handler: keeps read model in sync
+    @event_handler("bets", "BetPlaced")
+    async def update_leaderboard(event: BetPlaced):
+        await redis.zincrby(f"leaderboard:{event.market_id}", event.amount, event.user_id)
+  example_bad: |
+    # BAD: Single model for reads and writes
+    async def get_leaderboard(market_id):
+        # Heavy join query, 3.2s, blocks writes
+        return await db.execute("""
+            SELECT u.name, SUM(b.amount) as total
+            FROM bets b JOIN users u ON b.user_id = u.id
+            WHERE b.market_id = :market_id AND b.settled = true
+            GROUP BY u.id ORDER BY total DESC LIMIT 50
+        """, {"market_id": market_id})
+  when_applies: Systems where read and write patterns have different performance requirements, especially leaderboards, dashboards, search
+  sources: ["https://microservices.io/patterns/data/cqrs.html"]
+
+- id: RT-EVT-008
+  text: "Saga pattern for distributed transactions must define compensating actions for every step. If step 3 fails, steps 1 and 2 must be rolled back via compensation, not via distributed locks."
+  why: >
+    A bet placement involved 3 services: (1) reserve funds, (2) create bet, (3) update market odds.
+    Step 3 failed (market closed), but steps 1 and 2 were already committed. The user's funds were
+    locked and the bet existed but was invalid. Without compensating transactions, manual database
+    intervention was needed for every such failure. This happened 50 times/day during market close
+    periods, requiring 2 engineers dedicated to manual cleanup.
+  how_to_do_right: |
+    1. Define saga as sequence of steps, each with a compensating action
+    2. Step 1: Reserve funds -> Compensate: Release funds
+    3. Step 2: Create bet -> Compensate: Cancel bet
+    4. Step 3: Update odds -> Compensate: Revert odds
+    5. On failure at step N: execute compensations for steps N-1, N-2, ..., 1 in reverse order
+    6. Store saga state in database: track which steps completed for recovery
+    7. Compensations must be idempotent (may be retried)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, architecture]
+    concern: [consistency]
+  example_good: |
+    from dataclasses import dataclass
+    from enum import Enum
+
+    class SagaStep:
+        def __init__(self, name: str, execute: Callable, compensate: Callable):
+            self.name = name
+            self.execute = execute
+            self.compensate = compensate
+
+    class SagaOrchestrator:
+        def __init__(self, steps: list[SagaStep]):
+            self.steps = steps
+
+        async def run(self, context: dict) -> dict:
+            completed = []
+            try:
+                for step in self.steps:
+                    result = await step.execute(context)
+                    context[step.name] = result
+                    completed.append(step)
+                return {"status": "success", "context": context}
+            except Exception as e:
+                # Compensate in reverse order
+                for step in reversed(completed):
+                    try:
+                        await step.compensate(context)
+                    except Exception as comp_error:
+                        logger.error(f"Compensation failed for {step.name}: {comp_error}")
+                        # Store for manual intervention
+                        await self.store_failed_compensation(step.name, context, comp_error)
+                return {"status": "failed", "error": str(e), "compensated": True}
+
+    # Usage
+    place_bet_saga = SagaOrchestrator([
+        SagaStep("reserve_funds", reserve_funds, release_funds),
+        SagaStep("create_bet", create_bet, cancel_bet),
+        SagaStep("update_odds", update_odds, revert_odds),
+    ])
+    result = await place_bet_saga.run({"user_id": "123", "amount": 50, "market_id": "M1"})
+  example_bad: |
+    # BAD: No compensating transactions — partial state on failure
+    async def place_bet(user_id, amount, market_id):
+        await reserve_funds(user_id, amount)  # Committed
+        await create_bet(user_id, amount, market_id)  # Committed
+        await update_odds(market_id, amount)  # FAILS — funds locked, bet exists but invalid
+  when_applies: Any business operation spanning multiple services or databases
+  sources: ["https://microservices.io/patterns/data/saga.html"]
+
+- id: RT-EVT-009
+  text: "Compensating transactions must be semantically inverse, not database rollbacks. A compensation for 'ship order' is 'request return', not 'DELETE FROM shipments'. Compensations are new business events."
+  why: >
+    A team implemented compensation for "create invoice" as "DELETE FROM invoices". This violated
+    accounting regulations that require all invoices to be preserved (even cancelled ones). The
+    correct compensation was "create credit note" — a new event that offsets the original. The
+    DELETE approach also caused referential integrity issues when payment records referenced the
+    deleted invoice.
+  how_to_do_right: |
+    1. Compensation creates new events, never deletes or modifies existing ones
+    2. "FundsReserved" -> compensation: "FundsReleased" (not DELETE reservation)
+    3. "InvoiceCreated" -> compensation: "CreditNoteIssued" (not DELETE invoice)
+    4. "BetPlaced" -> compensation: "BetCancelled" (not DELETE bet)
+    5. Both original and compensation events are stored in the event log
+    6. This maintains full audit trail and satisfies regulatory requirements
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, fintech, compliance]
+    concern: [consistency]
+  example_good: |
+    # Correct: Compensation is a new business event
+    async def cancel_bet(context: dict):
+        bet_id = context["create_bet"]["bet_id"]
+        await event_bus.publish("bets", BetCancelled(
+            bet_id=bet_id,
+            reason="saga_compensation",
+            original_amount=context["amount"],
+            cancelled_at=datetime.utcnow(),
+        ))
+        # Bet record still exists with status="cancelled"
+        await db.execute(
+            "UPDATE bets SET status = 'cancelled', cancelled_at = NOW() WHERE id = :id",
+            {"id": bet_id},
+        )
+
+    async def release_funds(context: dict):
+        await event_bus.publish("accounts", FundsReleased(
+            user_id=context["user_id"],
+            amount=context["amount"],
+            reason="bet_cancelled",
+            reservation_id=context["reserve_funds"]["reservation_id"],
+        ))
+  example_bad: |
+    # BAD: Compensation deletes records — audit trail destroyed
+    async def cancel_bet(context):
+        await db.execute("DELETE FROM bets WHERE id = :id", {"id": context["bet_id"]})
+        # Bet record gone forever. No audit trail. Regulatory violation.
+
+    async def release_funds(context):
+        await db.execute(
+            "UPDATE accounts SET balance = balance + :amount WHERE user_id = :uid",
+            {"amount": context["amount"], "uid": context["user_id"]},
+        )
+        # No event published. No record of why balance changed.
+  when_applies: Any saga compensation, especially in financial, healthcare, or regulated domains
+  sources: ["https://martinfowler.com/bliki/CQRS.html"]
+
+- id: RT-EVT-010
+  text: "Dead letter queues (DLQ) must capture events that fail processing after a configurable number of retries (default: 3). Every DLQ entry must include the original event, error details, retry count, and timestamps."
+  why: >
+    A malformed event caused a consumer to crash on every retry. Without a DLQ, the event blocked
+    the partition — all subsequent events for that partition were stuck behind it (head-of-line
+    blocking). 10,000 events accumulated over 2 hours before an engineer manually skipped the
+    bad event. With a DLQ, the bad event would have been moved aside after 3 retries (30 seconds)
+    and processing would have continued.
+  how_to_do_right: |
+    1. Retry failed events 3 times with exponential backoff (1s, 5s, 30s)
+    2. After 3 failures: move to DLQ topic/stream with full context
+    3. DLQ entry must include: original event, error message, stack trace, retry count, timestamps
+    4. Monitor DLQ depth: alert if >0 (every DLQ entry needs investigation)
+    5. Build reprocessing tool: replay DLQ events after fixing the bug
+    6. Never silently drop events — DLQ is the safety net
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, reliability]
+    concern: [message_broker]
+  example_good: |
+    import traceback
+
+    class ResilientConsumer:
+        MAX_RETRIES = 3
+        RETRY_DELAYS = [1, 5, 30]  # seconds
+
+        async def consume(self, event: CloudEvent, handler: Callable):
+            for attempt in range(self.MAX_RETRIES):
+                try:
+                    await handler(event)
+                    return  # Success
+                except Exception as e:
+                    logger.warning(f"Retry {attempt + 1}/{self.MAX_RETRIES} for {event.id}: {e}")
+                    if attempt < self.MAX_RETRIES - 1:
+                        await asyncio.sleep(self.RETRY_DELAYS[attempt])
+
+            # All retries exhausted — send to DLQ
+            await self.send_to_dlq(event, e)
+
+        async def send_to_dlq(self, event: CloudEvent, error: Exception):
+            dlq_entry = {
+                "original_event": event.dict(),
+                "error": str(error),
+                "traceback": traceback.format_exc(),
+                "retries": self.MAX_RETRIES,
+                "failed_at": datetime.utcnow().isoformat(),
+                "consumer": self.consumer_name,
+            }
+            await self.event_bus.publish("dlq", dlq_entry)
+            logger.error(f"Event {event.id} sent to DLQ after {self.MAX_RETRIES} retries")
+            dlq_depth.labels(consumer=self.consumer_name).inc()
+  example_bad: |
+    # BAD: No DLQ — bad event blocks entire partition forever
+    async def consume(event, handler):
+        while True:
+            try:
+                await handler(event)
+                return
+            except Exception:
+                await asyncio.sleep(1)
+                # Infinite retry loop — never moves on, blocks all events behind it
+  when_applies: All event consumers in production systems
+  sources: ["https://kafka.apache.org/documentation/#design_pull"]
+
+- id: RT-EVT-011
+  text: "Event replay must be supported for debugging and recovery. The event store must retain events for at least 7 days and support replay from any timestamp or sequence number."
+  why: >
+    A bug in the leaderboard consumer caused incorrect rankings for 3 hours. After fixing the bug,
+    the team needed to rebuild the leaderboard from scratch. Without replay capability, they had
+    to write a one-off migration script that took 8 hours to build and test. With event replay,
+    they would have deleted the read model and replayed events from the start — a 10-minute operation.
+  how_to_do_right: |
+    1. Event store retains events for minimum 7 days (configurable, 30 days recommended)
+    2. Support replay from: timestamp, sequence number, or beginning
+    3. Replay tool: reset consumer offset, reprocess events at controlled speed
+    4. Read model must be rebuildable: drop and replay is a supported operation
+    5. Replay rate limiting: don't overwhelm downstream services (max 1000 events/sec)
+    6. Idempotent consumers (RT-EVT-005) are prerequisite for safe replay
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, reliability]
+    concern: [message_broker]
+  example_good: |
+    class EventReplayService:
+        async def replay(
+            self,
+            topic: str,
+            consumer_group: str,
+            from_timestamp: datetime | None = None,
+            from_offset: int | None = None,
+            rate_limit: int = 1000,  # events per second
+        ):
+            # Reset consumer offset
+            if from_timestamp:
+                offsets = await self.get_offsets_for_timestamp(topic, from_timestamp)
+            elif from_offset is not None:
+                offsets = {p: from_offset for p in self.get_partitions(topic)}
+            else:
+                offsets = {p: 0 for p in self.get_partitions(topic)}  # Beginning
+
+            await self.reset_offsets(consumer_group, offsets)
+
+            # Replay with rate limiting
+            count = 0
+            async for event in self.consume(topic, consumer_group):
+                await self.process(event)
+                count += 1
+                if count % rate_limit == 0:
+                    await asyncio.sleep(1.0)  # Rate limit
+                    logger.info(f"Replayed {count} events from {topic}")
+
+    # Usage: rebuild leaderboard after bug fix
+    replay = EventReplayService()
+    await redis.delete("leaderboard:*")  # Clear read model
+    await replay.replay("bets", "leaderboard-consumer", from_timestamp=seven_days_ago)
+  example_bad: |
+    # BAD: No replay support — one-off migration scripts for every bug
+    # After a consumer bug, the team has to:
+    # 1. Write a SQL query to extract data from the write model
+    # 2. Transform it into the read model format
+    # 3. Hope they didn't miss any edge cases
+    # 4. This takes 8+ hours every time
+  when_applies: Any event-driven system where read models may need rebuilding
+  sources: ["https://martinfowler.com/eaaDev/EventSourcing.html"]
+
+- id: RT-EVT-012
+  text: "Event store design must use append-only storage with immutable records. Use a dedicated events table with entity_id, event_type, version, data, and metadata columns. Never use generic JSON blob storage."
+  why: >
+    A team stored events as JSON blobs in a generic "events" table without proper indexing or
+    schema. Querying events for a specific entity required a full table scan with JSON parsing.
+    At 10M events, the "get account history" query took 45 seconds. After restructuring with
+    proper columns and indexes, the same query took 12ms.
+  how_to_do_right: |
+    1. Table schema: id (BIGSERIAL), entity_id (UUID indexed), event_type (VARCHAR indexed),
+       version (INT), data (JSONB), metadata (JSONB), created_at (TIMESTAMPTZ indexed)
+    2. Unique constraint on (entity_id, version) to prevent duplicate events
+    3. Append-only: no UPDATE or DELETE permissions on the events table
+    4. Index on (entity_id, version) for event replay per entity
+    5. Index on (event_type, created_at) for cross-entity queries
+    6. Partition by month for large volumes (>1M events/month)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, databases]
+    concern: [consistency]
+  example_good: |
+    -- Event store table with proper schema
+    CREATE TABLE events (
+        id BIGSERIAL PRIMARY KEY,
+        entity_id UUID NOT NULL,
+        entity_type VARCHAR(100) NOT NULL,
+        event_type VARCHAR(200) NOT NULL,
+        version INT NOT NULL,
+        data JSONB NOT NULL,
+        metadata JSONB NOT NULL DEFAULT '{}',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (entity_id, version)  -- Prevent duplicate events
+    );
+
+    CREATE INDEX idx_events_entity ON events (entity_id, version);
+    CREATE INDEX idx_events_type_time ON events (event_type, created_at);
+    CREATE INDEX idx_events_created ON events (created_at);
+
+    -- Prevent mutations: revoke UPDATE and DELETE
+    REVOKE UPDATE, DELETE ON events FROM app_user;
+
+    # Python: append event
+    async def append_event(entity_id: str, entity_type: str, event_type: str,
+                           version: int, data: dict, metadata: dict):
+        await db.execute("""
+            INSERT INTO events (entity_id, entity_type, event_type, version, data, metadata)
+            VALUES (:entity_id, :entity_type, :event_type, :version, :data::jsonb, :metadata::jsonb)
+        """, {
+            "entity_id": entity_id, "entity_type": entity_type,
+            "event_type": event_type, "version": version,
+            "data": json.dumps(data), "metadata": json.dumps(metadata),
+        })
+  example_bad: |
+    # BAD: Generic blob storage, no schema, no indexes
+    CREATE TABLE events (
+        id SERIAL,
+        payload TEXT  -- Everything as unstructured text
+    );
+
+    # Querying requires full scan + JSON parsing
+    events = await db.fetch_all("SELECT * FROM events")
+    account_events = [e for e in events if json.loads(e.payload)["entity_id"] == account_id]
+  when_applies: Any system implementing event sourcing or event-driven audit trails
+  sources: ["https://kafka.apache.org/documentation/#design_persistence"]
+
+- id: RT-EVT-013
+  text: "Domain events are internal to a bounded context and carry rich domain objects. Integration events cross context boundaries and must use only primitive types and IDs, never domain objects."
+  why: >
+    A team published domain events (with full User objects, including email and password hash)
+    as integration events to Kafka. The Analytics service received events containing password
+    hashes — a security violation. The Notifications service coupled to the User schema and broke
+    when a field was renamed. Domain events are for internal use; integration events are contracts.
+  how_to_do_right: |
+    1. Domain event: rich, internal. Contains domain objects: User, Order, Claim
+    2. Integration event: minimal, external. Contains only IDs and primitive values
+    3. Map domain event to integration event at the boundary (anti-corruption layer)
+    4. Integration events are versioned contracts (see RT-EVT-004)
+    5. Never expose internal domain objects in integration events
+    6. Integration events should be self-contained (consumer doesn't need to call back)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, architecture]
+    concern: [message_broker]
+  example_good: |
+    # Domain event: rich, internal to Order bounded context
+    @dataclass
+    class OrderPlacedDomain:
+        order: Order  # Full domain object with methods
+        user: User  # Internal — contains email, hashed_password
+        payment: PaymentMethod  # Internal — contains card details
+
+    # Integration event: minimal, published to Kafka
+    @dataclass
+    class OrderPlacedIntegration:
+        order_id: str
+        user_id: str
+        total_cents: int  # Primitive, not Decimal
+        currency: str
+        item_count: int
+        occurred_at: str  # ISO 8601 string, not datetime object
+
+    # Boundary mapper: domain -> integration
+    class OrderEventMapper:
+        @staticmethod
+        def to_integration(domain_event: OrderPlacedDomain) -> OrderPlacedIntegration:
+            return OrderPlacedIntegration(
+                order_id=str(domain_event.order.id),
+                user_id=str(domain_event.user.id),
+                total_cents=int(domain_event.order.total * 100),
+                currency=domain_event.order.currency,
+                item_count=len(domain_event.order.items),
+                occurred_at=datetime.utcnow().isoformat(),
+            )
+  example_bad: |
+    # BAD: Publishing domain objects as integration events
+    await kafka.publish("orders", {
+        "order": order.__dict__,  # Exposes internal structure
+        "user": user.__dict__,  # Exposes email, password hash!
+        "payment": payment.__dict__,  # Exposes card details!
+    })
+  when_applies: Any system publishing events consumed by services in different bounded contexts
+  sources: ["https://martinfowler.com/bliki/BoundedContext.html"]
+
+- id: RT-EVT-014
+  text: "Event-driven testing must use an in-memory event bus for unit tests and a real broker for integration tests. Test event handlers in isolation with deterministic event sequences."
+  why: >
+    A team tested event consumers only with integration tests against a real Kafka cluster.
+    Tests took 45 seconds to run (broker startup + topic creation + message delivery latency).
+    Developers stopped running tests locally, leading to 12 bugs in a month that would have been
+    caught by fast unit tests. After adding in-memory event bus: unit test suite ran in 2 seconds,
+    CI pipeline dropped from 8 minutes to 2 minutes.
+  how_to_do_right: |
+    1. In-memory event bus for unit tests: instant, deterministic, no infrastructure
+    2. Test event handlers as pure functions: given event X, expect side effect Y
+    3. Test event serialization/deserialization separately
+    4. Integration tests with real broker: test actual delivery, partitioning, consumer groups
+    5. Use testcontainers for integration tests (real Kafka/Redis in Docker)
+    6. Test event ordering: publish [A, B, C], verify consumer processes in order
+    7. Test idempotency: publish same event twice, verify single side effect
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, testing]
+    concern: [message_broker]
+  example_good: |
+    # In-memory event bus for unit tests
+    class InMemoryEventBus:
+        def __init__(self):
+            self.published: list[CloudEvent] = []
+            self.handlers: dict[str, list[Callable]] = defaultdict(list)
+
+        async def publish(self, topic: str, event: CloudEvent):
+            self.published.append(event)
+            for handler in self.handlers.get(topic, []):
+                await handler(event)
+
+        def subscribe(self, topic: str, handler: Callable):
+            self.handlers[topic].append(handler)
+
+    # Unit test: fast, deterministic
+    @pytest.mark.asyncio
+    async def test_order_placed_updates_inventory():
+        bus = InMemoryEventBus()
+        inventory = MockInventoryRepo()
+        handler = InventoryHandler(inventory)
+        bus.subscribe("orders", handler.on_order_placed)
+
+        event = create_event("orders", "OrderPlaced", {"sku": "ABC", "quantity": 5})
+        await bus.publish("orders", event)
+
+        assert inventory.get_stock("ABC") == 95  # Started at 100, decremented by 5
+
+    # Integration test: real Kafka via testcontainers
+    @pytest.mark.integration
+    async def test_event_delivery_with_real_kafka():
+        async with KafkaContainer() as kafka:
+            producer = AIOKafkaProducer(bootstrap_servers=kafka.get_bootstrap_server())
+            # Test actual delivery and consumer group behavior
+  example_bad: |
+    # BAD: Only integration tests — slow, flaky, developers skip them
+    @pytest.mark.asyncio
+    async def test_order_handler():
+        # Requires real Kafka running — 45 seconds per test
+        producer = AIOKafkaProducer(bootstrap_servers="kafka:9092")
+        await producer.send("orders", value=json.dumps(event).encode())
+        await asyncio.sleep(5)  # Wait for consumer to process... maybe
+        # Flaky: timing-dependent assertions
+  when_applies: All event-driven systems, both unit and integration test suites
+  sources: ["https://docs.pytest.org/en/stable/how-to/fixtures.html"]
+
+- id: RT-EVT-015
+  text: "Event monitoring must track production rate, consumption rate, consumer lag, processing latency, and DLQ depth per consumer group. Alert when consumer lag exceeds 1000 events or grows for 5 consecutive minutes."
+  why: >
+    A consumer silently fell behind by 2 million events over a weekend. The read model (leaderboard)
+    was 48 hours stale. Users saw incorrect rankings and made decisions based on outdated data.
+    No one noticed because there was no consumer lag monitoring. A simple metric tracking
+    "latest published offset - latest consumed offset" would have alerted within 5 minutes.
+  how_to_do_right: |
+    1. Track per consumer group: consumer_lag (published_offset - consumed_offset)
+    2. Track: events_produced_total, events_consumed_total (counters)
+    3. Track: event_processing_latency_ms (histogram, p50/p95/p99)
+    4. Track: dlq_depth (gauge per consumer group)
+    5. Alert: consumer_lag > 1000 events (immediate investigation)
+    6. Alert: consumer_lag growing for 5 consecutive minutes (consumer degraded)
+    7. Alert: dlq_depth > 0 (every DLQ entry needs investigation)
+    8. Dashboard: show lag per consumer, processing rate, error rate
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, observability]
+    concern: [metrics, dashboards]
+  example_good: |
+    from prometheus_client import Counter, Gauge, Histogram
+
+    events_produced = Counter("events_produced_total", "Events published", ["topic"])
+    events_consumed = Counter("events_consumed_total", "Events processed", ["topic", "consumer_group"])
+    consumer_lag = Gauge("consumer_lag", "Consumer lag in events", ["topic", "consumer_group"])
+    processing_latency = Histogram("event_processing_seconds", "Event processing latency",
+                                   ["topic", "consumer_group"],
+                                   buckets=[0.001, 0.01, 0.1, 0.5, 1.0, 5.0])
+    dlq_depth = Gauge("dlq_depth", "Dead letter queue depth", ["consumer_group"])
+
+    class MonitoredConsumer:
+        async def consume(self, event: CloudEvent, handler: Callable):
+            start = time.monotonic()
+            try:
+                await handler(event)
+                events_consumed.labels(topic=self.topic, consumer_group=self.group).inc()
+            except Exception:
+                dlq_depth.labels(consumer_group=self.group).inc()
+                raise
+            finally:
+                processing_latency.labels(
+                    topic=self.topic, consumer_group=self.group
+                ).observe(time.monotonic() - start)
+
+        async def update_lag(self):
+            """Called periodically to update lag metric."""
+            lag = await self.get_lag()
+            consumer_lag.labels(topic=self.topic, consumer_group=self.group).set(lag)
+  example_bad: |
+    # BAD: No monitoring — consumer falls behind silently
+    async def consume(event, handler):
+        await handler(event)  # No metrics, no lag tracking, no alerts
+  when_applies: All event-driven systems in production
+  sources: ["https://kafka.apache.org/documentation/#monitoring"]
+
+- id: RT-EVT-016
+  text: "Use an event schema registry to enforce schema compatibility and prevent breaking changes from reaching production. The registry must reject backward-incompatible changes."
+  why: >
+    A developer renamed a field from "user_id" to "userId" in a Kafka event. The change passed
+    code review because the reviewer didn't check consumer compatibility. All 5 consumers crashed
+    in production because they expected "user_id". A schema registry would have rejected the
+    change at publish time, preventing the deployment.
+  how_to_do_right: |
+    1. Use Confluent Schema Registry, AWS Glue, or custom JSON Schema registry
+    2. Register schemas for all event types
+    3. Set compatibility mode to BACKWARD (new schema can read old data)
+    4. Producer validates against registry before publishing
+    5. CI pipeline checks schema compatibility on PR
+    6. Schema registry rejects: field renames, required field additions, type changes
+    7. Schema registry allows: optional field additions, field deprecation (with default)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, architecture]
+    concern: [message_broker, migration]
+  example_good: |
+    from jsonschema import validate, ValidationError
+
+    class EventSchemaRegistry:
+        def __init__(self):
+            self.schemas: dict[str, dict] = {}
+
+        def register(self, event_type: str, schema: dict):
+            if event_type in self.schemas:
+                self._check_backward_compatible(self.schemas[event_type], schema)
+            self.schemas[event_type] = schema
+
+        def validate_event(self, event: CloudEvent):
+            schema = self.schemas.get(event.type)
+            if not schema:
+                raise ValueError(f"No schema registered for {event.type}")
+            validate(instance=event.data, schema=schema)
+
+        def _check_backward_compatible(self, old_schema: dict, new_schema: dict):
+            old_required = set(old_schema.get("required", []))
+            new_required = set(new_schema.get("required", []))
+            added_required = new_required - old_required
+            if added_required:
+                raise ValueError(
+                    f"Breaking change: new required fields {added_required}. "
+                    f"Add as optional with defaults instead."
+                )
+
+    # Usage in producer
+    registry = EventSchemaRegistry()
+    registry.register("com.forekast.order.placed.v1", ORDER_PLACED_SCHEMA)
+
+    async def publish(event: CloudEvent):
+        registry.validate_event(event)  # Rejects incompatible events
+        await kafka.send(event)
+  example_bad: |
+    # BAD: No schema validation — any shape of event can be published
+    async def publish(topic, data):
+        await kafka.send(topic, json.dumps(data).encode())  # No validation
+        # Developer renames "user_id" to "userId" — all consumers crash
+  when_applies: Any event-driven system with multiple producers or consumers
+  sources: ["https://docs.confluent.io/platform/current/schema-registry/index.html"]
+
+- id: RT-EVT-017
+  text: "Eventual consistency patterns must include a reconciliation mechanism. Periodically compare the write model and read model to detect and fix drift caused by missed or corrupted events."
+  why: >
+    A CQRS system's read model drifted from the write model over 3 months. A network glitch
+    caused 47 events to be lost (consumer acknowledged before processing — a bug). The leaderboard
+    was wrong for 200 users. Nobody noticed because there was no reconciliation. The drift was
+    discovered when a user complained their ranking was wrong. Manual investigation took 2 weeks
+    to identify all affected users.
+  how_to_do_right: |
+    1. Run reconciliation job daily (off-peak hours)
+    2. Compare write model state with read model state for a random sample (1000 entities)
+    3. If mismatch detected: trigger event replay for that entity
+    4. Track drift metrics: drift_count, drift_rate, time_to_reconcile
+    5. Alert if drift rate exceeds 0.1% (indicates systemic issue)
+    6. Log all reconciliation corrections for audit
+    7. Reconciliation must be idempotent and safe to run concurrently
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, reliability]
+    concern: [consistency]
+  example_good: |
+    class ReconciliationService:
+        async def reconcile(self, sample_size: int = 1000):
+            """Compare write model with read model, fix drift."""
+            # Random sample of entities
+            entity_ids = await self.write_db.execute(
+                "SELECT id FROM accounts ORDER BY RANDOM() LIMIT :n", {"n": sample_size}
+            )
+            drift_count = 0
+            for entity_id in entity_ids:
+                write_state = await self.get_write_state(entity_id)
+                read_state = await self.get_read_state(entity_id)
+                if write_state != read_state:
+                    drift_count += 1
+                    logger.warning(f"Drift detected for {entity_id}: "
+                                   f"write={write_state}, read={read_state}")
+                    await self.replay_events(entity_id)
+
+            drift_rate = drift_count / sample_size
+            drift_metric.set(drift_rate)
+            if drift_rate > 0.001:  # 0.1%
+                await alert(f"High drift rate: {drift_rate:.4f} ({drift_count}/{sample_size})")
+            logger.info(f"Reconciliation complete: {drift_count} drifts in {sample_size} samples")
+
+    # Schedule daily
+    @scheduler.cron("0 3 * * *")  # 3 AM daily
+    async def daily_reconciliation():
+        await ReconciliationService().reconcile()
+  example_bad: |
+    # BAD: No reconciliation — drift accumulates silently
+    # Read model just trusts events are complete and correct
+    # After 3 months, 200 users have wrong data, nobody knows
+  when_applies: Any CQRS or event-driven system with separate read and write models
+  sources: ["https://microservices.io/patterns/data/cqrs.html"]
+
+- id: RT-EVT-018
+  text: "Event-driven error handling must distinguish between transient errors (retry) and permanent errors (DLQ immediately). Never retry permanent errors — they waste resources and delay processing of subsequent events."
+  why: >
+    A consumer retried a "UserNotFound" error 3 times with 30-second backoff for every event
+    referencing a deleted user. With 5,000 such events per day, retries consumed 450,000 seconds
+    (125 hours) of wasted processing time. The events always failed because the user was permanently
+    deleted. They should have gone directly to the DLQ for investigation, not retried.
+  how_to_do_right: |
+    1. Define transient errors: network timeout, database connection lost, rate limited (HTTP 429/503)
+    2. Define permanent errors: validation error, entity not found, schema mismatch, permission denied
+    3. Transient errors: retry with exponential backoff (1s, 5s, 30s), then DLQ
+    4. Permanent errors: send to DLQ immediately, no retry
+    5. Unknown errors: treat as transient (retry once), then DLQ
+    6. Log error classification for debugging
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka, redis]
+  domains:
+    domain: [realtime, reliability]
+    concern: [message_broker]
+  example_good: |
+    class PermanentError(Exception):
+        """Error that will never succeed on retry."""
+        pass
+
+    class TransientError(Exception):
+        """Error that may succeed on retry."""
+        pass
+
+    class ClassifiedConsumer:
+        TRANSIENT_ERRORS = (ConnectionError, TimeoutError, OSError)
+        PERMANENT_ERRORS = (ValidationError, ValueError, KeyError)
+
+        async def consume(self, event: CloudEvent, handler: Callable):
+            try:
+                await handler(event)
+            except self.PERMANENT_ERRORS as e:
+                logger.error(f"Permanent error for {event.id}: {e}")
+                await self.send_to_dlq(event, e, retries=0)  # No retry
+            except self.TRANSIENT_ERRORS as e:
+                logger.warning(f"Transient error for {event.id}: {e}")
+                await self.retry_with_backoff(event, handler, e)
+            except Exception as e:
+                logger.warning(f"Unknown error for {event.id}: {e}, treating as transient")
+                await self.retry_with_backoff(event, handler, e, max_retries=1)
+
+        async def retry_with_backoff(self, event, handler, error, max_retries=3):
+            for attempt in range(max_retries):
+                await asyncio.sleep(self.RETRY_DELAYS[attempt])
+                try:
+                    await handler(event)
+                    return
+                except Exception:
+                    continue
+            await self.send_to_dlq(event, error, retries=max_retries)
+  example_bad: |
+    # BAD: Retries everything indiscriminately
+    async def consume(event, handler):
+        for i in range(3):
+            try:
+                await handler(event)
+                return
+            except Exception:
+                await asyncio.sleep(30)  # 30s retry for permanent errors = wasted time
+        # Still no DLQ — event is silently dropped after 3 retries
+  when_applies: All event consumers that need to handle both transient and permanent failures
+  sources: ["https://kafka.apache.org/documentation/#design_errors"]

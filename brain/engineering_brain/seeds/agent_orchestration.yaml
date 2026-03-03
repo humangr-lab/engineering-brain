@@ -1,0 +1,1577 @@
+layer: rules
+domain: agent_orchestration
+knowledge:
+
+- id: ORCH-001
+  text: >
+    Every LLM agent in a multi-agent pipeline must have an explicit lifecycle with defined
+    states: IDLE, RUNNING, WAITING_FOR_DEPENDENCY, FAILED, COMPLETED. Never treat an agent
+    as a black box that either finishes or does not. Track state transitions and emit events
+    on every change so the orchestrator always has accurate situational awareness.
+  why: >
+    Without explicit lifecycle tracking, you cannot distinguish a hanging agent from a slow
+    one, a failed agent from a waiting one, or identify where in a 20-step pipeline things
+    broke. Production incidents in multi-agent systems are nearly impossible to diagnose
+    without state event streams. LangGraph documents state machines as a core requirement
+    for resilient agent graphs, and the brains pipeline (CLAUDE.md) relies on heartbeats
+    and state events as the foundation for the Run Master's monitoring loop.
+  how_to_do_right: |
+    1. Define a state enum: AgentState = Enum("IDLE","RUNNING","WAITING","FAILED","COMPLETED")
+    2. Emit a state-change event to Redis Streams or Langfuse on every transition.
+    3. Record: agent_id, previous_state, new_state, timestamp, task_id, reason.
+    4. Set a watchdog: alert if any agent stays in RUNNING > max_expected_duration * 1.5.
+    5. On FAILED: capture full exception + last 5 messages in context for post-mortem.
+    6. Implement heartbeat: agents emit a HEARTBEAT event every 30s while RUNNING.
+    7. Any agent silent for 2 missed heartbeats: escalate to orchestrator immediately.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [langgraph, crewai, redis]
+  domains:
+    domain: [agent_orchestration, observability]
+    concern: [lifecycle_management, reliability]
+  example_good: |
+    import enum
+    from dataclasses import dataclass, field
+    from datetime import datetime
+
+    class AgentState(enum.Enum):
+        IDLE = "idle"
+        RUNNING = "running"
+        WAITING = "waiting"
+        FAILED = "failed"
+        COMPLETED = "completed"
+
+    @dataclass
+    class AgentLifecycle:
+        agent_id: str
+        state: AgentState = AgentState.IDLE
+        last_heartbeat: datetime = field(default_factory=datetime.utcnow)
+        task_id: str | None = None
+
+        def transition(self, new_state: AgentState, reason: str = "") -> None:
+            prev = self.state
+            self.state = new_state
+            self.last_heartbeat = datetime.utcnow()
+            emit_event("agent_state_change", {
+                "agent_id": self.agent_id,
+                "from": prev.value,
+                "to": new_state.value,
+                "task_id": self.task_id,
+                "reason": reason,
+                "ts": self.last_heartbeat.isoformat(),
+            })
+  example_bad: |
+    # No lifecycle tracking — just fire and forget
+    async def run_agent(task):
+        result = await llm.invoke(task.prompt)
+        return result  # Did it succeed? Fail? How long? Unknown.
+  when_applies: "Every production multi-agent system with more than 2 agents in a pipeline."
+  sources:
+    - "LangGraph Documentation — State Management: https://langchain-ai.github.io/langgraph/concepts/low_level/#state"
+    - "Langfuse — AI Agent Observability: https://langfuse.com/blog/2024-07-ai-agent-observability-with-langfuse"
+    - "Google SRE Book Ch. 6 — Monitoring Distributed Systems: https://sre.google/sre-book/monitoring-distributed-systems/"
+
+- id: ORCH-002
+  text: >
+    Set per-agent token budgets, not just a global pipeline budget. An unconstrained agent
+    in a multi-agent workflow will consume the entire context window on a single subtask,
+    starving downstream agents. Enforce hard limits at the orchestrator level before
+    dispatching any task.
+  why: >
+    In production LangGraph pipelines, a single summarization agent given a large document
+    corpus can consume 50K+ tokens on a task that should take 2K, blowing the session
+    budget and causing all subsequent agents to receive truncated context or fail outright.
+    Token-Budget-Aware LLM Reasoning (ACL 2025) shows that dynamic token allocation
+    reduces costs without significant accuracy loss. Anthropic's context engineering guide
+    confirms that unbounded agents degrade downstream performance through context rot.
+  how_to_do_right: |
+    1. Define budget tiers: LIGHT=2K, STANDARD=8K, HEAVY=32K, UNLIMITED=orchestrator only.
+    2. Assign each agent role a default budget tier based on task complexity.
+    3. Pass budget as explicit param: agent.invoke(task, max_tokens=budget).
+    4. Log actual usage vs budget after each invocation.
+    5. If agent exceeds 80% of budget, emit WARNING and consider truncating input.
+    6. Never allow an individual worker agent more than 20% of total session budget.
+    7. Reserve 15% of session budget as buffer for orchestrator reflection and error recovery.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langgraph, anthropic, openai]
+  domains:
+    domain: [agent_orchestration, cost_management]
+    concern: [context_window, token_budget]
+  example_good: |
+    AGENT_BUDGETS = {
+        "spec_analyzer": 8_000,
+        "code_generator": 32_000,
+        "qa_reviewer": 4_000,
+        "summarizer": 2_000,
+        "orchestrator": 16_000,  # reserved for orchestrator only
+    }
+
+    def dispatch_agent(role: str, task: str, session_budget_remaining: int) -> str:
+        budget = min(AGENT_BUDGETS[role], int(session_budget_remaining * 0.20))
+        if budget < 1_000:
+            raise InsufficientBudgetError(f"Only {budget} tokens left for {role}")
+        return agents[role].invoke(task, max_tokens=budget)
+  example_bad: |
+    # No budget constraints — orchestrator just fires agents
+    for agent in pipeline_agents:
+        result = agent.invoke(build_full_context())  # Context grows unbounded
+        all_results.append(result)
+        # By agent 4, context is 90K tokens and accuracy has degraded severely
+  when_applies: "Any multi-agent pipeline where more than one LLM call chains sequentially or in parallel."
+  sources:
+    - "Token-Budget-Aware LLM Reasoning, ACL 2025: https://aclanthology.org/2025.findings-acl.1274/"
+    - "Anthropic — Effective Context Engineering for AI Agents: https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents"
+    - "Factory.ai — The Context Window Problem: https://factory.ai/news/context-window-problem"
+
+- id: ORCH-003
+  text: >
+    Implement pipeline checkpointing at every major stage boundary. An agent pipeline that
+    runs for 10+ minutes without checkpoints will lose all progress on any failure and must
+    restart from scratch. Persist intermediate state to an external store (Redis, PostgreSQL,
+    or filesystem) after every agent completes its task.
+  why: >
+    Long-running multi-agent workflows are statistically almost certain to encounter a
+    transient failure (network timeout, API rate limit, OOM) before completion. Without
+    checkpoints, a 45-minute pipeline that fails at step 12 of 15 restarts from step 1,
+    wasting compute, tokens, and time. The Temporal/LangGraph documentation explicitly
+    recommends externalizing state for any workflow expected to run more than a few minutes.
+    The brains pipeline uses file-based checkpoints as a core design decision specifically
+    because early versions without checkpoints caused repeated full restarts.
+  how_to_do_right: |
+    1. Define stage boundaries: STAGE_SPEC, STAGE_IMPL, STAGE_QA, STAGE_REVIEW.
+    2. After each stage, serialize state to JSON and persist atomically:
+       checkpoint_store.save(run_id, stage_name, state)
+    3. On pipeline startup, check for existing checkpoint:
+       state = checkpoint_store.load_latest(run_id) or initial_state
+    4. Include in checkpoint: completed_tasks, partial_outputs, token_usage, timestamp, git_sha.
+    5. Checkpoint must be atomic (write to temp file, then rename) to avoid corrupt state.
+    6. Set checkpoint TTL = max_pipeline_duration * 3 to allow manual resume.
+    7. Emit CHECKPOINT_SAVED event to observability layer after each save.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [langgraph, redis, postgresql]
+  domains:
+    domain: [agent_orchestration, reliability]
+    concern: [checkpoint_resume, durability]
+  example_good: |
+    import json
+    import os
+    from glob import glob
+
+    class CheckpointStore:
+        def __init__(self, base_dir: str):
+            self.base_dir = base_dir
+
+        def save(self, run_id: str, stage: str, state: dict) -> None:
+            path = f"{self.base_dir}/{run_id}_{stage}.json"
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"stage": stage, "state": state, "ts": utcnow()}, f)
+            os.rename(tmp, path)  # Atomic: avoids corrupt state on crash
+
+        def load_latest(self, run_id: str) -> dict | None:
+            checkpoints = sorted(glob(f"{self.base_dir}/{run_id}_*.json"))
+            if not checkpoints:
+                return None
+            with open(checkpoints[-1]) as f:
+                return json.load(f)
+  example_bad: |
+    # Pipeline runs without any state persistence
+    async def run_full_pipeline(tasks):
+        results = []
+        for task in tasks:
+            result = await run_agent(task)  # Fails at step 12?
+            results.append(result)          # Back to step 1, no recovery possible
+        return results
+  when_applies: "Any pipeline with more than 3 sequential agent stages or expected runtime > 5 minutes."
+  sources:
+    - "LangGraph — Persistence and Checkpointing: https://langchain-ai.github.io/langgraph/concepts/persistence/"
+    - "Temporal.io — Durable Execution: https://docs.temporal.io/concepts/what-is-a-workflow"
+    - "Kinde — Orchestrating Multi-Step Agents: https://www.kinde.com/learn/ai-for-software-engineering/ai-devops/orchestrating-multi-step-agents-temporal-dagster-langgraph-patterns-for-long-running-work/"
+
+- id: ORCH-004
+  text: >
+    Define explicit delegation criteria before any agent can invoke a sub-agent: delegate
+    if the task requires a specialized capability not in the caller's system prompt; do it
+    yourself if the task fits within 3 reasoning steps. Never delegate to reduce context
+    load — that creates coordination overhead worse than the original problem.
+  why: >
+    Over-delegation is one of the most common failure modes in multi-agent systems. Each
+    handoff adds 1-3s minimum latency (a new LLM call), a new opportunity for context loss,
+    and a new failure point. Teams building with CrewAI and LangGraph consistently report
+    that systems with 5+ agent hops for simple tasks are slower and less accurate than
+    single-agent systems. The cost of coordination is often higher than the cost of
+    generalization. Over-delegation is premature optimization of the wrong variable.
+  how_to_do_right: |
+    1. Create a Delegation Decision Matrix with: task_type, threshold, action.
+    2. Threshold examples:
+       - Code generation > 200 LOC: delegate to code_agent
+       - Domain knowledge not in system prompt: delegate to specialist
+       - Task has 2+ independent subtasks: fan-out to parallel agents
+       - Everything else: handle inline
+    3. Add a decision log: log why the agent chose to delegate vs self-execute.
+    4. Measure: track delegation_rate per agent. If > 60%, the agent is under-scoped.
+    5. Measure: track avg_hops per pipeline run. If > 4, refactor to reduce fan-out.
+    6. Never delegate error recovery — the delegating agent owns its failures.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai, langgraph]
+  domains:
+    domain: [agent_orchestration, design]
+    concern: [delegation, task_routing]
+  example_good: |
+    def should_delegate(task: Task, agent_capabilities: list[str]) -> tuple[bool, str]:
+        # Delegate if task requires a capability outside this agent's scope
+        if task.required_capability not in agent_capabilities:
+            return True, f"capability '{task.required_capability}' not in scope"
+        # Delegate if task is independently parallelizable
+        if len(task.subtasks) >= 2 and all_independent(task.subtasks):
+            return True, "independent subtasks benefit from parallel execution"
+        # Do it yourself if simple and within scope
+        return False, "within scope and complexity threshold"
+
+    delegate, reason = should_delegate(task, AGENT_CAPS["spec_analyzer"])
+    log_delegation_decision(task.id, delegate, reason=reason)
+  example_bad: |
+    # Agent delegates everything to avoid context growth — creates 6-hop chain
+    async def analyze_spec(spec_text: str):
+        return await sub_agent.invoke(f"Analyze this: {spec_text[:500]}")
+        # 3-second task becomes 18 seconds across 6 hops with 5x the failure surface
+  when_applies: "Every agent that can invoke sub-agents or hand off to other agents in the pipeline."
+  sources:
+    - "Anthropic — Building Effective Agents: https://www.anthropic.com/research/building-effective-agents"
+    - "Skywork AI — Best Practices Multi-Agent Handoffs: https://skywork.ai/blog/ai-agent-orchestration-best-practices-handoffs/"
+    - "CrewAI vs LangGraph — ZenML: https://www.zenml.io/blog/langgraph-vs-crewai"
+
+- id: ORCH-005
+  text: >
+    When multiple agents produce conflicting outputs, resolve via weighted voting with
+    explicit tiebreaker rules — never silently pick the first or last response. Define the
+    voting protocol in the orchestrator, not in individual agents. Agents must not know
+    they are being voted against; that knowledge biases their outputs.
+  why: >
+    Silent conflict resolution produces the most dangerous class of bugs: the system appears
+    to work but is making arbitrary choices. In adversarial setups, an orchestrator that
+    picks the "first" agent response eliminates all adversarial value. Multi-agent blackboard
+    research (arxiv 2510.01285) shows that weighted voting with role-based weights outperforms
+    simple majority in domain-specific tasks by 13-57%. The arbitration layer must be
+    transparent and produce auditable decisions.
+  how_to_do_right: |
+    1. Define agent weights per task domain (e.g., security_agent weight=2.0 for auth tasks).
+    2. Voting protocol:
+       a. Collect all agent outputs with confidence scores.
+       b. Normalize confidence: conf_i / sum(conf_j for all j).
+       c. Weighted vote: score_i = weight_i * conf_i.
+       d. Pick argmax(score_i).
+       e. If top-2 within 5% margin: escalate to arbitration or human layer.
+    3. Log every vote: who voted what, weights used, winning output, margin of victory.
+    4. If margin < threshold AND severity == critical: block, escalate to human.
+    5. Implement WEAK/STRONG veto: STRONG blocks regardless of vote; WEAK flags for review.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [crewai, langgraph]
+  domains:
+    domain: [agent_orchestration, conflict_resolution]
+    concern: [voting, arbitration, consensus]
+  example_good: |
+    from dataclasses import dataclass
+
+    @dataclass
+    class AgentVote:
+        agent_id: str
+        output: str
+        confidence: float
+        weight: float  # Role-based weight defined in routing config
+
+    def arbitrate(votes: list[AgentVote], close_margin: float = 0.05) -> str:
+        total = sum(v.weight * v.confidence for v in votes)
+        scored = {v.agent_id: (v.weight * v.confidence) / total for v in votes}
+        sorted_scores = sorted(scored.values(), reverse=True)
+        winner_id = max(scored, key=scored.get)
+        margin = sorted_scores[0] - sorted_scores[1] if len(sorted_scores) > 1 else 1.0
+        if margin < close_margin:
+            escalate_to_human(votes, margin)  # Too close — human decides
+        return next(v.output for v in votes if v.agent_id == winner_id)
+  example_bad: |
+    # Silently picks last agent response — arbitrary and unauditable
+    def arbitrate(votes):
+        return votes[-1].output  # "Last writer wins" — eliminates all adversarial value
+  when_applies: "Any multi-agent system with 2+ agents producing outputs on the same task."
+  sources:
+    - "arxiv 2510.01285 — LLM-based Multi-Agent Blackboard System: https://arxiv.org/pdf/2510.01285"
+    - "Arion Research — Conflict Resolution Playbook: https://www.arionresearch.com/blog/conflict-resolution-playbook-how-agentic-ai-systems-detect-negotiate-and-resolve-disputes-at-scale"
+    - "ACL 2025 — Multi-agent coordination: https://aclanthology.org/2025.acl-long.421.pdf"
+
+- id: ORCH-006
+  text: >
+    Implement circuit breakers on every external dependency an agent calls: LLM API, tool,
+    database, or sub-agent. A circuit breaker has three states: CLOSED (normal), OPEN
+    (failing — reject fast), HALF_OPEN (testing recovery). Without circuit breakers, a
+    single slow LLM API response creates a cascading queue backup that takes down the
+    entire pipeline.
+  why: >
+    In production multi-agent pipelines, an API rate limit or network hiccup causes all
+    queued agents to pile up waiting for the same resource. Without circuit breakers, a
+    30-second API timeout per agent times 20 queued agents equals 10 minutes of blocked
+    execution. The SRE Book (Google) treats circuit breakers as mandatory reliability
+    infrastructure for distributed systems. LangGraph production guides explicitly recommend
+    circuit breakers at each node to contain errors before they cascade.
+  how_to_do_right: |
+    1. Configure per-dependency circuit breaker with:
+       - failure_threshold: 3 failures in 60s triggers OPEN
+       - recovery_timeout: 30s before testing HALF_OPEN
+       - success_threshold: 2 successes in HALF_OPEN returns to CLOSED
+    2. In OPEN state: raise CircuitOpenError immediately without waiting.
+    3. Log every state transition with dependency name and reason.
+    4. Expose circuit state in /health endpoint for monitoring.
+    5. On CircuitOpenError: use cached result if safe, or mark task DEGRADED,
+       or escalate to orchestrator for rerouting to a backup agent.
+    6. Never share one circuit breaker across multiple unrelated dependencies.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [langgraph, httpx, tenacity]
+  domains:
+    domain: [agent_orchestration, reliability]
+    concern: [circuit_breaker, cascading_failure]
+  example_good: |
+    from enum import Enum
+    from datetime import datetime, timedelta
+
+    class CircuitState(Enum):
+        CLOSED = "closed"
+        OPEN = "open"
+        HALF_OPEN = "half_open"
+
+    class CircuitBreaker:
+        def __init__(self, name: str, failure_threshold=3, recovery_timeout=30):
+            self.name = name
+            self.state = CircuitState.CLOSED
+            self.failures = 0
+            self.last_failure: datetime | None = None
+            self.failure_threshold = failure_threshold
+            self.recovery_timeout = timedelta(seconds=recovery_timeout)
+
+        def call(self, fn, *args, **kwargs):
+            if self.state == CircuitState.OPEN:
+                if datetime.utcnow() - self.last_failure > self.recovery_timeout:
+                    self.state = CircuitState.HALF_OPEN
+                else:
+                    raise CircuitOpenError(f"Circuit {self.name} is OPEN")
+            try:
+                result = fn(*args, **kwargs)
+                if self.state == CircuitState.HALF_OPEN:
+                    self.state = CircuitState.CLOSED
+                    self.failures = 0
+                return result
+            except Exception as e:
+                self.failures += 1
+                self.last_failure = datetime.utcnow()
+                if self.failures >= self.failure_threshold:
+                    self.state = CircuitState.OPEN
+                raise
+  example_bad: |
+    # Direct calls without protection — one slow API blocks everything
+    async def call_llm(prompt: str):
+        return await openai.chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": prompt}]
+        )  # 30s timeout x 20 queued agents = pipeline dead for 10 minutes
+  when_applies: "Every agent that calls an external service: LLM API, database, HTTP tool, sub-agent."
+  sources:
+    - "Google SRE Book — Handling Overload: https://sre.google/sre-book/handling-overload/"
+    - "Martin Fowler — CircuitBreaker Pattern: https://martinfowler.com/bliki/CircuitBreaker.html"
+    - "LangGraph State Machines in Production: https://dev.to/jamesli/langgraph-state-machines-managing-complex-agent-task-flows-in-production-36f4"
+
+- id: ORCH-007
+  text: >
+    Use a strict hierarchical agent model (L0-L6) where higher-level agents coordinate but
+    never directly execute low-level work, and lower-level agents execute but never directly
+    modify orchestration state. Mixing coordination and execution in the same agent creates
+    an undebuggable tangle where failures cannot be attributed to a specific concern.
+  why: >
+    Systems where agents both plan and execute have two sources of failure that are nearly
+    impossible to disentangle in post-mortems. The run_master/squad_lead/worker hierarchy
+    in the brains pipeline separates concerns deliberately — when code generation fails, it
+    is a L5 worker problem; when a task is assigned to the wrong agent, it is a L4
+    squad_lead problem. This mirrors Conway's Law: the agent architecture should reflect
+    the accountability structure, not convenience.
+  how_to_do_right: |
+    1. Define layers with explicit contracts:
+       L0 System: pipeline health, memory, session management
+       L1 Executive: strategic decisions, product-level routing
+       L2 VP: domain-level planning and resource allocation
+       L3 Master: sprint/task-level coordination
+       L4 Squad Lead: work assignment, blocker resolution
+       L5 Worker: code/content/analysis execution
+       L6 Specialist: narrow domain execution (security, DB, etc.)
+    2. Enforce: L5/L6 agents cannot write to orchestration state.
+    3. Enforce: L0-L3 agents cannot invoke LLM APIs directly for execution tasks.
+    4. Each layer communicates only with adjacent layers — no L1 to L6 shortcuts.
+    5. Log the layer of every agent action for observability and attribution.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai, langgraph]
+  domains:
+    domain: [agent_orchestration, architecture]
+    concern: [hierarchy, separation_of_concerns]
+  example_good: |
+    class SquadLead(Agent):
+        """L4 — assigns work, never executes."""
+        def assign_task(self, task: Task, worker: "Worker") -> Assignment:
+            return Assignment(task=task, assignee=worker.id, deadline=task.eta)
+        # SquadLead never calls llm.invoke() for execution — only for planning
+
+    class Worker(Agent):
+        """L5 — executes, never modifies pipeline state."""
+        def execute(self, assignment: Assignment) -> WorkProduct:
+            result = self.llm.invoke(assignment.task.prompt)
+            return WorkProduct(assignment_id=assignment.id, output=result)
+            # Worker never touches pipeline_state, orchestration_queue, etc.
+  example_bad: |
+    class SuperAgent(Agent):
+        """God agent — plans, executes, reviews, and modifies pipeline state."""
+        def run(self, tasks):
+            for task in tasks:
+                plan = self.plan(task)
+                result = self.execute(plan)
+                self.pipeline_state[task.id] = result  # Mixing execution + state mutation
+                if self.review(result) == "FAIL":
+                    self.retry_queue.append(task)  # Impossible to debug which concern failed
+  when_applies: "Any multi-agent system with more than 3 distinct agent roles."
+  sources:
+    - "CLAUDE.md Brains — Hierarchical Agent Architecture L0-L6"
+    - "CrewAI — Hierarchical Process: https://docs.crewai.com/concepts/processes#hierarchical-process"
+    - "Conway's Law — Mel Conway 1968: https://www.melconway.com/Home/Committees_Paper.html"
+
+- id: ORCH-008
+  text: >
+    Implement backpressure in agent pipelines using bounded queues with explicit overflow
+    policies. An unbounded queue in front of a slow agent will accumulate thousands of
+    tasks and consume all available memory before the problem is detected. Define maximum
+    queue depth and what to do when reached: block, drop oldest, drop newest, or reroute.
+  why: >
+    In event-driven agent pipelines, producers (orchestrators) can generate tasks orders
+    of magnitude faster than consumers (worker agents) can process them, especially when
+    agents make LLM calls with variable latency (0.5s to 30s per call). Without
+    backpressure, queue depth grows until OOM kill. The Reactive Manifesto (2014) identifies
+    backpressure as a core requirement for resilient systems, and it applies directly to
+    agent pipelines running on MacBook-class hardware with memory constraints.
+  how_to_do_right: |
+    1. Use asyncio.Queue(maxsize=N) or Redis list with LLEN check before LPUSH.
+    2. Set maxsize based on: max_acceptable_latency_s / avg_agent_processing_time_s.
+       Example: 60s max latency / 5s avg processing = queue depth 12.
+    3. Define overflow policy per queue:
+       BLOCK: caller awaits space (safe, watch for deadlock)
+       DROP_OLDEST: removes head item (safe for idempotent tasks)
+       DROP_NEWEST: rejects new item (producer gets immediate error)
+       REROUTE: sends overflow to backup agent pool
+    4. Emit QUEUE_FULL metric when queue reaches 80% capacity.
+    5. Expose queue depth in /metrics endpoint.
+    6. Agent consumers must ACK tasks before pulling next — no silent consumption.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [asyncio, redis, langgraph]
+  domains:
+    domain: [agent_orchestration, reliability]
+    concern: [backpressure, queue_management]
+  example_good: |
+    import asyncio
+
+    class BoundedAgentQueue:
+        def __init__(self, maxsize: int, overflow: str = "block"):
+            self.q = asyncio.Queue(maxsize=maxsize)
+            self.overflow = overflow
+
+        async def put(self, task) -> bool:
+            if self.q.full():
+                if self.overflow == "drop_newest":
+                    return False  # Reject incoming task immediately
+                elif self.overflow == "drop_oldest":
+                    self.q.get_nowait()  # Evict oldest to make room
+                # "block" falls through to q.put() which awaits capacity
+            await self.q.put(task)
+            return True
+
+        async def get(self):
+            return await self.q.get()
+            # Caller must call q.task_done() after processing
+  example_bad: |
+    # Unbounded list — memory bomb under production load
+    task_queue = []
+    async def orchestrator_loop():
+        while True:
+            tasks = await poll_new_tasks()
+            task_queue.extend(tasks)  # Grows without bound
+            # Worker is 10x slower than producer — queue hits 50K items before OOM
+  when_applies: "Any pipeline where producers and consumers operate at different rates."
+  sources:
+    - "Reactive Manifesto — Backpressure: https://www.reactivemanifesto.org/glossary#Back-Pressure"
+    - "Dagster — Data Backpressure: https://dagster.io/glossary/data-backpressure"
+    - "Threepointformula — Agentic Design Pattern: Rate Limiting (2025): https://threepointformula.wordpress.com/2025/11/02/agentic-design-pattern-rate-limiting/"
+
+- id: ORCH-009
+  text: >
+    Never share raw mutable state between parallel agents. Use a message-passing or
+    blackboard pattern where all inter-agent communication goes through a central,
+    versioned store. Direct shared memory between concurrent agents causes race conditions
+    that are nearly impossible to reproduce or debug in LLM-based systems.
+  why: >
+    LLM agents are not deterministic — two agents given the same input at slightly different
+    times may produce conflicting updates to shared state. A race condition in a synchronous
+    Python program is detectable; a race condition where two agents both update a spec
+    document produces silent corruption that may not manifest until a QA gate several
+    steps later. The blackboard architecture (Hayes-Roth 1985, re-validated for LLMs in
+    arxiv 2507.01701) achieves 13-57% improvement over baselines while eliminating
+    race conditions through centralized, versioned access.
+  how_to_do_right: |
+    1. Implement a Blackboard with optimistic locking (Redis WATCH/MULTI/EXEC).
+    2. Every write includes a version: blackboard.write(key, value, expected_version).
+    3. If expected_version != current_version: raise ConflictError.
+    4. Caller retries with exponential backoff (max 3 retries, base 0.5s, factor 2).
+    5. Agents never hold references to shared objects — only IDs.
+    6. Blackboard maintains an append-only event log of all writes for auditability.
+    7. Agents communicate results by posting to blackboard, not calling each other directly.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [redis, langgraph, crewai]
+  domains:
+    domain: [agent_orchestration, concurrency]
+    concern: [shared_state, race_conditions, blackboard]
+  example_good: |
+    import redis, json
+
+    class Blackboard:
+        def __init__(self, r: redis.Redis):
+            self.r = r
+
+        def write(self, key: str, value: dict, expected_version: int) -> int:
+            with self.r.pipeline() as pipe:
+                pipe.watch(f"bb:{key}:version")
+                current = int(self.r.get(f"bb:{key}:version") or 0)
+                if current != expected_version:
+                    raise ConflictError(f"Version mismatch: {expected_version} != {current}")
+                pipe.multi()
+                pipe.set(f"bb:{key}", json.dumps(value))
+                pipe.incr(f"bb:{key}:version")
+                pipe.rpush(f"bb:{key}:log", json.dumps({"v": current+1, "val": value}))
+                pipe.execute()
+                return current + 1
+
+        def read(self, key: str) -> tuple[dict, int]:
+            val = self.r.get(f"bb:{key}")
+            ver = int(self.r.get(f"bb:{key}:version") or 0)
+            return json.loads(val) if val else {}, ver
+  example_bad: |
+    # Shared dict mutated by concurrent agents — race condition guaranteed
+    shared_results = {}
+    async def agent_a(task):
+        shared_results["analysis"] = await llm.invoke(task)  # Overwrites silently
+
+    async def agent_b(task):
+        shared_results["analysis"] = await llm.invoke(task)  # Last writer wins arbitrarily
+  when_applies: "Any pipeline with 2+ agents that run in parallel or share output artifacts."
+  sources:
+    - "arxiv 2507.01701 — Exploring Advanced LLM Multi-Agent Blackboard Architecture: https://arxiv.org/html/2507.01701v1"
+    - "arxiv 2510.01285 — LLM-based Multi-Agent Blackboard System: https://arxiv.org/pdf/2510.01285"
+    - "Redis — WATCH/MULTI/EXEC Optimistic Locking: https://redis.io/docs/latest/develop/interact/transactions/#optimistic-locking-using-check-and-set"
+
+- id: ORCH-010
+  text: >
+    Define retry vs. escalate rules explicitly before any agent fails. The rule: retry if
+    the failure is transient (network error, rate limit, timeout); escalate immediately if
+    the failure is semantic (wrong output, hallucination, validation failure). Never retry
+    semantic failures — they will fail again for the same reason with the same prompt.
+  why: >
+    The most common mistake in multi-agent error handling is applying exponential backoff
+    to semantic failures. If an agent produces output that fails schema validation, retrying
+    with the same prompt 3 more times wastes tokens and time for near-zero benefit. The
+    LLM's next attempt with the same broken prompt and context will produce the same error
+    class. Semantic failures require: prompt repair, context change, or escalation to a
+    more capable agent. The distinction is: transient = infrastructure problem, semantic =
+    reasoning problem. These have fundamentally different remedies.
+  how_to_do_right: |
+    1. Classify failures at the point of detection:
+       TRANSIENT: TimeoutError, RateLimitError, ConnectionError, HTTP 429/503
+       SEMANTIC: ValidationError, SchemaError, HallucinationDetected, LogicContradiction
+    2. For TRANSIENT: retry with exponential backoff:
+       base=1s, factor=2, jitter=uniform(0, 0.3*delay), max_delay=30s, max_retries=3
+    3. For SEMANTIC: escalate immediately to parent agent with failure_context.
+    4. Parent agent may: repair prompt, add examples, switch to stronger model, or escalate.
+    5. Never retry SEMANTIC errors without changing at least one input variable.
+    6. Log failure_type with every error for post-mortem classification analysis.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langgraph, tenacity]
+  domains:
+    domain: [agent_orchestration, error_handling]
+    concern: [retry, escalation, failure_classification]
+  example_good: |
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+    TRANSIENT_ERRORS = (TimeoutError, RateLimitError, ConnectionError)
+
+    @retry(
+        retry=retry_if_exception_type(TRANSIENT_ERRORS),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=30),
+    )
+    async def call_agent(agent, task: Task) -> AgentOutput:
+        try:
+            return await agent.invoke(task)
+        except ValidationError as e:
+            # Semantic failure — do NOT retry, escalate immediately
+            raise SemanticFailure(agent_id=agent.id, error=str(e), task=task) from e
+        # TRANSIENT errors propagate up to tenacity for exponential backoff retry
+  example_bad: |
+    for attempt in range(3):
+        try:
+            result = agent.invoke(task)
+            break
+        except Exception:
+            time.sleep(2 ** attempt)
+            # Retries schema validation failures 3 times — guaranteed same failure
+            # Wastes 3 LLM calls on a problem that needs a different prompt, not a retry
+  when_applies: "Every agent invocation point in any production pipeline."
+  sources:
+    - "tenacity library — retry conditions: https://tenacity.readthedocs.io/en/latest/"
+    - "AWS — Exponential Backoff and Jitter: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/"
+    - "LangGraph error handling patterns: https://dev.to/jamesli/langgraph-state-machines-managing-complex-agent-task-flows-in-production-36f4"
+
+- id: ORCH-011
+  text: >
+    Every agent output must pass a structured validation gate before being passed to the
+    next agent. Treat inter-agent handoffs like public API contracts: define the output
+    schema with Pydantic, validate it immediately after the LLM call, and reject malformed
+    output at the source — never let bad data propagate downstream.
+  why: >
+    A hallucination or malformed output from agent 2 in a 10-agent pipeline will silently
+    corrupt all downstream outputs. By the time agent 10 produces its final result, the
+    root cause is buried 8 steps back and nearly impossible to reconstruct without having
+    captured the raw output at each stage. Skywork AI's 2025 multi-agent best practices
+    guide identifies structured validation at handoff points as the single highest-impact
+    reliability improvement for production multi-agent systems.
+  how_to_do_right: |
+    1. Define a Pydantic model for every agent's output type.
+    2. After every LLM call: output = AgentOutput.model_validate_json(raw_text).
+    3. If validation fails: classify as SEMANTIC failure, escalate with raw_text + error.
+    4. Use JSON mode at the LLM API level to reduce parse failures upstream.
+    5. Include in output schema: confidence_score (0-1), reasoning_trace, output_data.
+    6. Log validation pass/fail rate per agent. If any agent > 5% fail rate, fix the prompt.
+    7. Never use free-form text as inter-agent communication for anything structured.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [pydantic, langgraph, anthropic]
+  domains:
+    domain: [agent_orchestration, data_quality]
+    concern: [output_validation, schema_enforcement, handoff]
+  example_good: |
+    from pydantic import BaseModel, Field, model_validator
+
+    class CodeAnalysisOutput(BaseModel):
+        issues: list[str] = Field(description="Identified issues")
+        severity: str = Field(pattern="^(critical|high|medium|low)$")
+        confidence: float = Field(ge=0.0, le=1.0)
+        reasoning: str = Field(min_length=10)
+
+        @model_validator(mode="after")
+        def validate_critical_has_issues(self) -> "CodeAnalysisOutput":
+            if self.severity == "critical" and not self.issues:
+                raise ValueError("Critical severity requires at least one issue listed")
+            return self
+
+    async def run_code_analyzer(code: str) -> CodeAnalysisOutput:
+        raw = await llm.invoke(code_analysis_prompt(code), response_format="json")
+        return CodeAnalysisOutput.model_validate_json(raw)  # Validates or raises
+  example_bad: |
+    # Unvalidated string passed between agents — corruption guaranteed
+    async def pipeline(code: str):
+        analysis = await agent_analyze(code)  # Returns raw string
+        review = await agent_review(analysis)  # No schema — agent guesses format
+        # Agent 3 gets garbage, produces garbage; root cause buried by then
+  when_applies: "Every agent-to-agent handoff point in any multi-agent pipeline."
+  sources:
+    - "Skywork AI — Reliable Handoffs: https://skywork.ai/blog/ai-agent-orchestration-best-practices-handoffs/"
+    - "Pydantic v2 — Model Validation: https://docs.pydantic.dev/latest/concepts/validators/"
+    - "Anthropic — Increase Consistency with Structured Outputs: https://docs.anthropic.com/en/docs/test-and-evaluate/strengthen-guardrails/increase-consistency"
+
+- id: ORCH-012
+  text: >
+    Instrument every agent call with a Langfuse trace span that captures: input tokens,
+    output tokens, latency, model used, agent_id, task_id, run_id, and parent_span_id.
+    Without distributed tracing with parent-child span relationships, you cannot answer
+    the most basic production question: "Which agent caused this run to take 4 minutes?"
+  why: >
+    Multi-agent systems have emergent performance characteristics — a 50% slowdown is
+    rarely one agent being 50% slower; it is one agent being 10x slower and everything
+    else waiting. Without per-span tracing, you see only aggregate latency. With per-span
+    tracing, you immediately see that agent code_reviewer at step 7 consumed 2 minutes of
+    a 4-minute run. Langfuse 2025 best practices documentation identifies distributed
+    tracing as the highest-ROI observability investment for LLM agent systems.
+  how_to_do_right: |
+    1. Initialize Langfuse client once at startup; propagate trace context via context var.
+    2. Every agent call: span = langfuse.start_span(name=agent_id, parent_id=parent_span_id).
+    3. Record on span: input_tokens, output_tokens, model, latency_ms.
+    4. On success: span.end(status="success").
+    5. On failure: span.end(status="error", metadata={"error": str(e)}).
+    6. Propagate the same trace_id through all agents in a single pipeline run.
+    7. Add custom gate scores: langfuse.score(trace_id, name="gate_pass", value=1.0).
+    8. Never block on observability calls — use fire-and-forget with timeout.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langfuse, langgraph, crewai]
+  domains:
+    domain: [agent_orchestration, observability]
+    concern: [tracing, monitoring, performance]
+  example_good: |
+    from langfuse import Langfuse
+    import time
+
+    lf = Langfuse()
+
+    def traced_agent_call(agent_id: str, task: str, trace_id: str,
+                          parent_span_id: str | None = None) -> str:
+        span = lf.start_span(
+            name=agent_id,
+            trace_id=trace_id,
+            parent_observation_id=parent_span_id,
+            input={"task": task[:200]},
+        )
+        t0 = time.monotonic()
+        try:
+            result = agents[agent_id].invoke(task)
+            span.end(
+                output={"preview": str(result)[:200]},
+                metadata={"latency_ms": int((time.monotonic() - t0) * 1000)},
+                status_message="success",
+            )
+            return result
+        except Exception as e:
+            span.end(status_message="error", metadata={"error": str(e)})
+            raise
+  example_bad: |
+    # No tracing — blind in production
+    async def run_pipeline(tasks):
+        for task in tasks:
+            result = await agent.invoke(task)
+            # 4-minute run? No idea which step took how long. Guessing game.
+  when_applies: "Every LLM call in every production agent pipeline."
+  sources:
+    - "Langfuse — AI Agent Observability and Tracing: https://langfuse.com/blog/2024-07-ai-agent-observability-with-langfuse"
+    - "Langfuse — Tracing Data Model: https://langfuse.com/docs/observability/data-model"
+    - "Langfuse — LangGraph Integration Cookbook: https://langfuse.com/guides/cookbook/example_langgraph_agents"
+
+- id: ORCH-013
+  text: >
+    Set explicit timeouts on every agent task at two levels: soft timeout (emit warning,
+    continue) and hard timeout (cancel task, mark FAILED, trigger recovery). A missing
+    timeout on a single agent in a sequential pipeline means the entire pipeline can hang
+    indefinitely waiting for an LLM API that is silently queueing on the server side.
+  why: >
+    LLM API calls have no guaranteed response time. A model that normally responds in 2s
+    may hang for 5 minutes on certain prompts (context window overload, server-side queue
+    backup). In a sequential 10-agent pipeline, one hanging agent with no timeout means
+    the pipeline never completes and requires manual intervention. Production incident
+    post-mortems consistently identify missing timeouts as the cause of stuck pipelines.
+    asyncio.wait_for() adds 2 lines of code and saves hours of debugging.
+  how_to_do_right: |
+    1. Set soft_timeout = expected_p95_duration * 2 (emit warning, continue)
+    2. Set hard_timeout = expected_p95_duration * 5 (cancel, mark FAILED)
+    3. Use asyncio.wait_for(coro, timeout=hard_timeout) for all async agent calls.
+    4. For synchronous agents: concurrent.futures with future.result(timeout=N).
+    5. On hard timeout: log agent_id, task_id, elapsed, soft_limit, hard_limit.
+    6. Pipeline-level watchdog: if total_elapsed > sum(all_hard_timeouts) * 1.2, abort.
+    7. Calibrate timeouts from p95 latency in Langfuse traces over a 7-day window.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [asyncio, langgraph]
+  domains:
+    domain: [agent_orchestration, reliability]
+    concern: [timeout, hanging_agents, recovery]
+  example_good: |
+    import asyncio
+
+    AGENT_TIMEOUTS = {
+        "spec_analyzer": {"soft": 30, "hard": 120},
+        "code_generator": {"soft": 60, "hard": 300},
+        "qa_reviewer": {"soft": 20, "hard": 90},
+    }
+
+    async def run_agent_with_timeout(agent_id: str, task: str) -> str:
+        t = AGENT_TIMEOUTS[agent_id]
+        try:
+            return await asyncio.wait_for(
+                agents[agent_id].invoke(task),
+                timeout=t["hard"]
+            )
+        except asyncio.TimeoutError:
+            log_timeout(agent_id, limit=t["hard"])
+            raise AgentTimeoutError(f"{agent_id} exceeded {t['hard']}s hard timeout")
+  example_bad: |
+    # No timeout — pipeline hangs indefinitely when LLM queues on server side
+    async def run_agent(agent_id: str, task: str):
+        return await agents[agent_id].invoke(task)  # Can wait 5+ minutes silently
+  when_applies: "Every agent invocation in any production pipeline."
+  sources:
+    - "Python asyncio.wait_for: https://docs.python.org/3/library/asyncio-task.html#asyncio.wait_for"
+    - "Google SRE Book Ch. 22 — Addressing Cascading Failures: https://sre.google/sre-book/addressing-cascading-failures/"
+    - "LangGraph — Long-Running Agent Orchestration: https://www.auxiliobits.com/blog/orchestrating-long-running-processes-using-langgraph-agents/"
+
+- id: ORCH-014
+  text: >
+    When deciding between parallel and sequential agent execution, build a task dependency
+    graph first and execute topological layers in parallel. Never parallelize tasks with
+    data dependencies — race conditions result. Never serialize tasks without dependencies
+    — you waste 30-50% of wall-clock time. The dependency graph is the ground truth; never
+    parallelize or serialize by intuition alone.
+  why: >
+    Naive parallelization of agents that share output produces nondeterministic corruption.
+    Naive serialization of independent agents (e.g., generating docs and tests can both
+    run after code generation) wastes significant time on pipelines with 5+ tasks.
+    The span (longest path through the DAG) determines the minimum achievable runtime.
+    Claude Code's own sub-agent patterns document explicitly: "parallel only works when
+    agents touch different files / different state." Build the graph, run the topo sort,
+    then execute.
+  how_to_do_right: |
+    1. Represent tasks as a DAG: nodes=tasks, edges=data dependencies.
+    2. Topological sort produces layers of mutually independent tasks.
+    3. Execute each layer with asyncio.gather(*[run_agent(t) for t in layer]).
+    4. Critical path = longest directed path from source to sink.
+    5. Tasks on critical path get priority: higher token budget, faster model.
+    6. If two tasks write the same output key: force them sequential regardless.
+    7. Visualize the DAG in the run report — hidden dependencies surface immediately.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [asyncio, langgraph, graphlib]
+  domains:
+    domain: [agent_orchestration, scheduling]
+    concern: [parallelism, dependency_graph, critical_path]
+  example_good: |
+    import graphlib
+    import asyncio
+
+    # Explicit dependency declaration — no guessing
+    deps = {
+        "spec_analysis": set(),
+        "risk_assessment": set(),                          # Independent of spec — Layer 0
+        "code_generation": {"spec_analysis"},              # Layer 1
+        "test_generation": {"spec_analysis"},              # Layer 1, parallel with code_gen
+        "qa_review": {"code_generation", "test_generation"},  # Layer 2
+    }
+
+    async def run_dag(deps: dict[str, set], context: dict) -> dict:
+        ts = graphlib.TopologicalSorter(deps)
+        results = {}
+        for batch in ts.static_order():
+            # All tasks in the same topological layer are independent
+            batch_results = await asyncio.gather(
+                *[run_agent(t, {**context, **results}) for t in [batch]]
+            )
+            results[batch] = batch_results[0]
+        return results
+  example_bad: |
+    # Sequential execution of independent tasks — 50% time wasted
+    async def run_pipeline(tasks):
+        for task in tasks:
+            results[task] = await run_agent(task)
+            # risk_assessment waits behind spec_analysis even though it has no dependency
+  when_applies: "Any pipeline with 3+ agent tasks where some are logically independent of others."
+  sources:
+    - "Python graphlib — TopologicalSorter: https://docs.python.org/3/library/graphlib.html"
+    - "Claude Code Sub-Agents — Parallel vs Sequential: https://claudefa.st/blog/guide/agents/sub-agent-best-practices"
+    - "Riloworks — The Dependency Graph Guide to Agent Architecture: https://blog.riloworks.com/its-the-dependency-graph-stupid-a-guide-to-agent-architecture/"
+
+- id: ORCH-015
+  text: >
+    The Run Master (L0 orchestrator) must maintain a real-time dashboard of all running
+    agents and must never block waiting for any single agent. The Run Master monitors all
+    agents via non-blocking polling and intervenes only when thresholds are breached.
+    A blocking orchestrator is a single point of failure for the entire pipeline.
+  why: >
+    Without a non-blocking orchestrator, a stuck worker agent becomes a stuck orchestrator.
+    The pipeline has a single point of failure at the coordination layer. The Run Master's
+    sole job is situational awareness and intervention — it must have a complete view of
+    all agents at all times. The brains CLAUDE.md defines the Run Master as a "zelador"
+    (caretaker) with three pillars: stay running, communicate status, self-improve. All
+    three require non-blocking monitoring via event loops, not sequential await chains.
+  how_to_do_right: |
+    1. Run Master uses asyncio event loop with non-blocking agent status polling every 5s.
+    2. Maintain agent registry: {agent_id: AgentStatus} with last_heartbeat timestamp.
+    3. If any agent's last_heartbeat > soft_timeout: emit WARNING to Langfuse.
+    4. If any agent's last_heartbeat > hard_timeout: cancel task, trigger replacement.
+    5. Publish dashboard state to Redis key run_master:dashboard every 5s.
+    6. Dashboard visible via: PYTHONPATH=src python -m pipeline_v2.cli lg-status.
+    7. Run Master never calls LLM APIs directly for execution — delegates to L5 workers.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [asyncio, redis, langgraph]
+  domains:
+    domain: [agent_orchestration, monitoring]
+    concern: [run_master, dashboard, health_monitoring]
+  example_good: |
+    import asyncio
+
+    class RunMaster:
+        def __init__(self):
+            self.agents: dict[str, AgentStatus] = {}
+
+        async def monitor_loop(self):
+            """Non-blocking — never awaits individual agent results."""
+            while True:
+                await asyncio.sleep(5)
+                now = utcnow()
+                for agent_id, status in self.agents.items():
+                    elapsed = (now - status.last_heartbeat).seconds
+                    if elapsed > status.hard_timeout:
+                        asyncio.create_task(self.intervene(agent_id, "hard_timeout"))
+                    elif elapsed > status.soft_timeout:
+                        emit_warning(agent_id, elapsed)
+                asyncio.create_task(self.publish_dashboard())
+
+        async def intervene(self, agent_id: str, reason: str) -> None:
+            await self.cancel_agent(agent_id)
+            await self.reschedule_task(self.agents[agent_id].current_task)
+  example_bad: |
+    # Blocking orchestrator — stuck agent 3 means stuck orchestrator
+    async def orchestrate(agents):
+        for agent in agents:
+            result = await agent.run()  # Hangs here if any agent hangs
+            process_result(result)      # Everything downstream waits forever
+  when_applies: "All production multi-agent pipeline orchestrators with 3+ concurrent agents."
+  sources:
+    - "CLAUDE.md Brains — Run Master v2.0 (zelador pattern)"
+    - "LangGraph — Orchestrating Long-Running Processes: https://www.auxiliobits.com/blog/orchestrating-long-running-processes-using-langgraph-agents/"
+    - "Google SRE Book Ch. 4 — Service Level Objectives: https://sre.google/sre-book/service-level-objectives/"
+
+- id: ORCH-016
+  text: >
+    When an agent fails and must be retried, inject the previous failure context into the
+    retry prompt explicitly. A bare retry is statistically almost as likely to fail as the
+    original. A retry with failure context ("Your previous attempt failed because X — avoid
+    Y this time") improves success rate by 40-60% for structural and format errors.
+  why: >
+    Research on LLM self-correction (Reflexion, Shinn et al. 2023) demonstrates that models
+    shown their own failures with explicit error diagnosis recover 40-60% more often than
+    bare retries. The intuition: the LLM has no memory of its failed attempt without
+    explicit injection. A retry without failure context is statistically equivalent to a
+    fresh attempt with the same broken prompt — same distribution of outputs, same error
+    class. Failure context changes the conditional distribution enough to matter.
+  how_to_do_right: |
+    1. Capture failure_context on every agent failure:
+       {attempt: N, error_type: str, error_detail: str, failed_output_preview: str[:200]}
+    2. Build informed retry prompt:
+       "Attempt {N} failed: {error_type} — {error_detail}.
+       Output '{failed_output[:100]}' was rejected because {reason}.
+       This time, ensure {correction_guidance}."
+    3. Inject failure_context as a system message, not in the user turn.
+    4. Limit to 2 informed retries — if 3 attempts fail, escalate (problem is the prompt).
+    5. Log informed_retry: True/False for each retry to measure its effectiveness over time.
+    6. For SEMANTIC_HALLUCINATION errors: add a factual grounding example to the retry prompt.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langgraph, anthropic, openai]
+  domains:
+    domain: [agent_orchestration, error_handling]
+    concern: [retry, self_correction, reflexion]
+  example_good: |
+    async def invoke_with_informed_retry(agent, task: Task, max_retries: int = 2):
+        failure_history = []
+        for attempt in range(max_retries + 1):
+            try:
+                prompt = build_prompt(task, failure_history=failure_history)
+                return await agent.invoke(prompt)
+            except (ValidationError, SemanticError) as e:
+                failure_history.append({
+                    "attempt": attempt + 1,
+                    "error": str(e),
+                    "output_preview": getattr(e, "raw_output", "")[:200],
+                })
+                if attempt == max_retries:
+                    raise MaxRetriesExceeded(task=task, history=failure_history)
+
+    def build_prompt(task: Task, failure_history: list) -> str:
+        if not failure_history:
+            return task.prompt
+        last = failure_history[-1]
+        return (task.prompt +
+                f"\n\nPrevious attempt {last['attempt']} failed: {last['error']}. "
+                f"Output was: '{last['output_preview']}'. Avoid this error.")
+  example_bad: |
+    for attempt in range(3):
+        try:
+            return await agent.invoke(task.prompt)  # Same prompt every attempt
+        except Exception:
+            pass  # No failure context — same broken prompt produces same failure
+  when_applies: "Every agent retry in a production pipeline, especially for structured output generation."
+  sources:
+    - "Reflexion — Shinn et al. NeurIPS 2023: https://arxiv.org/abs/2303.11366"
+    - "Anthropic — Reduce Hallucinations: https://docs.anthropic.com/en/docs/test-and-evaluate/strengthen-guardrails/reduce-hallucinations"
+    - "LangGraph Self-RAG Self-Correction: https://langchain-ai.github.io/langgraph/tutorials/rag/langgraph_self_rag/"
+
+- id: ORCH-017
+  text: >
+    Use a resource ordering protocol to prevent deadlocks in multi-agent pipelines: assign
+    a global integer ID to every shared resource and require agents to acquire resources
+    only in ascending ID order. An agent that needs resources A and B must acquire
+    A-first if ID(A) < ID(B), regardless of which it wants first.
+  why: >
+    Deadlocks in multi-agent systems appear as hangs where all agents report RUNNING or
+    WAITING with no errors. The pipeline simply stops making progress. Without a resource
+    ordering protocol, deadlocks are probabilistic — they may not appear in testing but
+    trigger under production load when multiple agents simultaneously compete for the same
+    shared resources. Classic Dijkstra deadlock prevention (1965): assign a global total
+    ordering to resources; always acquire in that order. This eliminates circular wait —
+    the only deadlock-enabling condition that software can control.
+  how_to_do_right: |
+    1. Create a global resource registry with assigned integer IDs:
+       RESOURCE_ORDER = {"spec_doc": 1, "blackboard": 2, "output_store": 3, "audit_log": 4}
+    2. Before acquiring any lock: sort needed resources by RESOURCE_ORDER[r].
+    3. Acquire locks in ascending ID order only — never out of order.
+    4. If an agent needs a resource with ID < any currently held lock:
+       release all locks, restart from the lowest-ID resource needed.
+    5. Set maximum lock hold time = 30s — release automatically on timeout.
+    6. Run Master monitors for agents in WAITING state > soft_timeout with a held lock.
+    7. Log all lock acquisitions and releases for post-mortem deadlock analysis.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [asyncio, redis, langgraph]
+  domains:
+    domain: [agent_orchestration, concurrency]
+    concern: [deadlock_prevention, locking, resources]
+  example_good: |
+    RESOURCE_ORDER = {"spec_doc": 1, "blackboard": 2, "output_store": 3, "audit_log": 4}
+
+    async def acquire_resources_ordered(needed: list[str]) -> list:
+        # Sort by global order — eliminates circular wait
+        ordered = sorted(needed, key=lambda r: RESOURCE_ORDER[r])
+        acquired = []
+        for resource in ordered:
+            lock = resource_locks[resource]
+            await asyncio.wait_for(lock.acquire(), timeout=30.0)
+            acquired.append(lock)
+        return acquired  # Release in reverse order: for l in reversed(acquired): l.release()
+  example_bad: |
+    # Each agent acquires in its own preferred order — deadlock inevitable
+    async def agent_a():
+        await lock_spec.acquire()    # Holds spec_doc (ID=1)
+        await lock_output.acquire()  # Waits for output_store (ID=3)
+
+    async def agent_b():
+        await lock_output.acquire()  # Holds output_store (ID=3)
+        await lock_spec.acquire()    # Waits for spec_doc (ID=1) — circular wait, deadlock!
+  when_applies: "Any pipeline where 2+ agents may simultaneously access shared resources (files, DB rows, blackboard keys)."
+  sources:
+    - "Dijkstra — Resource Allocation Graphs and Deadlock Prevention (1965)"
+    - "OSTEP Ch. 32 — Common Concurrency Problems: https://pages.cs.wisc.edu/~remzi/OSTEP/threads-bugs.pdf"
+    - "Python asyncio.Lock: https://docs.python.org/3/library/asyncio-sync.html#asyncio.Lock"
+
+- id: ORCH-018
+  text: >
+    Implement error propagation boundaries: when an agent fails, the error propagates
+    upward exactly one level in the hierarchy, is handled or escalated there, and never
+    silently drops or leaks across multiple levels. An unhandled exception in a L5 worker
+    should never crash the L0 orchestrator — and should never be silently swallowed either.
+  why: >
+    In deeply nested agent hierarchies, an unhandled exception in a worker can propagate
+    through L4 to L3 to L2 to L1 and kill the entire pipeline if no boundary exists.
+    Alternatively, poorly placed bare except clauses at the orchestrator level silently
+    swallow errors that should have been escalated. Both failure modes are catastrophic:
+    one crashes the system, the other produces a system that appears to succeed while
+    silently dropping work. Every layer must handle what it can and escalate what it cannot.
+  how_to_do_right: |
+    1. Define custom exception hierarchy mirroring agent layers:
+       AgentError (base) → WorkerError → SquadLeadError → MasterError → PipelineError
+    2. Each layer catches only its own level's errors and wraps before re-raising:
+       try: worker.run()
+       except WorkerError as e: raise SquadLeadError(f"Squad failed: {e}") from e
+    3. Never use bare except Exception: always specify which errors are handled.
+    4. Orchestrator catches PipelineError: logs, alerts, and presents context — does not re-raise raw.
+    5. Each re-raised exception includes: original_error, agent_id, task_id, attempt_number.
+    6. Dead letter queue: tasks that exhaust all retries go to DLQ for human review, never silently drop.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [langgraph, crewai]
+  domains:
+    domain: [agent_orchestration, error_handling]
+    concern: [error_propagation, exception_hierarchy]
+  example_good: |
+    class AgentError(Exception):
+        def __init__(self, msg: str, agent_id: str, task_id: str):
+            super().__init__(msg)
+            self.agent_id = agent_id
+            self.task_id = task_id
+
+    class WorkerError(AgentError): pass
+    class SquadLeadError(AgentError): pass
+
+    class SquadLead:
+        async def run_worker(self, worker, task):
+            try:
+                return await worker.run(task)
+            except WorkerError as e:
+                if self.can_recover(e):
+                    return await self.fallback_worker.run(task)
+                # Escalate — wrap so parent knows the level of failure
+                raise SquadLeadError(
+                    f"Squad exhausted recovery options: {e}",
+                    agent_id=self.id, task_id=task.id
+                ) from e
+  example_bad: |
+    async def orchestrate(agents, tasks):
+        for agent, task in zip(agents, tasks):
+            try:
+                results.append(await agent.run(task))
+            except Exception:
+                pass  # Silently drops ALL errors — pipeline "succeeds" with missing output
+  when_applies: "Every agent that invokes sub-agents or that can fail in production."
+  sources:
+    - "Google SRE Book Ch. 13 — Emergency Response: https://sre.google/sre-book/emergency-response/"
+    - "Python Exception Chaining: https://docs.python.org/3/tutorial/errors.html#exception-chaining"
+    - "LangGraph Subgraph Error Handling: https://langchain-ai.github.io/langgraph/how-tos/subgraph-errors/"
+
+- id: ORCH-019
+  text: >
+    Never hard-code agent model assignments in pipeline code. Maintain a model routing
+    table (YAML config) that maps task_type and complexity to model choice. This enables
+    hot-swapping models without code changes and systematic cost/performance optimization:
+    use a fast cheap model for simple tasks, a frontier model only for complex reasoning.
+  why: >
+    Pipeline code that hard-codes a specific model in 40 places becomes a maintenance
+    problem when the model is deprecated and an optimization problem when a cheaper model
+    offers equivalent quality for 80% of tasks. Using the same frontier model for both
+    "extract JSON from spec" (a 1K token task) and "design the entire architecture" (a
+    32K reasoning task) wastes 10-50x compute on the simple task. Model routing is a
+    first-class engineering concern that pays compounding dividends as the pipeline scales.
+  how_to_do_right: |
+    1. Define a MODEL_ROUTING_TABLE in YAML: task_type × complexity → model_id.
+    2. Complexity tiers: SIMPLE (< 3 reasoning steps), STANDARD (3-10), COMPLEX (10+).
+    3. Load routing table from config — never embed model names in Python source.
+    4. Allow per-task override: task.model_override = "claude-opus-4-6".
+    5. Log model used per task in Langfuse for cost attribution and comparison.
+    6. Implement fallback chain: if primary model unavailable, try secondary.
+    7. Review routing quarterly — models improve and pricing changes continuously.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [anthropic, openai, langgraph]
+  domains:
+    domain: [agent_orchestration, cost_management]
+    concern: [model_routing, configuration]
+  example_good: |
+    # configs/model_routing.yaml
+    # routing:
+    #   spec_extraction:
+    #     simple: gpt-4o-mini
+    #     standard: claude-sonnet-4-6
+    #     complex: claude-opus-4-6
+    #   code_generation:
+    #     simple: gpt-4o-mini
+    #     standard: claude-opus-4-6
+    #     complex: claude-opus-4-6
+
+    import yaml
+
+    class ModelRouter:
+        def __init__(self, config_path: str):
+            with open(config_path) as f:
+                self.routing = yaml.safe_load(f)["routing"]
+
+        def get_model(self, task_type: str, complexity: str,
+                      override: str | None = None) -> str:
+            return override or self.routing[task_type][complexity]
+  example_bad: |
+    async def analyze_spec(text: str):
+        # Hard-coded in 40 places — grep-and-replace on every model upgrade
+        return await anthropic.messages.create(model="claude-opus-4-6", ...)
+
+    async def extract_json(text: str):
+        return await anthropic.messages.create(model="claude-opus-4-6", ...)
+        # Using frontier model for a task that gpt-4o-mini handles equally well
+  when_applies: "Any pipeline with more than 2 different agent task types or expected lifetime > 3 months."
+  sources:
+    - "Anthropic — Model Overview: https://docs.anthropic.com/en/docs/about-claude/models/overview"
+    - "Budget-Aware Tool-Use Enables Effective Agent Scaling: https://arxiv.org/html/2511.17006v1"
+    - "OpenAI — Model Endpoint Compatibility: https://platform.openai.com/docs/models"
+
+- id: ORCH-020
+  text: >
+    Implement two-stage context compression for long-running agents: lossless first
+    (remove whitespace, deduplicate repeated content), then selective lossy summarization
+    only when lossless is insufficient. Never apply lossy compression to: the original
+    task specification, the 3 most recent messages, or any structured data (JSON, YAML, code).
+  why: >
+    Context rot (Chroma 2025 research, 18 LLMs tested) quantifies what engineers observe
+    qualitatively: LLM accuracy degrades as context length grows beyond a task-specific
+    optimum, even within the claimed context window. A 100K token context is often worse
+    than a 20K token context due to attention dilution on critical content. Naive truncation
+    of old messages almost always removes the task specification — catastrophic. The correct
+    approach is surgical: protect high-signal content and compress low-signal filler.
+  how_to_do_right: |
+    1. Track token count after every message: count = count_tokens(messages).
+    2. When count > 0.7 * context_limit: enter compression mode.
+    3. Stage 1 (lossless): remove whitespace, deduplicate adjacent identical messages.
+    4. Stage 2 (selective summarization): summarize messages[2:-3].
+       Protected: messages[0] (system prompt), messages[1] (task spec), last 3 messages.
+    5. Stage 3 (tool result pruning): if tool_result.tokens > 2K, keep first 500 + last 200.
+    6. Never compress: JSON/YAML/code blocks, error messages, validation results.
+    7. Log compression_ratio per session to track effectiveness over time.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [anthropic, openai, langgraph]
+  domains:
+    domain: [agent_orchestration, context_management]
+    concern: [context_compression, token_efficiency]
+  example_good: |
+    def compress_context(messages: list[dict], limit: int) -> list[dict]:
+        if count_tokens(messages) <= limit * 0.7:
+            return messages  # No compression needed
+
+        # Protected: system(0), task spec(1), last 3 messages
+        head = messages[:2]
+        tail = messages[-3:]
+        compressible = messages[2:-3]
+
+        if compressible:
+            summary = summarize_messages(compressible)  # LLM summarization call
+            compressed = [{"role": "system", "content": f"[SUMMARY OF PRIOR CONTEXT]: {summary}"}]
+            return head + compressed + tail
+        return messages
+  example_bad: |
+    # Naive truncation — almost always removes the task specification first
+    def compress_context(messages, limit):
+        while count_tokens(messages) > limit:
+            messages.pop(0)  # Removes system prompt and task spec before anything else
+        return messages  # Agent has no idea what it was supposed to do
+  when_applies: "Any agent expected to run more than 5 turns or process documents > 10K tokens."
+  sources:
+    - "Anthropic — Effective Context Engineering: https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents"
+    - "Context Window Management Strategies: https://www.getmaxim.ai/articles/context-window-management-strategies-for-long-context-ai-agents-and-chatbots/"
+    - "JetBrains Research — Efficient Context Management (2025): https://blog.jetbrains.com/research/2025/12/efficient-context-management/"
+
+- id: ORCH-021
+  text: >
+    Agent handoff packets must include five fields as a minimum contract: task_id,
+    parent_trace_id, acceptance_criteria (list of verifiable conditions), timeout_deadline
+    (absolute timestamp), and rollback_instructions. A handoff missing acceptance_criteria
+    gives the receiving agent no definition of success; a handoff missing rollback_instructions
+    leaves the pipeline unable to recover if the receiving agent fails partway through.
+  why: >
+    Poorly structured handoffs are the most common source of "agent did the wrong thing"
+    bugs. The sending agent assumes the receiving agent knows what success looks like; the
+    receiving agent guesses. Skywork AI's 2025 guide identifies incomplete handoffs as the
+    primary cause of agent rework loops: agent produces output, sender rejects it for an
+    unstated reason, retry happens with same implicit criteria, same rejection. Adding
+    explicit acceptance_criteria to handoffs reduces these loops by approximately 70% in
+    their documented production systems.
+  how_to_do_right: |
+    1. Define HandoffPacket as a Pydantic model with all 5 required fields.
+    2. acceptance_criteria: list of verifiable conditions, not vague descriptions.
+       Good: ["output is valid JSON", "all required keys present", "no placeholder text"]
+       Bad: ["good quality output", "complete and thorough"]
+    3. rollback_instructions: specific steps to undo partial work if agent fails mid-task.
+    4. timeout_deadline: absolute UTC timestamp, not relative duration.
+    5. Receiving agent validates HandoffPacket on receipt — reject malformed packets immediately.
+    6. Receiving agent reports back: accepted | rejected | completed with reason.
+    7. Log every handoff packet for audit trail — these are the paper trail for post-mortems.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pydantic, langgraph, crewai]
+  domains:
+    domain: [agent_orchestration, handoff_protocol]
+    concern: [task_transfer, acceptance_criteria, rollback]
+  example_good: |
+    from pydantic import BaseModel
+    from datetime import datetime, timedelta
+
+    class HandoffPacket(BaseModel):
+        task_id: str
+        parent_trace_id: str
+        input_data: dict
+        acceptance_criteria: list[str]  # Verifiable, not vague
+        timeout_deadline: datetime       # Absolute UTC timestamp
+        rollback_instructions: list[str] # How to undo partial work
+
+    packet = HandoffPacket(
+        task_id="TASK-123",
+        parent_trace_id=current_trace_id,
+        input_data={"code": source_code},
+        acceptance_criteria=[
+            "output is valid JSON with top-level 'issues' key",
+            "each issue has 'severity' field matching pattern critical|high|medium|low",
+            "no placeholder text or TODO markers in output",
+        ],
+        timeout_deadline=datetime.utcnow() + timedelta(minutes=5),
+        rollback_instructions=["delete partial_output/{task_id} from output_store"],
+    )
+  example_bad: |
+    # Unstructured handoff — receiving agent invents its own success criteria
+    async def handoff(result: str, next_agent: Agent):
+        await next_agent.invoke(f"Previous agent output: {result}. Do the next step.")
+        # No criteria, no deadline, no rollback — every agent iteration is a surprise
+  when_applies: "Every agent-to-agent handoff in any production multi-agent pipeline."
+  sources:
+    - "Skywork AI — Reliable Handoffs: https://skywork.ai/blog/ai-agent-orchestration-best-practices-handoffs/"
+    - "LangChain — Handoffs Documentation: https://docs.langchain.com/oss/python/langchain/multi-agent/handoffs"
+    - "Pydantic v2 Documentation: https://docs.pydantic.dev/latest/"
+
+- id: ORCH-022
+  text: >
+    Use Langfuse session grouping to correlate all traces from a single pipeline run under
+    one session_id. Without session grouping, debugging a 20-agent pipeline means searching
+    through thousands of unrelated trace records. With session grouping, the entire run
+    appears as a single entity with all agent spans as navigable children.
+  why: >
+    Langfuse traces without session grouping appear as independent events with no relationship
+    to each other. When a pipeline run involves 20 agents over 2 hours, correlating failures
+    without session context requires manually matching timestamps and task IDs — error-prone,
+    time-consuming, and often abandoned. Session grouping with a consistent run_id as
+    session_id is a 2-line addition that reduces mean time to diagnosis from 30 minutes to
+    5 minutes. Every trace in the brains pipeline uses run_id as session_id for this reason.
+  how_to_do_right: |
+    1. Generate run_id = str(uuid4()) at pipeline start — this becomes session_id.
+    2. Pass session_id to every Langfuse trace: langfuse.trace(session_id=run_id).
+    3. Propagate run_id through all agent calls as part of task context (not just metadata).
+    4. Add run metadata to session: product, sprint_id, git_sha, start_time.
+    5. Use descriptive trace names: langfuse.trace(name=f"{product}:{sprint}:{task}").
+    6. Add Langfuse tags for filtering: tags=[product, sprint, "agent_run", env].
+    7. At pipeline end: update session with final status, total duration, total_tokens.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langfuse, langgraph]
+  domains:
+    domain: [agent_orchestration, observability]
+    concern: [tracing, session_management, debugging]
+  example_good: |
+    import uuid
+    from langfuse import Langfuse
+
+    lf = Langfuse()
+
+    def start_pipeline_run(product: str, sprint: str) -> str:
+        run_id = str(uuid.uuid4())
+        lf.trace(
+            id=run_id,
+            name=f"pipeline:{product}:{sprint}",
+            session_id=run_id,  # Same ID — groups all spans under this run
+            tags=[product, sprint, "pipeline_run"],
+            metadata={"product": product, "sprint": sprint},
+        )
+        return run_id  # Pass through all downstream agent calls
+
+    def create_agent_span(run_id: str, agent_id: str, task: str):
+        return lf.span(trace_id=run_id, name=agent_id, input={"task": task[:200]})
+  example_bad: |
+    # No session grouping — 20-agent run produces 20 orphaned traces
+    for agent, task in zip(agents, tasks):
+        trace = lf.trace(name=agent.id)  # No session_id — unrelated to other traces
+        result = agent.invoke(task)
+        trace.update(output=result)
+  when_applies: "Every multi-agent pipeline run in any environment."
+  sources:
+    - "Langfuse — Sessions: https://langfuse.com/docs/observability/features/sessions"
+    - "Langfuse — Distributed Tracing: https://langfuse.com/docs/observability/features/trace-ids-and-distributed-tracing"
+    - "Mastering Langfuse Agent Monitoring: https://sparkco.ai/blog/mastering-langfuse-agent-monitoring-a-deep-dive"
+
+- id: ORCH-023
+  text: >
+    Run explicit agent health checks before dispatching any tasks. Verify that every
+    agent's dependencies (LLM API reachable, tools initialized, required env vars set)
+    are healthy before starting a pipeline run. A pipeline that starts 20 agents only
+    to have 10 fail immediately on API unavailability wastes tokens on orchestration
+    that could have been prevented by a 2-second startup check.
+  why: >
+    The most expensive bugs in multi-agent systems are early-detection failures that
+    could have been caught before spending a single token: the API key is invalid, the
+    vector store is down, or a required tool is misconfigured. These failures are 100%
+    predictable with a health check and 100% avoidable. The brains pipeline (CLAUDE.md)
+    explicitly implements health checks for all 8 stacks before any sprint starts because
+    early versions wasted entire pipeline runs on missing infrastructure dependencies.
+  how_to_do_right: |
+    1. Define a health_check() method on every agent class that returns bool.
+    2. health_check() verifies: LLM API reachable with a lightweight ping, tools init,
+       required env vars present and non-empty.
+    3. Orchestrator runs all health checks in parallel with 5s timeout each at startup.
+    4. If any CRITICAL agent health check fails: abort pipeline, report which agent failed.
+    5. If only NON-CRITICAL agent health checks fail: continue with degraded mode and log warning.
+    6. Expose /health endpoint that re-runs health checks on demand.
+    7. Re-run health checks every 60s for pipelines expected to run > 30 minutes.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langgraph, fastapi, httpx]
+  domains:
+    domain: [agent_orchestration, reliability]
+    concern: [health_check, startup, dependency_verification]
+  example_good: |
+    import asyncio
+
+    class AgentWithHealthCheck:
+        async def health_check(self) -> tuple[bool, str]:
+            try:
+                await asyncio.wait_for(self.llm_client.ping(), timeout=5.0)
+                return True, "healthy"
+            except Exception as e:
+                return False, str(e)
+
+    async def startup_health_check(agents: list[AgentWithHealthCheck]) -> None:
+        results = await asyncio.gather(*[a.health_check() for a in agents])
+        failed = [a.id for a, (ok, _) in zip(agents, results) if not ok]
+        if failed:
+            raise StartupError(f"Health check failed for: {failed}")
+        # All healthy — safe to dispatch first task
+  example_bad: |
+    # No health check — dispatches tasks immediately, half fail on missing API key
+    async def start_pipeline(agents, tasks):
+        await asyncio.gather(*[agent.run(task) for agent, task in zip(agents, tasks)])
+        # 10 immediate failures: API key invalid, DB unreachable — all avoidable
+  when_applies: "Every pipeline startup and every agent re-initialization after failure."
+  sources:
+    - "CLAUDE.md Brains — Stack Check for all 8 stacks before pipeline start"
+    - "Google SRE Book Ch. 9 — Simplicity (fail fast): https://sre.google/sre-book/simplicity/"
+    - "LangGraph — Multi-Agent Workflows Enterprise: https://www.royalcyber.com/blogs/ai-ml/langgraph-multi-agent-workflows-enterprise-ai/"
+
+- id: ORCH-024
+  text: >
+    Implement agent memory isolation: each agent invocation receives only the memory
+    relevant to its current task, queried explicitly by key, not the full accumulated
+    pipeline history injected automatically. An agent that receives 80K tokens of
+    irrelevant pipeline history performs worse than one that receives 8K tokens of
+    targeted context — context rot degrades accuracy even within the model's context limit.
+  why: >
+    Context rot (Chroma 2025 research across 18 LLMs) quantifies what engineers observe:
+    accuracy degrades as context length grows beyond the task-specific optimum. An agent
+    performing code review does not benefit from knowing the spec analysis completed 40
+    minutes ago — it actively hurts performance by diluting attention on what matters.
+    Letta's stateful agent architecture implements explicit memory querying deliberately
+    for this reason. The naive approach of dumping all pipeline state into every agent
+    context is the most common performance antipattern in multi-agent systems.
+  how_to_do_right: |
+    1. Maintain pipeline memory as a queryable store: Letta, Qdrant, or a keyed dict.
+    2. Each task definition declares required_memory_keys: an explicit list, not wildcard.
+    3. Before dispatch: fetch ONLY required_memory_keys from store for this task type.
+    4. Agent receives: task_prompt + targeted_memory (not full history).
+    5. After agent completes: update store with only the keys defined in output_memory_keys.
+    6. Never auto-inject "all previous results" — every memory access must be intentional.
+    7. Log memory_tokens_injected per agent to track and optimize over time.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [letta, qdrant, langgraph]
+  domains:
+    domain: [agent_orchestration, memory_management]
+    concern: [memory_isolation, context_quality, performance]
+  example_good: |
+    TASK_MEMORY_REQUIREMENTS = {
+        "code_review": ["spec_summary", "coding_standards", "previous_issues"],
+        "test_generation": ["spec_summary", "implementation_summary"],
+        "qa_check": ["acceptance_criteria", "test_results"],
+    }
+
+    class TargetedMemoryStore:
+        def __init__(self, store: dict):
+            self.store = store
+
+        def fetch_for_task(self, task_type: str) -> dict:
+            keys = TASK_MEMORY_REQUIREMENTS[task_type]
+            return {k: self.store[k] for k in keys if k in self.store}
+
+    # Each agent gets only what it needs — 2K targeted vs 80K dump
+    memory = store.fetch_for_task("code_review")
+    result = code_review_agent.invoke(task, context=memory)
+  example_bad: |
+    # Dumps entire pipeline history into every agent context — context rot
+    async def dispatch_agent(agent, task, pipeline_history):
+        full = "\n".join(str(h) for h in pipeline_history)  # 80K irrelevant tokens
+        return await agent.invoke(full + "\n\nNow do: " + task)
+  when_applies: "Any multi-agent pipeline with 3+ stages where agents share intermediate results."
+  sources:
+    - "Letta — Stateful Agent Memory: https://docs.letta.com/concepts/memory"
+    - "Memory in LLM Multi-agent Systems Survey: https://www.techrxiv.org/users/1007269/articles/1367390"
+    - "Context Engineering for AI Agents: https://medium.com/@kuldeep.paul08/context-engineering-optimizing-llm-memory-for-production-ai-agents-6a7c9165a431"
+
+- id: ORCH-025
+  text: >
+    Every multi-agent pipeline must have a defined escalation ladder with time budgets at
+    each level: Worker auto-retries (Level 1, max 5 min), Squad Lead attempts alternatives
+    (Level 2, max 15 min), Master reduces scope or reroutes (Level 3, max 30 min), Human
+    Layer blocks and awaits human decision (Level 4, no time limit). Without a defined
+    ladder, failures either stall indefinitely or page humans for problems that could have
+    been auto-resolved.
+  why: >
+    Escalation without a defined ladder produces two failure modes: agents retry indefinitely
+    consuming tokens and time while the pipeline stalls; or every minor failure escalates
+    immediately to human, creating alert fatigue that causes humans to ignore alerts.
+    The correct model mirrors IT incident management: L1 resolves what it can in N minutes,
+    escalates to L2, then L3. The brains pipeline implements Human Layer Specialist at L6
+    with 7 defined Human Layers — escalation is a first-class architectural concern in
+    any system with real stakes.
+  how_to_do_right: |
+    1. Define escalation ladder with explicit time budgets:
+       L1 Worker: informed retry x2, 5-minute budget
+       L2 Squad Lead: alternative approach or different worker, 15-minute budget
+       L3 Master: scope reduction, squad rerouting, non-critical task skip, 30-minute budget
+       L4 Human: block pipeline, notify via configured channel, await decision
+    2. Escalation trigger at each level: exhausted retries OR timeout OR STRONG veto.
+    3. Each escalation event includes: original_task, all_attempts, total_time, recommendation.
+    4. Human Layer receives actionable choices: retry | skip | abort | manual_fix.
+    5. Track escalation_rate per task_type — if > 10%, fix root cause in prompt or task design.
+    6. Log all escalations with resolution for trend analysis.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [langgraph, crewai, redis]
+  domains:
+    domain: [agent_orchestration, escalation]
+    concern: [human_in_the_loop, incident_management]
+  example_good: |
+    import asyncio
+
+    async def run_with_escalation_ladder(task: Task, worker, squad_lead) -> Result:
+        # L1: Worker with informed retry (max 5 min)
+        try:
+            return await asyncio.wait_for(
+                invoke_with_informed_retry(worker, task, max_retries=2), timeout=300)
+        except (MaxRetriesExceeded, asyncio.TimeoutError) as l1_err:
+            pass
+
+        # L2: Squad Lead attempts alternative approach (max 15 min)
+        try:
+            return await asyncio.wait_for(
+                squad_lead.attempt_alternative(task, failure_context=l1_err), timeout=900)
+        except Exception as l2_err:
+            pass
+
+        # L4: Human Layer — block and await decision
+        await notify_human_layer(task, attempts=[l1_err, l2_err])
+        return await await_human_decision(task.id)
+  example_bad: |
+    async def run_task(task):
+        try:
+            return await worker.run(task)
+        except Exception:
+            await send_pagerduty_alert(task)  # Every minor error pages human — alert fatigue
+  when_applies: "Every production multi-agent pipeline where some tasks are critical enough to block on failure."
+  sources:
+    - "CLAUDE.md Brains — Human Layer Specialist, 7 Human Layers"
+    - "Arion Research — Conflict Resolution Playbook: https://www.arionresearch.com/blog/conflict-resolution-playbook"
+    - "Google SRE Book Ch. 14 — Managing Incidents: https://sre.google/sre-book/managing-incidents/"

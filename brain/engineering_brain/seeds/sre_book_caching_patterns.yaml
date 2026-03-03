@@ -1,0 +1,265 @@
+layer: rules
+technology: SRE
+domain: caching
+knowledge:
+- id: CR-SRE-CACHE-001
+  text: Cache invalidation strategy must be chosen before the cache is built — write-through, write-behind, or TTL-based expiration.
+    Each has different consistency, performance, and complexity tradeoffs. There is no "just add a cache" — every cache introduces
+    a consistency problem.
+  why: 'Google''s caching practices (derived from Chapters 20-22 on load management and cascading failures) treat cache consistency
+    as a first-class design concern. Write-through: every write updates both the database and the cache atomically — strong
+    consistency but write latency increases. Write-behind (write-back): writes update the cache, which asynchronously flushes
+    to the database — fast writes but data loss risk if cache crashes before flush. TTL-based: data is cached for a fixed
+    duration and refreshes on expiry — simple but serves stale data for up to TTL duration. The worst pattern: no strategy
+    at all — data is cached indefinitely, invalidated ad-hoc when someone notices it''s stale, and bugs appear as "the data
+    is wrong sometimes."
+
+    '
+  how_to_do_right: '1. Choose a strategy BEFORE building the cache: write-through for consistency-critical data, TTL-based
+    for read-heavy data that tolerates staleness.
+
+    2. Write-through: update DB, then update cache, in the same transaction boundary. If cache update fails, invalidate the
+    cache key.
+
+    3. TTL-based: set TTL based on data change frequency. User profiles (1 hour), product prices (5 minutes), real-time data
+    (30 seconds).
+
+    4. Use cache-aside (lazy loading): read from cache, on miss → read from DB → write to cache. Most common and simplest
+    pattern.
+
+    5. NEVER update the cache without updating the database. The database is the source of truth, the cache is a performance
+    optimization.
+
+    6. Monitor cache consistency: periodically sample cached values and compare with database. Any mismatch indicates a cache
+    invalidation bug.
+
+    '
+  example_good: "import redis\nimport json\nfrom typing import Optional\n\nclass CacheAsideWithWriteThrough:\n    def __init__(self, db, cache: redis.Redis):\n        self.db = db\n        self.cache = cache\n\n    def get_product(self, product_id: str) -> dict:\n        \"\"\"Cache-aside: read from cache, on miss → DB → cache.\"\"\"\n        cached = self.cache.get(f'product:{product_id}')\n        if cached:\n            return json.loads(cached)\n        product = self.db.query('SELECT * FROM products WHERE id = %s', (product_id,))\n        if product:\n            self.cache.setex(f'product:{product_id}', 300, json.dumps(product))  # TTL: 5 min\n        return product\n\n    def update_product(self, product_id: str, data: dict):\n        \"\"\"Write-through: update DB first, then invalidate cache.\"\"\"\n        self.db.execute('UPDATE products SET data = %s WHERE id = %s', (json.dumps(data), product_id))\n        self.cache.delete(f'product:{product_id}')  # Invalidate, don't update\n        # Next read will repopulate from DB (cache-aside)\n\n    def monitor_consistency(self):\n        \"\"\"Periodic check: sample cached values vs DB.\"\"\"\n        for key in self.cache.scan_iter('product:*', count=100):\n            product_id = key.decode().split(':')[1]\n            cached = json.loads(self.cache.get(key))\n            db_val = self.db.query('SELECT * FROM products WHERE id = %s', (product_id,))\n            if cached != db_val:\n                self.alert(f'Cache inconsistency for product {product_id}')\n"
+  example_bad: "class NaiveCache:\n    def get_product(self, product_id):\n        cached = cache.get(f'product:{product_id}')\n        if cached:\n            return json.loads(cached)\n        product = db.query('SELECT * FROM products WHERE id = %s', (product_id,))\n        cache.set(f'product:{product_id}', json.dumps(product))  # No TTL! Cached forever.\n        return product\n\n    def update_product(self, product_id, data):\n        # Updates DB but forgets to invalidate cache\n        db.execute('UPDATE products SET data = %s WHERE id = %s', (json.dumps(data), product_id))\n        # Cache still serves old data indefinitely\n        # No consistency monitoring — stale data served silently\n"
+  when_applies: "When adding a cache to any data path — choose an invalidation strategy (write-through, TTL, cache-aside) before building the cache."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [redis]
+  domains:
+    domain: [architecture, performance, reliability]
+    concern: [caching, data_integrity, consistency]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-CACHE-002
+  text: Cache stampede (thundering herd on cache expiry) can take down your database — when a popular cache key expires, hundreds
+    of concurrent requests all miss the cache simultaneously and hit the database, causing a load spike that can cascade into
+    an outage.
+  why: 'Google''s cascading failures chapter (Chapter 22) identifies cache stampede as a common trigger for cascading failures.
+    Scenario: a cache key holding popular data (e.g., front page content) expires. 500 concurrent requests arrive within 100ms.
+    All 500 miss the cache. All 500 query the database. The database, sized for 50 QPS (because the cache handles the other
+    450), receives 500 queries simultaneously. The database becomes overloaded. Queries slow down. The cache remains empty
+    (queries haven''t returned yet). More requests arrive and also miss the cache. The database falls further behind. Eventually
+    the database becomes unresponsive, and the cascading failure propagates upstream.
+
+    '
+  how_to_do_right: '1. Cache locking (single-flight): when a cache miss occurs, only ONE request queries the database. Other
+    requests wait for the first request to populate the cache.
+
+    2. Probabilistic early expiration: refresh the cache BEFORE it expires. Each access has a random chance of triggering
+    a background refresh when the TTL is within 10% of expiry.
+
+    3. Background refresh: a separate process refreshes popular keys before they expire. The cache never actually expires
+    for hot keys.
+
+    4. Stale-while-revalidate: return the stale cached value immediately while refreshing in the background. The user sees
+    slightly stale data but no latency spike.
+
+    5. Rate-limit database queries on cache miss: even with stampede protection, cap the number of concurrent cache-miss queries
+    to the database.
+
+    6. Monitor cache hit rate and database QPS together: a sudden drop in cache hit rate correlates with a spike in database
+    QPS — this is the stampede signal.
+
+    '
+  example_good: "import threading\nimport time\nimport random\n\nclass StampedeProtectedCache:\n    def __init__(self, cache, db):\n        self.cache = cache\n        self.db = db\n        self._locks = {}  # Per-key locks for single-flight\n\n    def get(self, key: str) -> dict:\n        \"\"\"Single-flight cache miss: only one request queries DB.\"\"\"\n        cached = self.cache.get(key)\n        if cached:\n            # Probabilistic early refresh: 10% chance when TTL < 10% remaining\n            ttl = self.cache.ttl(key)\n            if ttl < 30 and random.random() < 0.1:  # Last 30s of 300s TTL\n                threading.Thread(target=self._refresh, args=(key,), daemon=True).start()\n            return cached\n\n        # Cache miss: only one request goes to DB\n        lock = self._locks.setdefault(key, threading.Lock())\n        if lock.acquire(timeout=5):\n            try:\n                # Double-check: another thread may have populated while we waited\n                cached = self.cache.get(key)\n                if cached:\n                    return cached\n                return self._refresh(key)\n            finally:\n                lock.release()\n        else:\n            # Lock timeout: return stale data if available\n            stale = self.cache.get(f'stale:{key}')\n            return stale if stale else None\n\n    def _refresh(self, key: str) -> dict:\n        value = self.db.query(key)\n        self.cache.setex(key, 300, value)\n        self.cache.setex(f'stale:{key}', 600, value)  # Stale copy for fallback\n        return value\n"
+  example_bad: "class NaiveCache:\n    def get(self, key):\n        cached = self.cache.get(key)\n        if cached:\n            return cached\n        # 500 concurrent requests all miss the cache simultaneously\n        # All 500 query the database\n        value = self.db.query(key)  # DB receives 500x normal load\n        self.cache.set(key, value, ttl=300)\n        return value\n        # DB overloaded → queries slow → cache stays empty → more misses\n        # Cascading failure from a single cache expiry\n"
+  when_applies: "When a popular cache key can expire while many concurrent requests need it — implement single-flight, probabilistic refresh, or stale-while-revalidate."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [redis]
+  domains:
+    domain: [performance, reliability]
+    concern: [caching, fault_tolerance, circuit_breaker]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-CACHE-003
+  text: Multi-layer caching (L1 in-process, L2 distributed, L3 database) reduces latency at each layer but multiplies the
+    consistency problem. Each layer can serve stale data independently, and invalidation must propagate through ALL layers
+    — not just the one you remember.
+  why: 'Google uses multi-layer caching because each layer serves a different performance need: L1 (in-process, HashMap/dict):
+    < 1ms latency, per-instance, no network. L2 (distributed, Redis/Memcached): 1-5ms latency, shared across instances, network
+    hop. L3 (database query cache): 5-50ms latency, result set caching. The problem multiplies: when data changes, you must
+    invalidate L1 (all instances, not just the one that processed the write), L2 (the distributed cache), AND L3 (the database
+    query cache). Missing any layer serves stale data. Worse: L1 is per-instance, so even if you invalidate the distributed
+    cache, each instance''s local cache may still hold stale data until its TTL expires.
+
+    '
+  how_to_do_right: '1. L1 (in-process): short TTL (10-60 seconds), small size (1000-10000 entries). Used for hot data accessed
+    multiple times per second.
+
+    2. L2 (distributed): medium TTL (5-60 minutes), medium size (100K-1M entries). Used for shared data accessed across instances.
+
+    3. Write invalidation flow: write to DB → invalidate L2 → publish invalidation event → each instance invalidates L1.
+
+    4. Use pub/sub for L1 invalidation: when data changes, publish an event. Each instance subscribes and invalidates its
+    local cache.
+
+    5. Shorter TTL at higher layers: L1 TTL < L2 TTL. This limits the staleness window of the hardest-to-invalidate layer.
+
+    6. Monitor per-layer hit rates: L1 should be > 90%, L2 > 80%. Low hit rates mean the cache is not effective at that layer.
+
+    '
+  example_good: "import json\nfrom typing import Dict, Optional\n\nclass MultiLayerCache:\n    def __init__(self, l1_local: dict, l2_redis, pubsub):\n        self.l1 = l1_local       # In-process dict, < 1ms, per-instance\n        self.l2 = l2_redis       # Distributed Redis, 1-5ms, shared\n        self.pubsub = pubsub     # For L1 invalidation across instances\n        self.l1_ttl = 30         # Short TTL for hardest-to-invalidate layer\n        self.l2_ttl = 300        # Medium TTL for distributed cache\n\n    def get(self, key: str) -> Optional[dict]:\n        # L1 check (< 1ms)\n        if key in self.l1 and self.l1[key]['expires'] > time.time():\n            return self.l1[key]['value']\n        # L2 check (1-5ms)\n        l2_val = self.l2.get(key)\n        if l2_val:\n            value = json.loads(l2_val)\n            self.l1[key] = {'value': value, 'expires': time.time() + self.l1_ttl}\n            return value\n        return None  # True cache miss → go to DB\n\n    def invalidate(self, key: str):\n        \"\"\"Write path: DB → invalidate L2 → publish event → each instance invalidates L1.\"\"\"\n        self.l2.delete(key)\n        self.pubsub.publish('cache_invalidation', json.dumps({'key': key}))\n\n    def on_invalidation_event(self, message):\n        \"\"\"Subscriber: invalidate L1 when another instance writes.\"\"\"\n        key = json.loads(message)['key']\n        self.l1.pop(key, None)\n"
+  example_bad: "# Single-layer cache with no invalidation strategy across layers\nlocal_cache = {}  # L1: in-process\n\ndef get(key):\n    if key in local_cache:\n        return local_cache[key]  # Never expires! Stale forever.\n    value = redis.get(key)       # L2\n    if value:\n        local_cache[key] = value  # Cached locally forever\n        return value\n    return db.query(key)\n\ndef update(key, value):\n    db.update(key, value)\n    redis.set(key, value)  # L2 updated\n    # But L1 in EVERY OTHER instance still has stale data!\n    # No pub/sub, no TTL on L1 — stale until process restart\n"
+  when_applies: "When using multiple cache layers (in-process + distributed) — invalidation must propagate through ALL layers, and higher layers need shorter TTLs."
+  severity: medium
+  technologies:
+    lang: [general, go, python]
+    platform: [redis]
+  domains:
+    domain: [architecture, performance, reliability]
+    concern: [caching]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-CACHE-004
+  text: Cache warming after deployment or restart is critical — a cold cache under full production load causes a "cache miss
+    storm" that can overwhelm the database. Pre-populate the cache with known hot keys before routing traffic to the instance.
+  why: 'Google''s cascading failure prevention (Chapter 22) identifies cold cache amplification as a cascading failure trigger.
+    After deployment: new instances start with empty caches. Full production traffic is routed to the instance. Every request
+    is a cache miss. All misses hit the database. If the instance handles 1000 QPS with 95% cache hit rate, the database normally
+    sees 50 QPS from this instance. With an empty cache, the database sees 1000 QPS — a 20x spike. This is equivalent to a
+    cache stampede but worse because it affects ALL keys, not just one. Google''s solution: warm the cache before accepting
+    traffic. Methods: replay recent access logs against the new instance, pre-populate from the distributed cache (L2→L1),
+    or gradually ramp traffic (start at 10%, increase as cache warms).
+
+    '
+  how_to_do_right: '1. During deployment: use readiness probes that check cache warmth. Don''t route traffic until the cache
+    is at least partially warm.
+
+    2. Pre-populate from distributed cache: on startup, load top-N keys from Redis into the local cache before accepting traffic.
+
+    3. Gradual traffic ramp: start new instances at 10% traffic weight, increase by 10% every 30 seconds as the cache warms.
+
+    4. Replay recent access logs: use the last hour''s access logs to identify hot keys and pre-fetch them.
+
+    5. Monitor per-instance cache hit rate after deployment: if it drops below 50% for more than 5 minutes, slow down the
+    deployment.
+
+    6. Keep the previous version running until the new version''s cache is warm. Blue-green deployment is ideal for this.
+
+    '
+  example_good: "import json\nimport time\nfrom typing import List\n\nclass CacheWarmer:\n    def __init__(self, local_cache, distributed_cache, db):\n        self.local = local_cache\n        self.distributed = distributed_cache\n        self.db = db\n\n    def warm_on_startup(self, top_n: int = 1000):\n        \"\"\"Pre-populate local cache from distributed cache before accepting traffic.\"\"\"\n        hot_keys = self.distributed.zrevrange('hot_keys', 0, top_n)\n        for key in hot_keys:\n            value = self.distributed.get(key)\n            if value:\n                self.local.set(key, json.loads(value), ttl=60)\n        return len(hot_keys)\n\n    def is_warm(self, min_hit_rate: float = 0.5) -> bool:\n        \"\"\"Readiness check: don't accept traffic until cache is warm enough.\"\"\"\n        if self.local.stats()['total_requests'] < 100:\n            return False  # Not enough data to evaluate\n        return self.local.stats()['hit_rate'] >= min_hit_rate\n\n# Kubernetes readiness probe checks cache warmth\n@app.get('/readyz')\ndef readiness():\n    cache_ready = cache_warmer.is_warm(min_hit_rate=0.5)\n    if not cache_ready:\n        return JSONResponse(status_code=503, content={'ready': False, 'reason': 'cache_cold'})\n    return {'ready': True}\n\n# Gradual traffic ramp: 10% → 25% → 50% → 100%\n"
+  example_bad: "# Cold cache after deployment — full production load hits empty cache\ndef start_server():\n    app.run()  # Immediately accepts 100% traffic\n    # Every request is a cache miss\n    # Normal: 50 DB QPS (95% cache hit rate)\n    # Cold start: 1000 DB QPS (0% cache hit rate) → 20x spike\n    # DB overloaded → queries timeout → cache stays empty → cascade\n    # Same as cache stampede but for ALL keys, not just one\n"
+  when_applies: "After any deployment or restart of a service with local caching — pre-populate the cache before accepting production traffic."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [redis, kubernetes]
+  domains:
+    domain: [operations, deployment, performance, reliability]
+    concern: [caching]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-CACHE-005
+  text: Cache key design determines cache effectiveness — a poorly designed key causes either low hit rates (too specific)
+    or stale data (too generic). The key must capture exactly the dimensions that affect the cached value, no more, no less.
+  why: 'Google''s caching practice treats key design as critical infrastructure. Too specific: key = "user:123:page:5:sort:name:filter:active:locale:en"
+    — every slight variation is a cache miss. Hit rate drops to 10%. Too generic: key = "users_list" — returns the same cached
+    result regardless of page, sort, or filter. Users see wrong data. The right key: includes dimensions that change the output
+    (page, sort, filter) but excludes dimensions that don''t (user timezone for a non-timezone-dependent list). Key design
+    also affects cache memory: long keys waste memory. Hash keys that collide corrupt data. Keys without namespacing conflict
+    across services.
+
+    '
+  how_to_do_right: '1. Include only dimensions that affect the result: if the response changes by page/sort/filter, include
+    them. If user locale doesn''t affect the result, exclude it.
+
+    2. Use consistent key format: "service:resource:id:params_hash" (e.g., "catalog:products:list:abc123" where abc123 is
+    a hash of page+sort+filter).
+
+    3. Hash variable-length components: don''t use "filter=name:John,age:25,city:NYC" as a key part — hash it. Keeps key length
+    bounded.
+
+    4. Namespace keys by service: "service_A:users" vs "service_B:users". Prevents cross-service key collision.
+
+    5. Include schema version in key: "v2:users:list:abc123". When the response format changes, the old cache is automatically
+    invalidated.
+
+    6. Monitor cache key cardinality: if the number of unique keys grows unboundedly, the cache will eventually evict everything
+    and become useless.
+
+    '
+  example_good: "import hashlib\nimport json\n\ndef make_cache_key(service: str, resource: str, params: dict, schema_version: int = 2) -> str:\n    \"\"\"Well-designed cache key: namespaced, versioned, hashed params.\"\"\"\n    # Only include dimensions that affect the result\n    relevant_params = {k: v for k, v in sorted(params.items()) if k in ('page', 'sort', 'filter')}\n    params_hash = hashlib.md5(json.dumps(relevant_params).encode()).hexdigest()[:12]\n    return f'v{schema_version}:{service}:{resource}:{params_hash}'\n    # Example: 'v2:catalog:products:a1b2c3d4e5f6'\n    # - Namespaced by service (no cross-service collision)\n    # - Schema version (auto-invalidates on format change)\n    # - Hashed params (bounded key length)\n\n# Usage\nkey = make_cache_key('catalog', 'products', {'page': 2, 'sort': 'price', 'filter': 'active'})\n# 'v2:catalog:products:a1b2c3d4e5f6'\n"
+  example_bad: "def make_cache_key(user_id, page, sort, filter, locale, timezone, theme):\n    # Too specific: includes dimensions that don't affect result\n    return f'users_list:{user_id}:{page}:{sort}:{filter}:{locale}:{timezone}:{theme}'\n    # Every slight variation is a separate cache miss\n    # Hit rate drops to 10% — cache is useless\n\n# OR too generic:\ndef make_cache_key_generic():\n    return 'users_list'  # Same key for all queries!\n    # Returns cached page 1 when user asks for page 5\n    # Returns cached sort-by-name when user sorts by date\n"
+  when_applies: "When designing cache keys for any caching layer — include only dimensions that affect the cached value, namespace by service, and version the schema."
+  severity: medium
+  technologies:
+    lang: [general]
+    platform: [redis]
+  domains:
+    domain: [architecture, performance, reliability]
+    concern: [caching]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-CACHE-006
+  text: Negative caching (caching "not found" results) prevents repeated expensive lookups for non-existent resources. Without
+    negative caching, an attacker can enumerate IDs and every non-existent ID hits the database — a cache-bypass DoS attack.
+  why: 'Google caches negative results because the absence of data is itself valuable information. Without negative caching:
+    request for user_id=999999 → cache miss → database query → not found → response 404. Next request for user_id=999999 →
+    cache miss again (we only cached positive results) → database query again → not found again. If an attacker sends 10,000
+    requests/second for non-existent IDs, every single one hits the database — the cache provides zero protection. With negative
+    caching: first miss queries the database, result "not found" is cached with a short TTL (30-300 seconds). Subsequent requests
+    for the same non-existent ID are served from cache. This also prevents legitimate "hot miss" patterns: a popular API returns
+    404 for a resource that doesn''t exist yet.
+
+    '
+  how_to_do_right: '1. Cache "not found" results with a short TTL (30-300 seconds). Shorter TTL than positive results because
+    the resource may be created soon.
+
+    2. Use a sentinel value (e.g., empty object, null marker) to distinguish "cached not-found" from "cache miss." Don''t
+    use absence-of-key.
+
+    3. Limit negative cache size: use a Bloom filter to track queried-but-not-found keys. Bloom filter uses minimal memory
+    and has zero false negatives.
+
+    4. For write-heavy systems: invalidate negative cache when a resource is created. Otherwise, a newly created resource
+    returns 404 until the negative cache expires.
+
+    5. Monitor negative cache hit rate: high negative cache hits for a specific pattern indicates either an attack or a client
+    bug (requesting nonexistent resources).
+
+    6. Rate-limit requests for non-existent resources independently: if a client requests 100 different non-existent IDs per
+    second, it''s likely an enumeration attack.
+
+    '
+  example_good: "import json\nimport time\n\nNEGATIVE_CACHE_TTL = 60  # Short TTL: resource may be created soon\nSENTINEL = '__NOT_FOUND__'\n\nclass NegativeCachingService:\n    def __init__(self, cache, db):\n        self.cache = cache\n        self.db = db\n\n    def get_user(self, user_id: str) -> dict:\n        cached = self.cache.get(f'user:{user_id}')\n        if cached == SENTINEL:\n            return None  # Cached not-found — don't hit DB\n        if cached:\n            return json.loads(cached)\n\n        # Cache miss: query DB\n        user = self.db.query('SELECT * FROM users WHERE id = %s', (user_id,))\n        if user:\n            self.cache.setex(f'user:{user_id}', 300, json.dumps(user))\n            return user\n        else:\n            # Cache the negative result with short TTL\n            self.cache.setex(f'user:{user_id}', NEGATIVE_CACHE_TTL, SENTINEL)\n            return None\n\n    def create_user(self, user_id: str, data: dict):\n        self.db.insert_user(user_id, data)\n        self.cache.delete(f'user:{user_id}')  # Invalidate negative cache on create\n\n    def monitor_negative_hits(self):\n        \"\"\"High negative cache hits for a pattern = attack or client bug.\"\"\"\n        negative_rate = self.cache.count_pattern(SENTINEL) / self.cache.total_keys()\n        if negative_rate > 0.3:\n            self.alert(f'Negative cache rate {negative_rate:.0%} — possible enumeration attack')\n"
+  example_bad: "def get_user(user_id):\n    cached = cache.get(f'user:{user_id}')\n    if cached:\n        return json.loads(cached)\n    user = db.query('SELECT * FROM users WHERE id = %s', (user_id,))\n    if user:\n        cache.set(f'user:{user_id}', json.dumps(user), ttl=300)\n    return user  # Only caches positive results!\n    # Attacker sends 10K requests/second for non-existent user IDs\n    # Every request hits the database — cache provides zero protection\n    # DB overloaded despite having a cache\n"
+  when_applies: "When a cache-backed service can receive requests for non-existent resources — cache negative results to prevent cache-bypass DoS attacks."
+  severity: medium
+  technologies:
+    lang: [general]
+    platform: [redis]
+  domains:
+    domain: [performance, reliability, security]
+    concern: [caching]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked

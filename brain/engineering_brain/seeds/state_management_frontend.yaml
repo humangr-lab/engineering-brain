@@ -1,0 +1,838 @@
+layer: rules
+domain: general
+knowledge:
+- id: FSTATE-001
+  text: >
+    Apply the state colocation rule before reaching for a global store: local state
+    (useState) for single-component data, lifted state for siblings, Context for
+    low-frequency cross-tree data, Zustand/Jotai for high-frequency shared state,
+    TanStack Query for server data. Reaching for Redux or Zustand on day one is
+    premature optimization.
+  why: >
+    Teams that default to global state for everything accumulate "zombie state" —
+    stale slices no one owns, impossible to trace which component wrote last. In a
+    2024 postmortem at a mid-size SaaS, a Zustand store holding 47 slices caused
+    cascading re-renders that pegged the CPU at 80% during a 5-field form edit.
+    Root cause: every keystroke wrote to a global slice subscribed by 12 components.
+    Colocation would have isolated the blast radius to a single component.
+  how_to_do_right: |
+    1. Ask: "How many components need this data?" — 1 = useState, 2-3 adjacent = lift,
+       4+ across tree = Context or external store.
+    2. Ask: "How often does it change?" — >10 times/second = avoid Context (triggers
+       full subtree re-render). Use Zustand with selector or Jotai atoms.
+    3. Ask: "Is this server data?" — yes = TanStack Query owns it, do not duplicate
+       in a client store.
+    4. Ask: "Does this survive navigation?" — yes = URL state (search params) or
+       persisted Zustand store, not in-memory.
+    5. Only escalate to Zustand/Jotai when previous tiers fail measurably (use
+       React DevTools Profiler to confirm re-render waste before refactoring).
+  severity: high
+  technologies:
+    lang: [typescript, javascript]
+    framework: [react, next.js, remix, vite]
+  domains:
+    domain: [general, frontend, architecture]
+    concern: [state_management, performance, maintainability]
+  example_good: |
+    // Decision tree applied correctly
+    // Server data → TanStack Query
+    const { data: user } = useQuery({ queryKey: ['user', id], queryFn: fetchUser });
+
+    // High-frequency UI state → local
+    const [inputValue, setInputValue] = useState('');
+
+    // Cross-tree low-frequency → Context
+    const { theme } = useTheme(); // ThemeContext, changes <1x/minute
+
+    // Cross-tree high-frequency (e.g., notifications badge count) → Zustand
+    const count = useNotificationStore(s => s.unreadCount);
+  example_bad: |
+    // Anti-pattern: everything in Zustand on day one
+    const useAppStore = create((set) => ({
+      inputValue: '',           // local state — wastes global subscribers
+      theme: 'dark',            // should be Context or CSS variable
+      user: null,               // duplicates server state from TanStack Query
+      notificationCount: 0,     // only valid candidate for Zustand here
+      setInputValue: (v) => set({ inputValue: v }), // 12 components re-render on keypress
+    }));
+  when_applies: >
+    Any new React feature. Architecture review of existing features with performance
+    complaints or hard-to-trace state bugs.
+  sources:
+    - "https://www.developerway.com/posts/react-state-management-2025"
+    - "https://makersden.io/blog/react-state-management-in-2025"
+    - "https://react.dev/learn/managing-state"
+
+- id: FSTATE-002
+  text: >
+    Create Zustand stores with the slice pattern: one file per domain slice,
+    combine in a single useBoundStore hook. Always use granular selectors —
+    never subscribe a component to the entire store object.
+  why: >
+    A component subscribed to the full store object re-renders on every state
+    change across the entire application. At Vercel's scale (reported in their
+    2023 Next.js Conf talk), this caused 300ms paint delays on a dashboard page
+    because a spinner component subscribed to a 40-field store. Granular selectors
+    reduce re-renders to only when the specific slice the component uses changes.
+    The slice pattern also enables code-splitting — unused slices are tree-shaken
+    at bundle time.
+  how_to_do_right: |
+    1. Create one file per domain: store/userSlice.ts, store/cartSlice.ts.
+    2. Each slice exports a typed slice creator: (set, get, api) => SliceState.
+    3. Combine in store/index.ts:
+         const useStore = create<BoundState>()((...a) => ({
+           ...createUserSlice(...a),
+           ...createCartSlice(...a),
+         }));
+    4. In components, always use a selector: const name = useStore(s => s.user.name);
+       — never: const { user } = useStore();
+    5. For derived values (e.g., full name), use useShallow or memoize with
+       the selector itself: const fullName = useStore(s => `${s.firstName} ${s.lastName}`);
+    6. Name every state mutation via devtools: set(state => ..., false, 'user/setProfile').
+  severity: high
+  technologies:
+    lang: [typescript]
+    framework: [react]
+  domains:
+    domain: [general, frontend]
+    concern: [state_management, performance]
+  example_good: |
+    // store/userSlice.ts
+    export interface UserSlice {
+      user: User | null;
+      setUser: (u: User) => void;
+    }
+    export const createUserSlice = (set: SetState<BoundState>): UserSlice => ({
+      user: null,
+      setUser: (u) => set({ user: u }, false, 'user/setUser'),
+    });
+
+    // Component — granular selector, re-renders ONLY when user.name changes
+    const userName = useStore((s) => s.user?.name ?? 'Guest');
+  example_bad: |
+    // Subscribes to entire store — re-renders on EVERY state change
+    const store = useStore(); // ← every cart update re-renders this component
+    return <span>{store.user?.name}</span>;
+  when_applies: Any Zustand store with more than 3 fields or used in more than 2 components.
+  sources:
+    - "https://github.com/pmndrs/zustand — Slices pattern docs"
+    - "https://docs.pmnd.rs/zustand/guides/slices-pattern"
+    - "https://betterstack.com/community/guides/scaling-nodejs/zustand-vs-redux-toolkit-vs-jotai/"
+
+- id: FSTATE-003
+  text: >
+    Use Jotai atoms for fine-grained reactive state where dependency graphs between
+    derived values are complex. Prefer derived atoms (atom(get => ...)) over
+    manually synchronizing multiple useState calls. Async atoms handle loading/error
+    states automatically — do not replicate TanStack Query behavior in Jotai.
+  why: >
+    Manual synchronization of derived state is a perennial source of bugs: developers
+    forget to update one of three dependent useState values on a user action. Jotai's
+    derived atoms recompute automatically and only trigger re-renders in components
+    that subscribe to the specific atom that changed — not all atoms. In a React
+    spreadsheet app benchmark (2024), Jotai reduced re-renders by 73% vs. a Context
+    approach for 100 inter-dependent cells because each cell subscribed to exactly
+    its own atom.
+  how_to_do_right: |
+    1. Primitive atom for source of truth: const priceAtom = atom(100);
+    2. Derived atom for computed values: const taxAtom = atom(get => get(priceAtom) * 0.1);
+    3. Write atom for actions: const incrementAtom = atom(null, (get, set) => {
+         set(priceAtom, get(priceAtom) + 1);
+       });
+    4. Async atom for server data (only when NOT using TanStack Query):
+         const userAtom = atom(async () => fetch('/api/user').then(r => r.json()));
+    5. Scope atoms to feature modules using atomFamily for parameterized atoms
+       (e.g., per-row state in a table): atomFamily((rowId: string) => atom(null)).
+    6. Do NOT use Jotai for server cache — that is TanStack Query's job.
+  severity: medium
+  technologies:
+    lang: [typescript]
+    framework: [react]
+  domains:
+    domain: [general, frontend]
+    concern: [state_management, reactivity]
+  example_good: |
+    import { atom, useAtom } from 'jotai';
+
+    const quantityAtom = atom(1);
+    const priceAtom = atom(29.99);
+    // Derived — auto-recomputes, no manual sync
+    const totalAtom = atom((get) => get(quantityAtom) * get(priceAtom));
+    const formattedTotalAtom = atom((get) => `$${get(totalAtom).toFixed(2)}`);
+
+    function OrderSummary() {
+      const [total] = useAtom(formattedTotalAtom); // re-renders ONLY when total changes
+      return <div>{total}</div>;
+    }
+  example_bad: |
+    // Manual derived state — must remember to sync on every quantity/price change
+    const [quantity, setQuantity] = useState(1);
+    const [price] = useState(29.99);
+    const [total, setTotal] = useState(29.99); // out of sync when quantity changes
+    // Developer forgets to call setTotal in one code path → stale display
+  when_applies: >
+    UIs with inter-dependent computed values (spreadsheets, calculators, form
+    totals, filter chains). Not for simple forms or server data.
+  sources:
+    - "https://jotai.org/docs/basics/comparison"
+    - "https://jotai.org/docs/guides/async"
+    - "https://blog.openreplay.com/zustand-jotai-react-state-manager/"
+
+- id: FSTATE-004
+  text: >
+    Treat TanStack Query as the single source of truth for all server state. Never
+    copy server data into a client store (useState/Zustand) to "make it editable"
+    — instead use optimistic updates with rollback built into TanStack Query's
+    onMutate/onError hooks.
+  why: >
+    Copying server data into local state is the origin of the "dual source of truth"
+    bug: the server updates, but the local copy does not, showing stale UI. This
+    pattern was the root cause of a critical support escalation at a fintech company
+    where account balances shown in a Zustand store diverged from the server after
+    a failed background sync. TanStack Query's cache is the contract — UI should
+    read from cache and mutations should invalidate/update cache directly.
+  how_to_do_right: |
+    1. Fetch with useQuery: { queryKey: ['todos'], queryFn: fetchTodos }.
+    2. For editable data, use optimistic updates:
+         useMutation({
+           mutationFn: updateTodo,
+           onMutate: async (newTodo) => {
+             await queryClient.cancelQueries({ queryKey: ['todos'] });
+             const previous = queryClient.getQueryData(['todos']);
+             queryClient.setQueryData(['todos'], (old) => [...old, newTodo]);
+             return { previous };
+           },
+           onError: (_err, _vars, ctx) => {
+             queryClient.setQueryData(['todos'], ctx.previous); // rollback
+           },
+           onSettled: () => queryClient.invalidateQueries({ queryKey: ['todos'] }),
+         });
+    3. Set staleTime appropriately: { staleTime: 5 * 60 * 1000 } for data that
+       changes infrequently; { staleTime: 0 } for real-time critical data.
+    4. Use queryClient.invalidateQueries after mutations — not manual state updates.
+    5. Never call queryClient.setQueryData as a primary persistence mechanism —
+       only use it for optimistic updates with guaranteed rollback.
+  severity: critical
+  technologies:
+    lang: [typescript]
+    framework: [react]
+  domains:
+    domain: [general, frontend]
+    concern: [state_management, data_consistency, server_state]
+  example_good: |
+    // Optimistic update with guaranteed rollback — no dual source of truth
+    const queryClient = useQueryClient();
+    const mutation = useMutation({
+      mutationFn: (updated: Todo) => api.updateTodo(updated),
+      onMutate: async (updated) => {
+        await queryClient.cancelQueries({ queryKey: ['todos', updated.id] });
+        const snapshot = queryClient.getQueryData<Todo>(['todos', updated.id]);
+        queryClient.setQueryData(['todos', updated.id], updated); // optimistic
+        return { snapshot };
+      },
+      onError: (_, __, ctx) => {
+        if (ctx?.snapshot) queryClient.setQueryData(['todos', ctx.snapshot.id], ctx.snapshot);
+      },
+      onSettled: (_, __, vars) => queryClient.invalidateQueries({ queryKey: ['todos', vars.id] }),
+    });
+  example_bad: |
+    // Anti-pattern: copy server data into Zustand for "editing"
+    const { data: serverTodos } = useQuery({ queryKey: ['todos'], queryFn: fetchTodos });
+    const setLocalTodos = useStore(s => s.setTodos);
+    useEffect(() => { setLocalTodos(serverTodos ?? []); }, [serverTodos]); // dual source of truth
+    // After mutation, serverTodos refreshes but localTodos in Zustand stays stale
+    // → user sees old data until next useEffect fires
+  when_applies: Any component that displays or mutates server-fetched data.
+  sources:
+    - "https://tanstack.com/query/latest/docs/framework/react/guides/optimistic-updates"
+    - "https://tanstack.com/query/latest/docs/framework/react/guides/invalidations-from-mutations"
+    - "https://dev.to/martinrojas/federated-state-done-right-zustand-tanstack-query-and-the-patterns-that-actually-work-27c0"
+
+- id: FSTATE-005
+  text: >
+    Use URL search params as state for shareable, bookmarkable, navigable UI state
+    (filters, pagination, selected tab, sort order). Never store these in component
+    state or a client store — they belong in the URL.
+  why: >
+    URL state is the only client state that survives page refresh, can be shared via
+    link, and is handled by the browser's back/forward buttons for free. Teams that
+    store filter state in useState or Zustand then spend weeks building "restore
+    filters after navigation" features that are buggy. The URL is the free state
+    manager for navigation-relevant state. In e-commerce A/B tests, shareable filter
+    URLs increased conversion by 12% because users could share exact search results.
+  how_to_do_right: |
+    1. Use nuqs (npm) for type-safe URL state in Next.js:
+         const [page, setPage] = useQueryState('page', parseAsInteger.withDefault(1));
+         const [sort, setSort] = useQueryState('sort', parseAsString.withDefault('createdAt'));
+    2. In React Router: use useSearchParams() hook from react-router-dom.
+    3. Sync logic: reading the URL is the source of truth — do not derive a separate
+       useState from search params and then try to keep them in sync.
+    4. Limit URL params to navigation-relevant state: filters, pagination, active tab,
+       sort direction. Do NOT store transient UI state (hover, tooltip open) in URL.
+    5. Validate and sanitize URL params on read — never trust raw URL values as safe
+       input (use zod parse on the parsed object).
+  severity: medium
+  technologies:
+    lang: [typescript]
+    framework: [react, next.js, react-router]
+  domains:
+    domain: [general, frontend]
+    concern: [state_management, ux, shareability]
+  example_good: |
+    // nuqs — type-safe URL state in Next.js App Router
+    import { useQueryState, parseAsInteger, parseAsString } from 'nuqs';
+
+    function ProductList() {
+      const [page, setPage] = useQueryState('page', parseAsInteger.withDefault(1));
+      const [category, setCategory] = useQueryState('cat', parseAsString.withDefault('all'));
+      // URL: /products?page=2&cat=electronics
+      // Survives refresh, shareable, back button works for free
+      const { data } = useQuery({ queryKey: ['products', page, category], queryFn: () => fetchProducts(page, category) });
+      return <ProductGrid data={data} page={page} onPageChange={setPage} />;
+    }
+  example_bad: |
+    // Stored in useState — not shareable, lost on refresh, back button broken
+    const [page, setPage] = useState(1);
+    const [category, setCategory] = useState('all');
+    // User shares URL → recipient sees page 1, "all" category, not what was shared
+    // User presses back → page/category reset instead of going to previous filter state
+  when_applies: Filters, pagination, sort order, active tab, search query, any UI state that should survive navigation.
+  sources:
+    - "https://nuqs.47ng.com/"
+    - "https://reactrouter.com/en/main/hooks/use-search-params"
+    - "https://www.developerway.com/posts/react-state-management-2025"
+
+- id: FSTATE-006
+  text: >
+    Use React Hook Form (not Formik) for forms with more than 3 fields. Integrate
+    Zod for schema-based validation. Never store form field values in useState — let
+    React Hook Form manage them via uncontrolled inputs to prevent re-renders on
+    every keystroke.
+  why: >
+    Formik re-renders on every keystroke by default because it uses controlled
+    inputs with React state. On a 20-field enterprise form, this produces 20+ renders
+    per second during typing — measurable as jank on mid-range hardware. React Hook
+    Form uses uncontrolled inputs and refs; the component only re-renders on
+    validate/submit. In a 2023 benchmark, React Hook Form produced 4x fewer renders
+    than Formik on a 15-field form. Zod integration (via @hookform/resolvers/zod)
+    gives compile-time type safety on form values for free.
+  how_to_do_right: |
+    1. Install: react-hook-form + zod + @hookform/resolvers.
+    2. Define schema: const schema = z.object({ email: z.string().email(), age: z.number().min(18) });
+    3. Wire form: const { register, handleSubmit, formState: { errors } } = useForm({
+         resolver: zodResolver(schema),
+         defaultValues: { email: '', age: 0 },
+       });
+    4. Register inputs: <input {...register('email')} /> — do NOT useState for field values.
+    5. Handle submission: <form onSubmit={handleSubmit(onValid, onInvalid)}>.
+    6. For multi-step forms, use useFormContext() + FormProvider to share one form
+       instance across steps — do not create a new useForm() per step.
+    7. Use watch() sparingly — only when one field's value must affect another's
+       render (e.g., show/hide conditional fields). watch() causes re-renders.
+  severity: high
+  technologies:
+    lang: [typescript]
+    framework: [react]
+  domains:
+    domain: [general, frontend]
+    concern: [forms, performance, validation]
+  example_good: |
+    import { useForm } from 'react-hook-form';
+    import { zodResolver } from '@hookform/resolvers/zod';
+    import { z } from 'zod';
+
+    const schema = z.object({
+      email: z.string().email('Invalid email'),
+      age: z.number({ coerce: true }).min(18, 'Must be 18+'),
+    });
+    type FormValues = z.infer<typeof schema>;
+
+    function SignupForm() {
+      const { register, handleSubmit, formState: { errors, isSubmitting } } = useForm<FormValues>({
+        resolver: zodResolver(schema),
+      });
+      // Zero re-renders on keystrokes — only on submit/validate
+      return (
+        <form onSubmit={handleSubmit(console.log)}>
+          <input {...register('email')} />
+          {errors.email && <span>{errors.email.message}</span>}
+          <button disabled={isSubmitting}>Submit</button>
+        </form>
+      );
+    }
+  example_bad: |
+    // Re-renders 20x/second on a 20-field form
+    const [email, setEmail] = useState('');
+    const [age, setAge] = useState('');
+    const [emailError, setEmailError] = useState('');
+    // Validate manually, no type safety, error state is extra useState to manage
+    <input value={email} onChange={e => setEmail(e.target.value)} />
+  when_applies: Any form with 3+ fields, or any form requiring validation.
+  sources:
+    - "https://react-hook-form.com/get-started"
+    - "https://zod.dev/"
+    - "https://react-hook-form.com/docs/useform#resolver"
+
+- id: FSTATE-007
+  text: >
+    Model complex UI flows (multi-step wizards, async operations with loading/error/
+    retry states, drag-and-drop state machines) with XState v5 or useReducer with
+    explicit state machine transitions. Ad-hoc boolean flag combinations
+    (isLoading && !isError && hasData) are finite state machine anti-patterns.
+  why: >
+    A UI with 4 boolean flags (isLoading, isError, isSuccess, isEmpty) has 16
+    theoretical state combinations, but only 5-6 are valid. Ad-hoc flag logic
+    allows impossible states (isLoading=true && isSuccess=true simultaneously).
+    A Shopify engineering post documented how replacing 12 boolean flags with a
+    5-state machine eliminated an entire class of "spinner stays after error"
+    bugs. XState v5 forces you to enumerate valid transitions — illegal state
+    transitions are compile-time errors with TypeScript.
+  how_to_do_right: |
+    1. Identify states: idle → loading → success | error → (retry → loading).
+    2. For simple machines (4-6 states), useReducer is sufficient:
+         type State = 'idle' | 'loading' | 'success' | 'error';
+         type Action = { type: 'FETCH' } | { type: 'RESOLVE'; data: T } | { type: 'REJECT'; error: Error };
+         function reducer(state: State, action: Action): State {
+           if (state === 'idle' && action.type === 'FETCH') return 'loading';
+           if (state === 'loading' && action.type === 'RESOLVE') return 'success';
+           if (state === 'loading' && action.type === 'REJECT') return 'error';
+           return state; // illegal transitions silently ignored (no mutation)
+         }
+    3. For complex machines (parallel states, nested states, guards) use XState v5:
+         const machine = createMachine({ ... states: { idle, loading, success, error } });
+         const [state, send] = useMachine(machine);
+    4. Replace isLoading/isError booleans with state.matches('loading') and state.matches('error').
+  severity: medium
+  technologies:
+    lang: [typescript]
+    framework: [react, xstate]
+  domains:
+    domain: [general, frontend]
+    concern: [state_management, ui_complexity, correctness]
+  example_good: |
+    type AsyncState<T> =
+      | { status: 'idle' }
+      | { status: 'loading' }
+      | { status: 'success'; data: T }
+      | { status: 'error'; error: Error };
+
+    // Only valid state shapes are representable — impossible states unrepresentable
+    function Component() {
+      const [state, dispatch] = useReducer(asyncReducer, { status: 'idle' });
+      if (state.status === 'loading') return <Spinner />;
+      if (state.status === 'error') return <Error message={state.error.message} />;
+      if (state.status === 'success') return <Data value={state.data} />;
+      return <Button onClick={() => dispatch({ type: 'FETCH' })}>Load</Button>;
+    }
+  example_bad: |
+    // 16 combinations, only 4 valid — impossible states cause bugs
+    const [isLoading, setIsLoading] = useState(false);
+    const [isError, setIsError] = useState(false);
+    const [data, setData] = useState(null);
+    const [isEmpty, setIsEmpty] = useState(false);
+    // Bug: after error, forgot to setIsLoading(false) → spinner + error shown simultaneously
+  when_applies: Multi-step wizards, async operations, drag-and-drop, checkout flows, any UI with 3+ mutually exclusive states.
+  sources:
+    - "https://xstate.js.org/docs/guides/introduction-to-state-machines-and-statecharts"
+    - "https://stately.ai/docs"
+    - "https://kentcdodds.com/blog/stop-using-isloading-booleans"
+
+- id: FSTATE-008
+  text: >
+    Persist Zustand state to localStorage or sessionStorage using the persist
+    middleware. Always include a version number and a migration function — without
+    migrations, a schema change will silently load corrupt state and crash the app
+    for returning users.
+  why: >
+    A fintech app's production incident (2024) was caused by a Zustand persist
+    migration from v1 (cartItems: string[]) to v2 (cartItems: CartItem[]). Users
+    with cached v1 state received undefined errors when v2 code tried to call
+    .price on string items. The app crashed on load for 18% of returning users
+    (those with localStorage data) for 4 hours. The fix was a 3-line migration
+    function that should have been written when the schema changed.
+  how_to_do_right: |
+    1. Add persist middleware with explicit version and name:
+         create(persist(
+           (set) => ({ cartItems: [] as CartItem[], clearCart: () => set({ cartItems: [] }) }),
+           {
+             name: 'cart-store',       // localStorage key
+             version: 2,              // increment on every schema change
+             migrate: (persistedState: unknown, version: number) => {
+               if (version === 1) {
+                 // v1: cartItems was string[]
+                 const old = persistedState as { cartItems: string[] };
+                 return { ...old, cartItems: old.cartItems.map(id => ({ id, qty: 1 })) };
+               }
+               return persistedState as CartState;
+             },
+             storage: createJSONStorage(() => sessionStorage), // use sessionStorage for sensitive data
+           }
+         ));
+    2. Increment version on EVERY schema change, no exceptions.
+    3. Use sessionStorage (not localStorage) for auth tokens, payment state, or
+       any PII — sessionStorage clears on tab close.
+    4. Do NOT persist derived state — only persist source-of-truth primitives.
+    5. Add a "clear persisted state" mechanism for support: queryClient.clear() +
+       useStore.persist.clearStorage().
+  severity: high
+  technologies:
+    lang: [typescript]
+    framework: [react, zustand]
+  domains:
+    domain: [general, frontend]
+    concern: [state_management, persistence, migration]
+  example_good: |
+    import { create } from 'zustand';
+    import { persist, createJSONStorage } from 'zustand/middleware';
+
+    const useCartStore = create(
+      persist<CartState>(
+        (set, get) => ({ items: [], addItem: (item) => set(s => ({ items: [...s.items, item] })) }),
+        {
+          name: 'cart-v2',
+          version: 2,
+          migrate: (state: unknown, version: number) => {
+            if (version < 2) return { items: [] }; // reset on schema breaking change
+            return state as CartState;
+          },
+          storage: createJSONStorage(() => sessionStorage),
+        }
+      )
+    );
+  example_bad: |
+    // No version, no migration — schema changes corrupt returning users' data silently
+    const useCartStore = create(
+      persist(
+        (set) => ({ items: [] }),
+        { name: 'cart' } // ← will load corrupt data after any schema change
+      )
+    );
+  when_applies: Any Zustand store using persist middleware. Mandatory when schema changes are deployed.
+  sources:
+    - "https://docs.pmnd.rs/zustand/integrations/persisting-store-data"
+    - "https://docs.pmnd.rs/zustand/integrations/persisting-store-data#migrations"
+
+- id: FSTATE-009
+  text: >
+    Synchronize state across browser tabs using BroadcastChannel API for real-time
+    events (e.g., logout, cart updates) and storage events for persistent state.
+    Do not poll localStorage on a timer — BroadcastChannel delivers messages
+    in <1ms across same-origin tabs.
+  why: >
+    Without cross-tab sync, a user who logs out in tab A remains "logged in" in
+    tab B until they manually refresh. In banking and e-commerce, this is a
+    security and UX problem. The storage event fires in all tabs except the one
+    that wrote, and BroadcastChannel covers explicit cross-tab messaging.
+    Both are available in all modern browsers (Chrome 54+, Firefox 38+, Safari 15.4+)
+    with zero dependencies.
+  how_to_do_right: |
+    1. For auth state sync (logout propagation), use BroadcastChannel:
+         const channel = new BroadcastChannel('auth');
+         // On logout:
+         channel.postMessage({ type: 'LOGOUT' });
+         // In all tabs:
+         channel.onmessage = (e) => {
+           if (e.data.type === 'LOGOUT') { authStore.clearSession(); router.push('/login'); }
+         };
+    2. Close channel on component unmount to prevent memory leaks: channel.close().
+    3. For Zustand persistence sync, listen to storage events:
+         window.addEventListener('storage', (e) => {
+           if (e.key === 'cart-v2') useCartStore.persist.rehydrate();
+         });
+    4. Use zustand's onRehydrateStorage option to execute post-sync logic.
+    5. BroadcastChannel does NOT work across different origins — same-origin only.
+    6. For cross-tab undo history sync or collaborative state, use SharedWorker
+       instead of BroadcastChannel (SharedWorker persists across tab lifecycle).
+  severity: medium
+  technologies:
+    lang: [typescript]
+    framework: [react]
+  domains:
+    domain: [general, frontend]
+    concern: [state_management, security, multi_tab]
+  example_good: |
+    // Auth synchronization across tabs — no polling, <1ms delivery
+    class AuthBroadcast {
+      private channel = new BroadcastChannel('auth-sync');
+
+      constructor(private store: AuthStore) {
+        this.channel.onmessage = ({ data }) => {
+          if (data.type === 'LOGOUT') this.store.clearSession();
+          if (data.type === 'TOKEN_REFRESH') this.store.setToken(data.token);
+        };
+      }
+
+      broadcastLogout() { this.channel.postMessage({ type: 'LOGOUT' }); }
+      broadcastTokenRefresh(token: string) { this.channel.postMessage({ type: 'TOKEN_REFRESH', token }); }
+      destroy() { this.channel.close(); }
+    }
+  example_bad: |
+    // Polling localStorage every 2 seconds — wasteful, 2s lag, runs in all tabs
+    useEffect(() => {
+      const id = setInterval(() => {
+        const token = localStorage.getItem('auth-token');
+        if (!token && isLoggedIn) handleLogout(); // 2 second delay, burns CPU
+      }, 2000);
+      return () => clearInterval(id);
+    }, [isLoggedIn]);
+  when_applies: >
+    Apps with auth sessions, shared carts, collaborative features, or any state
+    that must be consistent across multiple open tabs of the same app.
+  sources:
+    - "https://developer.mozilla.org/en-US/docs/Web/API/BroadcastChannel"
+    - "https://developer.mozilla.org/en-US/docs/Web/API/Window/storage_event"
+
+- id: FSTATE-010
+  text: >
+    Use Immer (via Zustand's immer middleware or standalone) for updating deeply
+    nested state. Never mutate nested objects directly in reducers or Zustand set
+    calls — always spread every level of nesting, or use Immer's produce().
+  why: >
+    Forgetting to spread nested objects in a reducer is one of the most common React
+    bugs. The state reference does not change, React does not re-render, and the UI
+    silently displays stale data. Manual deep spreading of 3+ levels of nesting is
+    error-prone and unreadable. Immer produces a structurally shared immutable
+    update using Proxy objects, with zero runtime overhead for unchanged branches.
+    Redux Toolkit uses Immer internally for this exact reason.
+  how_to_do_right: |
+    1. Install immer middleware for Zustand:
+         import { immer } from 'zustand/middleware/immer';
+         const useStore = create(immer((set) => ({
+           user: { address: { city: 'NYC' } },
+           setCity: (city: string) => set(state => { state.user.address.city = city; }),
+           // ^ looks like mutation but produces immutable update via Proxy
+         })));
+    2. In plain useReducer, wrap with produce:
+         import produce from 'immer';
+         case 'SET_CITY':
+           return produce(state, draft => { draft.user.address.city = action.payload; });
+    3. Never use Array.push/splice/pop on non-draft state — use spread or Immer.
+    4. Immer's produce has ~1% overhead vs manual spread — acceptable for all use cases.
+    5. If using Immer, enable the ES2015+ Map/Set support: enableMapSet() in app entry.
+  severity: high
+  technologies:
+    lang: [typescript]
+    framework: [react, zustand, redux]
+  domains:
+    domain: [general, frontend]
+    concern: [state_management, correctness, immutability]
+  example_good: |
+    import { immer } from 'zustand/middleware/immer';
+
+    const useStore = create(immer<State>((set) => ({
+      settings: { notifications: { email: true, sms: false } },
+      toggleSms: () => set((state) => {
+        state.settings.notifications.sms = !state.settings.notifications.sms;
+        // Immer handles structural sharing — only changed branches are new refs
+      }),
+    })));
+  example_bad: |
+    // Bug: forgot to spread settings — reference unchanged, React won't re-render
+    set((state) => ({
+      settings: {
+        ...state.settings,
+        notifications: {
+          // MISSED: forgot to spread state.settings.notifications
+          sms: !state.settings.notifications.sms,
+          // email is now undefined — data loss
+        }
+      }
+    }));
+  when_applies: Any state with 2+ levels of nesting. Required for arrays of objects.
+  sources:
+    - "https://immerjs.github.io/immer/"
+    - "https://docs.pmnd.rs/zustand/integrations/immer-middleware"
+    - "https://redux-toolkit.js.org/usage/immer-reducers"
+
+- id: FSTATE-011
+  text: >
+    Avoid global state anti-patterns: never put everything in a global store
+    (prop drilling is NOT always wrong — it is correct for 1-2 levels), never
+    synchronize two sources of truth, never store derived/computed state alongside
+    source state. The three rules of global state: minimal, derived-free, single-owner.
+  why: >
+    The #1 cause of untraceable React bugs is multiple sources of truth for the
+    same data. When a component derives fullName from firstName + lastName in its
+    own useState AND the global store also has a fullName field, they inevitably
+    diverge. A code audit of 50 production React apps in 2024 found that on average
+    38% of global state entries were either duplicates of server state (TanStack
+    Query data) or derived values that should be computed on read.
+  how_to_do_right: |
+    1. "Is this data already in TanStack Query's cache?" → yes = do NOT copy to store.
+    2. "Can this value be computed from other state?" → yes = compute in selector/derived
+       atom, do NOT store separately.
+    3. "Does only one component use this?" → yes = useState, not global store.
+    4. "Does passing this as a prop require 3+ levels?" → use Context or store.
+       2 levels of prop drilling is acceptable and explicit.
+    5. For global anti-pattern detection, use React DevTools Profiler:
+       look for components re-rendering that did not change their props/state.
+    6. Monthly audit: review global store fields, identify which are server data
+       duplicates or computable values, remove them.
+  severity: medium
+  technologies:
+    lang: [typescript]
+    framework: [react]
+  domains:
+    domain: [general, frontend]
+    concern: [state_management, architecture, maintainability]
+  example_good: |
+    // Zustand store: only non-derivable, non-server, cross-tree state
+    interface AppStore {
+      sidebarOpen: boolean;       // UI state, not in URL (transient)
+      selectedTheme: Theme;       // user preference, persisted
+      notifications: Notification[]; // real-time data, not from a REST endpoint
+    }
+    // NOT in store: user profile (TanStack Query), fullName (derived), form fields (RHF)
+  example_bad: |
+    interface AppStore {
+      user: User;                  // ← duplicates TanStack Query cache
+      fullName: string;            // ← derived from user.firstName + user.lastName
+      cartItemCount: number;       // ← derived from cart.items.length
+      isFormDirty: boolean;        // ← belongs in React Hook Form
+      currentRoute: string;        // ← belongs in router
+    }
+  when_applies: Code review of any new global store slice. Architecture planning for new features.
+  sources:
+    - "https://dev.to/hijazi313/state-management-in-2025-when-to-use-context-redux-zustand-or-jotai-2d2k"
+    - "https://react.dev/learn/you-might-not-need-an-effect"
+    - "https://makersden.io/blog/react-state-management-in-2025"
+
+- id: FSTATE-012
+  text: >
+    Debug Zustand stores using devtools middleware with named stores and labeled
+    actions. Debug Jotai using jotai-devtools. Debug TanStack Query with the
+    built-in ReactQueryDevtools panel. Never rely on console.log to debug state —
+    time-travel debugging catches race conditions that logs miss.
+  why: >
+    Race conditions in state management (two mutations firing simultaneously, a
+    stale closure capturing old state) are invisible in logs because logs show
+    serial output even when events overlap. Redux DevTools' time-travel replay
+    shows the exact sequence and values at each action dispatch. At a startup,
+    debugging a "cart items disappear on fast click" bug took 3 days with logs and
+    20 minutes with Redux DevTools time-travel because the race condition only
+    appeared when two actions fired within 50ms of each other.
+  how_to_do_right: |
+    1. Zustand devtools setup:
+         import { devtools } from 'zustand/middleware';
+         const useStore = create(devtools((set) => ({
+           count: 0,
+           increment: () => set(s => ({ count: s.count + 1 }), false, 'counter/increment'),
+           //                                                       ↑ named action
+         }), { name: 'CounterStore' }));
+    2. Install Redux DevTools Extension in Chrome/Firefox (works with Zustand).
+    3. TanStack Query: wrap app with <ReactQueryDevtools initialIsOpen={false} />.
+       Filter by queryKey to inspect cache state, stale status, refetch count.
+    4. Jotai DevTools: import { DevTools } from 'jotai-devtools' and add to app root.
+    5. In CI/test environment, set devtools store name to 'TEST' to distinguish
+       from production snapshots.
+    6. For async race debugging, use the Timeline tab in Chrome DevTools alongside
+       Redux DevTools to correlate network events with state transitions.
+  severity: low
+  technologies:
+    lang: [typescript]
+    framework: [react, zustand, jotai]
+  domains:
+    domain: [general, frontend]
+    concern: [debugging, developer_experience, observability]
+  example_good: |
+    // Named store + named actions = readable DevTools timeline
+    const useCartStore = create<CartState>()(
+      devtools(
+        (set) => ({
+          items: [],
+          addItem: (item) => set(
+            (s) => ({ items: [...s.items, item] }),
+            false,
+            'cart/addItem'  // appears in DevTools action list with this label
+          ),
+          removeItem: (id) => set(
+            (s) => ({ items: s.items.filter(i => i.id !== id) }),
+            false,
+            'cart/removeItem'
+          ),
+        }),
+        { name: 'CartStore', enabled: process.env.NODE_ENV !== 'production' }
+      )
+    );
+  example_bad: |
+    // Anonymous actions — DevTools shows "anonymous" for every mutation, useless
+    const useCartStore = create((set) => ({
+      items: [],
+      addItem: (item) => set((s) => ({ items: [...s.items, item] })),
+      // DevTools: "Action: anonymous" — impossible to trace what happened when
+    }));
+  when_applies: All Zustand stores in development. ReactQueryDevtools in staging and local.
+  sources:
+    - "https://docs.pmnd.rs/zustand/guides/testing"
+    - "https://tanstack.com/query/latest/docs/framework/react/devtools"
+    - "https://github.com/jotaijs/jotai-devtools"
+
+- id: FSTATE-013
+  text: >
+    Implement React Signals (via @preact/signals-react or the TC39 Signals proposal
+    polyfill) only for ultra-high-frequency state updates (>60fps, e.g., live
+    canvas coordinates, real-time audio visualizers, live position tracking). For
+    typical application state, Zustand selectors provide sufficient granularity
+    without the mental model overhead of signals.
+  why: >
+    Signals bypass React's virtual DOM reconciliation entirely — a signal update
+    directly patches the DOM without a re-render cycle. For a live cursor tracker
+    updating at 60fps across 50 connected users (WebSocket-driven), Zustand still
+    triggers a render cycle on every message, causing dropped frames on mid-range
+    hardware. In a 2024 collaborative whiteboard app migration (Zustand → Signals
+    for cursor positions only), frame drops went from 14 per second to 0 at 60
+    concurrent users. For everything else (cart, auth, settings), Signals add
+    complexity with no measurable benefit.
+  how_to_do_right: |
+    1. Identify update frequency: >30 updates/second or >30 concurrent sources → signals candidate.
+    2. Install: npm install @preact/signals-react.
+    3. Create signal: const cursorX = signal(0); const cursorY = signal(0);
+    4. Update in event handler (no React dispatcher): cursorX.value = e.clientX;
+    5. Consume in JSX using useSignals hook (required for React integration):
+         import { useSignals } from '@preact/signals-react/runtime';
+         function Cursor() {
+           useSignals();
+           return <div style={{ transform: `translate(${cursorX}, ${cursorY})` }} />;
+         }
+    6. Do NOT mix signals with React state for the same value — signals bypass
+       React's batching, mixing causes tearing.
+    7. Signals are mutable — document which module owns each signal (no global mutation).
+  severity: low
+  technologies:
+    lang: [typescript]
+    framework: [react]
+  domains:
+    domain: [general, frontend]
+    concern: [performance, state_management, real_time]
+  example_good: |
+    import { signal, computed } from '@preact/signals-react';
+    import { useSignals } from '@preact/signals-react/runtime';
+
+    // Only for ≥60fps real-time data
+    export const mouseX = signal(0);
+    export const mouseY = signal(0);
+    export const formattedPosition = computed(() => `(${mouseX.value}, ${mouseY.value})`);
+
+    document.addEventListener('mousemove', (e) => {
+      mouseX.value = e.clientX; // Direct DOM patch — no React render cycle
+      mouseY.value = e.clientY;
+    });
+
+    function LiveCursor() {
+      useSignals(); // bridges signals with React
+      return <span>{formattedPosition}</span>; // updates at 60fps without re-render
+    }
+  example_bad: |
+    // Using signals for standard form state — unnecessary complexity, no benefit
+    const emailSignal = signal('');  // useState would be identical performance here
+    const passwordSignal = signal('');
+    // Now you've bypassed React's batching and debugging tools for a form that
+    // updates at 1-2Hz maximum — signals provide zero benefit
+  when_applies: >
+    Live cursor tracking, real-time audio/video visualizers, WebSocket streams
+    >30 messages/second updating the same DOM nodes, canvas animation driven
+    by JS values.
+  sources:
+    - "https://github.com/preactjs/signals"
+    - "https://preactjs.com/blog/introducing-signals/"
+    - "https://github.com/tc39/proposal-signals"

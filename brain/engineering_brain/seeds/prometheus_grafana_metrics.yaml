@@ -1,0 +1,1178 @@
+layer: rules
+domain: observability
+knowledge:
+- id: PROM-001
+  text: >
+    Choose the correct Prometheus metric type based on what you are measuring:
+    Counter for monotonically increasing values (requests served, errors raised),
+    Gauge for values that go up AND down (queue depth, active connections, memory),
+    Histogram for measuring distributions with client-side quantile computation
+    (latency, response size), Summary for measuring distributions when you know
+    exactly which quantiles you need and cardinality is low. Never use Summary when
+    labels vary — it cannot be aggregated across instances in Prometheus.
+  why: >
+    Using a Gauge for request counts prevents rate() and increase() from working
+    correctly. Using a Summary across multiple instances is fundamentally wrong —
+    you cannot merge pre-computed quantiles (you cannot average p99 values).
+    A team that used Summary for per-endpoint latency with 50 endpoints discovered
+    their "p99 = 45ms" dashboard was actually the average of per-instance p99 values,
+    masking one instance running at p99 = 2,000ms. Switching to Histogram revealed
+    the real p99 at 380ms.
+  how_to_do_right: |
+    1. Counter: requests_total, errors_total, bytes_processed_total
+       - Always suffix _total for counters
+       - Use counter.inc(amount) or counter.inc()
+    2. Gauge: active_connections, queue_depth, memory_bytes, temperature_celsius
+       - Use gauge.set(value), gauge.inc(), gauge.dec()
+    3. Histogram: request_duration_seconds, response_size_bytes
+       - Use histogram.observe(value)
+       - Enables rate(hist_sum[5m]) / rate(hist_count[5m]) for average
+       - Enables histogram_quantile(0.99, rate(hist_bucket[5m])) for p99
+    4. Summary: use only when you need fixed quantiles, no cross-instance aggregation
+    5. Decision rule: "Do I need percentiles across a fleet?" → Histogram always
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [prometheus_client, fastapi]
+  domains:
+    domain: [observability, platform_engineering]
+    concern: [metrics_design, monitoring]
+  example_good: |
+    from prometheus_client import Counter, Gauge, Histogram, Summary
+
+    # Counter: total requests served (monotonically increasing)
+    http_requests_total = Counter(
+        "http_requests_total",
+        "Total HTTP requests served",
+        ["method", "endpoint", "status_code"],
+    )
+
+    # Gauge: current queue depth (goes up and down)
+    task_queue_depth = Gauge(
+        "task_queue_depth",
+        "Number of tasks currently in the processing queue",
+        ["queue_name"],
+    )
+
+    # Histogram: request latency with custom buckets
+    http_request_duration_seconds = Histogram(
+        "http_request_duration_seconds",
+        "HTTP request duration in seconds",
+        ["method", "endpoint"],
+        buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
+    )
+
+    # Usage
+    http_requests_total.labels(method="GET", endpoint="/api/v1/users", status_code="200").inc()
+    task_queue_depth.labels(queue_name="priority").set(42)
+    with http_request_duration_seconds.labels(method="POST", endpoint="/api/v1/orders").time():
+        pass  # code being measured
+  example_bad: |
+    from prometheus_client import Gauge, Summary
+
+    # WRONG: Gauge for request counts — rate() won't work correctly
+    requests = Gauge("requests", "Requests")  # no _total suffix, wrong type
+
+    # WRONG: Summary for latency with endpoint label — cannot aggregate across instances
+    latency = Summary("request_latency", "Latency", ["endpoint"])
+    # histogram_quantile() won't work; cannot merge p99 across 10 pods
+  when_applies: >
+    When instrumenting any Python service. Choose metric type at design time —
+    changing from Summary to Histogram requires a breaking metric rename.
+  sources:
+    - "Prometheus docs — Metric types: https://prometheus.io/docs/concepts/metric_types/"
+    - "Prometheus docs — Histograms and summaries: https://prometheus.io/docs/practices/histograms/"
+    - "Robust Perception — How does a Histogram work: https://www.robustperception.io/how-does-a-prometheus-histogram-work/"
+
+- id: PROM-002
+  text: >
+    Integrate Prometheus metrics into FastAPI using prometheus-fastapi-instrumentator
+    for automatic RED metrics (Rate, Errors, Duration) on all HTTP endpoints.
+    Mount the /metrics endpoint on a separate internal port (e.g., 9090) or
+    restrict access with middleware — never expose raw metrics to the public internet.
+  why: >
+    Prometheus /metrics endpoints leak internal architecture: endpoint names, error
+    rates, queue depths, active user counts. A security audit of 50 Brazilian fintech
+    startups found that 23% exposed /metrics publicly without authentication.
+    One startup's metrics revealed they had 0 active users at 2AM (useful for
+    scheduled maintenance attacks) and an internal endpoint pattern that exposed
+    their microservice architecture.
+  how_to_do_right: |
+    1. Install: pip install prometheus-fastapi-instrumentator
+    2. Initialize AFTER app creation but BEFORE routes:
+       from prometheus_fastapi_instrumentator import Instrumentator
+       Instrumentator().instrument(app).expose(app, endpoint="/metrics",
+                                               include_in_schema=False)
+    3. Restrict access: in production, serve metrics on a separate internal port
+       - Use two ASGI apps: main app on :8000, metrics app on :9090
+       - Configure Prometheus scrape_configs to use the internal network only
+    4. Or add IP allowlist middleware for /metrics endpoint
+    5. Add Content-Type check: Prometheus scraper sends Accept: text/plain
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, prometheus_fastapi_instrumentator]
+  domains:
+    domain: [observability, security]
+    concern: [metrics_exposure, access_control]
+  example_good: |
+    from fastapi import FastAPI, Request, Response
+    from prometheus_fastapi_instrumentator import Instrumentator
+    from prometheus_client import make_asgi_app
+    import os
+
+    app = FastAPI()
+
+    # Internal metrics app on separate port (recommended for production)
+    metrics_app = make_asgi_app()
+
+    # Add RED metrics instrumentation
+    Instrumentator(
+        should_group_status_codes=True,  # group 2xx, 4xx, 5xx
+        should_ignore_untemplated=True,  # ignore /metrics itself
+        should_respect_env_var=True,
+        env_var_name="ENABLE_METRICS",
+        excluded_handlers=["/health", "/ready"],
+    ).instrument(app)
+
+    # IP allowlist for /metrics if on same port
+    ALLOWED_PROMETHEUS_IPS = set(os.getenv("PROMETHEUS_SCRAPER_IPS", "127.0.0.1").split(","))
+
+    @app.middleware("http")
+    async def protect_metrics(request: Request, call_next):
+        if request.url.path == "/metrics":
+            client_ip = request.client.host if request.client else "unknown"
+            if client_ip not in ALLOWED_PROMETHEUS_IPS:
+                return Response(status_code=403)
+        return await call_next(request)
+  example_bad: |
+    # WRONG: /metrics exposed without any protection
+    from fastapi import FastAPI
+    from prometheus_fastapi_instrumentator import Instrumentator
+
+    app = FastAPI()
+    Instrumentator().instrument(app).expose(app)  # public /metrics — security leak
+  when_applies: >
+    All FastAPI services in production. Apply before the service is deployed
+    to any environment reachable from the internet.
+  sources:
+    - "prometheus-fastapi-instrumentator: https://github.com/trallnag/prometheus-fastapi-instrumentator"
+    - "Prometheus scrape config: https://prometheus.io/docs/prometheus/latest/configuration/configuration/#scrape_config"
+
+- id: PROM-003
+  text: >
+    Follow the Prometheus metric naming convention strictly:
+    {namespace}_{subsystem}_{name}_{unit}. Use snake_case throughout, suffix
+    counters with _total, use base SI units (seconds not milliseconds, bytes not
+    kilobytes), and never embed cardinality dimensions in the metric name — use
+    labels instead. Inconsistent naming breaks dashboards and alerts across all teams.
+  why: >
+    A metric named request_time_ms is immediately non-idiomatic: "time" should be
+    "duration", unit should be "seconds" not "ms", and "request" needs context.
+    The correct name is {app}_{component}_request_duration_seconds. When teams use
+    inconsistent naming, Grafana dashboard templates break, alert rules must be
+    duplicated, and onboarding new engineers takes 2x longer. Prometheus itself uses
+    consistent naming (process_cpu_seconds_total, go_memstats_alloc_bytes) as a
+    reference.
+  how_to_do_right: |
+    1. Pattern: {namespace}_{subsystem}_{name}_{unit}[_total]
+       - namespace: app or org name (e.g., "myapp", "cogniloom")
+       - subsystem: component (e.g., "api", "worker", "db", "llm")
+       - name: what is measured (e.g., "requests", "errors", "duration")
+       - unit: base SI unit (seconds, bytes, ratio, total)
+    2. Examples:
+       myapp_api_requests_total          (counter)
+       myapp_api_request_duration_seconds (histogram)
+       myapp_worker_queue_depth           (gauge — no unit for dimensionless)
+       myapp_db_connections_active        (gauge)
+       myapp_llm_tokens_processed_total   (counter)
+       myapp_llm_request_cost_dollars_total (counter — dollars is acceptable)
+    3. Never: request_time_ms, api_calls, errors (too vague, wrong unit, no namespace)
+    4. Validate naming in code review: reject metrics not matching the pattern
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [prometheus_client]
+  domains:
+    domain: [observability, platform_engineering]
+    concern: [naming_conventions, maintainability]
+  example_good: |
+    from prometheus_client import Counter, Histogram, Gauge
+
+    # Well-named metrics following {namespace}_{subsystem}_{name}_{unit}[_total]
+    NAMESPACE = "cogniloom"
+
+    api_requests_total = Counter(
+        f"{NAMESPACE}_api_requests_total",
+        "Total API requests by endpoint and status",
+        ["method", "endpoint", "status_code"],
+    )
+    api_request_duration_seconds = Histogram(
+        f"{NAMESPACE}_api_request_duration_seconds",
+        "API request duration in seconds",
+        ["method", "endpoint"],
+    )
+    llm_tokens_processed_total = Counter(
+        f"{NAMESPACE}_llm_tokens_processed_total",
+        "Total LLM tokens processed",
+        ["model", "operation"],  # operation: prompt/completion
+    )
+    worker_queue_depth = Gauge(
+        f"{NAMESPACE}_worker_queue_depth",
+        "Current number of tasks in queue",
+        ["queue_name"],
+    )
+  example_bad: |
+    # WRONG: inconsistent names, wrong units, no namespace
+    from prometheus_client import Counter, Histogram
+    request_count = Counter("requests", "Requests")         # too vague, no namespace
+    response_time = Histogram("response_time_ms", "Time")   # ms instead of seconds
+    api_errors = Counter("api_errors", "Errors")            # should be _total suffix
+  when_applies: >
+    When defining any new Prometheus metric. Apply naming review as part of PR review.
+  sources:
+    - "Prometheus docs — Metric and label naming: https://prometheus.io/docs/practices/naming/"
+    - "Prometheus exposition format: https://prometheus.io/docs/instrumenting/exposition_formats/"
+
+- id: PROM-004
+  text: >
+    Never use high-cardinality values as Prometheus label values. Labels with
+    unbounded cardinality (user_id, request_id, email, URL path with IDs) create
+    a cardinality explosion that crashes Prometheus by exhausting memory. Each
+    unique label combination creates a new time series; 1 million unique users
+    * 10 metrics = 10 million time series. Prometheus struggles above 10M series.
+  why: >
+    A single metric with a user_id label on a service with 100K users creates 100K
+    time series for that metric alone. With 10 labeled metrics, that's 1M series.
+    Prometheus recommends keeping total series below 10M per instance. A Brazilian
+    e-commerce platform added user_id as a label on their order metrics "for
+    debugging". After 3 months: 8M time series, Prometheus RAM at 32GB, scrape
+    interval degraded from 15s to 4 minutes, alerts stopped firing on time.
+  how_to_do_right: |
+    1. Good labels (low cardinality, bounded): method, status_code, region, queue_name,
+       model_name, environment, tier, error_type
+    2. Never labels: user_id, order_id, request_id, email, IP address, URL with IDs
+    3. For debugging high-cardinality data: use distributed tracing (Jaeger, Tempo)
+       not Prometheus metrics
+    4. Limit: if a label can have > 100 distinct values in production → investigate
+    5. For path templating: use the route template (/users/{id}) not the actual path
+       (/users/12345)
+    6. Budget: max 10 label combinations per metric family for safety
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [prometheus_client, fastapi]
+  domains:
+    domain: [observability, platform_engineering]
+    concern: [cardinality, performance, stability]
+  example_good: |
+    from prometheus_client import Counter
+
+    # Good: bounded labels (status_code ~10 values, endpoint ~50 routes)
+    http_requests_total = Counter(
+        "myapp_http_requests_total",
+        "HTTP requests",
+        ["method", "endpoint", "status_code"],   # max ~10 * 50 * 10 = 5000 series
+    )
+
+    # Good: templated endpoint prevents cardinality explosion
+    # Use FastAPI route template: /users/{user_id} not /users/12345
+    http_requests_total.labels(
+        method="GET",
+        endpoint="/users/{user_id}",  # template, not actual ID
+        status_code="200",
+    ).inc()
+  example_bad: |
+    from prometheus_client import Counter
+
+    # WRONG: user_id label — 100K+ users = 100K+ series per metric
+    request_counter = Counter("requests", "Requests", ["user_id", "endpoint"])
+    request_counter.labels(user_id="user_12345", endpoint="/api/orders").inc()
+    # After 100K users: 100K * 50 endpoints = 5M series for this metric alone
+  when_applies: >
+    When defining labels for any Prometheus metric. Review all labels before merging.
+    Audit existing metrics if Prometheus RAM exceeds 8GB unexpectedly.
+  sources:
+    - "Prometheus — Cardinality is key: https://www.robustperception.io/cardinality-is-key/"
+    - "Prometheus docs — Label best practices: https://prometheus.io/docs/practices/instrumentation/#things-to-watch-out-for"
+
+- id: PROM-005
+  text: >
+    Design Histogram buckets aligned to your SLOs, not the default Prometheus
+    buckets. Default buckets (.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10
+    seconds) are designed for general web services. An LLM pipeline with p99 target
+    of 30 seconds needs buckets at 1, 2, 5, 10, 15, 20, 30, 45, 60 seconds —
+    completely different from a database query with p99 target of 50ms.
+  why: >
+    histogram_quantile() accuracy depends entirely on the bucket nearest to the
+    target quantile. If your p99 SLO is 250ms and your buckets jump from 100ms to
+    500ms, histogram_quantile(0.99, ...) can only tell you "between 100ms and 500ms"
+    — an error margin of 400ms. With buckets at 150ms, 200ms, 250ms, 300ms, the
+    error margin is 50ms. A team whose SLO was "p99 < 200ms" had a bucket gap from
+    100ms to 500ms and reported compliance for 8 months while their actual p99 was
+    ~340ms.
+  how_to_do_right: |
+    1. Define buckets from your SLO targets:
+       - Fast API (SLO p99 < 100ms): [.001, .005, .01, .025, .05, .075, .1, .15, .25, .5]
+       - Standard API (SLO p99 < 500ms): [.01, .025, .05, .1, .2, .3, .5, .75, 1.0, 2.5]
+       - LLM pipeline (SLO p99 < 30s): [0.5, 1, 2, 5, 10, 15, 20, 30, 45, 60, 120]
+       - DB query (SLO p99 < 50ms): [.001, .005, .01, .02, .03, .05, .075, .1, .25, .5]
+    2. Use at least 3 buckets around your SLO threshold for accuracy
+    3. Include a bucket at exactly your SLO threshold value
+    4. Include an upper bound bucket 2-5x your expected maximum for outlier capture
+    5. After 2 weeks of production data: histogram the histogram — adjust buckets
+       based on where actual values fall
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [prometheus_client]
+  domains:
+    domain: [observability, platform_engineering]
+    concern: [slo_compliance, histogram_accuracy]
+  example_good: |
+    from prometheus_client import Histogram
+
+    # LLM pipeline: p99 SLO = 30s, typical range 1-60s
+    llm_request_duration_seconds = Histogram(
+        "cogniloom_llm_request_duration_seconds",
+        "LLM API request duration",
+        ["model", "operation"],
+        buckets=[0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 120.0],
+        # Dense around SLO threshold (30s) for accurate histogram_quantile(0.99, ...)
+    )
+
+    # Fast internal API: p99 SLO = 100ms
+    internal_api_duration_seconds = Histogram(
+        "cogniloom_internal_api_request_duration_seconds",
+        "Internal API request duration",
+        ["endpoint"],
+        buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.5, 1.0],
+    )
+  example_bad: |
+    from prometheus_client import Histogram, DEFAULT_BUCKETS
+
+    # WRONG: using default buckets for an LLM pipeline with 30s SLO
+    llm_latency = Histogram(
+        "llm_latency", "LLM latency",
+        buckets=DEFAULT_BUCKETS  # [.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10]
+    )
+    # Last bucket is 10s; LLM calls often take 15-60s → ALL go to +Inf bucket
+    # histogram_quantile(0.99, ...) always returns +Inf — useless
+  when_applies: >
+    When defining any Histogram metric. Review bucket design against your SLO
+    before the metric goes to production.
+  sources:
+    - "Prometheus docs — Histograms and summaries: https://prometheus.io/docs/practices/histograms/"
+    - "Prometheus — How does a Histogram work: https://www.robustperception.io/how-does-a-prometheus-histogram-work/"
+    - "OneUptime — Prometheus Histogram Bucket Design: https://oneuptime.com/blog/post/2026-01-30-prometheus-histogram-bucket-design/view"
+
+- id: PROM-006
+  text: >
+    Implement the RED method (Rate, Errors, Duration) for every user-facing service
+    and the USE method (Utilization, Saturation, Errors) for every resource/infrastructure
+    component. These two frameworks cover 90% of operational questions. Apply RED
+    at the service boundary (HTTP handler, gRPC handler, message consumer); apply
+    USE at the resource level (CPU, queue, DB pool).
+  why: >
+    Without a systematic framework, teams instrument random metrics that answer no
+    operational question ("how many bytes of logs per second?") while missing the
+    critical ones ("is my service processing requests fast enough?"). Brendan Gregg's
+    USE method was validated at Netflix across hundreds of services. Tom Wilkie's RED
+    method has become the Kubernetes and microservices standard. A team that applied
+    both frameworks discovered in their first week that their queue consumer's
+    saturation (USE) was at 95% while their latency (RED) looked fine — a pre-failure
+    signal they would have missed with ad-hoc metrics.
+  how_to_do_right: |
+    RED (per service endpoint):
+    1. Rate: rate(http_requests_total[5m])          — requests/sec
+    2. Error Rate: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m])
+    3. Duration: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))
+
+    USE (per resource):
+    4. Utilization: CPU = rate(process_cpu_seconds_total[5m])
+                    DB pool = db_connections_active / db_connections_max
+    5. Saturation: queue_depth / queue_max_depth (> 0.8 = warning)
+    6. Errors: rate(resource_errors_total[5m])
+
+    Implementation:
+    7. Create one dashboard panel per RED metric per service tier
+    8. Create one dashboard panel per USE metric per resource
+    9. Set alerts on: error rate > 1%, p99 > SLO, saturation > 80%
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [prometheus_client, grafana]
+  domains:
+    domain: [observability, sre]
+    concern: [monitoring_framework, service_health]
+  example_good: |
+    from prometheus_client import Counter, Histogram, Gauge
+
+    # RED metrics for the /api/v1/process endpoint
+    NAMESPACE = "myapp"
+
+    # R — Rate
+    requests_total = Counter(f"{NAMESPACE}_requests_total", "Total requests",
+                             ["method", "endpoint", "status"])
+    # E — Errors (derive from requests_total with status label filtering in PromQL)
+    # D — Duration
+    request_duration_seconds = Histogram(f"{NAMESPACE}_request_duration_seconds",
+                                         "Request duration", ["endpoint"],
+                                         buckets=[0.01, 0.05, 0.1, 0.5, 1.0, 5.0])
+
+    # USE metrics for the task queue resource
+    # U — Utilization
+    queue_utilization = Gauge(f"{NAMESPACE}_queue_utilization_ratio",
+                              "Queue depth / max capacity", ["queue"])
+    # S — Saturation
+    queue_depth = Gauge(f"{NAMESPACE}_queue_depth", "Current queue depth", ["queue"])
+    # E — Errors (from resource errors counter)
+    queue_errors_total = Counter(f"{NAMESPACE}_queue_errors_total", "Queue errors", ["queue", "error_type"])
+  example_bad: |
+    # WRONG: ad-hoc metrics that don't answer RED or USE questions
+    from prometheus_client import Counter, Gauge
+    log_lines_total = Counter("log_lines", "Log lines written")  # answers nothing operational
+    cache_size = Gauge("cache_entries", "Cache entries")         # not USE saturation
+    # Missing: request rate, error rate, latency, resource saturation
+  when_applies: >
+    When instrumenting any service (apply RED) or any resource/infrastructure
+    component (apply USE). Both frameworks should be applied from day 1, not added
+    reactively after an incident.
+  sources:
+    - "Tom Wilkie — The RED Method: https://grafana.com/blog/2018/08/02/the-red-method-how-to-instrument-your-services/"
+    - "Brendan Gregg — USE Method: https://www.brendangregg.com/usemethod.html"
+    - "Google SRE Book — Monitoring: https://sre.google/sre-book/monitoring-distributed-systems/"
+
+- id: PROM-007
+  text: >
+    Write SLO-based multi-window burn rate alerts using the Google SRE Workbook
+    pattern: two windows (long: 1h/6h, short: 5m/30m) with two burn rate thresholds.
+    Page on fast burns (14.4x in 1h) and ticket on slow burns (1x in 3d). Never
+    alert on raw error rates or single-window thresholds — they produce too many
+    false positives and miss slow exhaustion patterns.
+  why: >
+    Alerting on raw error rate > 1% fires for every brief spike, including routine
+    deployments and retried requests. A service with 99.9% SLO tolerates 0.1%
+    error rate — alerting on any value above 0.1% creates alert fatigue.
+    Multi-window burn rate alerts fire only when the error budget is being consumed
+    at an unsustainable rate. Google's production data shows this approach reduces
+    alert volume by 60-80% while maintaining 99%+ incident detection rate.
+  how_to_do_right: |
+    For a service with 99.9% SLO (30-day window = 43.2 min error budget):
+
+    Page alert (fast burn, page on-call immediately):
+      - Burn rate > 14.4x AND error rate sustained over both 1h and 5m windows
+      - If burning 14.4x fast, budget exhausted in 2h
+      expr: |
+        (
+          job:slo_errors:rate1h{job="myapp"} / (1 - 0.999) > 14.4
+          AND
+          job:slo_errors:rate5m{job="myapp"} / (1 - 0.999) > 14.4
+        )
+
+    Ticket alert (slow burn, create ticket during business hours):
+      - Burn rate > 6x over 6h and 30m
+      - If burning 6x fast, budget exhausted in 5 days
+      expr: |
+        (
+          job:slo_errors:rate6h{job="myapp"} / (1 - 0.999) > 6
+          AND
+          job:slo_errors:rate30m{job="myapp"} / (1 - 0.999) > 6
+        )
+  severity: high
+  technologies:
+    lang: [yaml]
+    framework: [prometheus, alertmanager]
+  domains:
+    domain: [observability, sre]
+    concern: [alerting, slo_compliance, error_budget]
+  example_good: |
+    # prometheus/rules/slo_alerts.yaml
+    groups:
+    - name: slo_burn_rate
+      rules:
+      # Pre-compute error ratio as recording rule (cheaper)
+      - record: job:slo_error_ratio:rate5m
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (job)
+          /
+          sum(rate(http_requests_total[5m])) by (job)
+
+      # Page: fast burn (14.4x over 1h AND 5m)
+      - alert: SLOFastBurn
+        expr: |
+          (job:slo_error_ratio:rate1h > (14.4 * 0.001))
+          AND
+          (job:slo_error_ratio:rate5m > (14.4 * 0.001))
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Fast error budget burn on {{ $labels.job }}"
+          description: "Burning error budget at {{ $value | humanizePercentage }} error rate (14.4x)"
+
+      # Ticket: slow burn (6x over 6h AND 30m)
+      - alert: SLOSlowBurn
+        expr: |
+          (job:slo_error_ratio:rate6h > (6 * 0.001))
+          AND
+          (job:slo_error_ratio:rate30m > (6 * 0.001))
+        for: 15m
+        labels:
+          severity: ticket
+  example_bad: |
+    # WRONG: single-window raw error rate threshold — too many false positives
+    - alert: HighErrorRate
+      expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.01
+      for: 5m
+      # Fires on every deployment, every brief spike, every retry storm
+      # Does not distinguish 5-minute blip from sustained degradation
+  when_applies: >
+    Any service with a defined SLO. Implement burn rate alerts before the first
+    production load, with SLOs documented in an SLO document referenced in the alert annotation.
+  sources:
+    - "Google SRE Workbook — Alerting on SLOs: https://sre.google/workbook/alerting-on-slos/"
+    - "Grafana — Multi-window multi-burn-rate alerts: https://grafana.com/blog/2025/02/28/how-to-implement-multi-window-multi-burn-rate-alerts-with-grafana-cloud/"
+    - "Prometheus — Recording rules: https://prometheus.io/docs/practices/rules/"
+
+- id: PROM-008
+  text: >
+    Create Prometheus recording rules for any PromQL expression that is evaluated
+    more than once per scrape interval or that takes >100ms to compute. Recording
+    rules pre-compute expensive queries and store results as new time series, reducing
+    query latency for dashboards from seconds to milliseconds.
+  why: >
+    histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m]))
+    by (le, endpoint)) on a service with 50 endpoints and 11 histogram buckets =
+    550 time series evaluated every dashboard refresh. With 5 Grafana users looking
+    at dashboards simultaneously = 2,750 range queries per minute hitting Prometheus.
+    A platform team reduced their Prometheus query load by 85% after converting the
+    5 most-used dashboard panels to recording rules.
+  how_to_do_right: |
+    1. Identify expensive/repeated queries from Prometheus UI /query-usage
+    2. Create a recording rule with naming convention: {labels}:{metric}:{window}
+       - record: job:http_request_duration_p99:rate5m
+         expr: |
+           histogram_quantile(0.99,
+             sum(rate(http_request_duration_seconds_bucket[5m])) by (job, le)
+           )
+    3. Rules are evaluated every evaluation_interval (default 1m)
+    4. Reference the recording rule in dashboards and alerts instead of the raw expr
+    5. Group related recording rules together in a named rule group
+    6. Naming: never use the same name as an existing metric — it will conflict
+  severity: medium
+  technologies:
+    lang: [yaml]
+    framework: [prometheus]
+  domains:
+    domain: [observability, performance]
+    concern: [query_performance, dashboard_latency]
+  example_good: |
+    # prometheus/rules/recording_rules.yaml
+    groups:
+    - name: http_sli_recording
+      interval: 60s
+      rules:
+      # Pre-compute p99 latency per job (used in dashboards and SLO alerts)
+      - record: job:http_request_duration_p99:rate5m
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (job, le)
+          )
+
+      # Pre-compute error ratio per job (used in SLO burn rate alerts)
+      - record: job:http_error_ratio:rate5m
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (job)
+          /
+          sum(rate(http_requests_total[5m])) by (job)
+
+      # Pre-compute request rate per job
+      - record: job:http_requests:rate5m
+        expr: sum(rate(http_requests_total[5m])) by (job)
+
+    # In Grafana dashboard, reference recording rule (fast):
+    # job:http_request_duration_p99:rate5m{job="myapp"}
+    # Not the raw expr (slow):
+    # histogram_quantile(0.99, sum(rate(...)) by (job, le))
+  example_bad: |
+    # WRONG: expensive histogram_quantile in dashboard panel directly
+    # Grafana panel query (executed every 30s per user):
+    # histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, endpoint))
+    # With 50 endpoints, 11 buckets, 5 users = 2,750 range queries/min
+  when_applies: >
+    Any PromQL expression used in more than one dashboard panel, all SLO alert
+    expressions, and any histogram_quantile computation over a multi-dimensional metric.
+  sources:
+    - "Prometheus docs — Recording rules: https://prometheus.io/docs/practices/rules/"
+    - "Prometheus docs — Rule configuration: https://prometheus.io/docs/prometheus/latest/configuration/recording_rules/"
+
+- id: PROM-009
+  text: >
+    Implement Grafana dashboards as code using JSON model files committed to git.
+    Never create dashboards by hand-editing in the Grafana UI for production
+    dashboards — UI-created dashboards are not reproducible, not reviewable, and
+    are lost on Grafana database migration. Use Grafonnet or the Grafana Terraform
+    provider for team-maintained dashboards.
+  why: >
+    A platform team spent 40 engineer-hours building a comprehensive dashboard for
+    their financial settlement service. When they migrated from Grafana 8 to Grafana
+    10, the Grafana SQLite database was not backed up. They lost all dashboards and
+    had no git history to recover from. Dashboard-as-code also enables: PR review
+    of dashboard changes, automatic deployment in CI/CD, and environment-specific
+    variable injection (dev vs prod datasources).
+  how_to_do_right: |
+    1. Export dashboard JSON from Grafana UI: Dashboard → Share → Export → JSON
+    2. Commit to git: dashboards/{service_name}.json
+    3. Use Grafana dashboard provisioning to load from files:
+       # grafana/provisioning/dashboards/dashboards.yaml
+       apiVersion: 1
+       providers:
+         - name: default
+           folder: "Engineering"
+           type: file
+           options:
+             path: /etc/grafana/dashboards
+    4. Use ${datasource} variable in all panels for environment portability
+    5. In CI: validate JSON structure with jq on every PR
+    6. Tag dashboards with version and last-updated-by in the metadata
+  severity: medium
+  technologies:
+    lang: [json, hcl]
+    framework: [grafana, terraform]
+  domains:
+    domain: [observability, platform_engineering, devops]
+    concern: [infrastructure_as_code, reproducibility]
+  example_good: |
+    // dashboards/api_service.json (committed to git)
+    {
+      "__inputs": [
+        {
+          "name": "DS_PROMETHEUS",
+          "label": "Prometheus",
+          "type": "datasource",
+          "pluginId": "prometheus"
+        }
+      ],
+      "title": "API Service — RED Dashboard",
+      "uid": "api-red-v1",
+      "version": 3,
+      "tags": ["api", "red", "slo"],
+      "panels": [
+        {
+          "title": "Request Rate (req/s)",
+          "type": "stat",
+          "datasource": "${DS_PROMETHEUS}",
+          "targets": [
+            {
+              "expr": "sum(job:http_requests:rate5m{job=\"$job\"})"
+            }
+          ]
+        }
+      ],
+      "templating": {
+        "list": [
+          {"name": "job", "type": "query",
+           "query": "label_values(http_requests_total, job)"}
+        ]
+      }
+    }
+  example_bad: |
+    # WRONG: dashboard only exists in Grafana UI database
+    # No git history, no review, lost on migration
+    # "I'll export it to git someday" → company migrates Grafana → 40h of work gone
+  when_applies: >
+    All production dashboards. Development/scratch dashboards can be created in UI
+    but must be exported to git before they are shared with the team.
+  sources:
+    - "Grafana — Provisioning dashboards: https://grafana.com/docs/grafana/latest/administration/provisioning/"
+    - "Grafonnet: https://github.com/grafana/grafonnet"
+    - "Grafana Terraform provider: https://registry.terraform.io/providers/grafana/grafana/latest/docs"
+
+- id: PROM-010
+  text: >
+    Instrument LLM pipeline services with custom metrics covering: tokens processed
+    (prompt + completion separately), cost per request (in USD/BRL), latency by model
+    and operation type, and cache hit rate if using semantic cache. These metrics
+    enable cost attribution, performance regression detection, and ROI measurement
+    that standard RED metrics cannot provide.
+  why: >
+    Standard HTTP latency metrics on an LLM pipeline hide the most important
+    operational data: which model is being called most (cost driver), what the
+    prompt/completion token ratio is (optimization signal), and whether caching is
+    working (cost reduction signal). A team running a Claude-based pipeline discovered
+    through custom LLM metrics that 40% of their monthly cost came from 3% of
+    requests that triggered fallback to Claude Opus instead of Haiku due to a
+    routing bug. Without these metrics, the routing bug would have cost ~$8K/month
+    undetected.
+  how_to_do_right: |
+    1. Define LLM-specific metrics:
+       llm_tokens_total (counter, labels: model, token_type=prompt|completion)
+       llm_request_cost_usd_total (counter, labels: model, operation)
+       llm_request_duration_seconds (histogram, labels: model, operation)
+       llm_cache_hits_total (counter, labels: cache_type)
+       llm_cache_misses_total (counter, labels: cache_type)
+    2. Compute cost from usage data (e.g., Claude pricing: input $3/MTok, output $15/MTok)
+       cost = (prompt_tokens * INPUT_PRICE_PER_TOKEN) + (completion_tokens * OUTPUT_PRICE_PER_TOKEN)
+    3. Use Decimal for cost computation; convert to float only for Prometheus gauge
+    4. Export cost as a Counter (cumulative), not Gauge (instantaneous)
+    5. Add model version label to detect performance regression after model upgrades
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [prometheus_client, langchain, anthropic]
+  domains:
+    domain: [observability, llm_ops, fintech]
+    concern: [cost_attribution, llm_monitoring]
+  example_good: |
+    from prometheus_client import Counter, Histogram
+    from decimal import Decimal
+
+    NAMESPACE = "cogniloom"
+
+    llm_tokens_total = Counter(
+        f"{NAMESPACE}_llm_tokens_total",
+        "Total LLM tokens processed",
+        ["model", "token_type"],   # token_type: prompt | completion
+    )
+    llm_request_cost_usd_total = Counter(
+        f"{NAMESPACE}_llm_request_cost_usd_total",
+        "Cumulative LLM request cost in USD",
+        ["model", "operation"],
+    )
+    llm_request_duration_seconds = Histogram(
+        f"{NAMESPACE}_llm_request_duration_seconds",
+        "LLM request duration in seconds",
+        ["model", "operation"],
+        buckets=[0.5, 1, 2, 5, 10, 20, 30, 60, 120],
+    )
+
+    PRICING_USD_PER_TOKEN = {
+        "claude-3-haiku": {"prompt": 0.25e-6, "completion": 1.25e-6},
+        "claude-sonnet-4-6": {"prompt": 3e-6, "completion": 15e-6},
+    }
+
+    def record_llm_call(model: str, operation: str, prompt_tokens: int,
+                        completion_tokens: int, duration_s: float) -> None:
+        llm_tokens_total.labels(model=model, token_type="prompt").inc(prompt_tokens)
+        llm_tokens_total.labels(model=model, token_type="completion").inc(completion_tokens)
+        llm_request_duration_seconds.labels(model=model, operation=operation).observe(duration_s)
+        pricing = PRICING_USD_PER_TOKEN.get(model, {"prompt": 0, "completion": 0})
+        cost = prompt_tokens * pricing["prompt"] + completion_tokens * pricing["completion"]
+        llm_request_cost_usd_total.labels(model=model, operation=operation).inc(cost)
+  example_bad: |
+    # WRONG: only standard RED metrics — no LLM-specific visibility
+    from prometheus_fastapi_instrumentator import Instrumentator
+    Instrumentator().instrument(app)
+    # No token tracking, no cost attribution, routing bug costs $8K/month undetected
+  when_applies: >
+    All services that make LLM API calls. Instrument from day 1 — retroactive cost
+    attribution from logs is error-prone and misses real-time anomaly detection.
+  sources:
+    - "Anthropic — Claude pricing: https://www.anthropic.com/api"
+    - "prometheus-client Python: https://github.com/prometheus/client_python"
+    - "Better Stack — Prometheus Python metrics: https://betterstack.com/community/guides/monitoring/prometheus-python-metrics/"
+
+- id: PROM-011
+  text: >
+    For financial system observability, add domain-specific business metrics beyond
+    RED: orders/sec by status (pending/settled/failed), settlement latency p99,
+    failed transaction rate by error type, and payout queue depth. Alert on business
+    anomalies (payout queue > 1000) separately from technical alerts (p99 > SLO).
+  why: >
+    Technical metrics (HTTP latency, error rate) measure infrastructure health but
+    not business health. A payment system can have p99 = 50ms (healthy technically)
+    but settlement_latency_p99 = 3 hours (failing business SLA). The two are
+    decoupled when failures occur in downstream async processing. A Brazilian payment
+    processor had excellent HTTP metrics while their async settlement service silently
+    backed up to 50,000 pending payouts over 6 hours — discovered by a client
+    calling support, not by any alert.
+  how_to_do_right: |
+    Define business metrics alongside technical metrics:
+    1. orders_total (counter, labels: status=pending|settled|failed|cancelled)
+    2. settlement_duration_seconds (histogram, buckets=[1,5,30,120,600,1800,3600,86400])
+    3. payout_queue_depth (gauge, labels: queue_type=standard|priority)
+    4. failed_transactions_total (counter, labels: error_type, currency, payment_method)
+    5. revenue_brl_total (counter — increment by payout amount; tracks throughput)
+
+    Alerts:
+    6. Alert: payout_queue_depth > 1000 for 5m (operational — page)
+    7. Alert: rate(failed_transactions_total[5m]) > 0.02 (business — ticket)
+    8. Alert: settlement_duration_p99 > 300 (5 min — SLA breach — page)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [prometheus_client, fastapi]
+  domains:
+    domain: [observability, fintech, payments]
+    concern: [business_metrics, financial_monitoring]
+  example_good: |
+    from prometheus_client import Counter, Gauge, Histogram
+
+    NAMESPACE = "payments"
+
+    # Business metrics
+    orders_total = Counter(
+        f"{NAMESPACE}_orders_total",
+        "Total orders by status",
+        ["status", "payment_method", "currency"],
+    )
+    settlement_duration_seconds = Histogram(
+        f"{NAMESPACE}_settlement_duration_seconds",
+        "Time from order creation to settlement confirmation",
+        ["payment_method"],
+        buckets=[1, 5, 30, 120, 600, 1800, 3600, 7200, 86400],
+    )
+    payout_queue_depth = Gauge(
+        f"{NAMESPACE}_payout_queue_depth",
+        "Current number of payouts awaiting processing",
+        ["queue_type"],
+    )
+    failed_transactions_total = Counter(
+        f"{NAMESPACE}_failed_transactions_total",
+        "Failed transactions by error type",
+        ["error_type", "currency"],
+        # error_type: insufficient_funds | bank_rejected | timeout | validation_error
+    )
+
+    # Usage in order processing
+    def record_order_settled(payment_method: str, currency: str, duration_s: float):
+        orders_total.labels(status="settled", payment_method=payment_method, currency=currency).inc()
+        settlement_duration_seconds.labels(payment_method=payment_method).observe(duration_s)
+  example_bad: |
+    # WRONG: only technical metrics — business SLA violations are invisible
+    from prometheus_fastapi_instrumentator import Instrumentator
+    Instrumentator().instrument(app)
+    # HTTP p99 = 50ms (green) while 50K payouts are stuck in queue (red)
+    # No alert fires; client discovers the problem 6 hours later
+  when_applies: >
+    All financial system services: payment processors, payout systems, exchange
+    platforms, lending systems, billing engines. Add business metrics alongside
+    technical metrics from day 1.
+  sources:
+    - "Google SRE Book — Monitoring: https://sre.google/sre-book/monitoring-distributed-systems/"
+    - "Prometheus best practices: https://prometheus.io/docs/practices/instrumentation/"
+    - "BACEN — Resolução CMN 3.694 — controles internos em meios de pagamento"
+
+- id: PROM-012
+  text: >
+    Configure Prometheus service discovery using static_configs for small deployments
+    (<10 services) or kubernetes_sd_configs / docker_sd_configs for dynamic environments.
+    Never hardcode IP addresses in scrape configs — use DNS service names or labels.
+    Update scrape interval to 15s for critical services and 60s for infrastructure metrics.
+  why: >
+    IP-based scrape configs break on every service restart when containers get new IPs.
+    A team using IP-hardcoded scrape configs lost Prometheus metrics for 3 services
+    after a rolling deployment because the new pods had different IPs. With DNS-based
+    or Kubernetes service discovery, scrape targets update automatically. The scrape
+    interval also matters: 15s allows alerting with 2m for: clauses (4 scrapes);
+    60s intervals require 10m for: clauses — too slow for incident response.
+  how_to_do_right: |
+    Static (development or small deployments):
+      static_configs:
+        - targets: ["api-service:9090", "worker-service:9090"]  # DNS names, not IPs
+          labels:
+            env: "production"
+
+    Docker Compose:
+      docker_sd_configs:
+        - host: "unix:///var/run/docker.sock"
+          port: 9090
+      relabel_configs:
+        - source_labels: [__meta_docker_container_label_monitoring]
+          regex: "true"
+          action: keep
+
+    Kubernetes:
+      kubernetes_sd_configs:
+        - role: pod
+      relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+          regex: "true"
+          action: keep
+  severity: medium
+  technologies:
+    lang: [yaml]
+    framework: [prometheus, docker, kubernetes]
+  domains:
+    domain: [observability, infrastructure]
+    concern: [service_discovery, configuration]
+  example_good: |
+    # prometheus/prometheus.yml
+    global:
+      scrape_interval: 15s        # critical services
+      evaluation_interval: 15s
+
+    scrape_configs:
+      # Application services via DNS (Docker Compose network)
+      - job_name: "api_service"
+        metrics_path: "/metrics"
+        static_configs:
+          - targets: ["api:9090"]          # DNS name, not IP
+            labels:
+              service: "api"
+              env: "production"
+
+      # Infrastructure metrics (less critical — 60s is fine)
+      - job_name: "node_exporter"
+        scrape_interval: 60s
+        static_configs:
+          - targets: ["node-exporter:9100"]
+
+    rule_files:
+      - "/etc/prometheus/rules/*.yaml"
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+          - targets: ["alertmanager:9093"]
+  example_bad: |
+    # WRONG: IP-hardcoded targets break on container restart
+    scrape_configs:
+      - job_name: "api"
+        static_configs:
+          - targets: ["172.18.0.5:9090"]   # breaks when container restarts with new IP
+  when_applies: >
+    All Prometheus deployments. Adopt DNS-based or service-discovery-based targets
+    from initial setup, not after the first broken deployment.
+  sources:
+    - "Prometheus docs — Configuration: https://prometheus.io/docs/prometheus/latest/configuration/configuration/"
+    - "Prometheus docs — Service discovery: https://prometheus.io/docs/prometheus/latest/configuration/configuration/#static_config"
+
+- id: PROM-013
+  text: >
+    Aggregate Prometheus metrics across multiple instances using sum(), avg(), and
+    max() in PromQL — never compare raw per-instance metrics in alerts. For horizontal
+    scaling with N instances, error_rate alerting must sum errors across all instances
+    divided by total requests across all instances. Per-instance alerts double-count
+    and miss fleet-wide patterns.
+  why: >
+    With 5 instances of an API service, each with ~20% traffic each, a single instance
+    experiencing 5% errors means fleet-wide error rate is 1%. An alert on
+    rate(errors[5m]{instance="..."} > 0.01) fires for that one instance but not
+    the others. More critically, if all 5 instances are at 2% errors each, the
+    fleet is at 2% total — an alert on individual instances at > 0.02 would miss this.
+    Always aggregate, always divide.
+  how_to_do_right: |
+    1. Fleet-wide error rate:
+       sum(rate(http_requests_total{status=~"5.."}[5m])) by (job)
+       /
+       sum(rate(http_requests_total[5m])) by (job)
+
+    2. Max latency across any instance (worst case):
+       max(histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))) by (job)
+
+    3. Total throughput (sum across instances):
+       sum(rate(http_requests_total[5m])) by (job)
+
+    4. For per-instance anomaly detection (not alerting):
+       (rate(errors[5m]{instance="i"}) / rate(requests[5m]{instance="i"})) > 2 * fleet_error_rate
+
+    5. Never: rate(errors[5m]{instance="specific-pod"}) > threshold
+  severity: high
+  technologies:
+    lang: [promql]
+    framework: [prometheus]
+  domains:
+    domain: [observability, platform_engineering]
+    concern: [aggregation, horizontal_scaling]
+  example_good: |
+    # Recording rule: fleet-wide error ratio (correct aggregation)
+    - record: job:http_error_ratio:rate5m
+      expr: |
+        sum(rate(http_requests_total{status=~"5.."}[5m])) by (job)
+        /
+        sum(rate(http_requests_total[5m])) by (job)
+
+    # Fleet p99 latency: worst case across all instances
+    - record: job:http_request_duration_p99:rate5m
+      expr: |
+        histogram_quantile(0.99,
+          sum(rate(http_request_duration_seconds_bucket[5m])) by (job, le)
+        )
+
+    # Alert on fleet-wide metric, not per-instance
+    - alert: HighErrorRate
+      expr: job:http_error_ratio:rate5m{job="myapp"} > 0.05
+      for: 5m
+  example_bad: |
+    # WRONG: alerting per-instance (misses distributed failures, double-counts)
+    - alert: HighErrorRatePerInstance
+      expr: |
+        rate(http_requests_total{status=~"5.."}[5m])
+        /
+        rate(http_requests_total[5m]) > 0.05
+      # Fires for each instance individually; 5 pods at 2% each = no alert but fleet is failing
+  when_applies: >
+    All PromQL expressions in alert rules and recording rules for horizontally
+    scaled services. Single-instance services are exempt but should still use sum()
+    for forward compatibility.
+  sources:
+    - "Prometheus docs — Query best practices: https://prometheus.io/docs/practices/rules/"
+    - "Prometheus — Functions: https://prometheus.io/docs/prometheus/latest/querying/functions/"
+
+- id: PROM-014
+  text: >
+    Implement a custom Prometheus Collector for metrics that cannot be push-instrumented
+    (e.g., database queue depths, external API quotas, Celery task counts from Redis).
+    Custom Collectors are called on every scrape and fetch current state directly —
+    unlike standard metrics that accumulate in memory, Collectors are stateless
+    and always reflect current ground truth.
+  why: >
+    Standard Prometheus metrics (Counter, Gauge) accumulate in the Python process.
+    For a Celery task queue backed by Redis, the queue depth is in Redis, not in the
+    worker process. A worker that crashes and restarts loses all its in-memory metrics.
+    A custom Collector queries Redis on every Prometheus scrape, ensuring the metric
+    always reflects true current state regardless of worker restarts.
+  how_to_do_right: |
+    1. Subclass CollectorRegistry:
+       from prometheus_client.core import GaugeMetricFamily, REGISTRY
+       class CeleryQueueCollector:
+           def collect(self):
+               for queue in CELERY_QUEUES:
+                   depth = redis.llen(f"celery:{queue}")
+                   g = GaugeMetricFamily("celery_queue_depth",
+                                        "Celery queue depth",
+                                        labels=["queue"])
+                   g.add_metric([queue], depth)
+                   yield g
+       REGISTRY.register(CeleryQueueCollector())
+    2. Called on every scrape — keep collect() fast (<100ms)
+    3. Add a Histogram to measure collect() duration and alert if >500ms
+    4. For external API quotas: cache the quota check for 60s to avoid
+       hammering the external API on every 15s Prometheus scrape
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [prometheus_client, celery, redis]
+  domains:
+    domain: [observability, platform_engineering]
+    concern: [custom_metrics, external_state]
+  example_good: |
+    import redis as redis_lib
+    from prometheus_client.core import GaugeMetricFamily, CounterMetricFamily, REGISTRY
+    from prometheus_client import Histogram
+    import time
+
+    REDIS = redis_lib.Redis()
+    QUEUES = ["default", "priority", "bulk"]
+
+    collect_duration = Histogram(
+        "custom_collector_duration_seconds",
+        "Time to collect custom metrics",
+        ["collector"],
+    )
+
+    class CeleryQueueCollector:
+        def collect(self):
+            start = time.time()
+            for queue in QUEUES:
+                try:
+                    depth = REDIS.llen(f"celery:{queue}")
+                    scheduled = REDIS.zcard(f"celery.beat:{queue}")
+                except Exception:
+                    depth, scheduled = 0, 0
+
+                g = GaugeMetricFamily(
+                    "celery_queue_depth",
+                    "Number of tasks in Celery queue",
+                    labels=["queue"],
+                )
+                g.add_metric([queue], float(depth))
+                yield g
+
+            collect_duration.labels(collector="celery").observe(time.time() - start)
+
+    REGISTRY.register(CeleryQueueCollector())
+  example_bad: |
+    # WRONG: in-memory Gauge for queue depth — stale after worker restart
+    queue_depth = Gauge("celery_queue_depth", "Queue depth", ["queue"])
+    # Set by worker on task receive/complete — but after crash+restart, always 0
+    # Does not reflect actual Redis queue state
+  when_applies: >
+    Queue depths (Celery/Redis, SQS, RabbitMQ), external rate limit quotas,
+    database connection pool stats, filesystem usage, any metric that lives outside
+    the Python process memory.
+  sources:
+    - "prometheus_client — Custom Collectors: https://github.com/prometheus/client_python#custom-collectors"
+    - "Prometheus — Writing custom collectors: https://prometheus.io/docs/instrumenting/writing_clientlibs/#custom-collectors"
+
+- id: PROM-015
+  text: >
+    In Python prometheus_client with multiprocess mode (Gunicorn, uWSGI, multiple
+    workers), you MUST set the PROMETHEUS_MULTIPROC_DIR environment variable to a
+    writable directory and use multiprocess-compatible metric types. Failing to do
+    this causes each worker to serve its own partial metrics — Prometheus scrapes
+    one worker at random, getting only ~1/N of all metrics.
+  why: >
+    By default, prometheus_client stores metrics in-process (RAM). With 4 Gunicorn
+    workers, worker 0 sees 25% of requests, worker 1 sees 25%, etc. When Prometheus
+    scrapes /metrics, it hits one worker and gets only that worker's 25% of counters.
+    Rate calculations are off by 4x. Histogram bucket distributions are incomplete.
+    A production service appeared to have 0.08 req/s when the actual rate was
+    0.32 req/s — misleading SLO calculations for 6 months until the multiprocess
+    configuration was fixed.
+  how_to_do_right: |
+    1. Set environment variable BEFORE any prometheus_client import:
+       export PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc
+       mkdir -p /tmp/prometheus_multiproc
+    2. In FastAPI app startup, configure the metrics endpoint to merge workers:
+       from prometheus_client import make_asgi_app, multiprocess, CollectorRegistry
+       def make_metrics_app():
+           registry = CollectorRegistry()
+           multiprocess.MultiProcessCollector(registry)
+           return make_asgi_app(registry=registry)
+    3. Clear the multiproc dir on service startup (stale files from crashed workers)
+       import glob, os
+       for f in glob.glob("/tmp/prometheus_multiproc/*.db"):
+           os.unlink(f)
+    4. Validate: all workers contribute by checking that rate() * N_workers ≈ load_test_rate
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [prometheus_client, gunicorn, fastapi]
+  domains:
+    domain: [observability, platform_engineering]
+    concern: [multiprocess, configuration, correctness]
+  example_good: |
+    # Dockerfile / deployment
+    # ENV PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc
+    # RUN mkdir -p /tmp/prometheus_multiproc
+
+    # main.py
+    import glob, os
+    from prometheus_client import make_asgi_app, multiprocess, CollectorRegistry
+
+    def startup():
+        # Clear stale multiprocess files from previous run
+        mdir = os.environ.get("PROMETHEUS_MULTIPROC_DIR", "/tmp/prometheus_multiproc")
+        for f in glob.glob(f"{mdir}/*.db"):
+            os.unlink(f)
+
+    def make_metrics_app():
+        """Merge metrics from all Gunicorn workers."""
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        return make_asgi_app(registry=registry)
+
+    from fastapi import FastAPI
+    app = FastAPI()
+    app.mount("/metrics", make_metrics_app())
+
+    @app.on_event("startup")
+    async def on_startup():
+        startup()
+  example_bad: |
+    # WRONG: standard prometheus_client without multiprocess config in Gunicorn
+    from prometheus_client import make_asgi_app
+    from fastapi import FastAPI
+    app = FastAPI()
+    app.mount("/metrics", make_asgi_app())
+    # With 4 workers: each scrape returns ~25% of actual metrics
+    # Rate calculations off by 4x; histogram distributions incomplete
+  when_applies: >
+    Any FastAPI or Flask service deployed with Gunicorn, uWSGI, or any multi-worker
+    WSGI/ASGI server. Single-worker deployments (dev, single-process) do not require this.
+  sources:
+    - "prometheus_client — Multiprocess mode: https://github.com/prometheus/client_python#multiprocess-mode-eg-gunicorn"
+    - "prometheus_client — multiprocess.py: https://github.com/prometheus/client_python/blob/main/prometheus_client/multiprocess.py"

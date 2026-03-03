@@ -1,0 +1,783 @@
+layer: patterns
+technology: General
+domain: distributed_systems
+knowledge:
+- id: CR-DIST-RAFT-001
+  text: Raft Consensus — Use Raft for leader election and replicated state machines. Understand the leader election, log replication,
+    and safety properties.
+  why: 'Distributed systems need agreement on state (who is the leader, what is the current value, which transactions committed).
+    Without consensus, split-brain scenarios occur: two nodes both think they are the leader and accept conflicting writes.
+    Raft was designed as an understandable alternative to Paxos. It guarantees that once a log entry is committed, all nodes
+    will eventually have it, and no two leaders exist in the same term. etcd, CockroachDB, and TiDB all use Raft. A Kubernetes
+    cluster without proper etcd consensus lost 2 hours of deployments because two etcd members diverged and accepted conflicting
+    pod schedules.'
+  how_to_do_right: '1. Deploy odd number of nodes (3, 5, 7) — majority quorum requires (N/2)+1 votes.
+
+    2. 3 nodes tolerates 1 failure. 5 nodes tolerates 2 failures. Beyond 5, latency increases.
+
+    3. Leader election timeout: randomize between 150-300ms to avoid split votes.
+
+    4. Heartbeat interval: 50-100ms (must be << election timeout).
+
+    5. Log compaction (snapshotting) prevents unbounded log growth. Configure snapshot interval.
+
+    6. Monitor: leader changes/hour, commit latency, log size. Frequent leader changes = network issues.
+
+    '
+  severity: critical
+  technologies:
+    library: [tidb, raft]
+    platform: [etcd, cockroachdb, consul]
+  domains:
+    domain: [architecture, blockchain, reliability]
+    concern: [distributed_systems, consensus]
+  example_good: '# etcd cluster configuration for Kubernetes — 3 nodes with proper timeouts
+
+    # /etc/etcd/etcd.conf.yml
+
+
+    # Node 1 configuration
+
+    name: etcd-1
+
+    initial-cluster: etcd-1=https://10.0.1.1:2380,etcd-2=https://10.0.1.2:2380,etcd-3=https://10.0.1.3:2380
+
+    initial-cluster-state: new
+
+
+    # Raft tuning
+
+    heartbeat-interval: 100        # ms — leader sends heartbeat every 100ms
+
+    election-timeout: 1000         # ms — follower starts election after 1000ms without heartbeat
+
+    snapshot-count: 10000          # Compact log every 10K entries
+
+
+    # Health monitoring
+
+    # curl https://10.0.1.1:2379/health → {"health": "true"}
+
+    # etcdctl endpoint status → shows leader, raft term, raft index
+
+    '
+  example_bad: '# 2-node etcd cluster — CANNOT achieve consensus if one node fails
+
+    initial-cluster: etcd-1=https://10.0.1.1:2380,etcd-2=https://10.0.1.2:2380
+
+    # Quorum requires 2/2 = both nodes must be up
+
+    # If either node fails: no quorum → cluster is read-only → Kubernetes stops scheduling
+
+
+    # Even-numbered cluster (4 nodes) wastes resources
+
+    # 4-node quorum = 3, same fault tolerance as 3-node (tolerates 1 failure)
+
+    # But 4 nodes have higher write latency (more nodes to replicate to)
+
+    '
+  sources: ["https://raft.github.io/raft.pdf"]
+  when_applies: "When implementing consensus for leader election or replicated state machines in distributed clusters"
+- id: CR-DIST-FENCE-001
+  text: Fencing Tokens — Use monotonically increasing fencing tokens to prevent stale leaders from corrupting data after a
+    new leader is elected.
+  why: 'A leader that has been replaced (due to network partition or GC pause) may not know it has been replaced and continue
+    issuing writes. These zombie leader writes can overwrite data that the new leader has already modified. Fencing tokens
+    solve this: each leader gets a monotonically increasing token, and the storage layer rejects writes with tokens lower
+    than the current maximum. Without fencing, a GC pause in a Java service caused the old leader to wake up after 30 seconds,
+    issue stale writes, and corrupt 10,000 records that the new leader had already updated.'
+  how_to_do_right: '1. Each leader election generates a monotonically increasing fencing token (epoch/term number).
+
+    2. The leader includes its fencing token in every write request to the storage layer.
+
+    3. The storage layer tracks the highest fencing token it has seen.
+
+    4. If a write arrives with a token lower than the maximum, REJECT it (stale leader).
+
+    5. Lease-based leadership: leader must periodically renew its lease. Failure to renew = leadership lost.
+
+    6. Storage must enforce fencing atomically — check-and-reject must be a single operation.
+
+    '
+  severity: critical
+  technologies:
+    library: [zookeeper]
+    platform: [etcd, redis, postgresql]
+  domains:
+    domain: [architecture, blockchain]
+    concern: [distributed_systems, consensus, safety]
+  example_good: "class FencedStorage:\n    \"\"\"Storage layer that rejects writes from stale leaders.\"\"\"\n    def __init__(self,\
+    \ db: Database):\n        self.db = db\n\n    def write(self, key: str, value: Any, fencing_token: int) -> bool:\n   \
+    \     \"\"\"Atomic check-and-write with fencing token.\"\"\"\n        result = self.db.execute(\"\"\"\n            UPDATE\
+    \ kv_store\n            SET value = %(value)s, fencing_token = %(token)s\n            WHERE key = %(key)s AND fencing_token\
+    \ < %(token)s\n        \"\"\", {\"key\": key, \"value\": value, \"token\": fencing_token})\n\n        if result.rowcount\
+    \ == 0:\n            # Either key doesn't exist or a higher token already wrote\n            raise StaleLeaderError(\n\
+    \                f\"Fencing token {fencing_token} is stale for key {key}\"\n            )\n        return True\n\nclass\
+    \ Leader:\n    def __init__(self, storage: FencedStorage, token: int):\n        self.storage = storage\n        self.token\
+    \ = token  # Assigned during election, monotonically increasing\n\n    def process_write(self, key: str, value: Any):\n\
+    \        try:\n            self.storage.write(key, value, self.token)\n        except StaleLeaderError:\n            logger.warning(\"\
+    I am a stale leader — stepping down\")\n            self.step_down()\n"
+  example_bad: "class UnsafeLeader:\n    def process_write(self, key: str, value: Any):\n        # No fencing token — stale\
+    \ leader can overwrite new leader's data\n        self.db.execute(\n            \"UPDATE kv_store SET value = %s WHERE\
+    \ key = %s\", (value, key)\n        )\n        # Scenario:\n        # 1. Leader A writes value=100 at T=0\n        # 2.\
+    \ Leader A gets GC pause at T=1\n        # 3. Leader B elected at T=2, writes value=200\n        # 4. Leader A wakes up\
+    \ at T=3, writes value=100 (STALE!)\n        # 5. Data corrupted: value=100 should be 200\n"
+  sources: ["https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html"]
+  when_applies: "When coordinating distributed locks to prevent split-brain scenarios in clustered systems"
+- id: CR-DIST-SAGA-001
+  text: Saga Pattern — Use sagas (sequence of local transactions with compensating actions) instead of distributed two-phase
+    commit for cross-service transactions.
+  why: Two-phase commit (2PC) requires a coordinator that locks resources across all services until all vote to commit. If
+    the coordinator fails after the prepare phase, all participants are blocked with held locks — potentially for hours until
+    manual intervention. 2PC also couples services tightly and does not work across different database technologies. Sagas
+    break a distributed transaction into a sequence of local transactions, each with a compensating action (undo). If step
+    3 fails, compensating actions for steps 2 and 1 are executed in reverse order. Uber, Netflix, and Airbnb all use sagas
+    for their booking flows.
+  how_to_do_right: '1. Choreography saga: each service publishes an event after its local transaction; the next service listens
+    and reacts. Decentralized, hard to debug.
+
+    2. Orchestration saga: a central orchestrator tells each service what to do. Centralized, easier to debug and modify.
+
+    3. Every step MUST have a compensating action: charge → refund, reserve → release, create → delete.
+
+    4. Compensating actions must be idempotent — they may be called multiple times if retries occur.
+
+    5. Handle the "semantic rollback" problem: you can refund a charge, but you cannot unsend an email.
+
+    6. Persist saga state durably — if the orchestrator crashes, it must resume from where it left off.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python]
+    library: [temporal]
+    platform: [kafka, rabbitmq, postgresql]
+  domains:
+    domain: [architecture]
+    concern: [distributed_systems, transactions, microservices]
+  example_good: "# Orchestration saga for order processing\nclass OrderSaga:\n    \"\"\"Central orchestrator manages the distributed\
+    \ transaction.\"\"\"\n\n    steps = [\n        SagaStep(\n            action=reserve_inventory,\n            compensation=release_inventory,\n\
+    \        ),\n        SagaStep(\n            action=charge_payment,\n            compensation=refund_payment,\n       \
+    \ ),\n        SagaStep(\n            action=create_shipment,\n            compensation=cancel_shipment,\n        ),\n\
+    \        SagaStep(\n            action=send_confirmation_email,\n            compensation=None,  # Cannot unsend email\
+    \ — no compensation\n        ),\n    ]\n\n    async def execute(self, order: Order):\n        completed_steps = []\n \
+    \       try:\n            for step in self.steps:\n                await step.action(order)\n                completed_steps.append(step)\n\
+    \        except Exception as e:\n            # Compensate in reverse order\n            for step in reversed(completed_steps):\n\
+    \                if step.compensation:\n                    await step.compensation(order)\n            raise SagaFailed(f\"\
+    Step failed: {e}, compensated {len(completed_steps)} steps\")\n"
+  example_bad: "# Two-phase commit across microservices — blocking and fragile\nasync def place_order(order: Order):\n   \
+    \ # Phase 1: PREPARE — all services lock resources\n    inventory_ok = await inventory_service.prepare(order)  # Locks\
+    \ inventory rows\n    payment_ok = await payment_service.prepare(order)      # Holds payment authorization\n    shipping_ok\
+    \ = await shipping_service.prepare(order)    # Reserves shipping slot\n\n    if inventory_ok and payment_ok and shipping_ok:\n\
+    \        # Phase 2: COMMIT\n        await inventory_service.commit(order)\n        await payment_service.commit(order)\n\
+    \        await shipping_service.commit(order)\n    else:\n        # Phase 2: ROLLBACK\n        await inventory_service.rollback(order)\n\
+    \        await payment_service.rollback(order)\n        await shipping_service.rollback(order)\n\n    # PROBLEM: If this\
+    \ coordinator process crashes between PREPARE and COMMIT,\n    # all three services are stuck with held locks until manual\
+    \ intervention.\n    # PROBLEM: If payment_service.commit() succeeds but shipping_service.commit() fails,\n    # you're\
+    \ in an inconsistent state with no automatic recovery.\n"
+  sources: ["https://microservices.io/patterns/data/saga.html"]
+  when_applies: "When orchestrating multi-step business transactions across distributed services"
+- id: CR-DIST-OUTBOX-001
+  text: Transactional Outbox — Write events to an outbox table within the same database transaction as the business data,
+    then publish events asynchronously from the outbox.
+  why: 'When a service writes to its database AND publishes an event to a message broker, you have a dual-write problem: if
+    the database write succeeds but the event publish fails (or vice versa), the systems are inconsistent. The outbox pattern
+    solves this by writing the event to an ''outbox'' table in the same database transaction as the business data. A separate
+    process (or CDC connector like Debezium) reads the outbox table and publishes events to the message broker. This guarantees
+    at-least-once delivery without distributed transactions. Shopify uses the outbox pattern for order events — before adopting
+    it, they lost ~0.1% of order events during broker outages.'
+  how_to_do_right: '1. Write business data AND event to outbox table in the SAME database transaction.
+
+    2. Outbox table schema: id, aggregate_type, aggregate_id, event_type, payload, created_at, published_at.
+
+    3. A poller or CDC connector reads unpublished rows and publishes to the message broker.
+
+    4. After successful publish, mark the row as published (or delete it).
+
+    5. Consumers must be idempotent — the outbox guarantees at-least-once, not exactly-once.
+
+    6. Clean up published outbox rows periodically (keep for 24-48 hours for debugging).
+
+    '
+  severity: high
+  technologies:
+    library: [debezium]
+    platform: [postgresql, kafka, rabbitmq]
+  domains:
+    domain: [architecture, messaging]
+    concern: [distributed_systems, consistency]
+  example_good: "# Write business data + outbox event in same transaction\nclass OrderService:\n    async def create_order(self,\
+    \ order_data: dict) -> Order:\n        async with self.db.transaction():\n            # 1. Write business data\n     \
+    \       order = Order(**order_data)\n            self.db.add(order)\n\n            # 2. Write event to outbox (same transaction!)\n\
+    \            outbox_event = OutboxEvent(\n                aggregate_type=\"Order\",\n                aggregate_id=order.id,\n\
+    \                event_type=\"order.created\",\n                payload=json.dumps({\n                    \"order_id\"\
+    : order.id,\n                    \"customer_id\": order.customer_id,\n                    \"total\": str(order.total),\n\
+    \                }),\n            )\n            self.db.add(outbox_event)\n            # Both writes commit or both rollback\
+    \ — atomic!\n\n        return order\n\n# Separate process publishes outbox events\nclass OutboxPublisher:\n    async def\
+    \ poll_and_publish(self):\n        events = await self.db.query(OutboxEvent).filter(\n            OutboxEvent.published_at.is_(None)\n\
+    \        ).order_by(OutboxEvent.created_at).limit(100).all()\n\n        for event in events:\n            await self.broker.publish(event.event_type,\
+    \ event.payload)\n            event.published_at = datetime.utcnow()\n        await self.db.commit()\n"
+  example_bad: "# Dual write — database and broker are not atomic\nclass OrderService:\n    async def create_order(self, order_data:\
+    \ dict) -> Order:\n        # Step 1: Write to database\n        order = Order(**order_data)\n        self.db.add(order)\n\
+    \        await self.db.commit()\n\n        # Step 2: Publish event\n        await self.broker.publish(\"order.created\"\
+    , order.to_dict())\n        # PROBLEM 1: If broker.publish() fails, event is lost. DB has the order, but\n        # billing/notifications\
+    \ never learn about it.\n        # PROBLEM 2: If the process crashes between step 1 and step 2, same result.\n       \
+    \ # PROBLEM 3: If broker.publish() succeeds but is slow, and we retry,\n        # we publish duplicate events.\n"
+  sources: ["https://microservices.io/patterns/data/transactional-outbox.html"]
+  when_applies: "When ensuring atomic event publishing alongside database writes in microservices"
+- id: CR-DIST-CIRCUIT-001
+  text: Circuit Breaker — Wrap remote calls in a circuit breaker to fail fast when a dependency is down, preventing cascading
+    failures.
+  why: When a downstream service is down, every request to it times out (e.g., 30 seconds). If your service handles 100 requests/second
+    and each waits 30s for the dead dependency, you accumulate 3000 pending connections in 30 seconds, exhausting your connection
+    pool and thread pool. Now YOUR service is down too — cascading failure. A circuit breaker detects repeated failures, 'opens'
+    the circuit, and immediately returns errors without calling the dependency. This protects your service and gives the dependency
+    time to recover. Netflix's Hystrix library prevented cascading failures across hundreds of microservices.
+  how_to_do_right: '1. Three states: CLOSED (normal, requests pass through), OPEN (fail fast, no requests sent), HALF-OPEN
+    (test with one request).
+
+    2. Transition CLOSED → OPEN: when failure_count exceeds threshold (e.g., 5 failures in 10 seconds).
+
+    3. Transition OPEN → HALF-OPEN: after a timeout period (e.g., 30 seconds).
+
+    4. Transition HALF-OPEN → CLOSED: if the test request succeeds. HALF-OPEN → OPEN: if it fails.
+
+    5. Define fallback behavior: return cached data, default value, or a meaningful error.
+
+    6. Monitor circuit breaker state changes — frequent OPEN states indicate a systemic problem.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python]
+    library: [pybreaker, resilience4j, hystrix]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, microservices]
+  example_good: "from enum import Enum\nfrom datetime import datetime, timedelta\n\nclass CircuitState(Enum):\n    CLOSED\
+    \ = \"closed\"\n    OPEN = \"open\"\n    HALF_OPEN = \"half_open\"\n\nclass CircuitBreaker:\n    def __init__(self, failure_threshold:\
+    \ int = 5, recovery_timeout: int = 30):\n        self.failure_threshold = failure_threshold\n        self.recovery_timeout\
+    \ = timedelta(seconds=recovery_timeout)\n        self.state = CircuitState.CLOSED\n        self.failure_count = 0\n  \
+    \      self.last_failure_time: datetime | None = None\n\n    async def call(self, func, *args, fallback=None, **kwargs):\n\
+    \        if self.state == CircuitState.OPEN:\n            if datetime.utcnow() - self.last_failure_time > self.recovery_timeout:\n\
+    \                self.state = CircuitState.HALF_OPEN\n            else:\n                if fallback:\n              \
+    \      return await fallback()\n                raise CircuitOpenError(\"Circuit breaker is OPEN\")\n\n        try:\n\
+    \            result = await func(*args, **kwargs)\n            if self.state == CircuitState.HALF_OPEN:\n            \
+    \    self.state = CircuitState.CLOSED\n                self.failure_count = 0\n            return result\n        except\
+    \ Exception as e:\n            self.failure_count += 1\n            self.last_failure_time = datetime.utcnow()\n     \
+    \       if self.failure_count >= self.failure_threshold:\n                self.state = CircuitState.OPEN\n           \
+    \ raise\n\n# Usage\npayment_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30)\n\nasync def charge_with_fallback(order):\n\
+    \    return await payment_breaker.call(\n        payment_service.charge, order,\n        fallback=lambda: PendingCharge(order.id,\
+    \ \"queued\"),\n    )\n"
+  example_bad: "# No circuit breaker — cascading failure\nasync def process_order(order: Order):\n    # If payment_service\
+    \ is down, this blocks for 30 seconds (timeout)\n    result = await payment_service.charge(order)\n    # 100 requests/second\
+    \ × 30s timeout = 3000 blocked threads\n    # Thread pool exhausted → YOUR service stops responding\n    # Now orders\
+    \ service, notifications service, and analytics service all fail\n    # because they all depend on YOUR service → full\
+    \ system outage\n"
+  sources: ["https://martinfowler.com/bliki/CircuitBreaker.html"]
+  when_applies: "When calling unreliable external services that may cause cascading failures"
+- id: CR-DIST-BULKHEAD-001
+  text: Bulkhead Pattern — Isolate critical resources (thread pools, connection pools, memory) per dependency to prevent one
+    failing dependency from exhausting shared resources.
+  why: If all HTTP requests share a single thread pool and one downstream service is slow, slow requests consume all threads
+    waiting for that service, leaving no threads for requests to healthy services. The bulkhead pattern (named after ship
+    compartments that prevent the whole ship from sinking) gives each dependency its own isolated resource pool. When the
+    payment service is slow, only the payment thread pool fills up — the inventory and user service threads are unaffected.
+    Amazon isolates thread pools per dependency in their service mesh, preventing localized failures from becoming system-wide
+    outages.
+  how_to_do_right: '1. Separate thread/connection pools per downstream dependency.
+
+    2. Size each pool based on the dependency''s expected latency and throughput.
+
+    3. When a pool is exhausted, reject requests immediately (fail fast) instead of queuing indefinitely.
+
+    4. Combine with circuit breakers: pool exhaustion triggers the circuit breaker.
+
+    5. Monitor pool utilization per dependency — high utilization indicates the dependency is slow.
+
+    6. Configure timeouts per pool: fast dependencies get short timeouts, slow dependencies get longer ones.
+
+    '
+  severity: high
+  technologies:
+    lang: [python, java, asyncio]
+    library: [threadpoolexecutor]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, microservices]
+  example_good: "from concurrent.futures import ThreadPoolExecutor\nimport asyncio\n\nclass BulkheadedClient:\n    \"\"\"\
+    Each dependency gets its own isolated thread pool.\"\"\"\n\n    def __init__(self):\n        # Payment service: slow (1-5s),\
+    \ small pool\n        self.payment_pool = ThreadPoolExecutor(max_workers=10, thread_name_prefix=\"payment\")\n       \
+    \ # Inventory service: fast (50ms), larger pool\n        self.inventory_pool = ThreadPoolExecutor(max_workers=50, thread_name_prefix=\"\
+    inventory\")\n        # User service: medium (200ms), medium pool\n        self.user_pool = ThreadPoolExecutor(max_workers=20,\
+    \ thread_name_prefix=\"user\")\n\n    async def charge_payment(self, order: Order):\n        \"\"\"Uses payment pool —\
+    \ cannot starve inventory or user pools.\"\"\"\n        loop = asyncio.get_event_loop()\n        return await asyncio.wait_for(\n\
+    \            loop.run_in_executor(self.payment_pool, payment_client.charge, order),\n            timeout=5.0,\n      \
+    \  )\n\n    async def check_inventory(self, items: list):\n        \"\"\"Uses inventory pool — isolated from payment failures.\"\
+    \"\"\n        loop = asyncio.get_event_loop()\n        return await asyncio.wait_for(\n            loop.run_in_executor(self.inventory_pool,\
+    \ inventory_client.check, items),\n            timeout=1.0,\n        )\n"
+  example_bad: "# Shared thread pool for ALL dependencies\nshared_pool = ThreadPoolExecutor(max_workers=50)\n\nasync def process_order(order):\n\
+    \    # All three use the SAME pool\n    payment = await loop.run_in_executor(shared_pool, payment_client.charge, order)\n\
+    \    inventory = await loop.run_in_executor(shared_pool, inventory_client.check, order.items)\n    user = await loop.run_in_executor(shared_pool,\
+    \ user_client.get, order.user_id)\n\n    # If payment_service is slow (5s per request), 50 threads fill up with payment\
+    \ calls\n    # Now inventory and user calls ALSO fail — no threads available\n    # One slow dependency takes down ALL\
+    \ functionality\n"
+  sources: ["https://learn.microsoft.com/en-us/azure/architecture/patterns/bulkhead"]
+  when_applies: "When isolating failure domains to prevent one slow dependency from blocking all requests"
+- id: CR-DIST-PARTITION-001
+  text: Network Partition Handling — Design for network partitions by detecting split-brain scenarios and choosing a deterministic
+    resolution strategy.
+  why: 'Network partitions cause nodes to be unable to communicate with each other while still being individually functional.
+    The most dangerous result is split-brain: two groups of nodes both believe they are the authoritative cluster and accept
+    conflicting writes. When the partition heals, conflicting data must be resolved. Without explicit handling, you get data
+    loss, duplicate records, or corrupted state. A Redis Cluster without proper sentinel configuration experienced a split-brain
+    where both partitions accepted writes for 45 minutes, resulting in 12,000 conflicting keys that required manual reconciliation.'
+  how_to_do_right: '1. Detect partitions: nodes that cannot reach a majority quorum should stop accepting writes.
+
+    2. Quorum-based: only the partition with a majority of nodes (>N/2) continues operating.
+
+    3. Minority partition behavior: reject writes, serve stale reads with warnings, or shut down.
+
+    4. Use a witness/tiebreaker node in a third availability zone to break ties.
+
+    5. After partition heals: reconcile divergent state (last-writer-wins, merge, or manual review).
+
+    6. Test partition handling: use tc (traffic control) or Chaos Monkey to simulate network splits.
+
+    '
+  severity: critical
+  technologies:
+    library: [zookeeper]
+    platform: [redis, postgresql, etcd, consul]
+  domains:
+    domain: [architecture, reliability, infrastructure]
+    concern: [distributed_systems, networking]
+  example_good: "class PartitionAwareNode:\n    \"\"\"Node that detects partitions and degrades gracefully.\"\"\"\n\n    def\
+    \ __init__(self, cluster_size: int):\n        self.cluster_size = cluster_size\n        self.quorum = (cluster_size //\
+    \ 2) + 1\n        self.reachable_peers: set[str] = set()\n\n    def update_reachable_peers(self, peers: set[str]):\n \
+    \       self.reachable_peers = peers\n        if len(self.reachable_peers) + 1 < self.quorum:  # +1 for self\n       \
+    \     self.mode = \"read-only\"\n            logger.warning(\n                f\"Partition detected: {len(self.reachable_peers)+1}/{self.cluster_size}\
+    \ \"\n                f\"nodes reachable (need {self.quorum} for quorum). Entering read-only mode.\"\n            )\n\
+    \        else:\n            self.mode = \"read-write\"\n\n    def write(self, key: str, value: Any):\n        if self.mode\
+    \ == \"read-only\":\n            raise PartitionError(\n                \"Cannot accept writes — not enough nodes for\
+    \ quorum. \"\n                \"This prevents split-brain data corruption.\"\n            )\n        return self._replicated_write(key,\
+    \ value)\n"
+  example_bad: "class UnsafeNode:\n    def write(self, key: str, value: Any):\n        # No partition detection — always accepts\
+    \ writes\n        self.local_store[key] = value\n        try:\n            self.replicate_to_peers(key, value)\n     \
+    \   except ConnectionError:\n            pass  # Silently ignore replication failure\n        # Split-brain scenario:\n\
+    \        # Partition A: nodes 1,2 — both accept writes\n        # Partition B: nodes 3,4,5 — all accept writes\n     \
+    \   # When partition heals: conflicting values for same keys\n        # Data loss or corruption is inevitable\n"
+  sources: ["https://www.cs.cornell.edu/courses/cs6410/2018fa/slides/18-cap.pdf", "https://en.wikipedia.org/wiki/CAP_theorem"]
+  when_applies: "When designing systems that must handle network partitions and choose between consistency and availability"
+- id: CR-DIST-QUORUM-001
+  text: Quorum Reads/Writes — In leaderless replication, use quorum (W + R > N) to guarantee reading the most recent write,
+    where W = write replicas, R = read replicas, N = total replicas.
+  why: 'In a leaderless system with N=3 replicas, if you write to only 1 replica (W=1) and read from only 1 replica (R=1),
+    you might read from the replica that did not receive the write — stale data. With W=2, R=2 (W+R=4 > N=3), at least one
+    replica in your read set must have the latest write. The tradeoff: higher W = slower writes but faster consistent reads;
+    higher R = slower reads but faster writes. DynamoDB, Cassandra, and Riak all support tunable quorum. A social media app
+    set W=1, R=1 for speed and users constantly saw their own posts disappear and reappear.'
+  how_to_do_right: '1. Strong consistency: W + R > N. For N=3: W=2, R=2 (most common) or W=3, R=1.
+
+    2. High write availability: W=1, R=N. Writes are fast (one replica enough), reads are slow (must check all).
+
+    3. High read availability: W=N, R=1. Writes are slow (all replicas), reads are fast (any replica).
+
+    4. Sloppy quorum: during partition, write to any N reachable nodes (not necessarily the designated replicas). Increases
+    availability, reduces consistency.
+
+    5. Read repair: when a read detects stale data on a replica, update it in the background.
+
+    6. Anti-entropy: background process periodically compares replicas and repairs inconsistencies.
+
+    '
+  severity: high
+  technologies:
+    library: [riak, scylla]
+    platform: [cassandra, dynamodb]
+  domains:
+    domain: [architecture]
+    concern: [distributed_systems, consistency, data, database]
+  example_good: "# Cassandra with tunable consistency\nfrom cassandra.cluster import Cluster\nfrom cassandra import ConsistencyLevel\n\
+    \nclass UserProfileStore:\n    def __init__(self):\n        self.cluster = Cluster([\"node1\", \"node2\", \"node3\"])\n\
+    \        self.session = self.cluster.connect(\"myapp\")\n\n    def write_profile(self, user_id: str, data: dict):\n  \
+    \      \"\"\"Write with QUORUM (W=2 for RF=3) — guaranteed durable.\"\"\"\n        stmt = self.session.prepare(\n    \
+    \        \"INSERT INTO profiles (user_id, data) VALUES (?, ?)\"\n        )\n        stmt.consistency_level = ConsistencyLevel.QUORUM\
+    \  # W=2 of 3\n        self.session.execute(stmt, [user_id, json.dumps(data)])\n\n    def read_profile(self, user_id:\
+    \ str) -> dict:\n        \"\"\"Read with QUORUM (R=2 for RF=3) — W+R=4 > N=3, guaranteed fresh.\"\"\"\n        stmt =\
+    \ self.session.prepare(\n            \"SELECT data FROM profiles WHERE user_id = ?\"\n        )\n        stmt.consistency_level\
+    \ = ConsistencyLevel.QUORUM  # R=2 of 3\n        row = self.session.execute(stmt, [user_id]).one()\n        return json.loads(row.data)\
+    \ if row else None\n\n    def read_analytics(self, user_id: str) -> dict:\n        \"\"\"Read with ONE for analytics —\
+    \ stale is OK, speed matters.\"\"\"\n        stmt = self.session.prepare(\n            \"SELECT data FROM profiles WHERE\
+    \ user_id = ?\"\n        )\n        stmt.consistency_level = ConsistencyLevel.ONE  # R=1, fast but may be stale\n    \
+    \    row = self.session.execute(stmt, [user_id]).one()\n        return json.loads(row.data) if row else None\n"
+  example_bad: "# W=1, R=1 with N=3 — no consistency guarantee\ndef write_profile(user_id, data):\n    stmt.consistency_level\
+    \ = ConsistencyLevel.ONE  # W=1\n    session.execute(stmt, [user_id, data])\n    # Written to 1 of 3 replicas — might\
+    \ not propagate before read\n\ndef read_profile(user_id):\n    stmt.consistency_level = ConsistencyLevel.ONE  # R=1\n\
+    \    return session.execute(stmt, [user_id]).one()\n    # W+R = 2, which is NOT > N=3\n    # 33% chance of reading from\
+    \ the replica that doesn't have the latest write\n    # Users: \"I just updated my profile and it shows the old data!\"\
+    \n"
+  sources: ["https://martinfowler.com/articles/patterns-of-distributed-systems/quorum.html"]
+  when_applies: "When configuring read and write quorum levels for replicated distributed data stores"
+- id: CR-DIST-RETRY-001
+  text: Retry with Exponential Backoff and Jitter — Retry failed requests with exponentially increasing delays plus random
+    jitter to prevent thundering herd on recovery.
+  why: Immediate retries flood a recovering service with the same requests that caused the failure. Fixed-interval retries
+    synchronize clients, creating periodic load spikes. Exponential backoff spreads retries over time, and jitter (randomness)
+    desynchronizes clients that started retrying at the same time. Without jitter, if 1000 clients all fail at T=0, they all
+    retry at T=1s, then T=2s, then T=4s — synchronized waves that keep the server overwhelmed. AWS recommends exponential
+    backoff with full jitter for all SDK retries.
+  how_to_do_right: '1. Exponential backoff: delay = min(base * 2^attempt, max_delay).
+
+    2. Full jitter: delay = random(0, min(base * 2^attempt, max_delay)). Best for desynchronization.
+
+    3. Decorrelated jitter: delay = random(base, previous_delay * 3). Good alternative.
+
+    4. Max retries: 3-5 for API calls, 10+ for background jobs.
+
+    5. Max delay cap: 30-60 seconds for interactive, 5-10 minutes for background.
+
+    6. Retry only on transient errors (5xx, timeout, connection refused). Never retry 4xx (client error).
+
+    '
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [requests, httpx, aiohttp]
+    library: [tenacity]
+  domains:
+    domain: [architecture, reliability, infrastructure]
+    concern: [distributed_systems, networking]
+  example_good: "import random\nimport asyncio\nfrom httpx import AsyncClient, HTTPStatusError\n\nRETRYABLE_STATUS_CODES =\
+    \ {429, 500, 502, 503, 504}\n\nasync def request_with_backoff(\n    client: AsyncClient,\n    method: str,\n    url: str,\n\
+    \    max_retries: int = 5,\n    base_delay: float = 0.5,\n    max_delay: float = 30.0,\n    **kwargs,\n):\n    for attempt\
+    \ in range(max_retries + 1):\n        try:\n            response = await client.request(method, url, **kwargs)\n     \
+    \       response.raise_for_status()\n            return response\n        except HTTPStatusError as e:\n            if\
+    \ e.response.status_code not in RETRYABLE_STATUS_CODES:\n                raise  # 4xx errors are not retryable\n     \
+    \       if attempt == max_retries:\n                raise\n            # Full jitter exponential backoff\n           \
+    \ delay = random.uniform(0, min(base_delay * (2 ** attempt), max_delay))\n            # Respect Retry-After header if\
+    \ present\n            retry_after = e.response.headers.get(\"Retry-After\")\n            if retry_after:\n          \
+    \      delay = max(delay, float(retry_after))\n            await asyncio.sleep(delay)\n        except (ConnectionError,\
+    \ TimeoutError):\n            if attempt == max_retries:\n                raise\n            delay = random.uniform(0,\
+    \ min(base_delay * (2 ** attempt), max_delay))\n            await asyncio.sleep(delay)\n"
+  example_bad: "# Immediate retry with no backoff — hammers the server\nasync def request_with_retry(client, url, max_retries=10):\n\
+    \    for attempt in range(max_retries):\n        try:\n            response = await client.get(url)\n            response.raise_for_status()\n\
+    \            return response\n        except Exception:\n            pass  # Retry immediately — no delay, no backoff\n\
+    \    # 1000 clients × 10 retries × 0 delay = 10,000 requests per second\n    # The recovering server never gets a chance\
+    \ to stabilize\n\n# Fixed interval retry — synchronized thundering herd\nasync def request_with_fixed_retry(client, url):\n\
+    \    for attempt in range(5):\n        try:\n            return await client.get(url)\n        except Exception:\n   \
+    \         await asyncio.sleep(1.0)  # All clients retry at exactly the same interval\n            # T=0: 1000 requests\
+    \ fail\n            # T=1: 1000 retries arrive simultaneously\n            # T=2: 1000 retries arrive simultaneously (same\
+    \ wave)\n"
+  sources: ["https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/"]
+  when_applies: "When retrying failed operations in distributed systems with multiple concurrent clients"
+- id: CR-DIST-TIMEOUT-001
+  text: Timeout Budgets — Set timeouts at every layer (connection, request, total operation) and propagate deadline context
+    across service calls to prevent hanging requests.
+  why: 'A request without a timeout can block forever if the downstream service hangs (no response, no error). This ties up
+    a thread, a connection, and memory indefinitely. Worse, cascading timeouts occur when Service A calls B calls C: if C
+    is slow, B waits, A waits, and the user gets no response for 2 minutes. Timeout budgets propagate a deadline from the
+    edge: if the user''s request has a 5-second budget, and 2 seconds are spent in Service A, only 3 seconds remain for Service
+    B. This prevents the total wait from exceeding the user-facing timeout.'
+  how_to_do_right: '1. Set three timeouts: connect_timeout (TCP handshake, 1-3s), read_timeout (response, 5-30s), total_timeout
+    (end-to-end, 30-60s).
+
+    2. Propagate deadline: pass remaining budget as a header (e.g., X-Request-Deadline or gRPC deadline).
+
+    3. Each service checks remaining budget before calling downstream — if budget is exhausted, fail fast.
+
+    4. User-facing services: total timeout = 5-10 seconds. Background jobs: total timeout = 5-10 minutes.
+
+    5. Always set timeouts on: HTTP clients, database connections, cache lookups, file I/O, external APIs.
+
+    6. Log timeout events with context (which service, which endpoint, elapsed time) for debugging.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python, asyncio]
+    framework: [httpx, aiohttp]
+    platform: [grpc]
+  domains:
+    domain: [architecture, reliability, performance]
+    concern: [distributed_systems]
+  example_good: "import time\nfrom dataclasses import dataclass\n\n@dataclass\nclass DeadlineContext:\n    \"\"\"Propagates\
+    \ timeout budget across service calls.\"\"\"\n    deadline: float  # Unix timestamp when the request budget expires\n\n\
+    \    @classmethod\n    def from_budget(cls, budget_seconds: float) -> \"DeadlineContext\":\n        return cls(deadline=time.time()\
+    \ + budget_seconds)\n\n    @property\n    def remaining(self) -> float:\n        return max(0, self.deadline - time.time())\n\
+    \n    @property\n    def expired(self) -> bool:\n        return time.time() >= self.deadline\n\nasync def handle_request(request):\n\
+    \    # Start with 5-second budget for the entire request\n    ctx = DeadlineContext.from_budget(5.0)\n\n    # Service\
+    \ A: 2 seconds used\n    user = await user_service.get(\n        request.user_id,\n        timeout=min(2.0, ctx.remaining),\
+    \  # Cap at remaining budget\n    )\n\n    if ctx.expired:\n        raise TimeoutError(\"Request budget exhausted after\
+    \ user lookup\")\n\n    # Service B: only 3 seconds remaining\n    orders = await order_service.list(\n        user.id,\n\
+    \        timeout=min(3.0, ctx.remaining),  # Uses remaining budget\n    )\n\n    return {\"user\": user, \"orders\": orders}\n"
+  example_bad: "async def handle_request(request):\n    # No timeouts — each call can block indefinitely\n    user = await\
+    \ user_service.get(request.user_id)        # Could hang for 2 minutes\n    orders = await order_service.list(user.id)\
+    \             # Could hang for 2 more minutes\n    recommendations = await rec_service.get(user.id)       # Could hang\
+    \ for 2 more minutes\n    # Total wait: potentially 6+ minutes for a web request\n    # User sees a loading spinner until\
+    \ their browser times out at 60 seconds\n    # Server thread is tied up for the entire duration\n    return {\"user\"\
+    : user, \"orders\": orders, \"recs\": recommendations}\n"
+  sources: ["https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/"]
+  when_applies: "When setting timeouts for cross-service calls in latency-sensitive distributed architectures"
+- id: CR-DIST-TRACE-001
+  text: Distributed Tracing — Propagate trace context (trace_id, span_id, parent_id) across all service boundaries to enable
+    end-to-end request tracing.
+  why: 'In a microservices architecture, a single user request might traverse 5-15 services. When that request is slow or
+    fails, you need to know WHICH service caused the problem. Without distributed tracing, debugging is like finding a needle
+    in a haystack: you have logs from 15 services with no way to correlate them. Distributed tracing creates a tree of spans
+    (one per service call) linked by a trace ID. You can see the entire request lifecycle: Service A (20ms) → Service B (150ms)
+    → Service C (2000ms) → found the bottleneck. Google''s Dapper paper pioneered this; now OpenTelemetry is the industry
+    standard.'
+  how_to_do_right: '1. Use OpenTelemetry (OTEL) for instrumentation — vendor-neutral, industry standard.
+
+    2. Auto-instrument HTTP clients/servers, database drivers, and message consumers.
+
+    3. Propagate context via W3C Trace Context headers (traceparent, tracestate).
+
+    4. Add meaningful span attributes: user_id, order_id, payment_method, error type.
+
+    5. Set sampling rate based on traffic volume: 100% for development, 1-10% for production.
+
+    6. Export to a tracing backend: Jaeger, Zipkin, Tempo, Datadog, or Langfuse (for LLM traces).
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    library: [langfuse]
+    platform: [opentelemetry, jaeger, zipkin]
+  domains:
+    domain: [architecture, observability, quality]
+    concern: [distributed_systems, debugging]
+  example_good: "from opentelemetry import trace\nfrom opentelemetry.sdk.trace import TracerProvider\nfrom opentelemetry.sdk.trace.export\
+    \ import BatchSpanProcessor\nfrom opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter\nfrom\
+    \ opentelemetry.instrumentation.fastapi import FastAPIInstrumentor\nfrom opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor\n\
+    from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor\n\n# Setup — once at application startup\n\
+    provider = TracerProvider()\nprovider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))\ntrace.set_tracer_provider(provider)\n\
+    \n# Auto-instrument frameworks (propagates context automatically)\nFastAPIInstrumentor.instrument_app(app)\nHTTPXClientInstrumentor().instrument()\n\
+    SQLAlchemyInstrumentor().instrument(engine=db_engine)\n\n# Custom spans for business logic\ntracer = trace.get_tracer(\"\
+    order-service\")\n\nasync def process_order(order: Order):\n    with tracer.start_as_current_span(\"process_order\") as\
+    \ span:\n        span.set_attribute(\"order.id\", order.id)\n        span.set_attribute(\"order.total\", float(order.total))\n\
+    \        span.set_attribute(\"order.item_count\", len(order.items))\n\n        with tracer.start_as_current_span(\"validate_inventory\"\
+    ):\n            await inventory_service.check(order.items)\n\n        with tracer.start_as_current_span(\"charge_payment\"\
+    ):\n            await payment_service.charge(order)\n"
+  example_bad: "# No tracing — debugging distributed issues is guesswork\nasync def process_order(order):\n    logger.info(f\"\
+    Processing order {order.id}\")\n    await inventory_service.check(order.items)   # Which service is slow?\n    await payment_service.charge(order)\
+    \            # No way to know without tracing\n    await notification_service.send(order)         # Each service logs\
+    \ independently\n    logger.info(f\"Order {order.id} processed\")\n    # When order processing takes 30 seconds instead\
+    \ of 2:\n    # Check logs of 5 services, grep for order ID, manually correlate timestamps\n    # \"I think it was the\
+    \ payment service because the timestamp gap is big\"\n"
+  sources: ["https://opentelemetry.io/docs/concepts/signals/traces/"]
+  when_applies: "When tracing requests end-to-end across multiple services in a distributed system"
+- id: CR-DIST-CORRELID-001
+  text: Correlation IDs — Generate a unique correlation ID at the edge (API gateway/first service) and propagate it through
+    all downstream calls and log entries.
+  why: Even with distributed tracing, you need a human-readable identifier to search logs across all services for a specific
+    request. Trace IDs are 32-character hex strings optimized for tracing backends. Correlation IDs (often the same as trace
+    IDs, but can be user-friendly) appear in every log line, making it possible to grep across services. When a user reports
+    'my order failed at 2:15 PM', you search for the correlation ID from the API gateway log and instantly find all related
+    log entries across all services. Without correlation IDs, you search by timestamp ranges and guess which log entries are
+    related.
+  how_to_do_right: '1. Generate correlation ID at the API gateway or first service: UUID v4 or ULID.
+
+    2. Accept X-Correlation-ID header from clients (for client-side troubleshooting).
+
+    3. Include correlation ID in every log entry using structured logging.
+
+    4. Propagate via HTTP headers (X-Correlation-ID), message metadata, and async job context.
+
+    5. Return the correlation ID in API responses so users can reference it in support tickets.
+
+    6. Store correlation ID in database records for end-to-end audit trails.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, flask, structlog]
+  domains:
+    domain: [architecture, observability, quality]
+    concern: [distributed_systems, debugging]
+  example_good: "import uuid\nimport structlog\nfrom contextvars import ContextVar\nfrom starlette.middleware.base import\
+    \ BaseHTTPMiddleware\n\ncorrelation_id_var: ContextVar[str] = ContextVar(\"correlation_id\", default=\"\")\n\nclass CorrelationMiddleware(BaseHTTPMiddleware):\n\
+    \    async def dispatch(self, request, call_next):\n        # Accept from client or generate new\n        corr_id = request.headers.get(\"\
+    X-Correlation-ID\", str(uuid.uuid4()))\n        correlation_id_var.set(corr_id)\n\n        # Bind to all log entries in\
+    \ this request\n        structlog.contextvars.bind_contextvars(correlation_id=corr_id)\n\n        response = await call_next(request)\n\
+    \        # Return in response for client-side troubleshooting\n        response.headers[\"X-Correlation-ID\"] = corr_id\n\
+    \        return response\n\n# All downstream HTTP calls include the correlation ID\nasync def call_downstream(client:\
+    \ AsyncClient, url: str, **kwargs):\n    corr_id = correlation_id_var.get()\n    headers = kwargs.pop(\"headers\", {})\n\
+    \    headers[\"X-Correlation-ID\"] = corr_id\n    return await client.get(url, headers=headers, **kwargs)\n\n# Every log\
+    \ entry automatically includes correlation_id\nlogger = structlog.get_logger()\nlogger.info(\"order_created\", order_id=\"\
+    abc123\")\n# Output: {\"event\": \"order_created\", \"order_id\": \"abc123\", \"correlation_id\": \"550e8400-...\"}\n"
+  example_bad: "# No correlation ID — logs cannot be correlated across services\nimport logging\nlogger = logging.getLogger(__name__)\n\
+    \nasync def process_order(order):\n    logger.info(f\"Processing order {order.id}\")\n    # Service A log: \"Processing\
+    \ order abc123\" — no correlation ID\n    await payment_service.charge(order)\n    # Service B log: \"Charging $50.00\"\
+    \ — which order? which request?\n    # When 100 orders are processed per second, matching logs is impossible\n"
+  sources: ["https://www.enterpriseintegrationpatterns.com/patterns/messaging/CorrelationIdentifier.html"]
+  when_applies: "When correlating logs and events across services for a single business transaction"
+- id: CR-DIST-CHAOS-001
+  text: Chaos Engineering — Systematically inject controlled failures (network delays, service crashes, disk full) into production
+    to verify resilience before real failures occur.
+  why: 'Testing in staging does not catch all failure modes because staging environments have different traffic patterns,
+    data volumes, and infrastructure configurations than production. Chaos engineering proactively injects failures into production
+    in a controlled manner: kill a random service instance, inject 500ms network latency, fill up a disk, revoke a database
+    connection. If your system degrades gracefully under these conditions, it will handle real failures. Netflix''s Chaos
+    Monkey randomly terminates production instances — this practice helped them maintain 99.99% uptime despite frequent infrastructure
+    failures. Organizations that practice chaos engineering report 60% faster incident resolution because teams have already
+    practiced failure scenarios.'
+  how_to_do_right: '1. Start small: inject one failure type in one service during business hours with the team watching.
+
+    2. Define steady state: what metrics define ''healthy''? (error rate <1%, latency P99 <500ms).
+
+    3. Hypothesize: ''If we kill one instance of service X, error rate should stay below 1%.''
+
+    4. Inject the failure. Observe if steady state is maintained.
+
+    5. If steady state breaks: you found a weakness. Fix it. Then re-run the experiment.
+
+    6. Gradually increase scope: more failure types, more services, automated game days.
+
+    '
+  severity: high
+  technologies:
+    library: [litmus, chaos monkey, gremlin, tc]
+    platform: [kubernetes]
+  domains:
+    domain: [architecture, reliability, testing]
+    concern: [distributed_systems]
+  example_good: "# Chaos experiment definition (Litmus Chaos for Kubernetes)\napiVersion: litmuschaos.io/v1alpha1\nkind: ChaosEngine\n\
+    metadata:\n  name: pod-kill-experiment\nspec:\n  appinfo:\n    appns: production\n    applabel: app=order-service\n  chaosServiceAccount:\
+    \ litmus-admin\n  experiments:\n    - name: pod-delete\n      spec:\n        components:\n          env:\n           \
+    \ - name: TOTAL_CHAOS_DURATION\n              value: '30'              # Kill pods for 30 seconds\n            - name:\
+    \ CHAOS_INTERVAL\n              value: '10'              # Kill one pod every 10 seconds\n            - name: FORCE\n\
+    \              value: 'false'           # Graceful shutdown first\n\n# Automated verification after chaos\n# def verify_steady_state():\n\
+    #     error_rate = prometheus.query(\"rate(http_errors_total[5m])\")\n#     p99_latency = prometheus.query(\"histogram_quantile(0.99,\
+    \ http_duration)\")\n#     assert error_rate < 0.01, f\"Error rate {error_rate} > 1%\"\n#     assert p99_latency < 0.5,\
+    \ f\"P99 latency {p99_latency}s > 500ms\"\n"
+  example_bad: '# "We tested in staging, it works fine"
+
+    # Staging: 3 instances, 10 requests/second, fresh database
+
+    # Production: 50 instances, 10,000 requests/second, 500GB database
+
+    # Failure in production: connection pool exhausted under load
+
+    # This was never caught in staging because staging never had enough load
+
+    # to exhaust the connection pool. First discovered at 3 AM on Black Friday.
+
+    '
+  sources: ["https://principlesofchaos.org/"]
+  when_applies: "When testing system resilience by intentionally injecting failures into production or staging"
+- id: CR-DIST-SERVICEMESH-001
+  text: Service Mesh — Use a sidecar proxy (Envoy/Istio/Linkerd) for cross-cutting concerns (mTLS, retries, circuit breaking,
+    observability) instead of implementing them in every service.
+  why: 'Without a service mesh, every service must implement its own retry logic, circuit breakers, TLS, rate limiting, and
+    tracing propagation. In a polyglot environment (Python, Go, Java services), this means implementing the same patterns
+    in 3 different languages, maintaining 3 different libraries, and hoping they all behave consistently. A service mesh moves
+    these concerns to the infrastructure layer: a sidecar proxy handles retries, mTLS, circuit breaking, and tracing for every
+    service regardless of language. The application code focuses on business logic. Istio and Linkerd are the most deployed
+    service meshes, used by organizations with 50+ microservices.'
+  how_to_do_right: '1. Deploy sidecar proxies (Envoy) alongside each service — all traffic passes through the proxy.
+
+    2. mTLS: automatic encryption between services with certificate rotation.
+
+    3. Retry policies: configured per-route in the mesh, not in application code.
+
+    4. Circuit breaking: configured per-upstream service with failure thresholds.
+
+    5. Observability: automatic distributed tracing, metrics, and access logging.
+
+    6. Start with Linkerd (simpler) or Istio (more features). Migrate incrementally.
+
+    '
+  severity: medium
+  technologies:
+    platform: [service_mesh, istio, linkerd, envoy, kubernetes]
+  domains:
+    domain: [architecture, infrastructure]
+    concern: [distributed_systems, networking]
+  example_good: "# Istio VirtualService — retry and timeout configuration in infrastructure, not code\napiVersion: networking.istio.io/v1beta1\n\
+    kind: VirtualService\nmetadata:\n  name: order-service\nspec:\n  hosts:\n    - order-service\n  http:\n    - route:\n\
+    \        - destination:\n            host: order-service\n            port:\n              number: 8080\n      retries:\n\
+    \        attempts: 3\n        perTryTimeout: 2s\n        retryOn: 5xx,reset,connect-failure\n      timeout: 10s\n\n# DestinationRule\
+    \ — circuit breaking\napiVersion: networking.istio.io/v1beta1\nkind: DestinationRule\nmetadata:\n  name: order-service\n\
+    spec:\n  host: order-service\n  trafficPolicy:\n    connectionPool:\n      tcp:\n        maxConnections: 100\n      http:\n\
+    \        h2UpgradePolicy: DEFAULT\n        http1MaxPendingRequests: 100\n        http2MaxRequests: 1000\n    outlierDetection:\n\
+    \      consecutive5xxErrors: 5\n      interval: 10s\n      baseEjectionTime: 30s\n\n# Application code: ZERO retry/circuit\
+    \ breaker logic needed\n# @app.get(\"/orders\")\n# async def list_orders():\n#     return await order_repository.list()\n\
+    #     # Retries, timeouts, mTLS, tracing — ALL handled by the mesh\n"
+  example_bad: "# Every service implements its own cross-cutting concerns\n# Python service: custom retry decorator\n@retry(max_attempts=3,\
+    \ backoff=exponential(base=1))\nasync def call_payment_service(order):\n    async with httpx.AsyncClient(verify=\"/path/to/cert.pem\"\
+    ) as client:\n        return await client.post(PAYMENT_URL, json=order.dict(), timeout=5)\n\n# Go service: completely\
+    \ different retry implementation\n# func callPaymentService(order Order) error {\n#     for i := 0; i < 3; i++ {\n#  \
+    \       resp, err := http.Post(paymentURL, \"application/json\", ...)\n#         if err == nil { return nil }\n#     \
+    \    time.Sleep(time.Duration(math.Pow(2, float64(i))) * time.Second)\n#     }\n# }\n\n# Java service: yet another implementation\
+    \ with different behavior\n# 3 languages × 5 cross-cutting concerns = 15 implementations to maintain\n"
+  sources: ["https://istio.io/latest/docs/overview/what-is-istio/"]
+  when_applies: "When managing cross-cutting concerns like mTLS, retries, and observability across many microservices"
+- id: CR-DIST-APIGATEWAY-001
+  text: API Gateway — Use an API gateway as the single entry point for external clients, handling authentication, rate limiting,
+    request routing, and API composition.
+  why: 'Without an API gateway, external clients must know the addresses of individual microservices, handle authentication
+    with each service, and make multiple calls for a single page load (the API composition problem). An API gateway provides
+    a unified interface: one domain, one auth check, one rate limiter, and the ability to aggregate responses from multiple
+    backend services into a single response. This simplifies client development, centralizes security, and enables backend
+    services to be restructured without breaking client contracts. Every major cloud provider (AWS API Gateway, GCP Apigee,
+    Azure API Management) and open-source option (Kong, Ambassador) provides this pattern.'
+  how_to_do_right: '1. Single entry point: all external traffic goes through the gateway. Internal service-to-service traffic
+    bypasses it.
+
+    2. Authentication: validate tokens at the gateway. Backend services receive a verified user context header.
+
+    3. Rate limiting: enforce per-client limits at the gateway to protect all backend services.
+
+    4. Request routing: route /api/v1/orders to order-service, /api/v1/users to user-service.
+
+    5. API composition: aggregate responses from multiple services into one response for mobile clients.
+
+    6. Keep the gateway thin: routing, auth, rate limiting only. No business logic in the gateway.
+
+    '
+  severity: high
+  technologies:
+    library: [aws api gateway, ambassador]
+    platform: [kong, nginx, envoy]
+  domains:
+    domain: [architecture, api]
+    concern: [distributed_systems]
+  example_good: "# Kong API Gateway configuration\n# Route: /api/v1/orders → order-service\nservices:\n  - name: order-service\n\
+    \    url: http://order-service.internal:8080\n    routes:\n      - name: orders-route\n        paths: [\"/api/v1/orders\"\
+    ]\n        methods: [\"GET\", \"POST\", \"PUT\"]\n    plugins:\n      - name: jwt                         # Auth at gateway\n\
+    \        config:\n          claims_to_verify: [\"exp\"]\n      - name: rate-limiting               # Rate limit at gateway\n\
+    \        config:\n          minute: 100\n          policy: redis\n      - name: request-transformer         # Inject user\
+    \ context for backend\n        config:\n          add:\n            headers: [\"X-User-ID:$(jwt.sub)\"]\n\n# Backend service:\
+    \ NO auth logic needed — trusts X-User-ID from gateway\n# @app.get(\"/orders\")\n# async def list_orders(request: Request):\n\
+    #     user_id = request.headers[\"X-User-ID\"]  # Already verified by gateway\n#     return await order_repo.list_by_user(user_id)\n"
+  example_bad: '# No API gateway — clients call services directly
+
+    # Mobile app must:
+
+    # 1. Know the URL of each service (order-service.api.com, user-service.api.com, ...)
+
+    # 2. Authenticate with EACH service separately
+
+    # 3. Make 5 HTTP calls to render one page (user profile + orders + recommendations + ...)
+
+    # 4. Handle different error formats from each service
+
+
+    # Problems:
+
+    # - Rate limiting? Each service implements its own (inconsistently)
+
+    # - Auth? Each service validates tokens (duplicated logic)
+
+    # - Service moved to new URL? All clients must update
+
+    # - Need to aggregate data? Client makes N+1 calls over the network
+
+    '
+  sources: ["https://microservices.io/patterns/apigateway.html"]
+  when_applies: "When routing, authenticating, and rate-limiting external traffic into a microservice architecture"

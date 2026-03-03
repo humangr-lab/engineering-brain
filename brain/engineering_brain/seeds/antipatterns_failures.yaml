@@ -1,0 +1,2904 @@
+layer: rules
+domain: antipattern
+knowledge:
+
+  # ============================================================
+  # Architecture Anti-Patterns (ANTI-FAIL-001 to ANTI-FAIL-010)
+  # ============================================================
+
+  - id: ANTI-FAIL-001
+    text: "We used microservices with 2 developers — distributed systems need distributed teams"
+    why: >
+      Microservices introduce network boundaries, deployment complexity, distributed tracing,
+      contract testing, and eventual consistency. A 2-person team spends 80% of its time on
+      infrastructure instead of product. Netflix has 2,000+ engineers for 700+ microservices.
+      A 2-person team maintaining 12 services means each person owns 6 deployment pipelines,
+      6 monitoring dashboards, 6 sets of health checks, and 66 inter-service communication paths.
+      The operational overhead dwarfs the development velocity gain that microservices promise.
+    how_to_do_right: |
+      1. Start with a well-structured monolith (modular monolith pattern)
+      2. Define clear module boundaries with explicit interfaces (no circular dependencies)
+      3. Extract services only when you have: (a) a team per service, (b) independent deploy cadence, (c) different scaling needs
+      4. Use the "Strangler Fig" pattern to extract gradually, not Big Bang
+      5. Rule of thumb: 1 service per 5-8 engineers minimum
+    severity: high
+    technologies:
+      lang: [python, javascript, java, go]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # Modular monolith — clear boundaries, single deploy
+      # project/
+      #   orders/         <- module with its own models, services, routes
+      #   payments/       <- separate module, communicates via internal API
+      #   users/          <- separate module
+      #   shared/         <- shared kernel (events, value objects)
+      #   main.py         <- single entry point, single deploy
+      from orders.service import OrderService
+      from payments.service import PaymentService
+
+      class CheckoutUseCase:
+          def __init__(self, orders: OrderService, payments: PaymentService):
+              self.orders = orders
+              self.payments = payments
+
+          def execute(self, cart):
+              order = self.orders.create(cart)
+              self.payments.charge(order)  # in-process call, no network
+              return order
+    example_bad: |
+      # 2 devs, 12 microservices, each with its own:
+      # - Docker image, Kubernetes deployment, CI pipeline
+      # - Database, health check, retry policy, circuit breaker
+      # Monday: "order-service can't reach payment-service"
+      # Tuesday: "inventory-service schema migration broke notification-service"
+      # Wednesday: "distributed trace shows 340ms latency for what was a 2ms function call"
+      # Thursday: "spent all day updating 12 Dockerfiles for security patch"
+      # Friday: "deploy failed because service-mesh sidecar OOMed"
+      # Actual velocity: 1 feature per 2 weeks (was 3/week with monolith)
+    when_applies: Architecture decisions, greenfield projects, team scaling discussions
+    sources: ["https://martinfowler.com/bliki/MonolithFirst.html"]
+
+  - id: ANTI-FAIL-002
+    text: "We used distributed transactions (2PC) — it is slow, fragile, and blocks resources. Use sagas instead."
+    why: >
+      Two-Phase Commit (2PC) requires a coordinator to hold locks across multiple databases
+      until all participants agree. If any participant fails or the coordinator crashes between
+      prepare and commit, all participants are blocked holding locks. In practice, 2PC has
+      10-100x higher latency than local transactions, creates deadlock risks across service
+      boundaries, and cannot tolerate network partitions (violates the CAP theorem). The XA
+      protocol implementation in most databases is buggy and poorly tested because so few
+      people use it in production.
+    how_to_do_right: |
+      1. Use the Saga pattern: a sequence of local transactions with compensating actions
+      2. Choreography sagas for simple flows (events between services)
+      3. Orchestration sagas for complex flows (central coordinator, no distributed locks)
+      4. Design compensating transactions for every step (e.g., refund payment if shipping fails)
+      5. Use idempotency keys to handle retries safely
+      6. Accept eventual consistency — most business processes are already eventually consistent
+    severity: high
+    technologies:
+      lang: [python, javascript, java]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # Saga pattern — orchestration style
+      class OrderSaga:
+          async def execute(self, order):
+              try:
+                  payment = await self.payment_service.charge(order, idempotency_key=order.id)
+              except PaymentFailed:
+                  await self.order_service.cancel(order.id)
+                  return
+
+              try:
+                  shipment = await self.shipping_service.ship(order)
+              except ShippingFailed:
+                  await self.payment_service.refund(payment.id)  # compensating action
+                  await self.order_service.cancel(order.id)
+                  return
+
+              await self.order_service.complete(order.id)
+    example_bad: |
+      # 2PC distributed transaction — blocks all DBs until commit
+      xa_start('order-db', 'payment-db', 'inventory-db')  # acquire locks on 3 databases
+      order_db.insert(order)       # locked row in order-db
+      payment_db.debit(amount)     # locked row in payment-db
+      inventory_db.decrement(sku)  # locked row in inventory-db
+      xa_prepare()  # ask all 3 if they can commit — if coordinator crashes HERE, all 3 are blocked
+      xa_commit()   # all or nothing — but "nothing" means 3 databases stuck with open locks
+      # Real incident: coordinator OOMed between prepare and commit, 3 databases locked for 47 minutes
+    when_applies: Architecture decisions, multi-service data consistency, payment flows
+    sources: ["https://microservices.io/patterns/data/saga.html"]
+
+  - id: ANTI-FAIL-003
+    text: "We cached everything and a bug took 3 days to find — caching hides the source of truth"
+    why: >
+      Every cache introduces a second copy of data that can diverge from the source of truth.
+      When you cache aggressively, bugs manifest as stale data that is intermittently correct
+      (when cache is fresh) and intermittently wrong (when cache is stale), making reproduction
+      nearly impossible. Cache invalidation is one of the two hard problems in computer science
+      for a reason. Multi-layer caches (CDN + Redis + in-process) create a combinatorial explosion
+      of staleness states. The worst bugs are the ones where the cache is wrong but the system
+      appears to work, silently corrupting data or showing inconsistent views to different users.
+    how_to_do_right: |
+      1. Only cache what you have measured to be slow (profile first)
+      2. Single layer of caching preferred — multi-layer only when proven necessary
+      3. Always set TTLs (never cache forever)
+      4. Use cache-aside pattern: app checks cache, falls back to DB, populates cache
+      5. Implement cache hit/miss metrics from day 1
+      6. Have a "cache bust" admin endpoint for debugging
+      7. Log when serving from cache vs source in development
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # Cache-aside with TTL, metrics, and easy invalidation
+      class UserService:
+          def get_user(self, user_id: str) -> User:
+              cached = self.cache.get(f"user:{user_id}")
+              if cached:
+                  metrics.incr("cache.user.hit")
+                  return cached
+
+              metrics.incr("cache.user.miss")
+              user = self.db.query(User).get(user_id)
+              self.cache.set(f"user:{user_id}", user, ttl=300)  # 5 min TTL
+              return user
+
+          def update_user(self, user_id: str, data: dict) -> User:
+              user = self.db.query(User).get(user_id)
+              user.update(data)
+              self.db.commit()
+              self.cache.delete(f"user:{user_id}")  # explicit invalidation
+              return user
+    example_bad: |
+      # Cache everything, forever, across 3 layers
+      @cache(ttl=None)          # in-process cache, no TTL
+      @redis_cache(ttl=86400)   # Redis, 24h TTL
+      @cdn_cache(ttl=3600)      # CDN, 1h TTL
+      def get_user_profile(user_id):
+          return db.query(User).get(user_id)
+
+      # Bug: user updates email, but:
+      # - CDN serves old version for up to 1 hour
+      # - Redis serves old version for up to 24 hours
+      # - In-process cache serves old version FOREVER (until restart)
+      # - Different servers have different in-process cache states
+      # - QA cannot reproduce: "works on my machine" (their server just restarted)
+      # - 3 days of debugging before someone checks the cache layers
+    when_applies: Architecture decisions, performance optimization, debugging sessions
+    sources: ["https://martinfowler.com/bliki/TwoHardThings.html"]
+
+  - id: ANTI-FAIL-004
+    text: "We premature-optimized and created maintenance hell — profile first, optimize second"
+    why: >
+      Premature optimization distorts code structure around performance assumptions that are
+      often wrong. Donald Knuth's full quote is: "We should forget about small efficiencies,
+      say about 97% of the time: premature optimization is the root of all evil. Yet we should
+      not pass up our opportunities in that critical 3%." The key insight is that you cannot
+      know which 3% matters without profiling. Optimized code is harder to read, harder to
+      modify, and harder to debug. When you optimize without data, you often optimize the wrong
+      thing (e.g., optimizing a function that takes 2ms when the real bottleneck is a 500ms
+      database query).
+    how_to_do_right: |
+      1. Write clear, correct code first
+      2. Measure with profiling tools (cProfile, py-spy, Chrome DevTools, flamegraphs)
+      3. Identify the actual bottleneck (usually I/O, not CPU)
+      4. Optimize only the measured bottleneck
+      5. Benchmark before and after to verify improvement
+      6. Document WHY the optimization exists with a comment
+      7. Keep the simple version as a comment or in git history
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # Step 1: Write it clearly
+      def find_duplicates(items: list[str]) -> list[str]:
+          seen = set()
+          duplicates = []
+          for item in items:
+              if item in seen:
+                  duplicates.append(item)
+              seen.add(item)
+          return duplicates
+
+      # Step 2: Profile shows this function takes 0.3ms — not the bottleneck
+      # Step 3: Profile shows the bottleneck is the DB query (200ms)
+      # Step 4: Optimize the DB query, leave this function alone
+    example_bad: |
+      # "Let's optimize everything before we even have users"
+      def find_duplicates(items):
+          # Hand-rolled bloom filter for O(1) lookup with lower memory
+          # (premature: set() was already O(1) and took 0.3ms for our data size)
+          bit_array = bytearray(1 << 20)
+          hashes = [hashlib.md5, hashlib.sha1, lambda x: mmh3.hash(x)]
+          # ... 47 more lines of bloom filter implementation ...
+          # 6 months later: "Why do we have a bloom filter here?"
+          # "I don't know, but don't touch it, it might break something"
+          # The DB query next to it still takes 200ms, unoptimized
+    when_applies: Architecture decisions, code review, performance discussions
+    sources: ["https://wiki.c2.com/?PrematureOptimization"]
+
+  - id: ANTI-FAIL-005
+    text: "We built the right architecture for a future we never reached — YAGNI applies to architecture too"
+    why: >
+      Speculative architecture builds complexity for hypothetical requirements. If the requirements
+      never materialize, you maintain dead complexity forever. If they do materialize but differently
+      than expected, the pre-built architecture is wrong and must be reworked. Either way, you lose.
+      Architecture should emerge from actual constraints, not imagined ones. The cost of carrying
+      unused architecture is not just the initial build — it is every developer who must understand it,
+      every test that must exercise it, every deployment that must configure it, and every new hire
+      who asks "why is this so complex?" and gets "we might need it someday."
+    how_to_do_right: |
+      1. Build for today's requirements, not next year's hypotheticals
+      2. Make the system easy to change rather than trying to predict changes
+      3. Use the "Three Strikes" rule: build something 3 times before abstracting
+      4. Design for removability: if a component can be removed easily, it is decoupled enough
+      5. Revisit architecture quarterly with actual usage data
+      6. Accept that refactoring is cheaper than carrying unused complexity
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # Build for today: simple payment processing
+      class PaymentService:
+          def __init__(self, stripe_client):
+              self.stripe = stripe_client
+
+          def charge(self, amount: Decimal, currency: str, token: str) -> PaymentResult:
+              return self.stripe.charges.create(
+                  amount=int(amount * 100),
+                  currency=currency,
+                  source=token,
+              )
+      # When (IF) we need a second provider, we add an interface THEN
+      # Total: 1 class, 1 dependency, 5 minutes to understand
+    example_bad: |
+      # "We might need multiple payment providers someday"
+      class PaymentProviderFactory(ABC): ...
+      class PaymentStrategy(ABC): ...
+      class PaymentRouter: ...
+      class PaymentProviderRegistry: ...
+      class PaymentFallbackChain: ...
+      class PaymentProviderHealthCheck: ...
+      class PaymentProviderConfig: ...
+      class StripePaymentProvider(PaymentStrategy): ...
+      # 8 classes, 3 abstractions, 2 patterns — for 1 payment provider
+      # 18 months later: still only using Stripe
+      # But every new developer asks: "What are all these classes for?"
+      # And every Stripe API change requires updating 4 files instead of 1
+    when_applies: Architecture decisions, greenfield projects, feature planning
+    sources: ["https://martinfowler.com/bliki/Yagni.html"]
+
+  - id: ANTI-FAIL-006
+    text: "We built a platform before building a product — build 3 things first, then abstract"
+    why: >
+      Platforms are abstractions over multiple concrete use cases. Without concrete use cases,
+      you are guessing what the abstraction should look like. The result is always wrong because
+      you cannot design a good abstraction from zero examples. Amazon did not start with AWS —
+      they built internal infrastructure for amazon.com, then extracted the platform. Spotify did
+      not start with a platform team — they built 3 squads, noticed common patterns, then
+      extracted the platform. The "build the platform first" approach delays time-to-market by
+      6-18 months while producing an abstraction that does not fit real needs.
+    how_to_do_right: |
+      1. Build the first product/feature directly (no abstractions)
+      2. Build the second product/feature, notice similarities
+      3. Build the third product/feature, now you see the real pattern
+      4. Extract the platform from the three concrete implementations
+      5. The platform should make the EXISTING patterns easier, not enable hypothetical ones
+      6. "Duplication is far cheaper than the wrong abstraction" — Sandi Metz
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # Product 1: built a webhook handler for Stripe
+      # Product 2: built a webhook handler for GitHub
+      # Product 3: built a webhook handler for Slack
+      # NOW extract the pattern:
+      class WebhookPlatform:
+          """Extracted AFTER building 3 webhook handlers.
+          We know exactly what the abstraction needs:
+          - signature verification (each provider is different)
+          - idempotency (all 3 needed it)
+          - retry queue (all 3 needed it)
+          - payload normalization (all 3 had different formats)
+          """
+          def register(self, provider: str, verifier, normalizer): ...
+          def handle(self, request) -> WebhookResult: ...
+    example_bad: |
+      # Month 1-6: "Let's build the Universal Webhook Platform first"
+      # Designed features we IMAGINED we'd need:
+      #   - Plugin system for unlimited providers (used 1)
+      #   - GraphQL API for webhook management (curl was fine)
+      #   - Multi-tenant isolation (single tenant for 2 years)
+      #   - Custom transformation DSL (nobody wanted to learn it)
+      # Month 7: "OK now let's build the actual Stripe integration"
+      # Month 8: "The platform doesn't support Stripe's signature format"
+      # Month 9-12: Reworking the platform to fit reality
+    when_applies: Architecture decisions, platform team formation, startup technical strategy
+    sources: ["https://martinfowler.com/bliki/MonolithFirst.html"]
+
+  - id: ANTI-FAIL-007
+    text: "We used event sourcing for everything — it is overkill for CRUD and adds massive complexity"
+    why: >
+      Event sourcing stores every state change as an immutable event. Reconstructing current state
+      requires replaying all events from the beginning (or using snapshots). This is invaluable
+      for audit trails, temporal queries, and complex domain logic (banking, trading). But for
+      simple CRUD entities (user profiles, settings, blog posts), it adds enormous complexity:
+      event schema evolution, eventual consistency, read model projections, snapshot management,
+      and debugging by replaying event streams. The 95% of your system that is simple CRUD
+      should use simple CRUD storage. Reserve event sourcing for the 5% that genuinely needs it.
+    how_to_do_right: |
+      1. Default to simple CRUD with an audit log table
+      2. Use event sourcing ONLY for aggregates with complex state transitions
+      3. Good candidates: financial transactions, order lifecycles, document workflows
+      4. Bad candidates: user profiles, settings, tags, comments, notifications
+      5. If you need event sourcing, limit it to one bounded context, not the entire system
+      6. Consider "event-driven" (publish events) without "event sourcing" (store events as source of truth)
+    severity: high
+    technologies:
+      lang: [python, javascript, java]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # Simple CRUD for user profile (no event sourcing needed)
+      class UserProfile(Model):
+          name = CharField(max_length=100)
+          email = EmailField()
+          updated_at = DateTimeField(auto_now=True)
+
+      # Event sourcing ONLY for financial transactions (genuinely needs it)
+      class AccountAggregate:
+          def apply(self, event: AccountEvent):
+              match event:
+                  case MoneyDeposited(amount): self.balance += amount
+                  case MoneyWithdrawn(amount): self.balance -= amount
+                  case AccountFrozen():        self.frozen = True
+    example_bad: |
+      # Event sourcing for... user profile updates
+      class UserProfileEvents:
+          UserNameChanged = Event("name_changed", {"old_name": str, "new_name": str})
+          UserEmailChanged = Event("email_changed", {"old_email": str, "new_email": str})
+          UserAvatarChanged = Event("avatar_changed", {"old_url": str, "new_url": str})
+
+      # To display a user profile, replay ALL events since account creation:
+      events = event_store.get_events("user-42")  # 3,847 events over 2 years
+      profile = UserProfile()
+      for event in events:  # replay all 3,847 events
+          profile.apply(event)
+      # "Why is the profile page taking 800ms?"
+      # "Because user-42 changed their avatar 3,200 times"
+    when_applies: Architecture decisions, data storage strategy, system design
+    sources: ["https://martinfowler.com/eaaDev/EventSourcing.html"]
+
+  - id: ANTI-FAIL-008
+    text: "We had 47 microservices with no service mesh or observability — distributed debugging nightmare"
+    why: >
+      Microservices without observability is like driving blindfolded at 100mph. When a request
+      traverses 12 services and fails, you need distributed tracing to know WHERE it failed.
+      When latency spikes, you need per-service metrics to know WHICH service is slow. When a
+      service is overloaded, you need a service mesh for circuit breaking and load shedding.
+      Without these, every incident becomes "check the logs of all 47 services." Teams spend
+      days debugging issues that distributed tracing would locate in seconds. The operational
+      cost of unobservable microservices grows quadratically with the number of services.
+    how_to_do_right: |
+      1. Before deploying the 2nd microservice, set up: distributed tracing (Jaeger/Zipkin), centralized logging (ELK/Loki), metrics (Prometheus/Datadog)
+      2. Every request gets a correlation ID that propagates across all services
+      3. Every service emits: latency histograms, error rates, saturation metrics (RED method)
+      4. Set up alerting on SLOs, not individual metrics
+      5. Consider a service mesh (Istio/Linkerd) once you exceed 10 services
+      6. Create a service catalog/dependency map and keep it updated
+    severity: high
+    technologies:
+      lang: [python, javascript, go, java]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # Every service: structured logging with correlation ID
+      import structlog
+      logger = structlog.get_logger()
+
+      @app.middleware("http")
+      async def add_correlation_id(request, call_next):
+          correlation_id = request.headers.get("X-Correlation-ID", str(uuid4()))
+          structlog.contextvars.bind_contextvars(correlation_id=correlation_id)
+          response = await call_next(request)
+          response.headers["X-Correlation-ID"] = correlation_id
+          return response
+
+      # Every service: OpenTelemetry tracing
+      from opentelemetry import trace
+      tracer = trace.get_tracer(__name__)
+      with tracer.start_as_current_span("process_order"):
+          # Trace propagates automatically across HTTP calls
+          result = await payment_client.charge(order)
+    example_bad: |
+      # 47 services, each logging to its own stdout
+      # Incident: "User reports order stuck in processing"
+      # Developer 1: ssh into order-service, grep logs — "order sent to payment-service"
+      # Developer 2: ssh into payment-service, grep logs — "payment successful, sent to shipping"
+      # Developer 3: ssh into shipping-service, grep logs — "no matching order found"
+      # Developer 4: ssh into message-queue — "message was delivered to shipping-service-v1, but v2 is running"
+      # Time to diagnose: 6 hours (with tracing: 30 seconds)
+      # print(f"Order {order_id} processed")  # no correlation ID, no trace, no structure
+    when_applies: Architecture decisions, microservices adoption, DevOps planning
+    sources: ["https://opentelemetry.io/docs/concepts/observability-primer/"]
+
+  - id: ANTI-FAIL-009
+    text: "We chose the trendiest tech stack and the hiring pool shrank to zero — boring technology is often the right choice"
+    why: >
+      Trendy technology has a small talent pool, immature tooling, sparse documentation, and
+      unknown failure modes. When the original developers leave, replacements are nearly impossible
+      to find. Boring technology (PostgreSQL, Python, Java, React) has massive talent pools,
+      battle-tested tooling, comprehensive documentation, and well-known failure modes. Dan McKinley's
+      "Choose Boring Technology" principle: every company gets about 3 innovation tokens. Spend them
+      on your core differentiator, not on your database or web framework. The goal is to solve
+      business problems, not to have the most interesting resume.
+    how_to_do_right: |
+      1. Use boring technology by default (PostgreSQL, Redis, Python/Java/Go, React/Vue)
+      2. Reserve innovation tokens (max 3) for genuine competitive advantages
+      3. Evaluate technology on: hiring pool, documentation quality, community size, production track record
+      4. Ask: "Can I hire 5 developers for this stack in my city within 3 months?"
+      5. If you adopt something exotic, contain it to a single service, not the whole stack
+      6. Prototype with exotic tech, ship with proven tech
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # Boring tech stack that ships fast and hires easily:
+      # Backend: Python + FastAPI (or Django)
+      # Database: PostgreSQL
+      # Cache: Redis
+      # Frontend: React + TypeScript
+      # Infra: AWS + Terraform
+      # CI/CD: GitHub Actions
+      #
+      # Innovation token #1: ML model for core product feature (our differentiator)
+      # Innovation token #2: ClickHouse for analytics (genuine need for columnar)
+      # Everything else: boring, proven, hireable
+    example_bad: |
+      # "Let's use the cutting edge!"
+      # Backend: Elixir + Phoenix (cool! hiring pool: 12 people in our city)
+      # Database: CockroachDB (cool! nobody on the team has operated it)
+      # Cache: DragonflyDB (cool! released 6 months ago)
+      # Frontend: Solid.js + Astro (cool! 3 blog posts about it total)
+      # Infra: Fly.io + Pulumi (cool! Terraform has 10x more examples)
+      #
+      # 12 months later:
+      # - 2 of 3 original developers left
+      # - Job posting open for 4 months, 0 qualified candidates
+      # - CockroachDB had a bug, no one on team knew how to debug it
+      # - Stack Overflow has 3 questions about our exact DragonflyDB issue
+    when_applies: Architecture decisions, technology selection, hiring planning
+    sources: ["https://boringtechnology.club/"]
+
+  - id: ANTI-FAIL-010
+    text: "We over-abstracted — 6 layers of indirection to add a button. The AbstractButtonFactoryProvider anti-pattern."
+    why: >
+      Each layer of abstraction adds cognitive overhead for every developer who reads, debugs,
+      or modifies the code. When a junior developer needs to add a button and must navigate
+      through AbstractButtonFactory, ButtonStrategyProvider, ButtonRegistryService,
+      ButtonConfigurationManager, ButtonRenderingPipeline, and ButtonEventDispatcher, something
+      has gone terribly wrong. Abstraction should reduce complexity, not multiply it. The test
+      is simple: can a new team member understand and modify this code within their first week?
+      If not, you have over-abstracted. Every layer of indirection is a potential source of
+      bugs, a barrier to onboarding, and a tax on development velocity.
+    how_to_do_right: |
+      1. Inline first, extract when you see ACTUAL duplication (not hypothetical)
+      2. "A little copying is better than a little dependency" — Go proverbs
+      3. Limit inheritance depth to 2-3 levels maximum
+      4. Prefer composition over inheritance
+      5. If you cannot explain why an abstraction exists without saying "in case we need to," remove it
+      6. Count the number of files a new developer must open to understand a feature — aim for < 5
+    severity: high
+    technologies:
+      lang: [python, javascript, java]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # Direct, readable, debuggable
+      def create_button(label: str, on_click: Callable, style: str = "primary") -> Button:
+          return Button(label=label, on_click=on_click, class_name=f"btn btn-{style}")
+
+      # In the template/component:
+      button = create_button("Submit", handle_submit)
+      # New developer: reads 1 function, understands immediately
+    example_bad: |
+      # Enterprise astronaut edition
+      button = (
+          ButtonFactory.get_instance()
+          .create_builder("submit")
+          .with_strategy(ButtonRenderStrategy.PRIMARY)
+          .with_event_handler(
+              ButtonEventDispatcher.get_instance()
+              .create_handler(EventType.CLICK, handle_submit)
+          )
+          .with_config(
+              ButtonConfigurationManager.load("buttons.submit.config")
+          )
+          .validate(ButtonValidationPipeline.default())
+          .build()
+      )
+      # New developer: opens 8 files, reads 400 lines, still confused
+      # "What does ButtonConfigurationManager.load actually do?"
+      # "It loads a YAML file that maps to a ButtonConfig that feeds into..."
+    when_applies: Architecture decisions, code review, refactoring discussions
+    sources: ["https://refactoring.guru/refactoring/smells"]
+
+  # ============================================================
+  # Data Anti-Patterns (ANTI-FAIL-011 to ANTI-FAIL-020)
+  # ============================================================
+
+  - id: ANTI-FAIL-011
+    text: "We stored money as float and lost $42,000 — 0.1 + 0.2 = 0.30000000000000004. Use Decimal."
+    why: >
+      IEEE 754 floating-point cannot represent most decimal fractions exactly. 0.1 in binary
+      is a repeating fraction (like 1/3 in decimal). When you sum thousands of financial
+      transactions, rounding errors accumulate. A system processing 100,000 transactions/day
+      with an average error of $0.004 per transaction loses $400/day or $146,000/year. This is
+      not theoretical — it has caused real financial losses, regulatory violations, and accounting
+      discrepancies that take weeks to reconcile. Every financial system that stores money as
+      float eventually discovers this bug, usually after significant losses.
+    how_to_do_right: |
+      1. Use Decimal type in your language (Python: decimal.Decimal, Java: BigDecimal, JS: decimal.js)
+      2. Store as integer cents/smallest unit in the database (e.g., $10.50 = 1050)
+      3. Use NUMERIC/DECIMAL column type in PostgreSQL, never FLOAT/DOUBLE
+      4. Define rounding rules explicitly (ROUND_HALF_EVEN for financial, a.k.a. banker's rounding)
+      5. Validate that all arithmetic preserves precision (no implicit float conversion)
+      6. Write tests that verify exact amounts after thousands of operations
+    severity: critical
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      from decimal import Decimal, ROUND_HALF_EVEN
+
+      class Money:
+          def __init__(self, amount: str, currency: str = "USD"):
+              self.amount = Decimal(amount)  # Always from string, never from float
+              self.currency = currency
+
+          def __add__(self, other: "Money") -> "Money":
+              assert self.currency == other.currency
+              return Money(str(self.amount + other.amount), self.currency)
+
+          def to_cents(self) -> int:
+              return int((self.amount * 100).quantize(Decimal("1"), rounding=ROUND_HALF_EVEN))
+
+      # In the database: amount_cents INTEGER NOT NULL
+      # $10.50 stored as 1050 — zero precision loss
+      total = Money("0.1") + Money("0.2")
+      assert str(total.amount) == "0.3"  # Exactly 0.3, not 0.30000000000000004
+    example_bad: |
+      # Storing money as float
+      price = 0.1 + 0.2          # = 0.30000000000000004
+      total = sum(0.01 for _ in range(1000))  # = 9.999999999999831 (not 10.00)
+
+      # In PostgreSQL: amount FLOAT (WRONG!)
+      # After 100,000 transactions:
+      # Expected total: $1,523,847.00
+      # Actual total:   $1,523,805.17
+      # Difference:     $41,982.83 — unreconcilable
+      # Auditor: "Where did $42,000 go?"
+      # Developer: "Floating point..."
+      # Auditor: "That's not an answer the SEC will accept."
+    when_applies: Architecture decisions, code review, technology selection, financial systems
+    sources: ["https://docs.python.org/3/library/decimal.html"]
+
+  - id: ANTI-FAIL-012
+    text: "We built a single god SQL query — 30-second timeouts and impossible to debug. Break into focused queries."
+    why: >
+      A single query with 15 JOINs, 8 subqueries, and 200 lines of SQL is impossible to
+      optimize, debug, or modify safely. The query planner cannot produce a good execution plan
+      for such complexity. When it is slow, you cannot identify which JOIN or subquery is the
+      bottleneck. When requirements change, modifying one part risks breaking the whole query.
+      When it fails, the error message points to line 1 of a 200-line string. Multiple focused
+      queries are individually optimizable, cacheable, testable, and debuggable. The "N+1 query
+      problem" is real, but the solution is not "1 god query" — it is "N+1 focused queries with
+      proper batching."
+    how_to_do_right: |
+      1. Break complex queries into focused, single-purpose queries
+      2. Use CTEs (WITH clauses) for readability when a single query is needed
+      3. Batch related queries (IN clause, bulk fetch) to avoid N+1
+      4. Use EXPLAIN ANALYZE to verify each query's execution plan
+      5. Set query timeouts (e.g., statement_timeout = 5s in PostgreSQL)
+      6. Monitor slow query logs and optimize the top offenders
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # Focused queries, each optimizable and debuggable
+      async def get_dashboard_data(user_id: int) -> DashboardData:
+          user = await db.fetchone("SELECT * FROM users WHERE id = $1", user_id)
+          orders = await db.fetch(
+              "SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10",
+              user_id
+          )
+          order_ids = [o["id"] for o in orders]
+          items = await db.fetch(
+              "SELECT * FROM order_items WHERE order_id = ANY($1)", order_ids  # batch, not N+1
+          )
+          stats = await db.fetchone(
+              "SELECT COUNT(*), SUM(total) FROM orders WHERE user_id = $1", user_id
+          )
+          return DashboardData(user=user, orders=orders, items=items, stats=stats)
+      # 4 simple queries, each < 5ms, total ~20ms, each independently debuggable
+    example_bad: |
+      # The God Query
+      SELECT u.*, o.*, oi.*, p.*, s.*, r.*, c.*, inv.*,
+             (SELECT COUNT(*) FROM reviews WHERE product_id = p.id) as review_count,
+             (SELECT AVG(rating) FROM reviews WHERE product_id = p.id) as avg_rating,
+             (SELECT SUM(quantity) FROM inventory WHERE product_id = p.id) as stock,
+             -- ... 8 more subqueries ...
+      FROM users u
+      JOIN orders o ON o.user_id = u.id
+      JOIN order_items oi ON oi.order_id = o.id
+      JOIN products p ON p.id = oi.product_id
+      JOIN suppliers s ON s.id = p.supplier_id
+      LEFT JOIN returns r ON r.order_item_id = oi.id
+      LEFT JOIN coupons c ON c.id = o.coupon_id
+      LEFT JOIN inventory inv ON inv.product_id = p.id
+      -- ... 7 more JOINs ...
+      WHERE u.id = $1 AND o.status IN ('active', 'pending')
+      GROUP BY u.id, o.id, oi.id, p.id, s.id, r.id, c.id, inv.id
+      ORDER BY o.created_at DESC;
+      -- EXPLAIN ANALYZE: Seq Scan, 30 seconds, 4GB memory
+    when_applies: Architecture decisions, code review, database optimization
+    sources: ["https://www.postgresql.org/docs/current/queries-with.html"]
+
+  - id: ANTI-FAIL-013
+    text: "We had no indexes and blamed the ORM — 1 million rows without an index means a full table scan every query"
+    why: >
+      Without proper indexes, every query performs a sequential scan of the entire table. At
+      1 million rows, a sequential scan reads every single row regardless of the WHERE clause.
+      At 10 million rows, this becomes seconds per query. The ORM is not slow — the database is
+      doing exactly what you told it to do: scan every row because there is no index to guide it.
+      ORMs abstract SQL, but they cannot create indexes for you. The developer must understand
+      which columns are queried, filtered, sorted, and joined, and create indexes accordingly.
+      The most common performance issue in web applications is not the ORM — it is missing indexes.
+    how_to_do_right: |
+      1. Add indexes on every column used in WHERE, JOIN, and ORDER BY clauses
+      2. Use composite indexes for multi-column filters (order matters: most selective first)
+      3. Run EXPLAIN ANALYZE on every query in your critical path
+      4. Monitor pg_stat_user_indexes for unused indexes (remove them)
+      5. Monitor pg_stat_user_tables for seq_scan counts (add indexes for high counts)
+      6. Use partial indexes for filtered queries (WHERE status = 'active')
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # SQLAlchemy model with proper indexes
+      class Order(Base):
+          __tablename__ = "orders"
+          id = Column(BigInteger, primary_key=True)
+          user_id = Column(BigInteger, nullable=False, index=True)  # frequently filtered
+          status = Column(String(20), nullable=False)
+          created_at = Column(DateTime, nullable=False)
+
+          __table_args__ = (
+              Index("idx_orders_user_status", "user_id", "status"),  # composite for common query
+              Index("idx_orders_created_at", "created_at"),  # for ORDER BY
+              Index("idx_orders_active", "user_id", "created_at",
+                    postgresql_where=text("status = 'active'")),  # partial index
+          )
+
+      # EXPLAIN ANALYZE: Index Scan, 0.3ms, reads 15 rows out of 1M
+    example_bad: |
+      # "The ORM is slow"
+      class Order(Base):
+          __tablename__ = "orders"
+          id = Column(BigInteger, primary_key=True)
+          user_id = Column(BigInteger)   # no index
+          status = Column(String(20))     # no index
+          created_at = Column(DateTime)   # no index
+
+      # Query: SELECT * FROM orders WHERE user_id = 42 AND status = 'active' ORDER BY created_at
+      # EXPLAIN ANALYZE: Seq Scan on orders, rows=1000000, actual time=2847ms
+      # Developer: "SQLAlchemy is so slow, we should switch to raw SQL"
+      # DBA: "Add an index."
+      # Developer: *adds index* "Oh. 0.3ms now."
+    when_applies: Architecture decisions, code review, performance debugging
+    sources: ["https://www.postgresql.org/docs/current/indexes.html"]
+
+  - id: ANTI-FAIL-014
+    text: "We went schema-less with MongoDB and ended up with 47 different user document formats — schema-less means schema-in-code"
+    why: >
+      "Schema-less" is a misnomer. Every application has a schema — the question is whether it
+      is enforced by the database or scattered across application code. When the database does
+      not enforce a schema, every piece of code that reads data must handle every possible shape
+      the data might have. Over time, document shapes diverge as different code paths write
+      slightly different structures. After 2 years, you have documents from every version of
+      every code path that ever wrote to the collection. Migrations are impossible because you
+      do not know all the shapes that exist. Schema-on-read means every read must be defensive,
+      and bugs from unexpected shapes are discovered in production, not at deploy time.
+    how_to_do_right: |
+      1. If using MongoDB, use schema validation (jsonSchema) — enforced by the database
+      2. Define explicit models in your application (Mongoose schemas, Pydantic models)
+      3. Version your document schemas (add a schema_version field)
+      4. Write migration scripts when the schema changes (just like SQL migrations)
+      5. Validate all data at write time, not read time
+      6. Consider: if you need a schema anyway, maybe a relational database is simpler
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # MongoDB with enforced schema validation
+      db.createCollection("users", {
+          validator: {
+              $jsonSchema: {
+                  bsonType: "object",
+                  required: ["email", "name", "created_at", "schema_version"],
+                  properties: {
+                      email: { bsonType: "string", pattern: "^.+@.+$" },
+                      name: { bsonType: "string", minLength: 1 },
+                      schema_version: { enum: [2] },
+                      created_at: { bsonType: "date" }
+                  }
+              }
+          }
+      })
+      # Bad documents are rejected at write time, not discovered at read time
+    example_bad: |
+      # "Schema-less is freedom!"
+      # 2 years later, actual documents in the users collection:
+      # v1 (2022): { name: "Alice", email: "alice@co" }
+      # v2 (2022): { name: "Bob", mail: "bob@co" }     # typo: "mail" not "email"
+      # v3 (2023): { full_name: "Charlie", emails: ["c@co"] }  # renamed + array
+      # v4 (2023): { firstName: "David", lastName: "E", email: "d@co" }  # split name
+      # v5 (2024): { name: {first: "Eve", last: "F"}, email: "e@co", email_verified: true }
+
+      # Every read:
+      def get_user_email(user):
+          return (user.get("email") or user.get("mail") or
+                  (user.get("emails") or [None])[0])  # pray this covers all versions
+    when_applies: Architecture decisions, database selection, schema design
+    sources: ["https://www.mongodb.com/docs/manual/core/schema-validation/"]
+
+  - id: ANTI-FAIL-015
+    text: "We stored PII in log files and failed compliance audit — log(user) serializes everything including passwords and SSNs"
+    why: >
+      When you log an object, most languages serialize all its fields. If the User object contains
+      password_hash, ssn, credit_card, or health_data, those end up in plaintext in log files.
+      Log files are typically stored with weaker access controls than databases, replicated to
+      log aggregators (Splunk, Datadog, ELK), retained for months/years, and accessible to
+      every developer with production access. This violates GDPR (right to erasure — you cannot
+      delete from log files), PCI-DSS (credit card numbers in logs), HIPAA (health data exposure),
+      and SOC 2. A single log(user) statement can result in millions of dollars in fines and
+      mandatory breach notifications.
+    how_to_do_right: |
+      1. Never log full objects — log only the fields you need
+      2. Implement __repr__ / toString() that excludes sensitive fields
+      3. Use structured logging with explicit field selection
+      4. Create a PII filter/scrubber in your logging pipeline
+      5. Audit log statements in code review (search for log.*user, log.*request)
+      6. Use log redaction in your aggregator (Datadog Sensitive Data Scanner, etc.)
+      7. Test: "If this log line appeared on Hacker News, would we be in trouble?"
+    severity: critical
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      import structlog
+      logger = structlog.get_logger()
+
+      class User:
+          def __repr__(self):
+              return f"User(id={self.id}, email=***)"  # never expose PII in repr
+
+      # Log only what you need
+      logger.info("user_login", user_id=user.id, ip=request.remote_addr)
+      # NOT: logger.info("user_login", user=user, request=request)
+
+      # Pydantic model with sensitive field exclusion
+      class UserLog(BaseModel):
+          id: int
+          email: str = Field(exclude=True)  # never serialized
+          ssn: str = Field(exclude=True)
+    example_bad: |
+      import logging
+      logger = logging.getLogger(__name__)
+
+      # "Just log the user for debugging"
+      logger.info(f"User logged in: {user}")
+      # Log output: User(id=42, email='alice@company.com', password_hash='$2b$12$...',
+      #   ssn='123-45-6789', credit_card='4111-1111-1111-1111', health_records=[...])
+
+      logger.debug(f"Request: {request.__dict__}")
+      # Log output: {'headers': {'Authorization': 'Bearer eyJ...'}, 'body': {'password': '...'}}
+
+      # 6 months later: compliance auditor searches log files
+      # Finds: 847,000 SSNs, 1.2M email addresses, 23,000 credit card numbers
+      # Result: $2.3M GDPR fine, mandatory breach notification to all users
+    when_applies: Architecture decisions, code review, compliance review, logging design
+    sources: ["https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html"]
+
+  - id: ANTI-FAIL-016
+    text: "We used soft deletes everywhere and got 3x query complexity — hard delete plus an audit table is simpler"
+    why: >
+      Soft delete (setting is_deleted=true instead of actually deleting) means every query must
+      include WHERE is_deleted = false. Miss one query? Users see deleted data. Miss it in a
+      JOIN? Deleted records leak into results. Unique constraints break (email must be unique,
+      but the "deleted" user still has the email). Foreign keys point to "deleted" records.
+      Over time, the table grows without bound because nothing is ever actually removed.
+      Soft deletes are appropriate for specific use cases (undo, recycle bin) but applying them
+      globally turns every simple query into a minefield of forgotten filters.
+    how_to_do_right: |
+      1. Default to hard deletes + audit log table (separate table with: who, what, when, old_data)
+      2. Use soft deletes ONLY when users need to undo (recycle bin, 30-day recovery)
+      3. If using soft deletes, use a default query scope/manager that always filters
+      4. Solve the unique constraint problem: move deleted records to an archive table
+      5. Schedule periodic hard-deletion of soft-deleted records older than retention period
+      6. Test: write a query against the table — did you remember the is_deleted filter?
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # Hard delete + audit table
+      class UserService:
+          def delete_user(self, user_id: int):
+              user = self.db.query(User).get(user_id)
+              # Save to audit log first
+              self.db.add(AuditLog(
+                  table_name="users",
+                  record_id=user_id,
+                  action="DELETE",
+                  old_data=user.to_dict(),
+                  deleted_by=current_user.id,
+                  deleted_at=datetime.utcnow(),
+              ))
+              self.db.delete(user)  # actually delete
+              self.db.commit()
+
+      # Queries are simple — no is_deleted filter needed
+      users = db.query(User).filter(User.email == email).first()
+    example_bad: |
+      # Soft deletes everywhere
+      class User(Base):
+          is_deleted = Column(Boolean, default=False)
+          deleted_at = Column(DateTime, nullable=True)
+
+      # Every single query must remember the filter:
+      users = db.query(User).filter(User.is_deleted == False).all()  # easy to forget
+
+      # Bug #1: forgot the filter in the admin panel
+      admin_users = db.query(User).all()  # shows "deleted" users
+
+      # Bug #2: unique email constraint
+      # User deletes account (is_deleted=True), tries to re-register
+      # IntegrityError: email already exists (the "deleted" record still has it)
+
+      # Bug #3: JOIN leaks deleted data
+      SELECT o.*, u.name FROM orders o JOIN users u ON u.id = o.user_id
+      -- Shows orders with "deleted" user names (forgot WHERE u.is_deleted = false)
+    when_applies: Architecture decisions, code review, data model design
+    sources: ["https://martinfowler.com/bliki/SoftDelete.html"]
+
+  - id: ANTI-FAIL-017
+    text: "We stored timestamps without timezone and lost 3 hours debugging — always store and transmit in UTC"
+    why: >
+      A timestamp without timezone is ambiguous. Is "2024-03-10 02:30:00" in UTC, EST, or PST?
+      When daylight saving time transitions occur, naive timestamps produce impossible or duplicate
+      times (2:30 AM might not exist or might occur twice). When your database server is in UTC
+      but your application server is in EST, every timestamp is silently off by 5 hours. When you
+      deploy to a cloud region in a different timezone, all timestamps shift. This bug is insidious
+      because it works correctly most of the time and breaks only around DST transitions or
+      cross-timezone deployments — making it nearly impossible to reproduce.
+    how_to_do_right: |
+      1. Store all timestamps in UTC in the database (TIMESTAMPTZ in PostgreSQL)
+      2. Transmit all timestamps in ISO 8601 with timezone (2024-01-15T10:30:00Z)
+      3. Convert to local time only at the presentation layer (frontend)
+      4. Use timezone-aware datetime objects in your application (never naive datetimes)
+      5. Set database and server timezone to UTC
+      6. Test around DST boundaries (March and November in US, last Sunday of March/October in EU)
+    severity: critical
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      from datetime import datetime, timezone
+
+      # Always use timezone-aware UTC
+      now = datetime.now(timezone.utc)  # 2024-01-15 10:30:00+00:00
+
+      # Store as TIMESTAMPTZ in PostgreSQL
+      # CREATE TABLE events (
+      #     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      # );
+
+      # API response: ISO 8601 with timezone
+      {"created_at": "2024-01-15T10:30:00Z"}
+
+      # Frontend converts to local time for display
+      // const local = new Date(event.created_at).toLocaleString()
+
+      # Python: reject naive datetimes
+      def store_event(timestamp: datetime):
+          if timestamp.tzinfo is None:
+              raise ValueError("Timestamp must be timezone-aware (UTC)")
+    example_bad: |
+      from datetime import datetime
+
+      # Naive datetime — no timezone information
+      now = datetime.now()  # 2024-01-15 10:30:00 (in what timezone??)
+
+      # PostgreSQL: TIMESTAMP WITHOUT TIME ZONE
+      # Server in US-East, DB in UTC, app deployed to EU-West
+      # Event created at 3 PM local = stored as 15:00 (no TZ)
+      # Read from EU-West server: interpreted as 15:00 EU-West = 3 hours wrong
+
+      # DST bug: March 10, 2024, 2:30 AM US-East does not exist
+      # datetime(2024, 3, 10, 2, 30) — this time literally never happened
+      # But we stored it because naive datetimes don't validate
+
+      # Debugging: "This event says 10 AM but the user says it happened at 1 PM"
+      # "It works on my machine" (developer is in the same timezone as the server)
+    when_applies: Architecture decisions, code review, API design, database design
+    sources: ["https://docs.python.org/3/library/datetime.html#datetime.datetime.now"]
+
+  - id: ANTI-FAIL-018
+    text: "We used UUID v4 as primary key and index performance dropped 70% — use UUID v7 or bigint for primary keys"
+    why: >
+      UUID v4 is randomly generated. When used as a primary key with a B-tree index, inserts
+      scatter randomly across the entire index instead of appending to the end. This causes
+      excessive page splits, poor cache locality, and index fragmentation. At 10 million rows,
+      insert performance degrades significantly. The index occupies 2-3x more disk space than
+      necessary due to fragmentation. Range queries (created after X) are impossible because
+      UUID v4 has no temporal ordering. UUID v7 (RFC 9562, 2024) solves this by embedding a
+      timestamp prefix, making UUIDs monotonically increasing like bigint while retaining
+      globally unique properties.
+    how_to_do_right: |
+      1. Prefer BIGINT with GENERATED ALWAYS AS IDENTITY for internal primary keys
+      2. If you need globally unique IDs (distributed systems, public APIs), use UUID v7
+      3. UUID v7 embeds a Unix timestamp, so inserts are sequential and indexes stay compact
+      4. Use UUID v4 only for non-indexed identifiers (tokens, correlation IDs)
+      5. If stuck with UUID v4, add a separate BIGINT sequence column for ordering
+      6. Monitor index bloat: SELECT pg_relation_size('idx_name')
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      import uuid
+      from uuid_utils import uuid7  # or uuid6 library
+
+      # Option 1: BIGINT for internal, UUID v7 for external
+      class Order(Base):
+          id = Column(BigInteger, primary_key=True, autoincrement=True)  # internal, sequential
+          public_id = Column(UUID, default=uuid7, unique=True, index=True)  # external, sortable
+
+      # Option 2: UUID v7 as primary key (sequential + globally unique)
+      class Order(Base):
+          id = Column(UUID, primary_key=True, default=uuid7)
+          # UUID v7: 018e3a1c-8b5e-7000-... (timestamp prefix = sequential inserts)
+
+      # PostgreSQL: CREATE TABLE orders (
+      #     id UUID PRIMARY KEY DEFAULT gen_random_uuid_v7(),
+      # );
+    example_bad: |
+      import uuid
+
+      class Order(Base):
+          id = Column(UUID, primary_key=True, default=uuid.uuid4)
+          # UUID v4: f47ac10b-58cc-4372-a567-0e02b2c3d479 (random, no order)
+
+      # At 10M rows:
+      # INSERT: 3ms → 45ms (15x slower due to random index page splits)
+      # Index size: 890MB (should be 350MB — 2.5x bloat from fragmentation)
+      # SELECT WHERE created_at > X: full index scan (UUID has no temporal order)
+
+      # "Why is our database getting slower every month?"
+      # pg_stat_user_indexes: idx_orders_pkey — 890MB, 47% dead tuples
+      # REINDEX takes 4 hours and locks the table
+    when_applies: Architecture decisions, database design, performance optimization
+    sources: ["https://www.ietf.org/rfc/rfc9562.html"]
+
+  - id: ANTI-FAIL-019
+    text: "We built our own auth system and got hacked in 6 months — use an OAuth2/OIDC provider"
+    why: >
+      Authentication and authorization are the most security-critical components of any system.
+      Rolling your own means implementing: password hashing (bcrypt/argon2 with proper parameters),
+      timing-safe comparison, rate limiting, account lockout, CSRF protection, session management,
+      token rotation, MFA, password reset flows, email verification, brute force protection,
+      credential stuffing defense, and dozens of other security concerns. Miss ANY one of these
+      and you are vulnerable. Auth0, Clerk, Firebase Auth, and Keycloak have teams of security
+      engineers dedicated to getting this right. A startup developer implementing auth in a sprint
+      will miss critical security requirements that only become apparent after a breach.
+    how_to_do_right: |
+      1. Use an established auth provider (Auth0, Clerk, Firebase Auth, Keycloak, Supertokens)
+      2. If self-hosting, use Keycloak or Ory — never build from scratch
+      3. Use OAuth2 + OIDC standard protocols (not custom token schemes)
+      4. Store sessions server-side (not in JWT alone — JWTs cannot be revoked)
+      5. Enable MFA by default for admin accounts
+      6. Use Passkeys/WebAuthn for phishing-resistant auth
+      7. Regular security audits by external firm
+    severity: critical
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # Using Auth0 (or any OIDC provider)
+      from authlib.integrations.starlette_client import OAuth
+
+      oauth = OAuth()
+      oauth.register("auth0",
+          client_id=settings.AUTH0_CLIENT_ID,
+          client_secret=settings.AUTH0_CLIENT_SECRET,
+          server_metadata_url=f"https://{settings.AUTH0_DOMAIN}/.well-known/openid-configuration",
+      )
+
+      @app.route("/login")
+      async def login(request):
+          return await oauth.auth0.authorize_redirect(request, redirect_uri)
+
+      @app.route("/callback")
+      async def callback(request):
+          token = await oauth.auth0.authorize_access_token(request)
+          user_info = token["userinfo"]  # verified, secure, handles all edge cases
+    example_bad: |
+      # "How hard can auth be?"
+      @app.post("/login")
+      def login(email: str, password: str):
+          user = db.query(User).filter_by(email=email).first()
+          if user and user.password == hashlib.md5(password.encode()).hexdigest():  # MD5!
+              token = jwt.encode({"user_id": user.id}, SECRET_KEY)  # no expiry!
+              return {"token": token}  # no rate limiting, no lockout, no MFA
+
+      # Vulnerabilities in this code:
+      # 1. MD5 (crackable in seconds, no salt)
+      # 2. No timing-safe comparison (timing attack)
+      # 3. No rate limiting (brute force)
+      # 4. No account lockout (credential stuffing)
+      # 5. JWT with no expiry (stolen token = permanent access)
+      # 6. No refresh token rotation
+      # 7. No CSRF protection
+      # 8. No MFA
+      # 6 months later: "We've been breached. 50,000 user accounts compromised."
+    when_applies: Architecture decisions, code review, security review, greenfield projects
+    sources: ["https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html"]
+
+  - id: ANTI-FAIL-020
+    text: "Five services shared one database — shared DB means shared deployment and shared failure"
+    why: >
+      A shared database couples all services that use it. When one service needs a schema migration,
+      all services must be coordinated. When one service runs a heavy query, all services are
+      affected (noisy neighbor). When the database goes down, all services go down simultaneously.
+      Services cannot be deployed independently because a schema change might break another service.
+      The database becomes the bottleneck for both performance and organizational velocity. This is
+      the "distributed monolith" anti-pattern: you have the complexity of distributed systems with
+      none of the benefits (independent deployment, fault isolation, independent scaling).
+    how_to_do_right: |
+      1. Each service owns its data — private database or private schema
+      2. Services communicate via APIs or events, never direct database access
+      3. If data is needed by multiple services, the owning service exposes an API
+      4. Use events for data replication (service A publishes, service B subscribes and stores a local copy)
+      5. Accept eventual consistency between services (most use cases tolerate it)
+      6. Shared reference data (countries, currencies) can use a shared read-only database
+    severity: high
+    technologies:
+      lang: [python, javascript, java, go]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # Each service owns its database
+      # order-service → orders_db (only order-service can read/write)
+      # payment-service → payments_db (only payment-service can read/write)
+      # user-service → users_db (only user-service can read/write)
+
+      # Need user data in order-service? Call the API:
+      class OrderService:
+          async def create_order(self, user_id: int, items: list):
+              user = await self.user_client.get_user(user_id)  # API call, not DB query
+              order = Order(user_id=user_id, user_name=user.name)  # local copy of what we need
+              await self.order_repo.save(order)
+              await self.event_bus.publish(OrderCreated(order_id=order.id))  # payment-service listens
+    example_bad: |
+      # 5 services, 1 PostgreSQL database, everyone queries everything
+      # order-service:   SELECT * FROM users JOIN orders ...
+      # payment-service: SELECT * FROM users JOIN payments ...
+      # email-service:   SELECT * FROM users WHERE email ...
+      # analytics:       SELECT COUNT(*) FROM orders GROUP BY ... (heavy aggregation)
+      # admin-service:   ALTER TABLE users ADD COLUMN ... (breaks all services)
+
+      # Monday: analytics runs a 30-minute aggregation query
+      #   → order-service timeouts because connection pool is exhausted
+      #   → payment-service fails because the table is locked
+      # Tuesday: admin deploys a schema migration (ADD COLUMN to users)
+      #   → order-service crashes (unexpected column)
+      #   → email-service crashes (ORM model mismatch)
+      # Wednesday: all 5 teams in a meeting to coordinate the next deploy
+      #   → "We need to deploy all 5 services simultaneously at 2 AM"
+      #   → This is a distributed monolith with extra network latency
+    when_applies: Architecture decisions, microservices design, database strategy
+    sources: ["https://microservices.io/patterns/data/database-per-service.html"]
+
+  # ============================================================
+  # Process Anti-Patterns (ANTI-FAIL-021 to ANTI-FAIL-023)
+  # ============================================================
+
+  - id: ANTI-FAIL-021
+    text: "We skipped code review for a small change and introduced a security vulnerability — every change gets reviewed"
+    why: >
+      Security vulnerabilities often hide in small changes: a one-line regex fix that introduces
+      ReDoS, a "quick" SQL query that is injectable, a dependency bump that includes a compromised
+      package, a config change that opens a port. Small changes feel safe, which makes developers
+      less careful. The most dangerous commits are the ones that "obviously don't need review."
+      Skipping review creates a precedent: if this change is too small to review, what about the
+      next one? The line keeps moving until critical changes are merged without a second pair of
+      eyes. Code review is not just for catching bugs — it is for knowledge sharing, maintaining
+      standards, and ensuring no single person is a point of failure for the codebase.
+    how_to_do_right: |
+      1. Every change gets reviewed, no exceptions (enforce with branch protection rules)
+      2. Small changes should get FAST reviews (< 30 minutes turnaround), not NO reviews
+      3. Use automated checks as a first pass (linter, SAST, dependency audit, type checker)
+      4. For urgent hotfixes: pair program instead of skipping review (2 eyes in real-time)
+      5. Review the diff, not the description — small diffs hide big impact
+      6. Require at least 1 approval before merge (2 for security-sensitive paths)
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # Branch protection rules (GitHub)
+      # Settings → Branches → main:
+      # ✅ Require pull request reviews (1 minimum, 2 for /auth, /payments)
+      # ✅ Require status checks (lint, test, security scan)
+      # ✅ Require up-to-date branch
+      # ✅ Do not allow bypassing above settings (even for admins)
+
+      # For urgent hotfixes:
+      # Developer 1: writes the fix
+      # Developer 2: pair programs or reviews within 15 minutes
+      # Both: deploy together, monitor for 30 minutes
+      # Still reviewed, just faster turnaround
+    example_bad: |
+      # "It's just a one-line change, I'll push directly to main"
+      # The "one-line change":
+      - query = "SELECT * FROM users WHERE id = %s"
+      - cursor.execute(query, (user_id,))
+      + query = f"SELECT * FROM users WHERE id = {user_id}"  # SQL injection
+      + cursor.execute(query)
+
+      # Or the "trivial dependency bump":
+      - "event-stream": "3.3.5"
+      + "event-stream": "3.3.6"  # compromised package (real incident, 2018)
+
+      # Or the "simple config fix":
+      - ALLOWED_ORIGINS=["https://app.company.com"]
+      + ALLOWED_ORIGINS=["*"]  # "temporarily" allow all origins (never reverted)
+    when_applies: Architecture decisions, code review, process design, team standards
+    sources: ["https://google.github.io/eng-practices/review/"]
+
+  - id: ANTI-FAIL-022
+    text: "We had no staging environment and tested in production — the cost of staging is less than one production incident"
+    why: >
+      Testing in production means your users are your QA team. Every bug they discover costs:
+      customer trust, support tickets, engineering time for emergency fixes, potential data
+      corruption, SLA violations, and revenue loss. A staging environment costs perhaps $200-500/month
+      for cloud resources. A single production incident costs: 4 hours of engineering time ($800+),
+      customer support escalations, potential data recovery, post-mortem time, and immeasurable
+      reputation damage. The ROI on a staging environment is realized after the first prevented
+      incident. Without staging, you also cannot test database migrations, performance under load,
+      integration with third-party services, or configuration changes safely.
+    how_to_do_right: |
+      1. Maintain at minimum: development (local), staging (shared), production
+      2. Staging mirrors production: same infrastructure, same config (different secrets), same data shape
+      3. Run the full test suite in staging before promoting to production
+      4. Test database migrations in staging with production-sized data
+      5. Use feature flags to decouple deployment from release
+      6. Consider preview environments per pull request (Vercel, Railway, etc.)
+      7. If budget is tight: at least use a Docker Compose "staging" locally that mirrors production topology
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # Deployment pipeline with staging gate
+      # 1. PR merged to main → auto-deploy to staging
+      # 2. Staging: run integration tests, smoke tests, performance tests
+      # 3. Staging: QA manually verifies critical paths (15 min)
+      # 4. Staging: migration tested against production-sized data clone
+      # 5. Approval gate: at least 1 engineer verifies staging is healthy
+      # 6. Production: canary deploy (5% traffic for 10 minutes)
+      # 7. Production: gradual rollout (5% → 25% → 50% → 100%)
+
+      # Infrastructure as code — staging mirrors production
+      # terraform/staging/main.tf   ← same modules as production
+      # terraform/production/main.tf ← different instance sizes, same topology
+    example_bad: |
+      # "Staging is a waste of money, we'll test in production"
+      # Deploy pipeline: PR → merge → production (YOLO)
+
+      # Week 1: migration adds NOT NULL column without default → production DB locked for 40 minutes
+      # Week 2: new feature works locally, crashes in production (different Node version)
+      # Week 3: config change (wrong DB connection string) → 500 errors for 2 hours
+      # Week 4: "hotfix" for week 3 bug introduces a new bug → 3-hour outage
+
+      # Total cost of "saving" $300/month on staging:
+      # - 4 incidents × ~4 hours engineering time = $6,400+
+      # - Customer churn from poor reliability = ???
+      # - Team morale from constant firefighting = ???
+    when_applies: Architecture decisions, DevOps planning, infrastructure budgeting
+    sources: ["https://sre.google/sre-book/testing-reliability/"]
+
+  - id: ANTI-FAIL-023
+    text: "We did a Big Bang migration instead of gradual rollout — migrate 1%, then 10%, then 100%"
+    why: >
+      Big Bang migrations flip a switch and move everything at once. If anything goes wrong,
+      everything is broken and rollback is complex (if possible at all). Gradual migration lets
+      you discover problems at 1% traffic when the blast radius is small. Real-world migrations
+      fail for reasons you cannot predict in advance: data edge cases, performance at scale,
+      third-party API rate limits, timezone issues, character encoding, null values in unexpected
+      columns, concurrent modifications during migration, and dozens of other surprises. The
+      Strangler Fig pattern (gradually route traffic from old to new) is battle-tested at
+      companies like Amazon, Stripe, and GitHub. Big Bang works for hobby projects; gradual
+      rollout works for production systems with real users.
+    how_to_do_right: |
+      1. Run old and new systems in parallel (dual-write or shadow traffic)
+      2. Migrate 1% of traffic/data to new system, monitor for 24-48 hours
+      3. Compare results between old and new (reconciliation checks)
+      4. If 1% succeeds: 10%, then 25%, then 50%, then 100%
+      5. Keep the old system running until new system is proven stable (2+ weeks)
+      6. Have a rollback plan that does not require a migration (feature flag, DNS switch)
+      7. Communicate timeline to stakeholders: gradual = slower but safer
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, architecture]
+      concern: [failure, cautionary]
+    example_good: |
+      # Strangler Fig migration: old API → new API
+      class ApiRouter:
+          def route(self, request):
+              # Feature flag controls percentage (1% → 10% → 100%)
+              if feature_flags.is_enabled("use_new_api", user_id=request.user_id):
+                  try:
+                      result = self.new_api.handle(request)
+                      # Shadow: also call old API and compare (reconciliation)
+                      old_result = self.old_api.handle(request)
+                      if result != old_result:
+                          metrics.incr("migration.mismatch")
+                          logger.warning("mismatch", new=result, old=old_result)
+                      return result
+                  except Exception:
+                      metrics.incr("migration.fallback")
+                      return self.old_api.handle(request)  # fallback to old
+              return self.old_api.handle(request)
+
+      # Week 1: 1% traffic → found 3 edge cases, fixed them
+      # Week 2: 10% traffic → performance is good, 0 mismatches
+      # Week 3: 50% traffic → stable
+      # Week 4: 100% traffic → decommission old API
+    example_bad: |
+      # "Let's just switch everything over this weekend"
+      # Friday 11 PM: BEGIN BIG BANG MIGRATION
+      # - Shut down old system
+      # - Run migration script (4 hours for 50M rows)
+      # - Switch DNS to new system
+      # - Turn on new system
+
+      # Saturday 3 AM: Migration script fails at row 37,421,883
+      #   (unexpected NULL in a column that was "never NULL")
+      # Saturday 4 AM: Fix script, restart from beginning (cannot resume)
+      # Saturday 8 AM: Migration complete, switch DNS
+      # Saturday 9 AM: New system crashes under load (never tested at production scale)
+      # Saturday 10 AM: Try to rollback — old system's data is 12 hours stale
+      # Saturday 2 PM: Emergency data reconciliation (which system has the truth?)
+      # Monday: "Lessons learned: never do Big Bang again"
+    when_applies: Architecture decisions, system migration planning, technology upgrades
+    sources: ["https://martinfowler.com/bliki/StranglerFigApplication.html"]
+
+  # ============================================================
+  # Process Anti-Patterns cont'd (ANTI-FAIL-024 to ANTI-FAIL-030)
+  # ============================================================
+
+  - id: ANTI-FAIL-024
+    text: "We ignored test failures because 'flaky' — flaky tests hide real bugs, fix or delete, never skip"
+    why: >
+      Labeling a failing test as "flaky" and ignoring it creates a broken window effect. Once one
+      test is allowed to fail, the bar lowers for the next, and soon the entire test suite is
+      unreliable. Developers stop trusting test results and merge code without green CI. The real
+      danger: some of those "flaky" tests are actually detecting real intermittent bugs — race
+      conditions, timing issues, resource leaks — that only manifest under load in production.
+      A study at Google found that 1 in 7 "flaky" tests was actually catching a genuine bug.
+      When you skip flaky tests, you are statistically guaranteed to ship real bugs to production
+      while believing your test suite gave you a green light.
+    how_to_do_right: |
+      1. Quarantine flaky tests immediately — move to a separate suite, do not delete
+      2. Fix quarantined tests within 1 sprint (SLA: 2 weeks max)
+      3. If a test cannot be made reliable in 2 weeks, delete it and file a ticket for a rewrite
+      4. Track flaky test rate as a team metric (target: < 0.1% of test runs)
+      5. Common causes: shared state, time-dependent assertions, external dependencies, race conditions
+      6. Use test retries as a detection mechanism, not a solution (retry 3x, flag if any retry needed)
+      7. Never @skip or @ignore a test without a linked issue and expiry date
+    severity: high
+    technologies:
+      lang: [python, javascript, java, go]
+    domains:
+      domain: [antipattern, process]
+      concern: [failure, cautionary]
+    example_good: |
+      # Quarantine flaky test with expiry
+      @pytest.mark.quarantine(reason="JIRA-1234: race condition in event handler", expires="2026-03-15")
+      def test_event_processing_order():
+          ...
+
+      # Fix: make the test deterministic
+      def test_event_processing_order():
+          # Before: relied on wall-clock timing
+          # After: use deterministic event ordering with explicit barriers
+          event_bus = InMemoryEventBus(deterministic=True)
+          event_bus.publish(Event("A"))
+          event_bus.flush()  # explicit synchronization point
+          assert event_bus.processed == ["A"]
+
+      # CI dashboard: flaky rate 0.02%, quarantine: 3 tests, all with linked issues
+    example_bad: |
+      # "It's just flaky, skip it"
+      @pytest.mark.skip(reason="flaky")  # no issue linked, no expiry, forgotten forever
+      def test_concurrent_writes():
+          ...
+
+      # 6 months later: 47 skipped tests, nobody knows which are flaky vs. actually broken
+      # CI is "green" (100% of RUNNING tests pass)
+      # But 47 tests are not running, 7 of them catch real race conditions
+      # Production: intermittent data corruption every ~500 requests
+      # Root cause: the "flaky" test_concurrent_writes was detecting a real bug all along
+    when_applies: CI/CD pipeline design, test suite maintenance, code review
+    sources: ["https://testing.googleblog.com/2016/05/flaky-tests-at-google-and-how-we.html"]
+
+  - id: ANTI-FAIL-025
+    text: "We deployed without a rollback plan and had an 8-hour outage — rollback must be tested, alerts set, team on standby"
+    why: >
+      Every deployment is a controlled experiment. If the experiment fails, you need to undo it
+      quickly. Without a rollback plan, a bad deploy turns into an emergency where engineers scramble
+      to figure out how to revert while users are affected. Database migrations that cannot be rolled
+      back are especially dangerous: a forward-only migration that adds a NOT NULL column without a
+      default locks the table, and there is no quick undo. The mean time to recovery (MTTR) is the
+      most important reliability metric, and MTTR is directly proportional to how well you prepared
+      your rollback. Companies like Amazon deploy thousands of times per day because every deploy
+      has an automated rollback that triggers within 2 minutes of detecting anomalies.
+    how_to_do_right: |
+      1. Every deploy must have a documented rollback procedure (even if it is "redeploy previous version")
+      2. Test the rollback procedure before you need it (fire drill monthly)
+      3. Database migrations must be backward-compatible (expand-contract pattern)
+      4. Set automated rollback triggers: error rate > 1%, latency p99 > 2x baseline, health check fails
+      5. Keep the previous version's artifacts available for instant rollback (do not delete old images)
+      6. Have a communication plan: who to notify, status page update, customer support briefing
+      7. Deploy during business hours with the team available, not Friday at 5 PM
+    severity: high
+    technologies:
+      lang: [python, javascript, java, go]
+    domains:
+      domain: [antipattern, process]
+      concern: [failure, cautionary]
+    example_good: |
+      # Deploy with automated rollback
+      class DeploymentPipeline:
+          def deploy(self, version: str):
+              # 1. Save rollback target
+              previous_version = self.get_current_version()
+
+              # 2. Canary deploy (5% traffic)
+              self.deploy_canary(version, traffic_pct=5)
+              self.wait_and_monitor(minutes=10)
+
+              if self.error_rate() > 0.01 or self.p99_latency() > self.baseline_p99 * 2:
+                  self.rollback(previous_version)  # automatic rollback
+                  self.alert_team("Canary failed, rolled back automatically")
+                  return DeployResult.ROLLED_BACK
+
+              # 3. Gradual rollout
+              for pct in [25, 50, 100]:
+                  self.set_traffic(version, pct)
+                  self.wait_and_monitor(minutes=5)
+
+              return DeployResult.SUCCESS
+    example_bad: |
+      # "Just deploy it, what could go wrong?"
+      # Friday 4:30 PM: deploy new version, team leaves for weekend
+      # Friday 5:15 PM: monitoring alert fires, nobody responds
+      # Friday 7:00 PM: customer support flooded with tickets
+      # Friday 9:00 PM: on-call engineer wakes up, starts investigating
+      # Friday 11:00 PM: identifies the bug, but how to rollback?
+      #   - Old Docker image was deleted by cleanup job
+      #   - Database migration added a column that old code doesn't know about
+      #   - Config was changed in 3 places, nobody remembers the old values
+      # Saturday 1:00 AM: manual rollback attempt breaks something else
+      # Saturday 5:00 AM: system restored after 8 hours of downtime
+      # Monday: "Lessons learned" meeting that produces no changes
+    when_applies: Deployment planning, DevOps design, incident response preparation
+    sources: ["https://sre.google/sre-book/release-engineering/"]
+
+  - id: ANTI-FAIL-026
+    text: "We put environment-specific code instead of config — if env == 'production' is config disguised as code"
+    why: >
+      Scattering if env == 'production' checks throughout the codebase means your application
+      behaves differently in each environment in ways that are impossible to audit. The code paths
+      for staging and production diverge, so testing in staging does not validate what will run in
+      production. When a new environment is added (QA, load-test, demo), every if-env block must
+      be updated. Environment-specific code is untestable: you cannot unit test the production path
+      from a development environment. It also creates security risks: a developer might add
+      if env != 'production': disable_auth() for convenience, and that check becomes the only
+      thing protecting production authentication. Configuration should be externalized so the
+      same code runs in every environment with different settings.
+    how_to_do_right: |
+      1. Use environment variables or config files for all environment-specific values
+      2. The application code should be identical across all environments
+      3. Use feature flags for behavior differences, not environment checks
+      4. Config hierarchy: defaults → env file → environment variables → CLI args
+      5. Validate all config at startup (fail fast if required config is missing)
+      6. Use tools like pydantic-settings, python-decouple, or 12-factor methodology
+      7. Secret config (API keys, passwords) always via environment variables or vault, never in code
+    severity: high
+    technologies:
+      lang: [python, javascript, java, go]
+    domains:
+      domain: [antipattern, process]
+      concern: [failure, cautionary]
+    example_good: |
+      from pydantic_settings import BaseSettings
+
+      class Settings(BaseSettings):
+          database_url: str  # set via DATABASE_URL env var
+          redis_url: str = "redis://localhost:6379"
+          debug: bool = False
+          log_level: str = "INFO"
+          max_connections: int = 10
+
+          model_config = {"env_file": ".env"}
+
+      settings = Settings()  # same code everywhere, different .env per environment
+
+      # Usage: no if-env checks anywhere in the codebase
+      db = create_engine(settings.database_url, pool_size=settings.max_connections)
+      logging.basicConfig(level=settings.log_level)
+    example_bad: |
+      import os
+      ENV = os.getenv("ENV", "development")
+
+      # Scattered throughout the codebase:
+      if ENV == "production":
+          db_url = "postgresql://prod-db:5432/app"
+          max_connections = 50
+      elif ENV == "staging":
+          db_url = "postgresql://staging-db:5432/app"
+          max_connections = 10
+      else:
+          db_url = "sqlite:///local.db"
+          max_connections = 5
+
+      # In auth middleware:
+      if ENV != "production":
+          return True  # skip auth in non-production (security hole)
+
+      # In payment service:
+      if ENV == "production":
+          stripe.api_key = "sk_live_..."  # hardcoded secret!
+      else:
+          stripe.api_key = "sk_test_..."
+
+      # New environment "load-test" added: 47 if-env blocks need updating
+      # Developer forgets 3 of them: load-test sends real charges via Stripe
+    when_applies: Architecture decisions, code review, configuration management
+    sources: ["https://12factor.net/config"]
+
+  - id: ANTI-FAIL-027
+    text: "We accumulated tech debt for 6 months and couldn't ship new features — allocate 20% of sprint capacity for debt, non-negotiable"
+    why: >
+      Tech debt compounds like financial debt. Small shortcuts today create larger problems tomorrow.
+      After 6 months of accumulated debt, the codebase becomes so fragile that every new feature
+      takes 3-5x longer because developers spend most of their time working around existing problems.
+      Common symptoms: "I can't add this feature without refactoring X first", build times over
+      10 minutes, test suite takes 45 minutes, no one understands the billing module, every PR
+      requires changes in 15 files. The business eventually hits a wall where no new features can
+      ship at all, and the only option is a painful multi-month "tech debt sprint" that delivers
+      zero business value. The 20% rule prevents this: continuously paying down debt means you
+      never reach the tipping point where the codebase becomes unworkable.
+    how_to_do_right: |
+      1. Allocate 20% of every sprint for tech debt reduction (non-negotiable with product)
+      2. Maintain a visible tech debt backlog with impact scores (not just a graveyard of tickets)
+      3. Classify debt: deliberate (we chose this shortcut) vs. accidental (we didn't know better)
+      4. Pay interest first: fix the debt that slows you down most (measure by developer-hours-wasted)
+      5. Boy Scout Rule: leave every file you touch cleaner than you found it
+      6. Track debt metrics: build time, test time, coupling metrics, PR size trends
+      7. Make debt visible to stakeholders: "this feature takes 3 weeks instead of 1 because of debt in module X"
+    severity: high
+    technologies:
+      lang: [python, javascript, java, go]
+    domains:
+      domain: [antipattern, process]
+      concern: [failure, cautionary]
+    example_good: |
+      # Sprint planning with 20% debt budget
+      class SprintPlanner:
+          DEBT_BUDGET_PCT = 0.20  # non-negotiable
+
+          def plan_sprint(self, capacity_points: int, features: list, debt_items: list):
+              debt_budget = int(capacity_points * self.DEBT_BUDGET_PCT)
+              feature_budget = capacity_points - debt_budget
+
+              # Select highest-impact debt items
+              debt_work = sorted(debt_items, key=lambda d: d.impact_score, reverse=True)
+              selected_debt = self.fit_to_budget(debt_work, debt_budget)
+
+              # Remaining capacity for features
+              selected_features = self.fit_to_budget(features, feature_budget)
+
+              return Sprint(features=selected_features, debt=selected_debt)
+
+      # Result: steady velocity, no "debt cliff", manageable codebase
+    example_bad: |
+      # "We'll pay off tech debt next quarter" (said every quarter for 6 quarters)
+      # Month 1: "Skip tests, we need to ship fast" → 60% coverage
+      # Month 2: "Copy-paste this module, no time to refactor" → 3 copies diverge
+      # Month 3: "Just add another if-else, we'll clean up later" → 400-line function
+      # Month 4: "Disable the linter, too many warnings" → 2,847 warnings
+      # Month 5: "Tests are too slow, skip in CI" → 12-minute test suite nobody runs
+      # Month 6: "Why does every feature take 3 weeks?"
+      #   - 40% of dev time: understanding spaghetti code
+      #   - 30% of dev time: manual testing (automated tests broken)
+      #   - 20% of dev time: fixing bugs from copy-paste divergence
+      #   - 10% of dev time: actually writing the feature
+      # CTO: "We need to stop features for 3 months to fix technical debt"
+      # CEO: "We can't stop shipping for 3 months!"
+      # Result: death spiral
+    when_applies: Sprint planning, team velocity analysis, project management
+    sources: ["https://martinfowler.com/bliki/TechnicalDebt.html"]
+
+  - id: ANTI-FAIL-028
+    text: "We estimated in hours and delivered in weeks — multiply your estimate by pi (3.14)"
+    why: >
+      Software estimation is consistently optimistic because developers estimate the time to write
+      code, not the time to deliver a working feature. The actual work includes: understanding
+      requirements (often ambiguous), design decisions, coding, writing tests, code review, fixing
+      review feedback, debugging edge cases, integration testing, documentation, deployment,
+      monitoring, and fixing the bug discovered 2 days after deploy. Each of these steps can
+      reveal surprises. The "pi factor" (3.14x) is a well-known heuristic that accounts for
+      this systematically. A 2-day estimate becomes 6.28 days (about 1.5 weeks), which is
+      usually more accurate. This is not pessimism — it is empirically calibrated realism.
+      Hofstadter's Law: "It always takes longer than you expect, even when you take into
+      account Hofstadter's Law."
+    how_to_do_right: |
+      1. Estimate in ranges, not points (3-5 days, not "4 days")
+      2. Apply the pi multiplier (3.14x) to your initial gut estimate
+      3. Break work into tasks < 4 hours — if a task feels like "1 day", it is probably 3
+      4. Track actual vs. estimated time to calibrate your personal multiplier
+      5. Include non-coding work in estimates: review, testing, deployment, documentation
+      6. Use reference class forecasting: "last time we did something similar, it took X"
+      7. Communicate estimates as confidence intervals: "80% chance we finish in 2 weeks, 95% in 3 weeks"
+    severity: high
+    technologies:
+      lang: [python, javascript, java, go]
+    domains:
+      domain: [antipattern, process]
+      concern: [failure, cautionary]
+    example_good: |
+      # Estimation with pi multiplier and range
+      class TaskEstimator:
+          PI = 3.14
+
+          def estimate(self, gut_feeling_hours: float) -> dict:
+              adjusted = gut_feeling_hours * self.PI
+              return {
+                  "optimistic": gut_feeling_hours,          # best case (rarely happens)
+                  "realistic": adjusted,                     # most likely
+                  "pessimistic": adjusted * 1.5,             # if surprises arise
+                  "commitment": adjusted,                    # what to promise stakeholders
+              }
+
+      # "I think this will take 8 hours"
+      # → optimistic: 8h, realistic: 25h (~3 days), pessimistic: 38h (~5 days)
+      # → Tell stakeholder: "3-5 business days"
+      # Actual: 4 days. Stakeholder is happy (under the 5-day pessimistic)
+    example_bad: |
+      # Sprint planning meeting:
+      # PM: "How long for the user search feature?"
+      # Dev: "Probably 2 days"
+      # PM: "Great, I'll tell the client Thursday"
+      #
+      # Day 1: Code the search endpoint (4 hours — on track!)
+      # Day 2: Edge cases (empty query, special characters, SQL injection)
+      # Day 3: Performance is terrible (need to add full-text index)
+      # Day 4: Index migration on production data (2 hours, plus testing)
+      # Day 5: Code review — reviewer finds 3 issues
+      # Day 6: Fix review feedback, re-review
+      # Day 7: QA finds a bug with pagination
+      # Day 8: Fix pagination, deploy to staging, discover config issue
+      # Day 9: Production deploy, monitoring shows memory spike
+      # Day 10: Optimize memory, redeploy, done
+      #
+      # Estimate: 2 days. Actual: 10 days. Factor: 5x (close to pi * 1.5)
+      # Client: "You said Thursday. It's been two weeks."
+    when_applies: Sprint planning, project estimation, stakeholder communication
+    sources: ["https://www.construx.com/blog/the-cone-of-uncertainty/"]
+
+  - id: ANTI-FAIL-029
+    text: "We wrote documentation after the project and nobody maintained it — write docs with code or don't write them at all"
+    why: >
+      Documentation written after a project is complete is already stale by the time it is published.
+      The developers who wrote the code have moved on, details are forgotten, and the motivation to
+      document thoroughly has evaporated. Post-hoc documentation is a chore that produces mediocre
+      results. Worse, stale documentation is more dangerous than no documentation because it
+      actively misleads readers. If the README says "call initialize() before process()" but the
+      API changed and now initialize() is automatic, developers waste hours debugging a problem
+      that does not exist. Documentation must be a living artifact, updated with every code change.
+      The best approach is to make documentation part of the Definition of Done: a PR is not
+      complete until the docs are updated. Alternatively, generate documentation from code
+      (docstrings, type hints, OpenAPI specs) so it cannot drift.
+    how_to_do_right: |
+      1. Documentation is part of Definition of Done — PR not mergeable without doc updates
+      2. Prefer generated docs: OpenAPI from code, docstrings with Sphinx/MkDocs, type hints as documentation
+      3. README: keep it to setup instructions and architecture overview only (changes rarely)
+      4. ADRs (Architecture Decision Records): document WHY, not WHAT (WHY ages better)
+      5. Inline comments for non-obvious logic: "// We use X instead of Y because of Z"
+      6. Delete stale docs aggressively — no documentation is better than wrong documentation
+      7. Test your docs: CI job that runs README setup instructions in a fresh container
+    severity: high
+    technologies:
+      lang: [python, javascript, java, go]
+    domains:
+      domain: [antipattern, process]
+      concern: [failure, cautionary]
+    example_good: |
+      # Documentation generated from code — cannot go stale
+      from fastapi import FastAPI
+
+      app = FastAPI(
+          title="Order Service",
+          description="Manages order lifecycle",
+          version="2.1.0",
+      )
+
+      @app.post("/orders", response_model=OrderResponse, status_code=201)
+      async def create_order(order: OrderCreate):
+          """Create a new order.
+
+          Validates inventory availability, reserves items, and creates the order.
+          Returns 409 if any item is out of stock.
+          """
+          ...
+
+      # /docs → auto-generated OpenAPI documentation, always in sync with code
+      # ADR: docs/adr/0012-use-optimistic-locking.md (documents WHY, not WHAT)
+    example_bad: |
+      # Post-project documentation sprint (2 weeks of pure pain)
+      # Developer: *writes 40 pages of docs from memory*
+      # Week 1 after docs: 3 pull requests merged, 0 doc updates
+      # Month 1: docs mention 5 functions that were renamed
+      # Month 3: docs describe a workflow that was completely rewritten
+      # Month 6: new developer follows docs, wastes 2 days on wrong setup
+      # Month 12: docs abandoned, team relies on Slack messages and tribal knowledge
+      #
+      # The irony: the 2-week documentation sprint produced docs that were
+      # useful for approximately 3 weeks before becoming actively harmful
+    when_applies: Documentation strategy, code review, Definition of Done
+    sources: ["https://www.writethedocs.org/guide/docs-as-code/"]
+
+  - id: ANTI-FAIL-030
+    text: "Our hero developer left and the project stalled for 2 months — bus factor of 1 is a critical risk"
+    why: >
+      Bus factor is the number of team members who could be hit by a bus (or quit, or go on
+      parental leave, or get sick) before a project stalls. A bus factor of 1 means a single
+      person holds all the knowledge, and their departure — planned or not — creates an immediate
+      crisis. The "hero developer" pattern is seductive: one person who knows everything, works
+      weekends, and fixes everything fast. But this creates a single point of failure that
+      compounds over time. The hero accumulates undocumented knowledge, takes shortcuts that
+      only they understand, and inadvertently makes the system depend on their presence. When
+      they leave, the team discovers that nobody knows how the billing system works, the
+      deployment requires 7 manual steps that are not documented, and the "simple" cron job
+      has 15 edge cases that only the hero knew about.
+    how_to_do_right: |
+      1. Require at least 2 people to be familiar with every critical system (pair programming, rotation)
+      2. Rotate on-call and code ownership — no one person owns a module forever
+      3. Code review is mandatory (forces knowledge sharing)
+      4. Document tribal knowledge: runbooks, ADRs, architecture diagrams
+      5. If a developer says "only I know how this works," that is a P0 risk, not a compliment
+      6. Measure bus factor per repository/module and track it as a risk metric
+      7. Cross-training sprints: dedicate time for knowledge transfer between team members
+    severity: high
+    technologies:
+      lang: [python, javascript, java, go]
+    domains:
+      domain: [antipattern, process]
+      concern: [failure, cautionary]
+    example_good: |
+      # Bus factor tracking and mitigation
+      class BusFactorTracker:
+          def analyze_repository(self, repo_path: str) -> dict:
+              # Analyze git blame to find single-author modules
+              for module in self.get_modules(repo_path):
+                  authors = self.get_unique_authors(module)
+                  if len(authors) == 1:
+                      self.flag_risk(module, bus_factor=1, owner=authors[0])
+
+              return self.risk_report()
+
+      # Mitigation: pair programming rotation
+      # Week 1: Alice (expert) + Bob (learning) work on billing module
+      # Week 2: Alice + Charlie work on billing module
+      # Week 3: Bob + Charlie can maintain billing module independently
+      # Bus factor: 1 → 3 in 3 weeks
+
+      # Every critical system has a runbook:
+      # docs/runbooks/billing-system.md
+      # docs/runbooks/deployment-procedure.md
+      # docs/runbooks/incident-response.md
+    example_bad: |
+      # The "hero developer" pattern:
+      # Alice: 78% of all commits, only person who touches billing, deployment, and infra
+      # Team: "Alice will fix it" (for everything)
+      #
+      # Month 1: Alice gives 2-week notice
+      # Month 1, week 2: frantic knowledge transfer sessions (8 hours of brain dumps)
+      # Month 2: Alice leaves. Team discovers:
+      #   - Deployment requires SSH to 3 servers and running scripts in specific order
+      #   - Billing module has 12 hardcoded edge cases for specific customers
+      #   - The "test" environment was actually running on Alice's personal server
+      #   - 3 cron jobs run on Alice's laptop (now turned off)
+      # Month 2-3: team reverse-engineers Alice's code (2 months of stalled features)
+      # Month 4: team finally ships a feature (3 months behind roadmap)
+      # Cost: 2 months of stalled development for a 5-person team = 10 person-months
+    when_applies: Team management, risk assessment, project planning
+    sources: ["https://martinfowler.com/bliki/BusFactor.html"]
+
+  # ============================================================
+  # Integration Anti-Patterns (ANTI-FAIL-031 to ANTI-FAIL-038)
+  # ============================================================
+
+  - id: ANTI-FAIL-031
+    text: "We built string parsing for email validation and rewrote it 3 times — use a library or just send a verification email"
+    why: >
+      Email validation by regex or string parsing is a famously unsolvable problem. The RFC 5321
+      spec allows: quoted strings with spaces ("john doe"@example.com), IP addresses as domains
+      (user@[192.168.1.1]), comments (user(comment)@example.com), and plus addressing
+      (user+tag@example.com). Every custom regex either rejects valid emails or accepts invalid
+      ones. The iterative refinement cycle is predictable: v1 rejects "user+tag@domain.com" (valid),
+      v2 accepts "user@.com" (invalid), v3 breaks on international domains (valid). After 3
+      iterations you have a 500-character regex that nobody can maintain and still fails edge cases.
+      The pragmatic solution: check for an @ sign and a dot after it (basic sanity), then send a
+      verification email. The verification email is the only reliable validator.
+    how_to_do_right: |
+      1. Basic sanity check only: contains @, has something before and after, reasonable length
+      2. Send a verification email — this is the only true validation
+      3. If you need stricter parsing, use a battle-tested library (email-validator in Python, isemail in JS)
+      4. Never reject an email just because your regex doesn't understand it
+      5. Store emails lowercase and trimmed (case-insensitive per RFC)
+      6. Handle plus addressing (user+tag@domain.com) — don't strip the tag
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, integration]
+      concern: [failure, cautionary]
+    example_good: |
+      from email_validator import validate_email, EmailNotValidError
+
+      def validate_user_email(email: str) -> str:
+          """Validate and normalize email. Send verification for true validation."""
+          try:
+              result = validate_email(email, check_deliverability=False)
+              return result.normalized  # lowercase, trimmed, IDNA-encoded
+          except EmailNotValidError as e:
+              raise ValueError(f"Invalid email: {e}")
+
+      # Then send a verification email — the only true validation
+      async def register_user(email: str):
+          normalized = validate_user_email(email)
+          token = secrets.token_urlsafe(32)
+          await send_verification_email(normalized, token)
+          # User is not "verified" until they click the link
+    example_bad: |
+      import re
+
+      # Attempt 1: "simple" regex
+      def validate_email_v1(email):
+          return bool(re.match(r'^[\w.-]+@[\w.-]+\.\w+$', email))
+      # Rejects: "user+tag@domain.com" (valid), "name@sub.domain.co.uk" (valid)
+
+      # Attempt 2: "better" regex
+      def validate_email_v2(email):
+          return bool(re.match(r'^[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}$', email))
+      # Accepts: "user@.com" (invalid), "user@domain..com" (invalid)
+
+      # Attempt 3: "RFC-compliant" regex (500+ characters, nobody understands it)
+      EMAIL_REGEX = r"""(?:[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*|"
+          (?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*")
+          @(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|
+          \[(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}..."""
+      # Still wrong. 3 iterations, 3 bugs filed, still rejects valid emails.
+    when_applies: Input validation, API design, user registration
+    sources: ["https://tools.ietf.org/html/rfc5321"]
+
+  - id: ANTI-FAIL-032
+    text: "We implemented retry logic in 15 places with 15 different bugs — centralize retries with tenacity or a shared utility"
+    why: >
+      Retry logic is deceptively complex. Each implementation must handle: exponential backoff
+      (not hammering a failing service), jitter (avoiding thundering herd when all clients retry
+      simultaneously), maximum attempts, timeout budget (total time, not per-attempt), idempotency
+      (is it safe to retry this operation?), circuit breaking (stop retrying a dead service),
+      retry-able vs. non-retryable errors (don't retry 400 Bad Request), and logging/metrics
+      (how many retries are happening?). When 15 developers each write retry logic, you get 15
+      slightly different implementations: some without backoff (DDoS your own service), some
+      without jitter (thundering herd), some that retry non-idempotent operations (duplicate
+      charges), and some that retry forever (thread pool exhaustion).
+    how_to_do_right: |
+      1. Use a retry library: tenacity (Python), retry (Node.js), resilience4j (Java)
+      2. Centralize retry configuration in one place (retry policy factory)
+      3. Default policy: exponential backoff + jitter + max 3 attempts + 30s total timeout
+      4. Only retry on transient errors (5xx, timeout, connection reset) — never on 4xx
+      5. Ensure retried operations are idempotent (use idempotency keys for mutations)
+      6. Add circuit breaker on top of retries (stop retrying after N consecutive failures)
+      7. Monitor retry rate — high retry rate means the downstream service needs fixing
+    severity: high
+    technologies:
+      lang: [python, javascript, java]
+    domains:
+      domain: [antipattern, integration]
+      concern: [failure, cautionary]
+    example_good: |
+      import tenacity
+      import httpx
+
+      # Centralized retry policy
+      def transient_retry():
+          return tenacity.retry(
+              retry=tenacity.retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError)),
+              wait=tenacity.wait_exponential(multiplier=1, min=1, max=30) + tenacity.wait_random(0, 2),
+              stop=tenacity.stop_after_attempt(3),
+              before_sleep=tenacity.before_sleep_log(logger, logging.WARNING),
+          )
+
+      # Used consistently across the codebase
+      @transient_retry()
+      async def call_payment_service(payment: Payment) -> PaymentResult:
+          async with httpx.AsyncClient(timeout=10) as client:
+              resp = await client.post(PAYMENT_URL, json=payment.dict())
+              resp.raise_for_status()
+              return PaymentResult(**resp.json())
+    example_bad: |
+      # Developer A: no backoff (DDoS own service)
+      def call_api_v1(url):
+          for i in range(10):  # 10 retries with no delay
+              try: return requests.get(url)
+              except: pass
+
+      # Developer B: no jitter (thundering herd)
+      def call_api_v2(url):
+          for i in range(3):
+              try: return requests.get(url)
+              except: time.sleep(2 ** i)  # all clients retry at exactly the same time
+
+      # Developer C: retries non-idempotent POST (duplicate charges)
+      def charge_customer(amount):
+          for i in range(5):
+              try: return requests.post("/charge", json={"amount": amount})
+              except: time.sleep(1)
+          # Timeout on attempt 2, but the charge went through → customer charged twice
+
+      # Developer D: retries 400 Bad Request (will never succeed)
+      def create_user(data):
+          for i in range(3):
+              resp = requests.post("/users", json=data)
+              if resp.status_code >= 400:
+                  time.sleep(1)  # retrying "email already exists" — it will always fail
+    when_applies: API client design, microservices integration, resilience patterns
+    sources: ["https://microservices.io/patterns/reliability/circuit-breaker.html", "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/"]
+
+  - id: ANTI-FAIL-033
+    text: "We used polling where we needed webhooks and wasted 10x CPU — use webhooks, SSE, or long-polling for event-driven scenarios"
+    why: >
+      Polling means asking "is there anything new?" every N seconds, regardless of whether anything
+      changed. At 1,000 clients polling every 5 seconds, the server handles 200 requests/second
+      just to say "no, nothing new" 99% of the time. This wastes CPU, bandwidth, and database
+      queries. It also introduces latency: if you poll every 5 seconds, the average delay is 2.5
+      seconds. Polling more frequently reduces latency but increases waste proportionally.
+      Webhooks invert the model: the source notifies you when something changes. Zero wasted
+      requests, near-zero latency. The tradeoff is complexity (you need an endpoint, retry logic,
+      and signature verification), but this is a one-time cost that pays for itself immediately.
+      For real-time client updates, Server-Sent Events (SSE) or WebSockets replace polling.
+    how_to_do_right: |
+      1. Use webhooks for server-to-server event notification (Stripe, GitHub, Slack all support them)
+      2. Use SSE (Server-Sent Events) for server-to-browser push (simpler than WebSockets for one-way)
+      3. Use WebSockets only for bidirectional real-time communication (chat, gaming)
+      4. If you must poll (no webhook support), use exponential backoff with long intervals
+      5. Implement webhook signature verification (HMAC) to prevent spoofing
+      6. Webhook receiver must be idempotent (you may receive the same event twice)
+      7. Return 200 quickly, process webhook payload asynchronously (avoid timeouts)
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, integration]
+      concern: [failure, cautionary]
+    example_good: |
+      # Webhook receiver — push-based, zero polling waste
+      from fastapi import FastAPI, Request, HTTPException
+      import hmac, hashlib
+
+      @app.post("/webhooks/stripe")
+      async def stripe_webhook(request: Request):
+          payload = await request.body()
+          signature = request.headers.get("Stripe-Signature")
+
+          # Verify signature (prevent spoofing)
+          if not verify_stripe_signature(payload, signature):
+              raise HTTPException(403, "Invalid signature")
+
+          event = json.loads(payload)
+
+          # Return 200 immediately, process async
+          await task_queue.enqueue(process_stripe_event, event)
+          return {"received": True}
+
+      # SSE for real-time client updates
+      @app.get("/events/orders/{order_id}")
+      async def order_events(order_id: str):
+          async def event_stream():
+              async for event in order_event_bus.subscribe(order_id):
+                  yield f"data: {json.dumps(event)}\n\n"
+          return StreamingResponse(event_stream(), media_type="text/event-stream")
+    example_bad: |
+      # Polling: "is the payment done yet?"
+      import time, requests
+
+      def wait_for_payment(payment_id: str, timeout: int = 300):
+          start = time.time()
+          while time.time() - start < timeout:
+              resp = requests.get(f"/api/payments/{payment_id}")
+              if resp.json()["status"] == "completed":
+                  return resp.json()
+              time.sleep(5)  # poll every 5 seconds
+
+      # With 1,000 concurrent payments:
+      # 1,000 clients × 1 request/5 seconds = 200 requests/second
+      # 99% of requests return "still pending"
+      # Server CPU: 80% spent answering "no, nothing new"
+      # Database: 200 queries/second for a table that changes ~2 times/second
+      # Average latency: 2.5 seconds (could be near-zero with webhooks)
+      # Monthly cost: $400 in compute for what webhooks do for free
+    when_applies: API design, system integration, real-time features
+    sources: ["https://stripe.com/docs/webhooks"]
+
+  - id: ANTI-FAIL-034
+    text: "We trusted a third-party API format and it broke when they changed it — validate schemas and handle unknown fields gracefully"
+    why: >
+      Third-party APIs change without warning, regardless of what their documentation promises.
+      Fields get renamed, types change (string to array), new fields appear, optional fields
+      become null instead of absent, and pagination formats change. If your code does
+      response["data"]["user"]["email"] without validation, any of these changes produces a
+      KeyError or TypeError in production. The Postel's Law approach (be liberal in what you
+      accept) applies here: parse what you understand, ignore what you don't, and validate
+      critical fields explicitly. Schema validation at the boundary (where external data enters
+      your system) catches breaking changes before they propagate through your codebase.
+    how_to_do_right: |
+      1. Define Pydantic/dataclass models for all third-party API responses
+      2. Use model_config = {"extra": "ignore"} to handle unknown fields gracefully
+      3. Validate required fields explicitly — fail fast with clear error messages
+      4. Log unexpected response shapes (early warning of API changes)
+      5. Write integration tests that run against the real API (canary tests)
+      6. Pin API versions when available (Accept: application/vnd.api+json; version=2)
+      7. Wrap all third-party calls behind an adapter/anti-corruption layer
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, integration]
+      concern: [failure, cautionary]
+    example_good: |
+      from pydantic import BaseModel, Field
+      from typing import Optional
+
+      # Anti-corruption layer: third-party response → our model
+      class StripePaymentResponse(BaseModel):
+          model_config = {"extra": "ignore"}  # unknown fields won't crash us
+
+          id: str
+          amount: int
+          currency: str
+          status: str
+          customer_email: Optional[str] = None  # might be absent
+
+      class PaymentAdapter:
+          """Anti-corruption layer — isolates third-party API changes."""
+
+          def get_payment(self, payment_id: str) -> StripePaymentResponse:
+              raw = self.client.get(f"/payments/{payment_id}")
+              try:
+                  return StripePaymentResponse.model_validate(raw.json())
+              except ValidationError as e:
+                  logger.error("Stripe API response changed", raw=raw.json(), error=str(e))
+                  raise ThirdPartySchemaError(f"Stripe response validation failed: {e}")
+    example_bad: |
+      # Direct dictionary access — one API change = production crash
+      def get_payment_status(payment_id):
+          resp = requests.get(f"https://api.stripe.com/v1/payments/{payment_id}")
+          data = resp.json()
+          return {
+              "status": data["data"]["status"],           # KeyError if "data" wrapper removed
+              "email": data["data"]["customer"]["email"],  # TypeError if customer is null
+              "amount": data["data"]["amount"] / 100,      # TypeError if amount becomes string
+          }
+
+      # Stripe changes response format (it happens):
+      # Before: {"data": {"status": "paid", "customer": {"email": "a@b.com"}, "amount": 1000}}
+      # After:  {"status": "paid", "customer_email": "a@b.com", "amount_cents": 1000}
+      #
+      # Result: KeyError: 'data' → 500 error → all payment status checks fail
+      # Discovery: 3 AM alert, on-call scrambles, 2-hour outage
+    when_applies: Third-party API integration, data pipeline design, system boundaries
+    sources: ["https://martinfowler.com/bliki/TolerantReader.html"]
+
+  - id: ANTI-FAIL-035
+    text: "We sent emails synchronously in the API handler and tripled response latency — queue async operations, don't block the request"
+    why: >
+      Sending an email, generating a PDF, calling a slow third-party API, or processing a large
+      image are operations that take 500ms to 5 seconds. When done synchronously in an API handler,
+      the user waits for the entire operation. If the email server is slow (1.5 seconds), your
+      "fast" 200ms API response becomes 1700ms. If the email server times out, your API returns
+      a 500 error even though the primary operation (creating the order) succeeded. The user
+      retries, creating a duplicate order. Async processing decouples the fast path (accept the
+      request, return 202) from the slow path (send the email). The user gets a fast response,
+      and the background task handles the slow operation with its own retry logic.
+    how_to_do_right: |
+      1. Identify operations that are not needed for the API response (email, notifications, analytics)
+      2. Queue these operations for async processing (Celery, RQ, Bull, SQS, Redis Streams)
+      3. Return 202 Accepted with a status URL for long-running operations
+      4. Background workers handle retries, failures, and dead-letter queues independently
+      5. If the queue is down, degrade gracefully (log and retry later, don't block the request)
+      6. Monitor queue depth and processing time as operational metrics
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, integration]
+      concern: [failure, cautionary]
+    example_good: |
+      from celery import Celery
+
+      celery_app = Celery("tasks", broker="redis://localhost:6379")
+
+      @app.post("/orders", status_code=201)
+      async def create_order(order: OrderCreate):
+          # Fast path: create order in DB (50ms)
+          db_order = await order_repo.create(order)
+
+          # Async: queue email, notification, analytics (non-blocking)
+          send_confirmation_email.delay(db_order.id)
+          notify_warehouse.delay(db_order.id)
+          track_analytics.delay("order_created", db_order.id)
+
+          return db_order  # Response in 50ms, not 1700ms
+
+      @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+      def send_confirmation_email(self, order_id: int):
+          try:
+              order = get_order(order_id)
+              email_service.send(order.user_email, "Order Confirmed", ...)
+          except EmailError as exc:
+              self.retry(exc=exc)  # retry with backoff, independent of API
+    example_bad: |
+      @app.post("/orders")
+      async def create_order(order: OrderCreate):
+          # Step 1: Create order (50ms) ✓
+          db_order = await order_repo.create(order)
+
+          # Step 2: Send email (500ms-2000ms) ← blocks the response
+          email_service.send(order.user_email, "Order Confirmed", ...)
+
+          # Step 3: Notify warehouse (300ms) ← blocks the response
+          requests.post(WAREHOUSE_URL, json=db_order.dict())
+
+          # Step 4: Track analytics (200ms) ← blocks the response
+          analytics.track("order_created", db_order.dict())
+
+          return db_order  # Total: 50 + 1500 + 300 + 200 = 2050ms
+
+      # If email server is down:
+      # → 5-second timeout → 500 error → user thinks order failed
+      # → User retries → duplicate order created
+      # → Support ticket: "I was charged twice"
+    when_applies: API design, performance optimization, system architecture
+    sources: ["https://12factor.net/backing-services"]
+
+  - id: ANTI-FAIL-036
+    text: "Frontend and backend were tightly coupled — change one, break the other — use BFF pattern or GraphQL"
+    why: >
+      Tight coupling between frontend and backend means they must be deployed simultaneously,
+      developed in lockstep, and every backend change risks breaking the frontend. This manifests
+      as: the backend returns exactly the shape the frontend needs (over-fitting the API to one
+      client), the frontend makes 5 API calls to render one page (under-fetching), or the backend
+      returns 50 fields when the frontend needs 3 (over-fetching). When a mobile app is added,
+      it needs different data shapes than the web app, and the backend becomes a mess of
+      if-mobile-then branches. The Backend-For-Frontend (BFF) pattern or GraphQL decouples
+      the frontend's data needs from the backend's domain model, allowing each to evolve
+      independently.
+    how_to_do_right: |
+      1. BFF pattern: a thin API layer per frontend (web-bff, mobile-bff) that aggregates backend services
+      2. GraphQL: clients specify exactly what they need, backend provides a schema
+      3. REST API versioning: backend exposes stable, versioned endpoints that don't change per-client
+      4. Contract testing: Pact or similar tools verify frontend expectations match backend behavior
+      5. API-first development: define the contract (OpenAPI spec) before implementing either side
+      6. Never shape your domain API to match a specific UI layout
+    severity: high
+    technologies:
+      lang: [python, javascript, java]
+    domains:
+      domain: [antipattern, integration]
+      concern: [failure, cautionary]
+    example_good: |
+      # GraphQL: frontend requests exactly what it needs
+      # Backend provides a stable schema, clients choose their shape
+
+      # Schema
+      type Order {
+        id: ID!
+        status: String!
+        total: Float!
+        items: [OrderItem!]!
+        customer: Customer!
+      }
+
+      # Web app query (needs full details):
+      # query { order(id: "123") { id, status, total, items { name, qty }, customer { name, email } } }
+
+      # Mobile app query (needs summary only):
+      # query { order(id: "123") { id, status, total } }
+
+      # Same backend, different data shapes, zero coupling
+      # Backend can add fields without breaking any client
+      # Each client evolves independently
+    example_bad: |
+      # Backend API shaped to match the web UI exactly:
+      @app.get("/api/dashboard")
+      def get_dashboard():
+          # Returns exactly what the React dashboard component needs
+          return {
+              "header": {"user_name": user.name, "notification_count": 5},
+              "sidebar": {"menu_items": [...], "active_item": "orders"},
+              "main": {"recent_orders": [...], "chart_data": [...]},
+          }
+
+      # Problems:
+      # 1. Mobile app needs different shape → new endpoint /api/mobile-dashboard
+      # 2. Dashboard redesign → backend endpoint must change too
+      # 3. Backend developer must understand React component structure
+      # 4. Frontend developer must wait for backend changes for every UI tweak
+      # 5. API is untestable in isolation (what does "sidebar" mean in API terms?)
+    when_applies: API design, frontend-backend architecture, multi-platform development
+    sources: ["https://samnewman.io/patterns/architectural/bff/"]
+
+  - id: ANTI-FAIL-037
+    text: "We hardcoded third-party URLs throughout the codebase — use an abstraction layer, the provider is an implementation detail"
+    why: >
+      Hardcoding third-party service URLs (api.stripe.com, s3.amazonaws.com, smtp.sendgrid.net)
+      throughout the codebase creates invisible coupling. When you need to switch providers (Stripe
+      to Adyen, S3 to R2, SendGrid to Postmark), you discover the provider is referenced in 47
+      files across 12 modules. Each reference is slightly different: some use the SDK, some use
+      raw HTTP, some have different retry logic, some have hardcoded API keys. The migration takes
+      weeks instead of hours. An abstraction layer (PaymentGateway, ObjectStore, EmailSender)
+      means the provider is an implementation detail that can be swapped by changing one class.
+      This also enables testing: you can inject a mock payment gateway in tests without mocking
+      HTTP requests.
+    how_to_do_right: |
+      1. Define interfaces for external services: PaymentGateway, EmailSender, ObjectStore
+      2. Implement the interface for your current provider (StripeGateway, SendGridSender)
+      3. Inject the implementation via dependency injection (constructor, factory, config)
+      4. Store provider URLs and credentials in config, not in code
+      5. All code depends on the interface, never on the concrete provider
+      6. Switching providers: implement a new class, change the injection config, done
+      7. Test with a fake/mock implementation — no HTTP calls needed
+    severity: high
+    technologies:
+      lang: [python, javascript, java, go]
+    domains:
+      domain: [antipattern, integration]
+      concern: [failure, cautionary]
+    example_good: |
+      from abc import ABC, abstractmethod
+
+      # Interface — all code depends on this
+      class PaymentGateway(ABC):
+          @abstractmethod
+          async def charge(self, amount: int, currency: str, token: str) -> PaymentResult: ...
+
+          @abstractmethod
+          async def refund(self, payment_id: str, amount: int) -> RefundResult: ...
+
+      # Implementation — only referenced in DI configuration
+      class StripeGateway(PaymentGateway):
+          def __init__(self, api_key: str):
+              self.client = stripe.Client(api_key=api_key)
+
+          async def charge(self, amount, currency, token):
+              result = await self.client.charges.create(amount=amount, currency=currency, source=token)
+              return PaymentResult(id=result.id, status=result.status)
+
+      # Switching to Adyen: implement AdyenGateway, change DI config. Zero code changes elsewhere.
+      # Testing: inject MockGateway that returns canned responses. No HTTP mocking needed.
+    example_bad: |
+      # Stripe hardcoded in 47 files:
+      # orders/service.py
+      import stripe
+      stripe.api_key = "sk_live_..."  # hardcoded key
+      def create_order(cart):
+          charge = stripe.Charge.create(amount=cart.total, currency="usd", source=cart.token)
+
+      # payments/refund.py
+      import requests
+      def refund(payment_id):
+          requests.post(f"https://api.stripe.com/v1/refunds",  # hardcoded URL
+                        data={"charge": payment_id},
+                        headers={"Authorization": f"Bearer sk_live_..."})  # different key handling!
+
+      # analytics/revenue.py
+      from stripe import BalanceTransaction  # direct SDK import in analytics module
+
+      # 2 years later: "We need to switch to Adyen for EU customers"
+      # grep -r "stripe" → 47 files, 12 modules, 3 different auth patterns
+      # Estimated migration: 6 weeks. With abstraction layer: 2 days.
+    when_applies: Third-party integration, architecture decisions, dependency management
+    sources: ["https://martinfowler.com/bliki/InversionOfControl.html"]
+
+  - id: ANTI-FAIL-038
+    text: "We used global state singletons everywhere and couldn't write tests — use dependency injection instead"
+    why: >
+      Global state (module-level variables, singletons, class-level state) makes testing nearly
+      impossible because tests cannot run in isolation. Each test inherits state from previous
+      tests, creating order-dependent test suites that pass individually but fail when run together.
+      Global state also prevents parallelization (tests share and mutate the same state) and
+      makes refactoring dangerous (changing one module's global affects all modules that read it).
+      The singleton pattern is particularly insidious: it seems clean (Settings.instance()) but
+      it is a global variable with extra steps. Dependency injection solves this: each function
+      or class receives its dependencies as parameters, so tests can provide mocks, fakes, or
+      test-specific configurations without affecting any other code.
+    how_to_do_right: |
+      1. Pass dependencies as constructor or function parameters (dependency injection)
+      2. Use a DI container (dependency-injector, injector, or manual factory functions)
+      3. For configuration: pass a Settings object, don't read os.environ globally
+      4. For database: pass a session/connection, don't use a global db variable
+      5. For external services: pass a client instance, don't instantiate globally
+      6. Test-friendly: inject mocks/fakes, no monkeypatching needed
+      7. Exception: true constants (SECONDS_PER_DAY = 86400) are fine as module-level
+    severity: high
+    technologies:
+      lang: [python, javascript, java]
+    domains:
+      domain: [antipattern, integration]
+      concern: [failure, cautionary]
+    example_good: |
+      # Dependency injection — testable, isolated, explicit
+      class OrderService:
+          def __init__(self, db: Database, payment: PaymentGateway, email: EmailSender):
+              self.db = db
+              self.payment = payment
+              self.email = email
+
+          async def create_order(self, cart: Cart) -> Order:
+              order = Order.from_cart(cart)
+              await self.db.save(order)
+              await self.payment.charge(order.total, cart.payment_token)
+              await self.email.send_confirmation(order)
+              return order
+
+      # Test: inject fakes, no monkeypatching, no global state
+      async def test_create_order():
+          db = FakeDatabase()
+          payment = FakePaymentGateway(always_succeeds=True)
+          email = FakeEmailSender()
+          service = OrderService(db, payment, email)
+
+          order = await service.create_order(sample_cart)
+          assert order.status == "created"
+          assert len(email.sent) == 1  # email was "sent" to fake
+    example_bad: |
+      # Global state everywhere
+      import os
+      import redis
+
+      # Module-level globals
+      db = Database(os.environ["DATABASE_URL"])  # instantiated at import time
+      cache = redis.Redis(host="localhost")       # hardcoded connection
+      stripe.api_key = os.environ["STRIPE_KEY"]   # global SDK state
+
+      class OrderService:
+          def create_order(self, cart):
+              db.save(Order.from_cart(cart))          # uses global db
+              stripe.Charge.create(amount=cart.total)  # uses global stripe
+              cache.set(f"order:{order.id}", order)    # uses global cache
+
+      # Testing nightmare:
+      def test_create_order():
+          # Can't inject a test database — it's a global
+          # Can't avoid real Stripe calls — it's a global
+          # Can't run tests in parallel — they share global cache
+          # Must monkeypatch everything:
+          with mock.patch("orders.service.db"), \
+               mock.patch("orders.service.cache"), \
+               mock.patch("stripe.Charge.create"):
+              # 3 mocks for one test, fragile, breaks when internals change
+              ...
+    when_applies: Architecture decisions, code review, testability improvement
+    sources: ["https://martinfowler.com/articles/injection.html"]
+
+  # ============================================================
+  # Scaling Anti-Patterns (ANTI-FAIL-039 to ANTI-FAIL-045)
+  # ============================================================
+
+  - id: ANTI-FAIL-039
+    text: "We scaled vertically until $10K/month and had to rewrite — design for horizontal scaling from the start"
+    why: >
+      Vertical scaling (bigger server) has a hard ceiling: the largest cloud instance costs
+      $10,000-20,000/month and eventually cannot handle your load. Worse, vertical scaling
+      creates a single point of failure (one server goes down, everything is down). The
+      transition from vertical to horizontal scaling is not incremental — it is a rewrite.
+      Your application must become stateless (no in-memory sessions, no local file storage),
+      your database must handle concurrent connections from multiple servers, your background
+      jobs must use distributed locks, and your file uploads must go to object storage.
+      Designing for horizontal scaling from the start does not mean running 10 servers on day
+      one — it means structuring your code so that adding a second server requires zero code
+      changes. Stateless services, external session storage, object storage for files, and
+      distributed task queues are simple patterns that cost nothing to implement but save
+      months of rewriting later.
+    how_to_do_right: |
+      1. Design stateless services: no in-memory sessions, no local file storage
+      2. Use external session storage (Redis, database) from day one
+      3. Store files in object storage (S3, R2, GCS), not local filesystem
+      4. Use a task queue (Celery, Bull) for background jobs, not cron on one server
+      5. Use database connection pooling (PgBouncer, connection pool per instance)
+      6. Load balancer in front of application servers (even if you start with one)
+      7. Test with 2 instances early — expose shared-state assumptions before they become entrenched
+    severity: high
+    technologies:
+      lang: [python, javascript, java, go]
+    domains:
+      domain: [antipattern, scaling]
+      concern: [failure, cautionary]
+    example_good: |
+      # Horizontal-ready from day one (no extra cost, just good patterns)
+      from fastapi import FastAPI
+      from redis import Redis
+
+      app = FastAPI()
+      redis = Redis.from_url(settings.REDIS_URL)
+
+      # Sessions: external store (works with N servers)
+      @app.middleware("http")
+      async def session_middleware(request, call_next):
+          session_id = request.cookies.get("session_id")
+          request.state.session = await redis.hgetall(f"session:{session_id}")
+          response = await call_next(request)
+          return response
+
+      # File uploads: object storage (works with N servers)
+      @app.post("/upload")
+      async def upload_file(file: UploadFile):
+          key = f"uploads/{uuid7()}/{file.filename}"
+          await s3.upload_fileobj(file.file, BUCKET, key)  # not local filesystem
+          return {"url": f"{CDN_URL}/{key}"}
+
+      # Background tasks: distributed queue (works with N workers)
+      @celery.task
+      def process_order(order_id: int):
+          ...  # any worker can pick this up
+    example_bad: |
+      # "Just get a bigger server"
+      # Month 1: t3.small ($15/mo) — works fine
+      # Month 3: t3.xlarge ($120/mo) — CPU was maxed
+      # Month 6: c5.4xlarge ($480/mo) — more traffic
+      # Month 9: c5.9xlarge ($1,100/mo) — holiday season
+      # Month 12: c5.18xlarge ($2,200/mo) — growing user base
+      # Month 15: c5.metal ($4,500/mo) — can't go bigger on this instance type
+      # Month 18: u-6tb1.metal ($10,000/mo) — maximum AWS instance
+      # Month 19: "We need horizontal scaling"
+      #   Discovery: in-memory sessions (can't add second server)
+      #   Discovery: file uploads stored in /tmp (can't share between servers)
+      #   Discovery: cron jobs run on the one server (will run twice with two servers)
+      #   Discovery: SQLite used for some features (can't share between servers)
+      #   Estimated rewrite: 3 months. Actual: 5 months.
+    when_applies: Architecture decisions, infrastructure planning, scaling strategy
+    sources: ["https://12factor.net/processes"]
+
+  - id: ANTI-FAIL-040
+    text: "We stored sessions in memory and couldn't add a second server — use Redis or database sessions from day one"
+    why: >
+      In-memory sessions (the default in most web frameworks) store session data in the
+      application process. When you add a second server behind a load balancer, a user's request
+      might hit server A (which has their session) or server B (which does not). The result:
+      users are randomly logged out, shopping carts disappear, and form submissions lose state.
+      Sticky sessions (routing the same user to the same server) are a band-aid that defeats
+      the purpose of horizontal scaling (one server goes down, all its sessions are lost) and
+      prevents rolling deploys (old server must stay up until all sessions expire). External
+      session storage (Redis, database) costs nothing to implement on day one and makes
+      horizontal scaling a configuration change instead of a code rewrite.
+    how_to_do_right: |
+      1. Use Redis for session storage (fast, TTL support, shared across all servers)
+      2. Alternative: database sessions (PostgreSQL, simpler but slower than Redis)
+      3. Configure your framework's session middleware to use external storage from day one
+      4. Set appropriate TTLs (e.g., 24 hours for web sessions, 30 days for "remember me")
+      5. Never store large objects in sessions (store an ID, look up the data)
+      6. Test: start two instances behind a load balancer, verify session persistence
+    severity: high
+    technologies:
+      lang: [python, javascript, java]
+    domains:
+      domain: [antipattern, scaling]
+      concern: [failure, cautionary]
+    example_good: |
+      # Redis-backed sessions — horizontal scaling ready
+      from starlette.middleware.sessions import SessionMiddleware
+      from starlette_session import SessionAutoloadMiddleware
+      import redis
+
+      session_store = redis.Redis.from_url(settings.REDIS_URL)
+
+      app.add_middleware(
+          SessionMiddleware,
+          secret_key=settings.SESSION_SECRET,
+          backend=RedisSessionBackend(session_store),
+          max_age=86400,  # 24 hours
+      )
+
+      # Works with 1 server or 100 servers — zero code changes
+      # Rolling deploy: new servers share sessions with old servers
+      # Server crash: sessions survive because they're in Redis, not in-memory
+    example_bad: |
+      # Default in-memory sessions (Flask, Express, Django default)
+      from flask import Flask, session
+      app = Flask(__name__)
+      app.secret_key = "super-secret"
+
+      @app.route("/login", methods=["POST"])
+      def login():
+          session["user_id"] = user.id  # stored in server memory
+          return redirect("/dashboard")
+
+      # With 1 server: works perfectly
+      # Add a second server behind nginx load balancer:
+      # Request 1 → Server A: login, session created in Server A's memory
+      # Request 2 → Server B: "who are you?" (session not found)
+      # Request 3 → Server A: dashboard loads fine
+      # Request 4 → Server B: redirect to login again
+      # User: "The site keeps logging me out randomly!"
+
+      # "Fix": sticky sessions (ip_hash in nginx)
+      # Server A crashes → all users on Server A lose their sessions
+      # Deploy new version → can't restart Server A until all sessions expire
+    when_applies: Web application architecture, scaling preparation, session design
+    sources: ["https://redis.io/docs/latest/develop/data-types/hashes/"]
+
+  - id: ANTI-FAIL-041
+    text: "We loaded everything into memory and OOM'd at 100K users — use pagination, streaming, and database queries"
+    why: >
+      Loading entire datasets into application memory is the most common cause of Out of Memory
+      (OOM) kills in production. It works in development (1,000 rows, 2MB) but fails in production
+      (1,000,000 rows, 2GB). The pattern is insidious because it works perfectly until it
+      suddenly doesn't — there is no gradual degradation, just a crash. Common manifestations:
+      users = db.query(User).all() (loads all users into memory), data = file.read() (loads
+      entire file), results = [process(item) for item in large_list] (materializes entire result).
+      The fix is to process data in bounded chunks: pagination for APIs, streaming/cursors for
+      database queries, generators for data processing, and chunked reads for files.
+    how_to_do_right: |
+      1. Always paginate API responses (limit/offset or cursor-based)
+      2. Use database cursors or server-side streaming for large result sets
+      3. Use generators/iterators instead of materializing entire lists
+      4. Read files in chunks (for line in file:, not file.read())
+      5. Set memory limits and monitor memory usage in production
+      6. Process data in bounded batches (1,000 records at a time, not all at once)
+      7. Use database aggregation (COUNT, SUM, AVG) instead of loading data to count in Python
+    severity: high
+    technologies:
+      lang: [python, javascript, java]
+    domains:
+      domain: [antipattern, scaling]
+      concern: [failure, cautionary]
+    example_good: |
+      # Cursor-based pagination — constant memory regardless of dataset size
+      @app.get("/users")
+      async def list_users(cursor: str | None = None, limit: int = 50):
+          query = select(User).order_by(User.id).limit(limit + 1)
+          if cursor:
+              query = query.where(User.id > decode_cursor(cursor))
+
+          users = await db.execute(query)
+          rows = users.scalars().all()
+
+          has_next = len(rows) > limit
+          items = rows[:limit]
+          next_cursor = encode_cursor(items[-1].id) if has_next else None
+
+          return {"items": items, "next_cursor": next_cursor}
+
+      # Streaming large exports — never loads full dataset
+      async def export_users_csv():
+          async def generate():
+              yield "id,name,email\n"
+              async for batch in db.stream(select(User), batch_size=1000):
+                  for user in batch:
+                      yield f"{user.id},{user.name},{user.email}\n"
+          return StreamingResponse(generate(), media_type="text/csv")
+    example_bad: |
+      # Load everything into memory
+      @app.get("/users")
+      async def list_users():
+          users = await db.execute(select(User))
+          all_users = users.scalars().all()  # 100K users × 2KB each = 200MB in memory
+          return all_users  # serialize 200MB to JSON (another 200MB)
+
+      # Export: load all into memory, then write
+      @app.get("/export")
+      async def export():
+          users = await db.execute(select(User))
+          all_users = users.scalars().all()  # 200MB
+          csv_data = "\n".join(f"{u.id},{u.name}" for u in all_users)  # another 200MB
+          return Response(content=csv_data)  # 400MB total for one request
+
+      # With 10 concurrent export requests: 4GB memory → OOM kill
+      # Container restarts, all in-flight requests fail
+      # Load balancer sends retries to the same server → OOM again → crash loop
+    when_applies: API design, data processing, performance optimization
+    sources: ["https://www.postgresql.org/docs/current/queries-limit.html"]
+
+  - id: ANTI-FAIL-042
+    text: "We used a single queue for all message types and a slow consumer blocked everything — use separate queues per message type"
+    why: >
+      A single message queue processing all message types creates head-of-line blocking. If
+      email notifications (fast, 50ms) and video transcoding (slow, 5 minutes) share a queue,
+      a burst of video transcoding jobs blocks all email notifications for hours. The slow
+      consumer determines the throughput for all message types. This also prevents independent
+      scaling: you cannot add more video transcoding workers without also processing more
+      emails. Separate queues allow independent scaling (10 email workers, 2 video workers),
+      independent monitoring (email queue depth vs. video queue depth), independent retry
+      policies (retry email 3x in 5 minutes, retry video 2x in 30 minutes), and independent
+      priority (email is real-time, video is best-effort).
+    how_to_do_right: |
+      1. Separate queues by message type or processing characteristics (fast/slow, critical/best-effort)
+      2. At minimum: separate queues for real-time vs. batch processing
+      3. Independent worker pools per queue (scale independently)
+      4. Independent retry policies per queue (different retry intervals and max attempts)
+      5. Independent dead-letter queues per message type (easier debugging)
+      6. Monitor each queue independently: depth, processing time, error rate
+      7. Use priority queues within a type if needed (P0 emails before P2 emails)
+    severity: high
+    technologies:
+      lang: [python, javascript, java]
+    domains:
+      domain: [antipattern, scaling]
+      concern: [failure, cautionary]
+    example_good: |
+      # Separate queues by processing characteristics
+      from celery import Celery
+
+      app = Celery("tasks", broker="redis://localhost:6379")
+
+      # Queue configuration
+      app.conf.task_routes = {
+          "tasks.send_email": {"queue": "email"},            # fast, real-time
+          "tasks.send_notification": {"queue": "email"},     # fast, real-time
+          "tasks.transcode_video": {"queue": "video"},       # slow, CPU-intensive
+          "tasks.generate_report": {"queue": "batch"},       # slow, I/O-intensive
+          "tasks.process_payment": {"queue": "critical"},    # must not be delayed
+      }
+
+      # Independent workers per queue
+      # celery -A tasks worker -Q email --concurrency=20       (many fast workers)
+      # celery -A tasks worker -Q video --concurrency=2        (few slow workers)
+      # celery -A tasks worker -Q batch --concurrency=5        (medium batch workers)
+      # celery -A tasks worker -Q critical --concurrency=10    (dedicated for payments)
+    example_bad: |
+      # Single queue for everything
+      app.conf.task_default_queue = "default"
+
+      @app.task
+      def send_email(to, subject, body):
+          email_service.send(to, subject, body)  # 50ms
+
+      @app.task
+      def transcode_video(video_id):
+          ffmpeg.transcode(video_id)  # 5 minutes
+
+      @app.task
+      def process_payment(payment_id):
+          stripe.charge(payment_id)  # 200ms, CRITICAL
+
+      # Monday 9 AM: marketing sends newsletter → 50,000 email tasks queued
+      # Monday 9:01 AM: user uploads video → video task queued behind 50K emails
+      # Monday 9:02 AM: user makes payment → payment task queued behind 50K emails + video
+      # Monday 9:03 AM: user's payment hasn't processed (stuck behind 50K emails)
+      # User: "I paid but the order shows 'pending'"
+      # Support: "Please wait, we're processing a newsletter"
+    when_applies: Message queue design, async processing architecture, scaling strategy
+    sources: ["https://docs.celeryq.dev/en/stable/userguide/routing.html"]
+
+  - id: ANTI-FAIL-043
+    text: "We had no backpressure and the producer drowned the consumer — implement backpressure to protect your system"
+    why: >
+      Backpressure is the mechanism that prevents a fast producer from overwhelming a slow
+      consumer. Without it, the producer keeps generating work faster than the consumer can
+      process it. The queue grows unboundedly, memory increases, and eventually the system
+      crashes (OOM, disk full, or the queue broker itself fails). This is particularly dangerous
+      because it is a positive feedback loop: as the queue grows, the consumer gets slower
+      (more memory pressure, more GC pauses), which makes the queue grow faster. Backpressure
+      options include: bounded queues that reject new items when full, rate limiting on the
+      producer, consumer-driven pull (consumer requests work when ready), and circuit breakers
+      that shed load. The key insight is that dropping or delaying some work is better than
+      crashing the entire system.
+    how_to_do_right: |
+      1. Use bounded queues with a maximum size (reject or block when full)
+      2. Producer rate limiting: limit how fast producers can enqueue (token bucket, sliding window)
+      3. Consumer-driven pull: consumer fetches next item when ready (not push-based)
+      4. Circuit breaker: shed load when consumer is overwhelmed (return 503, drop low-priority items)
+      5. Monitor queue depth with alerts (warning at 80% capacity, critical at 95%)
+      6. Load shedding strategy: prioritize critical work, drop or delay best-effort work
+      7. Test with production-scale load to find the breaking point before production does
+    severity: high
+    technologies:
+      lang: [python, javascript, java, go]
+    domains:
+      domain: [antipattern, scaling]
+      concern: [failure, cautionary]
+    example_good: |
+      import asyncio
+      from collections import deque
+
+      class BackpressuredQueue:
+          """Bounded queue with backpressure support."""
+
+          def __init__(self, maxsize: int = 10_000):
+              self.queue = asyncio.Queue(maxsize=maxsize)
+              self.dropped = 0
+
+          async def put(self, item, priority: str = "normal") -> bool:
+              if self.queue.full():
+                  if priority == "critical":
+                      # Drop oldest non-critical item to make room
+                      self._evict_lowest_priority()
+                  else:
+                      self.dropped += 1
+                      logger.warning("Queue full, dropping item", dropped_total=self.dropped)
+                      return False  # backpressure signal to producer
+              await self.queue.put(item)
+              return True
+
+          async def get(self):
+              return await self.queue.get()  # consumer pulls when ready
+
+      # API with backpressure
+      @app.post("/events")
+      async def ingest_event(event: Event):
+          accepted = await event_queue.put(event, priority=event.priority)
+          if not accepted:
+              raise HTTPException(503, "System overloaded, retry later")
+    example_bad: |
+      # Unbounded queue — no backpressure
+      import queue
+      event_queue = queue.Queue()  # no maxsize = unbounded
+
+      # Producer: 10,000 events/second
+      @app.post("/events")
+      async def ingest_event(event: Event):
+          event_queue.put(event)  # always succeeds, queue grows forever
+          return {"status": "accepted"}
+
+      # Consumer: 100 events/second
+      def consumer():
+          while True:
+              event = event_queue.get()
+              process(event)  # takes 10ms per event
+
+      # 10,000 produced/sec - 100 consumed/sec = 9,900 items/sec accumulation
+      # After 1 hour: 35,640,000 items in queue
+      # Each item: ~1KB → 35GB of memory
+      # Result: OOM kill, all 35M queued events lost
+      # Recovery: restart, but producers immediately fill the queue again → crash loop
+    when_applies: System design, queue architecture, high-throughput systems
+    sources: ["https://mechanical-sympathy.blogspot.com/2012/05/apply-back-pressure-when-overloaded.html"]
+
+  - id: ANTI-FAIL-044
+    text: "We used WebSockets for everything including one-time requests — use HTTP for request/response and SSE for server push"
+    why: >
+      WebSockets are a persistent, bidirectional communication channel. They are appropriate for
+      real-time bidirectional use cases (chat, multiplayer games, collaborative editing). Using
+      them for one-time request-response operations (fetching a user profile, submitting a form)
+      adds unnecessary complexity: connection management, reconnection logic, message correlation
+      (matching responses to requests), authentication per-message (not per-connection), load
+      balancer configuration (sticky sessions or Layer 7 WS support), and inability to use
+      standard HTTP caching, CDNs, or REST tooling. For server-to-client push (notifications,
+      live updates), Server-Sent Events (SSE) are simpler than WebSockets: they use standard
+      HTTP, work through CDNs, auto-reconnect, and require no special load balancer config.
+      Use the right tool for each communication pattern.
+    how_to_do_right: |
+      1. HTTP (REST/GraphQL): request-response (CRUD, forms, queries) — 90% of use cases
+      2. SSE (Server-Sent Events): server-to-client push (notifications, live feeds, progress updates)
+      3. WebSockets: bidirectional real-time (chat, gaming, collaborative editing)
+      4. Decision matrix: need response to a request? → HTTP. Server pushes updates? → SSE. Both sides send freely? → WebSocket
+      5. SSE advantages over WebSocket: auto-reconnect, works with CDNs, standard HTTP auth, simpler implementation
+      6. If using WebSockets, implement reconnection with exponential backoff
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [antipattern, scaling]
+      concern: [failure, cautionary]
+    example_good: |
+      # Right tool for each pattern
+      from fastapi import FastAPI
+      from sse_starlette.sse import EventSourceResponse
+
+      # Pattern 1: Request-Response → HTTP
+      @app.get("/users/{user_id}")
+      async def get_user(user_id: int):
+          return await user_repo.get(user_id)  # cacheable, CDN-friendly, simple
+
+      # Pattern 2: Server Push → SSE
+      @app.get("/notifications/{user_id}")
+      async def notifications(user_id: int):
+          async def event_stream():
+              async for notification in notification_bus.subscribe(user_id):
+                  yield {"event": "notification", "data": json.dumps(notification)}
+          return EventSourceResponse(event_stream())
+
+      # Pattern 3: Bidirectional → WebSocket (only where needed)
+      @app.websocket("/chat/{room_id}")
+      async def chat(websocket: WebSocket, room_id: str):
+          await websocket.accept()
+          async for message in websocket.iter_json():
+              await chat_room.broadcast(room_id, message)
+    example_bad: |
+      # WebSocket for everything
+      @app.websocket("/api")
+      async def api_handler(websocket: WebSocket):
+          await websocket.accept()
+          async for raw in websocket.iter_text():
+              msg = json.loads(raw)
+
+              if msg["type"] == "get_user":           # should be GET /users/{id}
+                  user = await get_user(msg["id"])
+                  await websocket.send_json({"type": "user", "data": user, "req_id": msg["req_id"]})
+
+              elif msg["type"] == "create_order":     # should be POST /orders
+                  order = await create_order(msg["data"])
+                  await websocket.send_json({"type": "order", "data": order, "req_id": msg["req_id"]})
+
+              elif msg["type"] == "subscribe_notifications":  # SSE would be simpler
+                  ...
+
+      # Problems:
+      # - Every client must implement message correlation (req_id matching)
+      # - No HTTP caching (every "GET" is a WebSocket message)
+      # - No CDN support (persistent connections can't be cached)
+      # - Load balancer needs sticky sessions (or WebSocket-aware L7)
+      # - Authentication: per-connection, not per-request (escalation risk)
+      # - Can't use curl, Postman, or standard HTTP debugging tools
+    when_applies: API design, real-time feature architecture, protocol selection
+    sources: ["https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events"]
+
+  - id: ANTI-FAIL-045
+    text: "We built a real-time system on a relational database and hit the wall at 1K events/sec — use Redis Pub/Sub, Kafka, or CDC"
+    why: >
+      Relational databases are designed for ACID transactions, complex queries, and durable
+      storage — not for high-throughput, low-latency event distribution. Polling a database for
+      new events (SELECT WHERE created_at > last_check) creates contention, wastes I/O, and
+      has inherent latency (poll interval). Using database triggers for notifications couples
+      event delivery to transaction performance. At 1,000+ events/second, the database becomes
+      a bottleneck: write-ahead log contention, lock contention on hot tables, connection pool
+      exhaustion from long-polling clients, and index maintenance overhead. Purpose-built tools
+      exist for every real-time pattern: Redis Pub/Sub for ephemeral messaging, Kafka for
+      durable event streaming, SSE for browser push, and CDC (Change Data Capture) for
+      turning database changes into event streams without polling.
+    how_to_do_right: |
+      1. Redis Pub/Sub: ephemeral real-time messaging (notifications, live updates, <100K msg/sec)
+      2. Kafka/Redpanda: durable event streaming (event sourcing, audit log, replay, 1M+ msg/sec)
+      3. CDC (Debezium): stream database changes without polling (turns commits into events)
+      4. SSE/WebSocket for client delivery, backed by Redis or Kafka, not direct DB polling
+      5. Use the database for storage and queries, not for event distribution
+      6. Pattern: write to DB → CDC captures change → publishes to Kafka → consumers read from Kafka
+      7. If you need both persistence and real-time: write to DB, publish to Redis/Kafka (dual-write or CDC)
+    severity: high
+    technologies:
+      lang: [python, javascript, java, go]
+    domains:
+      domain: [antipattern, scaling]
+      concern: [failure, cautionary]
+    example_good: |
+      # Real-time system with proper event infrastructure
+      import redis.asyncio as aioredis
+      from fastapi import FastAPI
+
+      redis = aioredis.from_url(settings.REDIS_URL)
+
+      # Write: save to DB + publish event to Redis
+      async def create_order(order: OrderCreate):
+          db_order = await order_repo.save(order)
+          # Publish real-time event (Redis Pub/Sub)
+          await redis.publish("orders", json.dumps({
+              "event": "order_created",
+              "order_id": db_order.id,
+              "user_id": db_order.user_id,
+          }))
+          return db_order
+
+      # Real-time consumer: subscribes to Redis, pushes to client via SSE
+      @app.get("/events/orders")
+      async def order_events():
+          async def stream():
+              pubsub = redis.pubsub()
+              await pubsub.subscribe("orders")
+              async for message in pubsub.listen():
+                  if message["type"] == "message":
+                      yield f"data: {message['data']}\n\n"
+          return StreamingResponse(stream(), media_type="text/event-stream")
+
+      # 10,000+ events/sec with sub-millisecond latency
+    example_bad: |
+      # Real-time system on PostgreSQL
+      import time
+
+      # "Real-time" feed: poll the database every 500ms
+      def get_live_orders(last_check: datetime):
+          while True:
+              new_orders = db.execute(
+                  "SELECT * FROM orders WHERE created_at > %s ORDER BY created_at",
+                  (last_check,)
+              ).fetchall()
+              if new_orders:
+                  last_check = new_orders[-1].created_at
+                  yield new_orders
+              time.sleep(0.5)  # poll every 500ms
+
+      # With 100 connected clients: 200 queries/second just for polling
+      # With 1,000 clients: 2,000 queries/second (most return empty results)
+      # Database CPU: 90% spent on polling queries that return nothing
+      # Average latency: 250ms (half the poll interval)
+      # At 1K events/sec: index maintenance on created_at + 2K polling queries = DB overload
+      # Connection pool exhausted → new orders can't be written → cascade failure
+    when_applies: Real-time system architecture, event-driven design, scaling strategy
+    sources: ["https://kafka.apache.org/documentation/#design"]

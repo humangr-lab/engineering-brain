@@ -1,0 +1,1051 @@
+layer: rules
+domain: deployment
+knowledge:
+- id: DEVOPS-001
+  text: >
+    In GitHub Actions, use reusable workflows (workflow_call) for cross-repo CI logic and
+    composite actions for within-repo step reuse. Pin callers to version tags (v2), never
+    @main — drift between caller and workflow causes silent breaking changes at 3am.
+  why: >
+    Teams that pin reusable workflows to @main have seen CI break org-wide when the shared
+    workflow introduced a breaking change without a major version bump. A 2025 GitHub survey
+    found that 67% of reusable-workflow breakages came from unpinned refs. Composite actions
+    that are not self-contained (e.g., they assume the calling repo's files are present) cause
+    "file not found" failures that are nearly impossible to debug without local reproduction.
+  how_to_do_right: |
+    1. Create .github/workflows/ci-shared.yml in a dedicated infra repo (e.g., org/.github).
+    2. Tag releases: git tag v2.1.0 && git push origin v2.1.0.
+    3. In callers: uses: org/.github/.github/workflows/ci-shared.yml@v2.1.0
+    4. Document input schema in the reusable workflow under on.workflow_call.inputs.
+    5. Declare ALL required secrets under on.workflow_call.secrets — undeclared secrets
+       are silently empty (not an error), causing auth failures that look like network errors.
+    6. Run CI on the shared workflow repo itself (meta-CI) to validate every push.
+    7. Use Dependabot or Renovate to auto-bump workflow refs in caller repos.
+  severity: high
+  technologies:
+    lang: [yaml]
+    framework: [github-actions]
+  domains:
+    domain: [deployment, ci_cd]
+    concern: [reusability, stability, versioning]
+  example_good: |
+    # .github/workflows/build.yml (CALLER — pinned to tag)
+    jobs:
+      build:
+        uses: myorg/.github/.github/workflows/python-ci.yml@v3.2.0
+        with:
+          python-version: "3.12"
+          run-tests: true
+        secrets:
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+
+    # .github/workflows/python-ci.yml (REUSABLE — declares contract)
+    on:
+      workflow_call:
+        inputs:
+          python-version:
+            required: true
+            type: string
+          run-tests:
+            required: false
+            type: boolean
+            default: true
+        secrets:
+          PYPI_TOKEN:
+            required: false
+  example_bad: |
+    # WRONG: pinned to @main — breaks silently when shared workflow changes
+    jobs:
+      build:
+        uses: myorg/.github/.github/workflows/python-ci.yml@main
+        secrets: inherit  # WRONG: passes ALL secrets, violates least-privilege
+    # Also wrong: composite action that reads files from calling repo
+    # without checking they exist, causing "cat: file not found" errors
+  when_applies: "Any GitHub Actions setup with 2+ repos sharing CI logic, or any single repo with 3+ workflows sharing steps."
+  sources:
+    - "https://docs.github.com/en/actions/sharing-automations/reusing-workflows"
+    - "https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-composite-action"
+
+- id: DEVOPS-002
+  text: >
+    In monorepo CI, use path-based triggers with affected-package detection (Nx, Turborepo,
+    or git diff) to build ONLY what changed. Building all packages on every commit kills
+    CI throughput at O(N) cost per commit as the monorepo grows.
+  why: >
+    A 50-package monorepo building all packages on every PR commit takes 45+ minutes even
+    with parallelism. Nx affected detection cuts this to 3-8 minutes by tracing the dependency
+    graph and only rebuilding packages whose transitive deps changed. Teams that skip this
+    see CI queues back up, developers stop waiting for CI, and merge quality degrades.
+  how_to_do_right: |
+    1. Install affected detection: npm install --save-dev @nx/nx or turbo.
+    2. Generate affected list: npx nx affected --target=build --base=origin/main --head=HEAD
+       OR: turbo run build --filter=...[origin/main]
+    3. Pass as matrix to GitHub Actions:
+       - Run: echo "packages=$(npx nx show projects --affected --json)" >> $GITHUB_OUTPUT
+       - Use: matrix: { package: ${{ fromJson(steps.affected.outputs.packages) }} }
+    4. For language-specific monorepos (Python), use git diff + dependency parser:
+       git diff --name-only origin/main | python scripts/affected_packages.py
+    5. Always force-build on changes to: pyproject.toml, Dockerfile, .github/workflows/*,
+       shared/ directory — these are global dependencies.
+    6. Cache the dependency graph computation between runs (Nx Cloud or Turborepo remote cache).
+  severity: high
+  technologies:
+    lang: [yaml, python, typescript]
+    framework: [github-actions, nx, turborepo]
+  domains:
+    domain: [deployment, ci_cd, monorepo]
+    concern: [performance, scalability, build_time]
+  example_good: |
+    # .github/workflows/ci.yml
+    jobs:
+      detect-changes:
+        runs-on: ubuntu-latest
+        outputs:
+          affected: ${{ steps.nx-affected.outputs.affected }}
+        steps:
+          - uses: actions/checkout@v4
+            with:
+              fetch-depth: 0
+          - name: Detect affected packages
+            id: nx-affected
+            run: |
+              AFFECTED=$(npx nx show projects --affected --base=origin/main --json)
+              echo "affected=$AFFECTED" >> $GITHUB_OUTPUT
+
+      build:
+        needs: detect-changes
+        if: ${{ needs.detect-changes.outputs.affected != '[]' }}
+        strategy:
+          matrix:
+            package: ${{ fromJson(needs.detect-changes.outputs.affected) }}
+        steps:
+          - name: Build ${{ matrix.package }}
+            run: npx nx build ${{ matrix.package }}
+  example_bad: |
+    # WRONG: builds everything on every commit — O(N) cost
+    jobs:
+      build:
+        strategy:
+          matrix:
+            package: [service-a, service-b, service-c, service-d, service-e]  # all 50
+        steps:
+          - run: npm run build --workspace=${{ matrix.package }}
+    # Result: 45-minute CI on a 3-line README change
+  when_applies: "Any monorepo with 5+ independently deployable packages or services."
+  sources:
+    - "https://nx.dev/ci/features/affected"
+    - "https://turbo.build/repo/docs/crafting-your-repository/running-tasks#using-filters"
+    - "https://github.com/orgs/community/discussions/158727"
+
+- id: DEVOPS-003
+  text: >
+    Structure environment promotion as dev→staging→prod with separate GitHub Environments,
+    required reviewers, and environment-scoped secrets. Never let prod deployment run
+    without a human approval gate or passing staging smoke tests.
+  why: >
+    A single misconfigured merge-to-main pipeline that auto-deploys to prod caused a 4-hour
+    outage at a fintech company when a dependency update that passed unit tests broke HTTPS
+    certificate pinning in prod. Environment gates with required reviewers add 2-5 minutes
+    of latency and prevent entire classes of silent breakage. GitHub Environments provide
+    audit trails that compliance requires (SOC2, PCI-DSS).
+  how_to_do_right: |
+    1. Create 3 GitHub Environments: development, staging, production.
+    2. production: add required_reviewers (1-2 engineers), deployment_branch_policy (main only).
+    3. Scope secrets to their environment: PROD_DB_URL only in production environment.
+    4. Workflow structure:
+       - deploy-dev: on push to feature branches, no approval
+       - deploy-staging: on push to main, no approval, runs smoke tests
+       - deploy-prod: on push to main, requires staging to pass + human approval
+    5. Staging smoke tests must cover: HTTP 200 on /healthz, auth flow, 1 critical user journey.
+    6. Add deployment_protection_rules for prod: minimum 15 minutes wait after staging deploy
+       (lets monitoring catch early regressions before human approves).
+  severity: critical
+  technologies:
+    lang: [yaml]
+    framework: [github-actions]
+  domains:
+    domain: [deployment, ci_cd]
+    concern: [safety, compliance, promotion_gates]
+  example_good: |
+    # .github/workflows/deploy.yml
+    jobs:
+      deploy-staging:
+        environment: staging
+        runs-on: ubuntu-latest
+        steps:
+          - name: Deploy to staging
+            run: ./scripts/deploy.sh staging
+          - name: Run smoke tests
+            run: pytest tests/smoke/ --base-url=${{ vars.STAGING_URL }}
+
+      deploy-prod:
+        needs: deploy-staging
+        environment: production   # triggers required reviewer approval
+        runs-on: ubuntu-latest
+        steps:
+          - name: Deploy to production
+            run: ./scripts/deploy.sh production
+            env:
+              DB_URL: ${{ secrets.PROD_DB_URL }}  # only available in production env
+  example_bad: |
+    # WRONG: single environment, auto-deploys to prod on every push
+    jobs:
+      deploy:
+        steps:
+          - run: |
+              ./deploy.sh dev
+              ./deploy.sh staging
+              ./deploy.sh prod   # no gate, no approval, race to production
+            env:
+              DB_URL: ${{ secrets.DB_URL }}  # same secret for all envs
+  when_applies: "Any service with a production environment serving real users."
+  sources:
+    - "https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment"
+    - "https://sre.google/sre-book/release-engineering/"
+
+- id: DEVOPS-004
+  text: >
+    Use GitHub OIDC with HashiCorp Vault (or cloud OIDC with AWS/GCP/Azure) instead of
+    long-lived static secrets in GitHub Secrets. OIDC tokens are short-lived (300s TTL),
+    scoped to specific repos/branches/environments, and leave an audit trail. Static secrets
+    in CI are a credential leak waiting to happen.
+  why: >
+    GitHub reports that over 40% of secret scanning alerts in 2024 involved leaked CI/CD
+    credentials. Long-lived tokens stored as GitHub Secrets have no expiry — a repo fork,
+    a public log, or a compromised contributor can silently exfiltrate credentials that
+    remain valid for years. With OIDC, even if the token is captured it expires in 5 minutes
+    and is tied to a specific workflow run, making it useless to an attacker.
+  how_to_do_right: |
+    1. Configure Vault JWT auth backend with GitHub as the OIDC provider:
+       vault auth enable jwt
+       vault write auth/jwt/config oidc_discovery_url="https://token.actions.githubusercontent.com"
+    2. Create Vault policy scoped to repo+branch:
+       vault write auth/jwt/role/ci-deploy \
+         bound_claims='{"repository":"org/repo","ref":"refs/heads/main"}' \
+         policies="ci-deploy-policy" ttl=300s
+    3. In workflow: use hashicorp/vault-action@v3:
+       - uses: hashicorp/vault-action@v3
+         with:
+           url: ${{ secrets.VAULT_ADDR }}
+           role: ci-deploy
+           method: jwt
+           secrets: secret/ci/prod db_password | DB_PASSWORD
+    4. For cloud providers: use aws-actions/configure-aws-credentials with role-to-assume
+       and web-identity-token-file — no AWS_SECRET_ACCESS_KEY needed.
+    5. Scope Vault roles: main branch → prod secrets, feature/* → dev secrets only.
+  severity: critical
+  technologies:
+    lang: [yaml]
+    framework: [github-actions, hashicorp-vault, aws-iam]
+  domains:
+    domain: [deployment, security]
+    concern: [secrets_management, zero_trust, least_privilege]
+  example_good: |
+    # .github/workflows/deploy.yml
+    permissions:
+      id-token: write   # REQUIRED: allows OIDC token request
+      contents: read
+
+    jobs:
+      deploy:
+        steps:
+          - name: Get secrets from Vault via OIDC (no static credentials!)
+            uses: hashicorp/vault-action@v3
+            with:
+              url: https://vault.company.com
+              role: ci-deploy
+              method: jwt
+              secrets: |
+                secret/ci/prod db_password | DB_PASSWORD ;
+                secret/ci/prod api_key | API_KEY
+          - name: Deploy (uses env vars set by vault-action)
+            run: ./deploy.sh
+  example_bad: |
+    # WRONG: static long-lived secrets stored in GitHub Secrets
+    jobs:
+      deploy:
+        steps:
+          - run: ./deploy.sh
+            env:
+              DB_PASSWORD: ${{ secrets.PROD_DB_PASSWORD }}  # rotated never, leaks forever
+              AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}  # never expires
+              AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  when_applies: "Any CI/CD pipeline that needs access to production credentials, cloud resources, or sensitive configuration."
+  sources:
+    - "https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-hashicorp-vault"
+    - "https://developer.hashicorp.com/well-architected-framework/secure-systems/secure-applications/ci-cd-secrets/github-actions"
+
+- id: DEVOPS-005
+  text: >
+    Cache Docker layers in CI using registry-based caching (--cache-from type=registry),
+    not the GitHub Actions cache (actions/cache). Registry-based cache survives worker
+    rotation, scales across concurrent jobs, and reduces push/pull data by 70-90% on
+    typical app images.
+  why: >
+    GitHub Actions cache is evicted after 7 days of non-use and has a 10GB cap per repo.
+    On a monorepo with 5 services building in parallel, the cache fills up within hours and
+    starts evicting, making cache hit rate < 30%. Registry-based caching stores layers in
+    the container registry (ECR, GCR, GHCR) where they are retained indefinitely and shared
+    across all runners. A 1.2GB Python image with large torch dependency drops from 4 minutes
+    to 35 seconds with registry cache hits.
+  how_to_do_right: |
+    1. Use GHCR as cache registry (free for public repos, charged by storage for private):
+       docker buildx build \
+         --cache-from type=registry,ref=ghcr.io/org/app:buildcache \
+         --cache-to type=registry,ref=ghcr.io/org/app:buildcache,mode=max \
+         --tag ghcr.io/org/app:${{ github.sha }} .
+    2. mode=max caches ALL layers (not just final stage) — critical for multi-stage builds.
+    3. Separate cache tags per branch to prevent branch cache pollution:
+       --cache-from type=registry,ref=ghcr.io/org/app:cache-${{ github.ref_name }}
+       --cache-from type=registry,ref=ghcr.io/org/app:cache-main  # fallback
+    4. Structure Dockerfile for maximum cache hits: COPY requirements.txt first, RUN pip install,
+       THEN COPY src/ — changing source files does not invalidate dependency layer.
+    5. Use Docker Buildx with containerd worker: setup-buildx-action enables this automatically.
+  severity: medium
+  technologies:
+    lang: [dockerfile, yaml]
+    framework: [github-actions, docker, docker-buildx]
+  domains:
+    domain: [deployment, ci_cd]
+    concern: [performance, caching, build_time]
+  example_good: |
+    # .github/workflows/build.yml
+    jobs:
+      build:
+        steps:
+          - uses: docker/setup-buildx-action@v3
+
+          - uses: docker/login-action@v3
+            with:
+              registry: ghcr.io
+              username: ${{ github.actor }}
+              password: ${{ secrets.GITHUB_TOKEN }}
+
+          - uses: docker/build-push-action@v6
+            with:
+              context: .
+              push: true
+              tags: ghcr.io/org/app:${{ github.sha }}
+              cache-from: |
+                type=registry,ref=ghcr.io/org/app:buildcache-${{ github.ref_name }}
+                type=registry,ref=ghcr.io/org/app:buildcache-main
+              cache-to: type=registry,ref=ghcr.io/org/app:buildcache-${{ github.ref_name }},mode=max
+  example_bad: |
+    # WRONG: GitHub Actions cache for Docker layers — evicted, limited, slow on parallel builds
+    - uses: actions/cache@v4
+      with:
+        path: /tmp/.buildx-cache
+        key: docker-${{ runner.os }}-${{ hashFiles('Dockerfile') }}
+    - run: |
+        docker build --cache-from type=local,src=/tmp/.buildx-cache \
+                     --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max .
+  when_applies: "Any CI/CD pipeline building Docker images, especially multi-stage builds or images with heavy dependencies (ML, data science)."
+  sources:
+    - "https://docs.docker.com/build/cache/backends/registry/"
+    - "https://github.com/docker/build-push-action#cache-to"
+
+- id: DEVOPS-006
+  text: >
+    Run Alembic migrations in CI/CD as a separate pre-deploy job with explicit rollback
+    capability. Use the expand-contract pattern for zero-downtime: first migration adds
+    new column (expand), app deploys supporting both old and new schema, second migration
+    removes old column (contract). Never add NOT NULL columns without defaults in a single migration.
+  why: >
+    Single-step migrations that add NOT NULL columns, rename columns, or drop tables while
+    the old app version is still running cause either: (a) deployment failures as the old
+    app tries to write to dropped columns, or (b) table locks that block production traffic
+    for minutes. At a startup with 10M rows, a migration adding a NOT NULL column with no
+    default took 47 minutes and caused a complete service outage. The expand-contract pattern
+    eliminates this by decoupling schema changes from code changes.
+  how_to_do_right: |
+    1. Expand phase (migration v1): Add new column as NULLABLE:
+       op.add_column('users', sa.Column('email_verified', sa.Boolean(), nullable=True))
+    2. Deploy app v2: writes to BOTH old column and new column, reads from new column
+       with fallback to old column.
+    3. Backfill data (separate migration or background job):
+       op.execute("UPDATE users SET email_verified = false WHERE email_verified IS NULL")
+    4. Contract phase (migration v3): Add NOT NULL constraint + drop old column:
+       op.alter_column('users', 'email_verified', nullable=False)
+    5. In CI/CD, run migrations BEFORE deploying the app:
+       alembic upgrade head && kubectl rollout deploy/app
+    6. Test rollback in CI: alembic downgrade -1 must always succeed on a test DB.
+    7. Use squawk linter to auto-flag risky migration operations in PRs.
+  severity: critical
+  technologies:
+    lang: [python, sql]
+    framework: [alembic, sqlalchemy, postgresql]
+  domains:
+    domain: [deployment, database]
+    concern: [zero_downtime, schema_migrations, rollback]
+  example_good: |
+    # migrations/versions/001_expand_add_email_verified.py
+    def upgrade():
+        # EXPAND: add as nullable — safe to run while old app is live
+        op.add_column('users', sa.Column('email_verified', sa.Boolean(), nullable=True))
+
+    def downgrade():
+        op.drop_column('users', 'email_verified')
+
+    # --- deploy app v2 here ---
+
+    # migrations/versions/002_backfill_email_verified.py
+    def upgrade():
+        op.execute("UPDATE users SET email_verified = false WHERE email_verified IS NULL")
+
+    # migrations/versions/003_contract_make_not_null.py
+    def upgrade():
+        # CONTRACT: safe because all rows have values now
+        op.alter_column('users', 'email_verified', existing_type=sa.Boolean(), nullable=False)
+
+    def downgrade():
+        op.alter_column('users', 'email_verified', existing_type=sa.Boolean(), nullable=True)
+  example_bad: |
+    # WRONG: single migration adding NOT NULL column — locks table, breaks running app
+    def upgrade():
+        op.add_column('users', sa.Column(
+            'email_verified',
+            sa.Boolean(),
+            nullable=False,   # LOCKS TABLE during migration
+            server_default='false'  # server_default avoids lock but adds technical debt
+        ))
+        # Result: old app version gets IntegrityError when writing rows without this column
+  when_applies: "Any database migration on a table with more than 10K rows, or any migration running against a live production database."
+  sources:
+    - "https://www.getdefacto.com/article/database-schema-migrations"
+    - "https://specs.openstack.org/openstack/glance-specs/specs/ocata/implemented/glance/alembic-migrations.html"
+    - "https://testdriven.io/blog/alembic-database-migrations/"
+
+- id: DEVOPS-007
+  text: >
+    Implement blue-green deployment with Argo Rollouts rather than manual Kubernetes
+    Deployment switches. Define automated analysis with Prometheus metrics: if error_rate
+    > 1% or p99_latency > 2s during rollout, trigger automatic rollback without human
+    intervention. Manual rollback during an incident adds 5-15 minutes of mean time to
+    recovery.
+  why: >
+    Teams relying on manual kubectl rollout undo during incidents consistently miss the
+    5-minute recovery SLA because: the on-call engineer is being paged and context-switching,
+    the runbook step "check metrics then decide" takes judgment under pressure, and rollback
+    itself requires correct cluster credentials. Argo Rollouts analysis templates remove
+    human judgment from the fast path — metrics decide, not a panicking engineer at 2am.
+  how_to_do_right: |
+    1. Install Argo Rollouts controller in cluster.
+    2. Convert Deployment to Rollout resource with blue-green strategy:
+       strategy:
+         blueGreen:
+           activeService: app-active
+           previewService: app-preview
+           autoPromotionEnabled: false  # require analysis to pass
+    3. Define AnalysisTemplate querying Prometheus:
+       metrics:
+         - name: success-rate
+           successCondition: result[0] >= 0.99  # 99% success rate
+           provider:
+             prometheus:
+               query: rate(http_requests_total{status!~"5.."}[5m]) /
+                      rate(http_requests_total[5m])
+    4. Attach analysis to rollout: spec.strategy.blueGreen.prePromotionAnalysis
+    5. Set analysis interval: 30s checks for 5 minutes before promotion.
+    6. Test rollback works: argo rollouts abort <rollout-name> must cut traffic in < 10s.
+  severity: critical
+  technologies:
+    lang: [yaml]
+    framework: [kubernetes, argo-rollouts, argocd, prometheus]
+  domains:
+    domain: [deployment, infrastructure]
+    concern: [zero_downtime, automated_rollback, progressive_delivery]
+  example_good: |
+    # rollout.yaml
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    spec:
+      strategy:
+        blueGreen:
+          activeService: app-active
+          previewService: app-preview
+          autoPromotionEnabled: false
+          prePromotionAnalysis:
+            templates:
+              - templateName: success-rate
+            args:
+              - name: service-name
+                value: app-preview
+
+    ---
+    # analysis-template.yaml
+    apiVersion: argoproj.io/v1alpha1
+    kind: AnalysisTemplate
+    metadata:
+      name: success-rate
+    spec:
+      metrics:
+        - name: success-rate
+          interval: 30s
+          count: 10
+          successCondition: result[0] >= 0.99
+          failureLimit: 1
+          provider:
+            prometheus:
+              address: http://prometheus:9090
+              query: |
+                sum(rate(http_requests_total{service="{{args.service-name}}",status!~"5.."}[5m])) /
+                sum(rate(http_requests_total{service="{{args.service-name}}"}[5m]))
+  example_bad: |
+    # WRONG: manual rollout with no automated analysis
+    # deploy.sh
+    kubectl set image deployment/app app=myimage:v2
+    echo "Watch the metrics and manually rollback if needed"
+    # Result: on-call engineer wakes up, checks Grafana, decides, runs kubectl
+    # rollout undo — takes 8-15 minutes, SLA breach
+  when_applies: "Production deployments of any stateless service with Prometheus metrics available."
+  sources:
+    - "https://argoproj.github.io/rollouts/"
+    - "https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/"
+    - "https://www.redhat.com/en/blog/blue-green-canary-argo-rollouts"
+
+- id: DEVOPS-008
+  text: >
+    Use GitOps with ArgoCD for production deployments: Git is the single source of truth
+    for desired cluster state. Never use kubectl apply or helm install directly in CI —
+    push to a deploy repo and let ArgoCD sync. This gives free audit trail, drift detection,
+    and rollback via git revert.
+  why: >
+    Direct kubectl deployments from CI have no audit trail for who deployed what when,
+    no drift detection (someone manually patches prod and CI doesn't know), and rollback
+    requires re-running CI (slow). ArgoCD compares desired state (Git) vs actual state
+    (cluster) every 3 minutes and alerts or auto-corrects drift. After a prod incident,
+    the ability to git log the deploy repo and see "deploy: bump app to v2.3.1 by @alice"
+    cuts mean time to diagnosis by 60%.
+  how_to_do_right: |
+    1. Separate app code repo from deploy manifests repo (or use separate directory).
+    2. CI builds image, tags with git SHA, pushes to registry.
+    3. CI updates the image tag in deploy repo:
+       cd deploy-repo && yq -i '.spec.template.spec.containers[0].image = "app:'"$SHA"'"' app.yaml
+       git commit -m "deploy: app $SHA" && git push
+    4. ArgoCD watches deploy repo, auto-syncs (or waits for manual sync for prod).
+    5. Configure syncPolicy.syncOptions: [ServerSideApply=true] for safer applies.
+    6. Enable argocd notifications for Slack/PagerDuty on sync fail.
+    7. Set resource exclusions for ephemeral resources (leases, endpoints) to prevent
+       constant diff noise.
+  severity: high
+  technologies:
+    lang: [yaml]
+    framework: [argocd, kubernetes, git]
+  domains:
+    domain: [deployment, gitops]
+    concern: [auditability, drift_detection, rollback]
+  example_good: |
+    # CI step: update image tag in deploy repo
+    - name: Update deploy manifest
+      run: |
+        git clone https://github.com/org/deploy-repo
+        cd deploy-repo
+        yq -i '.spec.template.spec.containers[0].image = "ghcr.io/org/app:${{ github.sha }}"' \
+          apps/production/app.yaml
+        git config user.email "ci@company.com"
+        git commit -am "deploy: app to ${{ github.sha }}"
+        git push
+
+    # ArgoCD Application (deploy-repo/argocd/app.yaml)
+    apiVersion: argoproj.io/v1alpha1
+    kind: Application
+    spec:
+      source:
+        repoURL: https://github.com/org/deploy-repo
+        path: apps/production
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true   # auto-corrects manual kubectl changes
+  example_bad: |
+    # WRONG: direct kubectl in CI — no audit trail, no drift detection
+    - name: Deploy
+      run: |
+        kubectl apply -f k8s/
+        # No record of who deployed, when, what changed
+        # Someone does kubectl edit deployment/app in prod — CI doesn't know
+  when_applies: "Any Kubernetes-based production deployment. Even 1-service Kubernetes setups benefit from the audit trail."
+  sources:
+    - "https://argo-cd.readthedocs.io/en/stable/user-guide/best_practices/"
+    - "https://www.aviator.co/blog/how-to-manage-rollouts-and-rollbacks-using-argocd/"
+
+- id: DEVOPS-009
+  text: >
+    Add deployment gates: run smoke tests against the new deployment BEFORE switching
+    production traffic. Gates must check: /healthz returns 200, key business endpoint
+    returns expected schema, and at least one authenticated user flow succeeds. A gate
+    that only checks HTTP 200 on the root path misses 80% of real deployment failures.
+  why: >
+    Deployment failures at the application layer (not infrastructure) are invisible to
+    health checks that only ping /healthz. A broken database migration, a missing
+    environment variable, or a failed model load all return 200 on /healthz but fail on
+    real traffic. At an e-commerce company, 3 consecutive deployments passed health checks
+    but broke the checkout flow because the payment gateway ENV var was missing — caught
+    only after real users reported failures 20 minutes later.
+  how_to_do_right: |
+    1. Create smoke test suite (tests/smoke/) that runs in 60-90 seconds max.
+    2. Test structure:
+       - /healthz: 200, response contains {"status": "ok"}
+       - /api/v1/products?limit=1: 200, returns array with at least 1 item
+       - POST /api/v1/auth/login with test user: 200, returns JWT
+       - GET /api/v1/cart (authenticated): 200, not 500
+    3. Run smoke tests against staging URL before promoting to prod.
+    4. In blue-green: run smoke tests against preview (blue) environment before switching active service.
+    5. Set a 90-second timeout — smoke tests that take longer block releases.
+    6. Parameterize base URL: pytest tests/smoke/ --base-url=$DEPLOY_URL
+  severity: high
+  technologies:
+    lang: [python, yaml]
+    framework: [pytest, github-actions]
+  domains:
+    domain: [deployment, testing]
+    concern: [deployment_safety, smoke_testing, gates]
+  example_good: |
+    # tests/smoke/test_smoke.py
+    import pytest
+    import httpx
+
+    @pytest.fixture
+    def client(base_url):
+        return httpx.Client(base_url=base_url, timeout=10.0)
+
+    def test_health_check(client):
+        r = client.get("/healthz")
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
+
+    def test_products_endpoint_returns_data(client):
+        r = client.get("/api/v1/products", params={"limit": 1})
+        assert r.status_code == 200
+        data = r.json()
+        assert isinstance(data, list) and len(data) > 0
+        assert "id" in data[0] and "price" in data[0]  # schema check
+
+    def test_auth_flow(client):
+        r = client.post("/api/v1/auth/login", json={
+            "email": "smoke@test.internal", "password": "smoke-test-pass"
+        })
+        assert r.status_code == 200
+        assert "access_token" in r.json()
+  example_bad: |
+    # WRONG: only checks root path — misses application failures
+    - name: Smoke test
+      run: |
+        curl -f http://$STAGING_URL/  # only checks nginx is up, not the app
+        echo "Deployment OK"  # dangerous false confidence
+  when_applies: "Every production deployment, every staging promotion, and every blue-green traffic switch."
+  sources:
+    - "https://sre.google/sre-book/release-engineering/"
+    - "https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment"
+
+- id: DEVOPS-010
+  text: >
+    Version artifacts with semantic versioning tied to git SHAs, not just git tags.
+    Every pushed artifact must be traceable: registry image tag = git SHA. Version tags
+    (v1.2.3) are aliases that point to the canonical SHA-tagged artifact. Never deploy
+    an artifact that doesn't have a traceable git SHA.
+  why: >
+    When a production incident occurs at 3am, "which version is running?" must be
+    answerable in 30 seconds from the cluster or the artifact registry. Docker images
+    tagged as "latest" or "v1.2" are ambiguous — two builds can produce different binaries
+    with the same tag. At a data company, a "latest" redeploy after an incident accidentally
+    rolled BACK 3 days of patches because "latest" still pointed to the previous image.
+  how_to_do_right: |
+    1. Every CI build: tag with git SHA:
+       IMAGE_TAG="ghcr.io/org/app:${{ github.sha }}"
+    2. On merge to main: also tag with semver if this is a release:
+       VERSION=$(cat VERSION)
+       docker tag app:$SHA app:$VERSION
+       docker tag app:$SHA app:latest  # latest = always current main
+    3. Embed git SHA in application binary:
+       ENV APP_GIT_SHA=${{ github.sha }}
+       # App exposes it: GET /version → {"version": "v1.2.3", "sha": "abc1234"}
+    4. In Kubernetes: image: ghcr.io/org/app:abc1234def (SHA, not tag)
+    5. Use image digest for maximum immutability: ghcr.io/org/app@sha256:...
+    6. Record deployment in Git: deploy manifest shows SHA → auditable timeline.
+  severity: high
+  technologies:
+    lang: [yaml, bash]
+    framework: [docker, github-actions, kubernetes]
+  domains:
+    domain: [deployment, versioning]
+    concern: [traceability, auditability, rollback]
+  example_good: |
+    # .github/workflows/release.yml
+    jobs:
+      build-and-push:
+        steps:
+          - name: Build with SHA tag
+            run: |
+              docker build -t ghcr.io/org/app:${{ github.sha }} .
+              docker push ghcr.io/org/app:${{ github.sha }}
+
+          - name: Tag semver on release
+            if: startsWith(github.ref, 'refs/tags/v')
+            run: |
+              VERSION=${{ github.ref_name }}
+              docker tag ghcr.io/org/app:${{ github.sha }} ghcr.io/org/app:$VERSION
+              docker push ghcr.io/org/app:$VERSION
+
+    # Kubernetes manifest always uses SHA
+    # containers:
+    # - image: ghcr.io/org/app:a3f8c21d  # immutable, traceable
+  example_bad: |
+    # WRONG: deploying "latest" — untraceable, overwritten on every build
+    containers:
+    - image: ghcr.io/org/app:latest  # which version? who knows
+    # ALSO WRONG: version tag without SHA backing
+    # ghcr.io/org/app:v1.2.3 was built 3 times with the same tag (overwritten)
+  when_applies: "Every artifact that gets deployed to any environment, including development."
+  sources:
+    - "https://semver.org/"
+    - "https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry"
+
+- id: DEVOPS-011
+  text: >
+    Create PR preview environments automatically for branches using Kubernetes namespaces
+    or serverless preview URLs (Vercel, Railway, Render). Preview environments eliminate
+    "works on my machine" and allow product, design, and QA to review features without
+    a local setup. Tear them down automatically when the PR is closed.
+  why: >
+    Teams without preview environments spend 3-5x more time on review cycles because
+    reviewers must checkout code locally, run the app, and reproduce the feature context.
+    A 2024 State of DevOps study found teams with automated preview envs merged PRs 47%
+    faster and had 34% fewer regression bugs in staging. The key is automation — manual
+    preview env setup takes 20 minutes and never gets done consistently.
+  how_to_do_right: |
+    1. On PR open/push: create namespace pr-{PR_NUMBER} in Kubernetes:
+       kubectl create namespace pr-$PR_NUMBER
+    2. Deploy app to namespace using Helm with pr-specific values:
+       helm upgrade --install app-pr-$PR_NUMBER ./chart \
+         --namespace pr-$PR_NUMBER \
+         --set image.tag=$SHA \
+         --set ingress.host=pr-$PR_NUMBER.preview.company.com \
+         --set db.name=preview_$PR_NUMBER  # isolated DB
+    3. On PR close: delete namespace (cleans up all resources):
+       kubectl delete namespace pr-$PR_NUMBER
+    4. Post preview URL as a PR comment using GitHub Actions:
+       gh pr comment $PR_NUMBER --body "Preview: https://pr-$PR_NUMBER.preview.company.com"
+    5. Limit preview env lifetime: 72 hours max, then auto-destroy and notify.
+    6. Use lightweight DB: spin up ephemeral PostgreSQL with test data seed.
+  severity: medium
+  technologies:
+    lang: [yaml, bash]
+    framework: [kubernetes, helm, github-actions]
+  domains:
+    domain: [deployment, developer_experience]
+    concern: [preview_environments, review_velocity, testing]
+  example_good: |
+    # .github/workflows/preview.yml
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened]
+
+    jobs:
+      deploy-preview:
+        steps:
+          - name: Deploy preview environment
+            run: |
+              helm upgrade --install app-pr-${{ github.event.number }} ./chart \
+                --namespace pr-${{ github.event.number }} \
+                --create-namespace \
+                --set image.tag=${{ github.sha }} \
+                --set ingress.host=pr-${{ github.event.number }}.preview.company.com \
+                --wait --timeout 120s
+
+          - name: Post preview URL to PR
+            run: |
+              gh pr comment ${{ github.event.number }} \
+                --body "Preview environment: https://pr-${{ github.event.number }}.preview.company.com"
+            env:
+              GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      cleanup-preview:
+        if: github.event.action == 'closed'
+        steps:
+          - run: kubectl delete namespace pr-${{ github.event.number }} --ignore-not-found
+  example_bad: |
+    # WRONG: no preview environments — reviewers checkout locally
+    # Manual process: "Hey @alice, can you checkout PR-142 and test the new feature?"
+    # alice: "Sure, let me stop my current work, checkout the branch, configure .env..."
+    # 25 minutes later: "OK looks good, LGTM" (didn't actually test edge cases)
+  when_applies: "Any team with product managers, designers, or QA who review features — or any backend team doing API review."
+  sources:
+    - "https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment"
+    - "https://helm.sh/docs/helm/helm_upgrade/"
+
+- id: DEVOPS-012
+  text: >
+    Optimize CI parallelism explicitly: split pytest test suite by file groupings of
+    similar duration, not by single file. A test run where 90% of time is in 1 group
+    while 9 groups are idle wastes 9x runner cost. Use pytest-split or similar to
+    create equal-duration groups based on recorded test durations.
+  why: >
+    Default CI parallelism splits by file count, not duration. A project with 1 integration
+    test file taking 8 minutes and 20 unit test files taking 30 seconds each will split into
+    groups where 1 group takes 8 minutes and 20 groups take 30 seconds — total CI time
+    is 8 minutes regardless of parallelism. Duration-aware splitting reduces this to
+    (total_test_time / N_parallel) ≈ true linear speedup. pytest-split records durations
+    and splits into N groups of equal duration automatically.
+  how_to_do_right: |
+    1. Install: pip install pytest-split
+    2. First run: record durations:
+       pytest --store-durations --durations-path=.test-durations.json
+    3. Subsequent runs in CI:
+       pytest --splits=4 --group=${{ matrix.group }} \
+              --durations-path=.test-durations.json
+    4. Matrix job:
+       strategy:
+         matrix:
+           group: [1, 2, 3, 4]
+    5. Cache .test-durations.json in CI (update weekly or on significant test suite changes).
+    6. Monitor group durations: if any group is >20% longer than average, re-split.
+    7. Alternative: pytest-xdist for in-process parallelism (faster for unit tests, unreliable for integration tests with shared state).
+  severity: medium
+  technologies:
+    lang: [python, yaml]
+    framework: [pytest, github-actions, pytest-split]
+  domains:
+    domain: [deployment, ci_cd, testing]
+    concern: [performance, parallelism, ci_speed]
+  example_good: |
+    # .github/workflows/test.yml
+    jobs:
+      test:
+        strategy:
+          matrix:
+            group: [1, 2, 3, 4]  # 4 parallel runners
+        steps:
+          - uses: actions/cache@v4
+            with:
+              path: .test-durations.json
+              key: test-durations-${{ hashFiles('tests/**/*.py') }}
+
+          - name: Run test group ${{ matrix.group }}
+            run: |
+              pytest tests/ \
+                --splits=4 \
+                --group=${{ matrix.group }} \
+                --durations-path=.test-durations.json \
+                -v
+  example_bad: |
+    # WRONG: splits by directory — ignores duration, creates imbalanced groups
+    strategy:
+      matrix:
+        test-dir: [tests/unit, tests/api, tests/integration, tests/e2e]
+    # tests/integration takes 15 min, others take 2 min each
+    # total time = 15 min regardless, wasting 3 runners at 80% idle time
+  when_applies: "Any CI test suite taking more than 5 minutes total with more than 20 test files."
+  sources:
+    - "https://github.com/jerry-git/pytest-split"
+    - "https://docs.pytest.org/en/latest/how-to/xdist.html"
+
+- id: DEVOPS-013
+  text: >
+    Send deployment notifications to Slack/Teams with structured context: who deployed,
+    what SHA, which environment, link to deployment, and outcome. Silent CI/CD pipelines
+    mean teams learn about failures from users, not from alerts.
+  why: >
+    Teams without deployment notifications cannot correlate user reports with deployments.
+    "We got 3 support tickets at 2:15pm — did anything deploy?" is unanswerable without
+    notification history. Deployment notifications also create a cultural record: teams
+    see deployment velocity, notice when a service hasn't been deployed in 3 weeks
+    (stale), and can quickly check whether a specific feature is live in production.
+  how_to_do_right: |
+    1. Send notifications at 3 points: deployment START, SUCCESS, FAILURE.
+    2. Failure notification must include: link to failed job, git SHA, who triggered.
+    3. Use Slack's Block Kit for structured messages (not plain text):
+       {
+         "blocks": [
+           {"type": "section", "text": {"type": "mrkdwn",
+            "text": ":rocket: *Production Deploy* | <$RUN_URL|View Run>"
+           }},
+           {"type": "section", "fields": [
+             {"type": "mrkdwn", "text": "*Service:*\n app-backend"},
+             {"type": "mrkdwn", "text": "*Version:*\n ${{ github.sha }}"},
+             {"type": "mrkdwn", "text": "*By:*\n ${{ github.actor }}"},
+             {"type": "mrkdwn", "text": "*Status:*\n SUCCESS"}
+           ]}
+         ]
+       }
+    4. Use separate channels: #deployments for all, #deploy-failures for failures (paged).
+    5. Tag the on-call engineer on failure notifications.
+  severity: low
+  technologies:
+    lang: [yaml, json]
+    framework: [github-actions, slack]
+  domains:
+    domain: [deployment, observability]
+    concern: [visibility, team_communication, incident_response]
+  example_good: |
+    # .github/workflows/deploy.yml
+    jobs:
+      notify-deploy:
+        needs: deploy
+        if: always()
+        steps:
+          - name: Notify Slack
+            uses: slackapi/slack-github-action@v2
+            with:
+              payload: |
+                {
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": "${{ needs.deploy.result == 'success' && ':white_check_mark:' || ':x:' }} *Production Deploy* | <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+                      }
+                    },
+                    {
+                      "type": "section",
+                      "fields": [
+                        {"type": "mrkdwn", "text": "*SHA:*\n`${{ github.sha }}`"},
+                        {"type": "mrkdwn", "text": "*By:*\n${{ github.actor }}"},
+                        {"type": "mrkdwn", "text": "*Status:*\n${{ needs.deploy.result }}"}
+                      ]
+                    }
+                  ]
+                }
+            env:
+              SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  example_bad: |
+    # WRONG: no notifications — team discovers failures from user reports
+    jobs:
+      deploy:
+        steps:
+          - run: ./deploy.sh
+          # No notification. On-call engineer learns about failure from Datadog alert
+          # 10 minutes later, after real users were impacted.
+  when_applies: "Any production or staging deployment in a team environment."
+  sources:
+    - "https://github.com/slackapi/slack-github-action"
+    - "https://api.slack.com/block-kit"
+
+- id: DEVOPS-014
+  text: >
+    Use GitHub Actions matrix builds with fail-fast: false for cross-platform or
+    cross-version testing. Never use fail-fast: true (the default) when testing across
+    Python/Node versions — a failure on Python 3.9 should not cancel the Python 3.12 run
+    that would reveal a different, independent bug.
+  why: >
+    Default fail-fast: true means the first matrix failure cancels all other matrix jobs.
+    A library that fails on Python 3.9 (deprecated) but passes on 3.10-3.12 gives you
+    no data when fast-fail cancels the 3.10-3.12 runs. Teams make incorrect triage
+    decisions ("this only fails on 3.9, ship it") when they lack the full matrix picture.
+    Disabling fast-fail doubles data yield from a single CI run.
+  how_to_do_right: |
+    1. Set fail-fast: false on all cross-version matrices:
+       strategy:
+         fail-fast: false
+         matrix:
+           python-version: ["3.10", "3.11", "3.12"]
+    2. But: for dependent jobs (build → test → deploy), fail-fast on the deployment matrix
+       is correct — do not deploy if any environment fails.
+    3. Use matrix.include to add extra configurations:
+       matrix:
+         include:
+           - python-version: "3.12"
+             experimental: false
+             extra-flags: "--strict"
+    4. Set timeout-minutes per job in matrix (not on the overall workflow) to prevent
+       a single hung matrix job from blocking the entire run.
+  severity: medium
+  technologies:
+    lang: [yaml]
+    framework: [github-actions]
+  domains:
+    domain: [deployment, ci_cd, testing]
+    concern: [matrix_builds, test_coverage, debugging]
+  example_good: |
+    # .github/workflows/test.yml
+    jobs:
+      test:
+        strategy:
+          fail-fast: false   # ALL matrix combinations run regardless of individual failures
+          matrix:
+            python-version: ["3.10", "3.11", "3.12"]
+            os: [ubuntu-latest, macos-latest]
+        timeout-minutes: 20  # per-job, not per-workflow
+        steps:
+          - uses: actions/setup-python@v5
+            with:
+              python-version: ${{ matrix.python-version }}
+          - run: pytest tests/ -v
+  example_bad: |
+    # WRONG: fail-fast: true (default) — loses diagnostic data on matrix failures
+    strategy:
+      # fail-fast: true  (implicit default)
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    # If 3.10 fails, 3.11 and 3.12 are cancelled — you never know their status
+  when_applies: "Any matrix build testing across multiple Python/Node/Ruby versions, OS combinations, or framework configurations."
+  sources:
+    - "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-variations-of-jobs-in-a-workflow"
+
+- id: DEVOPS-015
+  text: >
+    Implement canary deployments for high-risk changes by routing 5% of traffic to
+    the new version for 30 minutes before full rollout. Define "high-risk" explicitly
+    in team standards: schema migrations, external API integrations, auth changes,
+    payment flows. Not every deploy needs canary — overuse creates operational burden.
+  why: >
+    A payment processing company deployed a change to fee calculation logic that passed
+    all unit tests. In production, a race condition in the DB transaction caused duplicate
+    charges for 0.3% of transactions — undetectable in tests. Canary deployment at 5%
+    traffic caught 3 incidents in 30 minutes, triggering automatic rollback before 95%
+    of users were affected. Full rollout would have caused 1,400 duplicate charges.
+  how_to_do_right: |
+    1. Use Argo Rollouts canary strategy:
+       strategy:
+         canary:
+           steps:
+             - setWeight: 5   # 5% of traffic to canary
+             - pause: {duration: 30m}
+             - analysis: {templates: [{templateName: success-rate}]}
+             - setWeight: 50
+             - pause: {duration: 10m}
+             - setWeight: 100
+    2. Define which changes require canary in team docs (e.g., DEPLOYMENT_STANDARDS.md).
+    3. Canary analysis must check business metrics, not just HTTP error rate:
+       - payment_success_rate > 0.998 (not just 5xx < 0.01)
+       - duplicate_charge_count == 0
+    4. Automatically roll back if analysis fails — never require manual intervention.
+    5. Alert on-call at canary start for high-risk changes (human oversight during analysis window).
+  severity: high
+  technologies:
+    lang: [yaml]
+    framework: [argo-rollouts, kubernetes, prometheus]
+  domains:
+    domain: [deployment, risk_management]
+    concern: [canary, progressive_delivery, blast_radius]
+  example_good: |
+    # rollout.yaml — canary for payment service
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    spec:
+      strategy:
+        canary:
+          canaryService: payment-canary
+          stableService: payment-stable
+          steps:
+            - setWeight: 5
+            - pause: {duration: 30m}
+            - analysis:
+                templates:
+                  - templateName: payment-success-rate
+            - setWeight: 25
+            - pause: {duration: 10m}
+            - setWeight: 100
+          analysis:
+            successfulRunHistoryLimit: 3
+            unsuccessfulRunHistoryLimit: 3
+  example_bad: |
+    # WRONG: full rollout for payment logic changes with no canary
+    kubectl set image deployment/payment-service payment=payment:v2
+    # If there's a bug, 100% of payment traffic is affected immediately
+    # Mean time to rollback: 8-15 minutes (woke up on-call, manual kubectl)
+  when_applies: "Deployments touching payment flows, authentication, data migrations, or any change where a bug affects financial correctness or security."
+  sources:
+    - "https://argoproj.github.io/rollouts/features/canary/"
+    - "https://sre.google/workbook/canarying-releases/"

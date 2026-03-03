@@ -1,0 +1,344 @@
+layer: rules
+technology: SRE
+domain: resilience
+knowledge:
+- id: CR-SRE-RES-001
+  text: Circuit breaker states — CLOSED (normal), OPEN (failing fast, no requests sent), HALF-OPEN (testing recovery). The
+    half-open state is critical and often forgotten — it sends a trickle of test requests to verify the downstream has recovered
+    before restoring full traffic.
+  why: 'The circuit breaker pattern (derived from electrical engineering) is Google''s primary defense against downstream
+    dependency failures propagating upstream. CLOSED state: all requests are forwarded. When error rate exceeds threshold,
+    transition to OPEN. OPEN state: all requests fail immediately without being sent (fail fast). After a cooldown period,
+    transition to HALF-OPEN. HALF-OPEN state: send ONE request to the downstream. If it succeeds, transition to CLOSED (recovered).
+    If it fails, transition back to OPEN (still broken). The half-open state prevents two problems: staying OPEN forever (missing
+    recovery) and going directly CLOSED (hammering a still-recovering service with full traffic). Many implementations skip
+    half-open, which means the circuit stays open until manually reset — turning a temporary failure into permanent unavailability.
+
+    '
+  how_to_do_right: '1. Implement all three states: CLOSED, OPEN, HALF-OPEN. Don''t skip half-open.
+
+    2. OPEN after: 5 consecutive failures, or > 50% error rate over 10 requests. Tune these thresholds for your service.
+
+    3. OPEN duration: 30 seconds before transitioning to HALF-OPEN. Too short = hammering a broken service. Too long = unnecessary
+    downtime.
+
+    4. HALF-OPEN: send 1 test request. If it succeeds, CLOSED. If it fails, OPEN for another 30 seconds.
+
+    5. Gradual recovery: after HALF-OPEN → CLOSED, optionally ramp traffic (10%, 25%, 50%, 100%) instead of full traffic immediately.
+
+    6. Log all state transitions with context: "Circuit for service-payments OPENED at 14:32 due to 5 consecutive timeouts."
+
+    '
+  example_good: "import time\nimport logging\nfrom enum import Enum\n\nlogger = logging.getLogger(__name__)\n\nclass CircuitState(Enum):\n    CLOSED = 'closed'\n    OPEN = 'open'\n    HALF_OPEN = 'half_open'\n\nclass CircuitBreaker:\n    def __init__(self, failure_threshold=5, cooldown=30):\n        self.state = CircuitState.CLOSED\n        self.failures = 0\n        self.threshold = failure_threshold\n        self.cooldown = cooldown\n        self.opened_at = 0\n\n    def call(self, fn, *args):\n        if self.state == CircuitState.OPEN:\n            if time.time() - self.opened_at > self.cooldown:\n                self.state = CircuitState.HALF_OPEN\n                logger.info(\"Circuit HALF-OPEN, testing recovery\")\n            else:\n                raise CircuitOpenError(\"Circuit is OPEN\")\n        try:\n            result = fn(*args)\n            if self.state == CircuitState.HALF_OPEN:\n                self.state = CircuitState.CLOSED\n                self.failures = 0\n                logger.info(\"Circuit CLOSED, service recovered\")\n            return result\n        except Exception:\n            self.failures += 1\n            if self.failures >= self.threshold:\n                self.state = CircuitState.OPEN\n                self.opened_at = time.time()\n                logger.error(\"Circuit OPENED after %d failures\", self.failures)\n            raise\n"
+  example_bad: "import requests\n\ndef call_payment_service(data):\n    try:\n        return requests.post('http://payment-svc/charge', json=data,\n                             timeout=30)\n    except Exception:\n        # No circuit breaker: keeps hammering the broken service\n        # Every request waits 30s for timeout\n        # 100 concurrent requests = 100 threads blocked for 30s\n        # Eventually this service also becomes unavailable\n        raise\n"
+  when_applies: "When calling external or downstream services that may become unavailable or slow."
+  severity: high
+  technologies:
+    lang: [general, go, java, python]
+    framework: [web]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, resilience]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-RES-002
+  text: Fallback strategies — when a dependency fails, serve degraded but useful responses. Static fallbacks (cached/default
+    values), graceful degradation (simpler computation), and fail-open vs fail-closed decisions must be designed explicitly
+    for each dependency.
+  why: 'Google designs fallback strategies for every critical dependency because "dependency unavailable → error" is the laziest
+    and least useful failure mode. Better options exist: if the recommendation engine is down, show popular items instead
+    of personalized ones (static fallback). If the image processing service is slow, serve the original image without resizing
+    (graceful degradation). If the analytics service is down, skip tracking (fail-open — don''t block the user for analytics).
+    If the authentication service is down, reject all requests (fail-closed — security requires this). The choice between
+    fail-open and fail-closed depends on the dependency''s role: non-essential features should fail-open (don''t break the
+    page because analytics is down), security features should fail-closed (don''t allow unauthenticated access because auth
+    is down).
+
+    '
+  how_to_do_right: '1. For every dependency, define a fallback: "If X is unavailable, do Y instead." Document this in the
+    service''s runbook.
+
+    2. Categorize dependencies: essential (auth, payment) vs optional (analytics, recommendations, logging).
+
+    3. Essential dependencies: fail-closed. If auth is down, reject requests. Don''t serve unauthenticated.
+
+    4. Optional dependencies: fail-open. If analytics is down, skip tracking and serve the page.
+
+    5. Cache fallback data: keep the last successful response from each dependency. Serve it (with "stale" indicator) if the
+    dependency fails.
+
+    6. Test all fallback paths. A fallback that was never tested probably doesn''t work. Include dependency failures in integration
+    tests.
+
+    '
+  example_good: "import logging\nfrom functools import lru_cache\n\nlogger = logging.getLogger(__name__)\n\nclass ProductPage:\n    def render(self, product_id: int) -> dict:\n        product = self.catalog.get(product_id)  # Essential\n        try:\n            reviews = self.reviews.get(product_id)\n        except ServiceUnavailable:\n            reviews = []  # Graceful degradation\n            logger.warning(\"Reviews unavailable, showing product without reviews\")\n        try:\n            recommendations = self.reco_engine.get(product_id)\n        except ServiceUnavailable:\n            recommendations = self._get_popular_items()  # Static fallback\n            logger.warning(\"Recommendations unavailable, using popular items\")\n        return {\"product\": product, \"reviews\": reviews,\n                \"recommendations\": recommendations}\n"
+  example_bad: "class ProductPage:\n    def render(self, product_id: int) -> dict:\n        product = self.catalog.get(product_id)\n        reviews = self.reviews.get(product_id)  # If this fails...\n        recommendations = self.reco_engine.get(product_id)  # ...page crashes\n        return {\"product\": product, \"reviews\": reviews,\n                \"recommendations\": recommendations}\n        # Recommendation engine down = entire product page down\n        # Users cannot even see the product, let alone buy it\n"
+  when_applies: "When a service depends on multiple downstream services and not all are essential for the core user experience."
+  severity: high
+  technologies:
+    lang: [general, go, java, python]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, resilience]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-RES-003
+  text: Feature flags must have expiration dates and ownership. A feature flag created 2 years ago that no one knows about,
+    controlling code that no one understands, is not a safety mechanism — it is a landmine. Clean up feature flags within
+    30 days of full launch.
+  why: 'Google uses feature flags extensively for safe launches and quick rollback, but treats abandoned flags as technical
+    debt. Every feature flag adds a code path that must be tested: with the flag on AND with the flag off. With 100 feature
+    flags, there are theoretically 2^100 possible configurations — an untestable space. In practice, stale flags create real
+    problems: an engineer accidentally flips a 2-year-old flag and enables partially-implemented code. A flag that was supposed
+    to be temporary becomes permanent and the "off" code path rots until it''s broken. Flags interact in unexpected ways (flag
+    A off + flag B on = crash). Google''s solution: every flag has an owner, a creation date, and an expected removal date.
+    Flags older than 90 days trigger an automatic code review requesting removal.
+
+    '
+  how_to_do_right: '1. Every feature flag must have: owner, creation date, expected removal date (< 90 days from full launch),
+    and a description.
+
+    2. After full launch + 30 days of stable operation: remove the flag and the "off" code path. Don''t keep it "just in case."
+
+    3. Track flag inventory: how many flags exist, how old are they, who owns them. Report monthly.
+
+    4. Automate flag cleanup alerts: "Flag X was created 60 days ago and is still active. Please remove or document why."
+
+    5. Test with ALL flags in default state and ALL flags in non-default state. Verify both configurations work.
+
+    6. Use a feature flag service (LaunchDarkly, Unleash, Flipt) rather than environment variables. Services provide audit
+    trails, gradual rollout, and targeting.
+
+    '
+  example_good: "import time\nfrom dataclasses import dataclass, field\n\n@dataclass\nclass FeatureFlag:\n    name: str\n    owner: str\n    created_at: float = field(default_factory=time.time)\n    expires_at: float = 0  # Must be set\n    description: str = \"\"\n    enabled: bool = False\n\n    def is_stale(self, max_age_days: int = 90) -> bool:\n        age_days = (time.time() - self.created_at) / 86400\n        return age_days > max_age_days\n\n# Flag inventory with expiration tracking\nflags = {\n    \"new_checkout_flow\": FeatureFlag(\n        name=\"new_checkout_flow\", owner=\"payments-team\",\n        expires_at=time.time() + 90*86400,  # 90 days\n        description=\"A/B test new checkout UX\"\n    )\n}\n"
+  example_bad: "# Feature flags as environment variables with no tracking\nNEW_CHECKOUT = os.getenv('NEW_CHECKOUT', 'false') == 'true'\nEXPERIMENTAL_SEARCH = os.getenv('EXP_SEARCH', 'false') == 'true'\nOLD_MIGRATION_FLAG = os.getenv('MIGRATION_V2', 'false') == 'true'\n# ^ Created 2 years ago, nobody knows what it does\n# ^ No owner, no expiration, no description\n# ^ Someone flips it accidentally -> partially-implemented code runs\n# ^ 100 flags like this = 2^100 untestable configurations\n"
+  when_applies: "When using feature flags for gradual rollouts, A/B testing, or kill switches in production."
+  severity: medium
+  technologies:
+    lang: [general]
+    platform: [deployment]
+  domains:
+    domain: [quality, operations, deployment, reliability]
+    concern: [code, resilience]
+  sources:
+  - url: https://sre.google/sre-book/reliable-product-launches/
+    title: 'Google SRE Book — Chapter 27: Reliable Product Launches at Scale'
+  validation_status: cross_checked
+- id: CR-SRE-RES-004
+  text: Retry budgets at the client level — if more than 10% of requests in the last minute were retries, STOP RETRYING. The
+    downstream is overloaded, and your retries are making it worse. This single rule prevents the most common cause of cascading
+    failures.
+  why: 'Google implements client-side retry budgets as the last line of defense against retry storms. Per-request retry limits
+    (max 3 retries) are insufficient because if 100 clients each retry 3 times, the downstream receives 300 additional requests
+    — 3x the original load. Client-side retry budgets solve this: each client tracks the percentage of its recent requests
+    that were retries. When the retry percentage exceeds a threshold (typically 10%), the client stops retrying entirely and
+    fails fast. This means: during a partial failure, clients retry normally and most succeed. During a severe failure, clients
+    detect that retries are futile (high retry percentage) and stop adding load. The downstream has a chance to recover without
+    being hammered by retries from hundreds of clients simultaneously.
+
+    '
+  how_to_do_right: '1. Track per-client retry percentage: (retries in last 60 seconds) / (total requests in last 60 seconds).
+
+    2. When retry percentage > 10%, stop retrying and return errors immediately. The downstream needs time to recover.
+
+    3. When retry percentage drops below 5%, resume retrying. The downstream has recovered.
+
+    4. Implement in the HTTP/RPC client library so ALL calls benefit, not just individually configured endpoints.
+
+    5. Log when retry budget is exhausted: "Retry budget exceeded for service-payments. 15% of requests were retries. Failing
+    fast."
+
+    6. Monitor retry budget exhaustion as a key reliability metric. Frequent exhaustion indicates a downstream reliability
+    problem.
+
+    '
+  example_good: "import time\nimport logging\nfrom collections import deque\n\nlogger = logging.getLogger(__name__)\n\nclass RetryBudget:\n    def __init__(self, window_sec=60, max_retry_pct=0.10):\n        self.window = window_sec\n        self.max_pct = max_retry_pct\n        self.requests: deque = deque()\n        self.retries: deque = deque()\n\n    def record_request(self, is_retry: bool = False):\n        now = time.time()\n        self.requests.append(now)\n        if is_retry:\n            self.retries.append(now)\n        self._evict_old(now)\n\n    def can_retry(self) -> bool:\n        self._evict_old(time.time())\n        if not self.requests:\n            return True\n        retry_pct = len(self.retries) / len(self.requests)\n        if retry_pct > self.max_pct:\n            logger.warning(\"Retry budget exhausted: %.1f%% retries\",\n                           retry_pct * 100)\n            return False\n        return True\n\n    def _evict_old(self, now):\n        cutoff = now - self.window\n        while self.requests and self.requests[0] < cutoff:\n            self.requests.popleft()\n        while self.retries and self.retries[0] < cutoff:\n            self.retries.popleft()\n"
+  example_bad: "import requests\nfrom tenacity import retry, stop_after_attempt\n\n# Per-request retry limit only — no client-level budget\n@retry(stop=stop_after_attempt(3))\ndef call_service(data):\n    return requests.post('http://payment-svc/charge', json=data)\n\n# 100 clients, each retrying 3 times = 300 extra requests\n# Downstream receives 4x normal load during partial failure\n# The retries prevent recovery, making the outage worse\n# A retry storm turns a partial failure into a total failure\n"
+  when_applies: "When implementing retry logic for calls to downstream services that may be experiencing partial failures."
+  severity: critical
+  technologies:
+    lang: [general, go, java, python]
+    platform: [grpc, http]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, fault_tolerance, resilience]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-RES-005
+  text: Design for partial availability — your system should serve 80% of features when 1 of 5 dependencies is down, not 0%
+    of features. Users who cannot complete checkout because the recommendation engine is down are victims of poor fault isolation.
+  why: 'Google designs services to operate in degraded mode because in a system with N dependencies, the probability that
+    ALL dependencies are healthy at any given time decreases exponentially with N. If each dependency has 99.9% availability
+    and you have 10 dependencies, the probability that all 10 are healthy is 99.9%^10 = 99.0% — meaning 1% of the time (7
+    hours/month), at least one dependency is down. If your service requires ALL dependencies to function, your service''s
+    availability is capped at 99.0% regardless of how reliable YOUR code is. Google''s approach: design each feature to declare
+    its dependencies and degrade individually. If the recommendation engine is down: show default products. If the review
+    service is down: show product without reviews. Only if the payment service is down should checkout be blocked.
+
+    '
+  how_to_do_right: '1. Map each feature to its dependencies: checkout requires (inventory, payment, shipping), product page
+    requires (catalog, images, reviews, recommendations).
+
+    2. Implement feature-level fallbacks: if reviews service is down, show "Reviews unavailable" — don''t crash the entire
+    product page.
+
+    3. Use async calls for optional dependencies: load the page with core data, then fetch recommendations/reviews asynchronously.
+    If async calls fail, the page is still usable.
+
+    4. Calculate compound availability: if you depend on 5 services at 99.9% each, your maximum availability is 99.5%. Design
+    accordingly.
+
+    5. Test feature-level degradation: disable each dependency individually and verify the service degrades gracefully for
+    that feature only.
+
+    6. Monitor per-feature availability separately: "checkout availability" and "search availability" may have different SLOs.
+
+    '
+  example_good: "import asyncio\nimport logging\n\nlogger = logging.getLogger(__name__)\n\nclass ProductService:\n    async def get_product_page(self, product_id: int) -> dict:\n        # Core data: required, fail if unavailable\n        product = await self.catalog.get(product_id)\n        # Optional data: load concurrently, degrade individually\n        reviews_task = asyncio.create_task(self._safe_get_reviews(product_id))\n        reco_task = asyncio.create_task(self._safe_get_recommendations(product_id))\n        reviews = await reviews_task  # [] on failure\n        recommendations = await reco_task  # popular items on failure\n        return {\"product\": product, \"reviews\": reviews,\n                \"recommendations\": recommendations}\n\n    async def _safe_get_reviews(self, pid: int) -> list:\n        try:\n            return await asyncio.wait_for(self.reviews.get(pid), timeout=2.0)\n        except Exception:\n            logger.warning(\"Reviews unavailable for product %d\", pid)\n            return []  # Degrade: show product without reviews\n"
+  example_bad: "class ProductService:\n    async def get_product_page(self, product_id: int) -> dict:\n        # All dependencies required — any failure = total failure\n        product = await self.catalog.get(product_id)\n        reviews = await self.reviews.get(product_id)\n        recommendations = await self.reco_engine.get(product_id)\n        analytics = await self.analytics.track(product_id)\n        # 4 dependencies at 99.9% each = 99.6% compound availability\n        # 3.5 hours/month of unnecessary downtime\n        # Because analytics tracking failure blocks the product page\n        return {\"product\": product, \"reviews\": reviews,\n                \"recommendations\": recommendations}\n"
+  when_applies: "When a service has multiple dependencies and needs to remain partially functional during individual dependency failures."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kubernetes]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, resilience]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-RES-006
+  text: Backpressure is the correct response to overload — propagate the load signal backward through the system so that producers
+    slow down when consumers cannot keep up. Without backpressure, the system absorbs all load until it collapses.
+  why: 'Google''s overload handling (Chapter 21) describes backpressure as the fundamental mechanism for sustainable throughput.
+    In a pipeline: Producer → Queue → Consumer. If the producer generates items faster than the consumer processes them, the
+    queue grows. Without backpressure, the queue grows until memory is exhausted and the system crashes. With backpressure,
+    when the queue reaches a threshold, the producer is told to slow down (TCP flow control, HTTP 429, queue full rejection).
+    The producer either reduces its rate or propagates the backpressure further upstream. This maintains system stability
+    at the cost of throughput reduction — which is the correct tradeoff. A system that serves 70% of requests correctly is
+    infinitely better than a system that attempts 100% and crashes serving 0%.
+
+    '
+  how_to_do_right: '1. Bound all buffers and queues. When the queue is full, the producer must be notified (rejection, exception,
+    flow control signal).
+
+    2. In HTTP: return 429 (Too Many Requests) with Retry-After. In gRPC: return RESOURCE_EXHAUSTED. In Kafka: producer.send()
+    blocks when buffer is full.
+
+    3. Propagate backpressure through the entire chain: if service C is slow, service B should reject requests from service
+    A, and A should reject requests from the client.
+
+    4. Use reactive streams (Project Reactor, RxJava, Akka Streams) for data-intensive pipelines — they have built-in backpressure.
+
+    5. Monitor backpressure events: "Producer slowed down 50 times in the last hour" indicates a capacity imbalance.
+
+    6. Don''t use unbounded queues to "absorb" load. Unbounded queues defer the problem until memory runs out — making the
+    eventual failure much worse.
+
+    '
+  example_good: "import asyncio\nfrom fastapi import FastAPI, Response\n\napp = FastAPI()\nMAX_QUEUE = 1000\nrequest_queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE)\n\n@app.post(\"/process\")\nasync def process_item(item: dict, response: Response):\n    try:\n        request_queue.put_nowait(item)\n    except asyncio.QueueFull:\n        response.status_code = 429\n        response.headers['Retry-After'] = '30'\n        return {\"error\": \"Service overloaded, retry after 30s\"}\n    # Bounded queue: producer is informed when capacity is reached\n    # Producer can back off, reducing load on the system\n    return {\"status\": \"queued\"}\n"
+  example_bad: "import queue\nfrom fastapi import FastAPI\n\napp = FastAPI()\nrequest_queue = queue.Queue()  # UNBOUNDED — no maxsize!\n\n@app.post(\"/process\")\nasync def process_item(item: dict):\n    request_queue.put(item)  # Always succeeds, never rejects\n    return {\"status\": \"queued\"}\n# Queue grows silently: 10K, 100K, 1M items\n# Memory usage grows until OOM kill\n# No backpressure signal to producers\n# System absorbs all load until it collapses catastrophically\n"
+  when_applies: "When building producer-consumer systems where the producer can generate work faster than the consumer can process it."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kafka, rabbitmq, grpc]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, fault_tolerance, resilience]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-RES-007
+  text: Chaos engineering gamedays — schedule quarterly exercises where the team intentionally injects failures (kill instances,
+    drop network, corrupt data) in a staging environment and practices the full incident response process. The goal is building
+    confidence, not finding bugs.
+  why: 'Google runs gamedays (DiRT — Disaster Recovery Testing) as organization-wide exercises because they provide value
+    that no automated test can: they exercise the HUMAN process of incident response, not just the technical systems. During
+    a gameday, the team practices: detecting the failure (does monitoring alert?), diagnosing the failure (can the team identify
+    root cause?), mitigating the failure (do rollback/failover procedures work?), communicating (does the IC framework function
+    smoothly?), and recovering (can the system return to normal?). Google found that gamedays consistently reveal: runbooks
+    that are outdated, escalation contacts that have changed, recovery procedures that have never been tested, and monitoring
+    gaps that only appear under specific failure modes.
+
+    '
+  how_to_do_right: '1. Schedule gamedays quarterly. Put them on the calendar as mandatory, not optional.
+
+    2. Define the failure scenario in advance: "At 14:00, we will kill the primary database and observe the response."
+
+    3. Run in staging (not production) until the team is confident in the process. Graduate to production with limited blast
+    radius.
+
+    4. Assign an observer: someone who doesn''t participate but records everything — timeline, decisions, communications,
+    gaps discovered.
+
+    5. Debrief after every gameday: what worked, what didn''t, what surprised us. Create action items for gaps.
+
+    6. Rotate scenarios: database failure, network partition, config rollback, secret rotation, dependency outage. Don''t
+    repeat the same scenario.
+
+    '
+  example_good: "# Gameday runbook template\ngameday:\n  date: \"2026-03-15 14:00 UTC\"\n  scenario: \"Primary database failover\"\n  hypothesis: \"Automated failover completes within 30s, no data loss\"\n  observer: \"Alice (not participating, records everything)\"\n  abort_conditions:\n    - \"Error rate > 5% for 2 minutes\"\n    - \"Any customer-facing alert fires\"\n    - \"Observer calls abort\"\n  steps:\n    - \"14:00 - Announce gameday in #incidents\"\n    - \"14:05 - Kill primary DB pod\"\n    - \"14:05 - Start timer: how long until replica promotes?\"\n    - \"14:10 - Verify: is traffic routing to new primary?\"\n    - \"14:15 - Verify: is data consistent?\"\n    - \"14:30 - Debrief: what worked, what surprised us?\"\n  action_items: []  # Filled after gameday\n"
+  example_bad: "# No gameday practice\n# Team has never tested failover\n# Runbook was written 18 months ago and never validated\n# On-call contacts are outdated (3 people left the team)\n# When the real incident happens:\n#   - Nobody knows the failover procedure\n#   - Runbook references a tool that was decommissioned\n#   - Escalation contacts are wrong\n#   - MTTR: 4 hours instead of 30 minutes\n"
+  when_applies: "When building confidence in incident response procedures and validating that recovery mechanisms actually work."
+  severity: medium
+  technologies:
+    lang: [general]
+    library: [quality, testing]
+    platform: [kubernetes]
+  domains:
+    domain: [management, culture, reliability, testing]
+    concern: [resilience, chaos_engineering]
+  sources:
+  - url: https://sre.google/sre-book/emergency-response/
+    title: 'Google SRE Book — Chapter 13: Emergency Response'
+  validation_status: cross_checked
+- id: CR-SRE-RES-008
+  text: Immutable infrastructure — never update running servers. Instead, build a new image with the changes and replace the
+    old servers with new ones. This guarantees that every server in production is running exactly the same code, with exactly
+    the same configuration.
+  why: 'Google''s release engineering (Chapter 8) and simplicity (Chapter 9) chapters both advocate for immutable infrastructure
+    because in-place updates are the primary source of configuration drift. When you update a running server (apt upgrade,
+    pip install, config file edit), there is no guarantee that the result matches what other servers look like. The update
+    might fail halfway, leaving the server in a partial state. The update might succeed differently on different servers (different
+    starting state, different execution order). After months of in-place updates, no two servers are identical — creating
+    the "snowflake server" problem. Immutable infrastructure eliminates this: every server is created from a versioned image.
+    To change anything, build a new image and replace ALL servers. This guarantees uniformity.
+
+    '
+  how_to_do_right: '1. Build container images or VM images in CI/CD. Tag with git commit SHA for traceability.
+
+    2. Never SSH into production servers to make changes. If you need a change, change the image and redeploy.
+
+    3. Use rolling updates or blue-green deployments to replace servers without downtime.
+
+    4. Store all configuration in the image or in a configuration management system (ConfigMaps, Consul). No local config
+    files.
+
+    5. If emergency changes are needed (rare), document them and rebuild the image within 24 hours to codify the change.
+
+    6. Destroy and recreate servers regularly (e.g., weekly in staging) to verify the images are complete and self-contained.
+
+    '
+  example_good: "# Dockerfile: deterministic, versioned image\nFROM python:3.12-slim@sha256:abc123...  # Pinned digest\nCOPY requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\nCOPY src/ /app/src/\nLABEL git.commit=${GIT_SHA}\n\n# Deploy: replace, never update in-place\n# kubectl set image deployment/api api=myapp:${GIT_SHA}\n# Rolling update replaces old pods with new ones\n# Every pod runs the exact same image\n# To change anything: build new image -> deploy new image\n"
+  example_bad: "# SSH into production to apply a \"quick fix\"\nssh prod-server-01\nvim /app/config.py  # Edit config directly on server\npip install new-package==1.2.3  # Install package on running server\nsudo systemctl restart myapp\n\n# Now prod-server-01 is different from prod-server-02\n# Nobody knows what changed or why\n# The Dockerfile doesn't reflect reality\n# Next deploy from CI overwrites the fix -> incident recurs\n# Months later: 5 servers, all slightly different -> \"snowflakes\"\n"
+  when_applies: "When managing production servers and deciding how to apply changes, updates, or fixes."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [docker, kubernetes, terraform]
+  domains:
+    domain: [operations, deployment, reliability]
+    concern: [resilience]
+  sources:
+  - url: https://sre.google/sre-book/release-engineering/
+    title: 'Google SRE Book — Chapter 8: Release Engineering'
+  validation_status: cross_checked

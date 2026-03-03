@@ -1,0 +1,399 @@
+layer: rules
+technology: Kubernetes
+domain: devops
+knowledge:
+- id: CR-K8S-CORE-001
+  text: Every container must define resource requests AND limits for CPU and memory.
+  why: Without requests, the scheduler cannot make informed placement decisions — pods land on overcommitted nodes and get
+    OOMKilled or CPU-throttled under load. Without limits, a single runaway container can starve all neighbors on the node,
+    causing cascading failures. Requests also determine QoS class (Guaranteed, Burstable, BestEffort) which dictates eviction
+    priority.
+  how_to_do_right: Set requests to your P50 usage (steady-state) and limits to your P99 peak. Start with VPA recommendations
+    in Off mode, observe for 7 days, then apply. Always set memory limits equal to requests for Guaranteed QoS on critical
+    workloads. Use LimitRange to enforce defaults at namespace level.
+  severity: critical
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [operations, devops, performance]
+  example_good: "containers:\n  - name: api\n    resources:\n      requests:\n        cpu: \"250m\"\n        memory: \"256Mi\"\
+    \n      limits:\n        cpu: \"1000m\"\n        memory: \"512Mi\"\n"
+  example_bad: "containers:\n  - name: api\n    image: myapp:latest\n    # No resources defined — BestEffort QoS, first to\
+    \ be evicted\n"
+  when_applies: Any project using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"]
+- id: CR-K8S-CORE-002
+  text: Pods must have liveness, readiness, and startup probes configured appropriately.
+  why: Without a readiness probe, the Service sends traffic to pods that are still initializing — users see 502s. Without
+    a liveness probe, a deadlocked process stays running but stops serving — the pod never restarts. Without a startup probe
+    on slow-starting apps, the liveness probe kills the pod before it finishes booting, causing a CrashLoopBackOff cycle.
+  how_to_do_right: Use readiness probe for 'can serve traffic' (HTTP 200 on /healthz). Use liveness probe for 'is process
+    alive' (HTTP 200 on /livez or TCP check). Use startup probe for slow starters with a generous failureThreshold. Set initialDelaySeconds
+    only on liveness, not on readiness. Never point liveness at a dependency (database) — if the DB is down, restarting your
+    pod won't fix it.
+  severity: critical
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [operations, devops, reliability]
+  example_good: "containers:\n  - name: api\n    startupProbe:\n      httpGet:\n        path: /healthz\n        port: 8080\n\
+    \      failureThreshold: 30\n      periodSeconds: 10\n    readinessProbe:\n      httpGet:\n        path: /readyz\n   \
+    \     port: 8080\n      periodSeconds: 5\n      failureThreshold: 3\n    livenessProbe:\n      httpGet:\n        path:\
+    \ /livez\n        port: 8080\n      periodSeconds: 15\n      failureThreshold: 3\n"
+  example_bad: "containers:\n  - name: api\n    # No probes — pod receives traffic while initializing,\n    # never restarts\
+    \ when deadlocked\n    livenessProbe:\n      httpGet:\n        path: /healthz\n        port: 8080\n      initialDelaySeconds:\
+    \ 5\n      # Too aggressive — kills slow-starting pods\n"
+  when_applies: Any project using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/"]
+- id: CR-K8S-CORE-003
+  text: Liveness probes must never check external dependencies — only the process itself.
+  why: If your liveness probe hits a database or external API, and that dependency goes down, Kubernetes restarts ALL your
+    pods simultaneously. This turns a partial outage (DB down) into a total outage (all pods restarting in a loop). This is
+    one of the most common production incidents in Kubernetes.
+  how_to_do_right: Liveness probe checks only 'is this process capable of handling requests' — an in-memory health check.
+    Readiness probe can check shallow dependencies (connection pool has at least one connection). Deep dependency checks belong
+    in external monitoring, not in probes.
+  severity: critical
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [operations, devops, reliability]
+  example_good: "livenessProbe:\n  httpGet:\n    path: /livez   # Only checks process health, not DB\n    port: 8080\nreadinessProbe:\n\
+    \  httpGet:\n    path: /readyz  # Can check DB connection pool\n    port: 8080\n"
+  example_bad: "livenessProbe:\n  httpGet:\n    path: /healthz  # This endpoint checks DB + Redis + S3\n    port: 8080\n \
+    \ # If Redis goes down, ALL pods restart simultaneously\n"
+  when_applies: Any project using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/#define-a-liveness-http-request"]
+- id: CR-K8S-CORE-004
+  text: Use init containers for pre-start dependencies — not sleep loops in the main container.
+  why: Sleep loops in the main container waste resources, are racy (how long is enough?), and obscure the actual startup sequence.
+    Init containers run sequentially, have clear success/failure semantics, and block pod startup until prerequisites are
+    met. They also have separate resource limits so they don't inflate your main container's resource requests.
+  how_to_do_right: 'Use init containers for: waiting on dependent services, running database migrations, populating shared
+    volumes, downloading config from a secret store. Each init container should have a clear timeout and exit criteria. Use
+    the native sidecar pattern (restartPolicy: Always on init containers) for long-running helpers in Kubernetes 1.28+.'
+  severity: medium
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [operations, devops, architecture]
+  example_good: "initContainers:\n  - name: wait-for-db\n    image: busybox:1.36\n    command: ['sh', '-c', 'until nc -z postgres\
+    \ 5432; do sleep 2; done']\n    resources:\n      requests:\n        cpu: \"50m\"\n        memory: \"32Mi\"\n  - name:\
+    \ run-migrations\n    image: myapp:v1.2.3\n    command: ['python', 'manage.py', 'migrate', '--noinput']\ncontainers:\n\
+    \  - name: api\n    image: myapp:v1.2.3\n"
+  example_bad: "containers:\n  - name: api\n    image: myapp:v1.2.3\n    command: ['sh', '-c', 'sleep 30 && python main.py']\n\
+    \    # Arbitrary sleep, no guarantee DB is ready, wastes 30s every restart\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/workloads/pods/init-containers/"]
+- id: CR-K8S-CORE-005
+  text: Pod containers should use the sidecar pattern for cross-cutting concerns, not baked-in logic.
+  why: Embedding logging agents, service mesh proxies, or secret syncing into your main container image creates tight coupling
+    — you cannot update the sidecar independently, it bloats your image, and it makes local development harder. The sidecar
+    pattern keeps concerns separated with clear interfaces via shared volumes or localhost networking.
+  how_to_do_right: 'In Kubernetes 1.28+, use native sidecar containers (restartPolicy: Always in initContainers). For older
+    clusters, use regular sidecar containers. Share data via emptyDir volumes or localhost. Common sidecars: Envoy (service
+    mesh), Fluent Bit (logging), Vault Agent (secrets), CloudSQL Proxy (database).'
+  severity: medium
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [operations, devops, architecture]
+  example_good: "# Kubernetes 1.28+ native sidecar\ninitContainers:\n  - name: log-shipper\n    image: fluent/fluent-bit:2.2\n\
+    \    restartPolicy: Always    # Makes it a native sidecar\n    volumeMounts:\n      - name: logs\n        mountPath: /var/log/app\n\
+    containers:\n  - name: api\n    image: myapp:v1.2.3\n    volumeMounts:\n      - name: logs\n        mountPath: /var/log/app\n\
+    volumes:\n  - name: logs\n    emptyDir: {}\n"
+  example_bad: "containers:\n  - name: api\n    image: myapp-with-fluentbit:v1.2.3\n    # Logging agent baked into app image\
+    \ — can't update independently\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/"]
+- id: CR-K8S-CORE-006
+  text: Deployments must configure rolling update strategy with appropriate maxSurge and maxUnavailable.
+  why: The default rolling update (maxSurge=25%, maxUnavailable=25%) is often too aggressive for small replica counts — with
+    4 replicas, 25% means 1 pod killed immediately, and if the new version is broken, you lose 25% capacity before detecting
+    the failure. For large deployments, too-conservative settings make rollouts painfully slow.
+  how_to_do_right: 'For critical services: maxSurge=1, maxUnavailable=0 (zero-downtime, but slower). For non-critical: maxSurge=25%,
+    maxUnavailable=25%. Always set minReadySeconds (30-60s) to let probes stabilize before continuing rollout. Set progressDeadlineSeconds
+    to detect stuck rollouts. Combine with PodDisruptionBudget.'
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [operations, devops, reliability]
+  example_good: "apiVersion: apps/v1\nkind: Deployment\nspec:\n  replicas: 4\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n\
+    \      maxSurge: 1\n      maxUnavailable: 0\n  minReadySeconds: 30\n  progressDeadlineSeconds: 600\n  revisionHistoryLimit:\
+    \ 10\n"
+  example_bad: "apiVersion: apps/v1\nkind: Deployment\nspec:\n  replicas: 2\n  # Default strategy: maxSurge=25%, maxUnavailable=25%\n\
+    \  # With 2 replicas: 1 pod killed immediately = 50% capacity loss\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#rolling-update-deployment"]
+- id: CR-K8S-CORE-007
+  text: Set revisionHistoryLimit to retain enough ReplicaSets for rollback but not indefinitely.
+  why: Each revision keeps an old ReplicaSet with its pod template. With no limit (or the default of 10), clusters with frequent
+    deployments accumulate hundreds of orphaned ReplicaSets, consuming etcd storage and slowing kubectl and the API server.
+    Setting it to 0 means you cannot rollback at all.
+  how_to_do_right: 'Set revisionHistoryLimit to 5-10 for most workloads. Critical services that need fast rollback: 10. CI/CD
+    canary pipelines that deploy 50 times a day: 3. Monitor etcd size and ReplicaSet count. Use ''kubectl rollout undo'' for
+    rollback.'
+  severity: medium
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [operations, devops]
+  example_good: "spec:\n  revisionHistoryLimit: 5\n  # Keeps last 5 ReplicaSets for rollback\n"
+  example_bad: "spec:\n  # revisionHistoryLimit not set — defaults to 10\n  # Or worse:\n  revisionHistoryLimit: 0  # Cannot\
+    \ rollback at all\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#revision-history-limit"]
+- id: CR-K8S-CORE-008
+  text: Never manage ReplicaSets directly — always use Deployments or higher-level abstractions.
+  why: ReplicaSets have no rollout strategy, no revision history, and no rollback mechanism. If you update a ReplicaSet's
+    pod template, existing pods are NOT updated — only new pods get the new template, so you end up with mixed versions. Deployments
+    handle all of this correctly by creating new ReplicaSets and orchestrating the transition.
+  how_to_do_right: Use Deployments for stateless workloads. Use StatefulSets for stateful workloads. Use DaemonSets for per-node
+    workloads. Use Jobs/CronJobs for batch workloads. The only time you interact with ReplicaSets directly is during debugging
+    with 'kubectl get rs'.
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [operations, devops]
+  example_good: "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\nspec:\n  replicas: 3\n  selector:\n    matchLabels:\n\
+    \      app: api\n  template:\n    metadata:\n      labels:\n        app: api\n"
+  example_bad: "apiVersion: apps/v1\nkind: ReplicaSet    # Never use directly\nmetadata:\n  name: api\nspec:\n  replicas:\
+    \ 3\n  # No rollout strategy, no revision history, no rollback\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/workloads/controllers/deployment/"]
+- id: CR-K8S-CORE-009
+  text: Use StatefulSets for workloads requiring stable network identity or persistent storage — never Deployments.
+  why: 'Deployments assign random pod names and can schedule replicas on any node with any PV. Databases, message queues,
+    and consensus systems (etcd, ZooKeeper, Kafka) need: (1) stable DNS names (pod-0, pod-1) for peer discovery, (2) ordered
+    startup/shutdown for leader election, (3) stable PV attachment so data follows the pod. StatefulSets guarantee all three.'
+  how_to_do_right: 'Use StatefulSets with a headless Service (clusterIP: None) for DNS-based discovery. Define volumeClaimTemplates
+    for per-pod storage. Set podManagementPolicy to Parallel only if your app handles unordered startup. Always set updateStrategy
+    to RollingUpdate with partition for canary upgrades.'
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [operations, devops, architecture]
+  example_good: "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: postgres\nspec:\n  serviceName: postgres\n  replicas:\
+    \ 3\n  podManagementPolicy: OrderedReady\n  updateStrategy:\n    type: RollingUpdate\n    rollingUpdate:\n      partition:\
+    \ 0\n  volumeClaimTemplates:\n    - metadata:\n        name: data\n      spec:\n        accessModes: [\"ReadWriteOnce\"\
+    ]\n        storageClassName: gp3\n        resources:\n          requests:\n            storage: 100Gi\n"
+  example_bad: "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: postgres\n# Deployment for a database — random pod\
+    \ names, no stable storage,\n# PV can be assigned to different pod after restart\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/"]
+- id: CR-K8S-CORE-010
+  text: Use DaemonSets with proper tolerations and nodeSelector for per-node infrastructure agents.
+  why: DaemonSets ensure exactly one pod per node — critical for log collectors, monitoring agents, and CNI plugins. Without
+    tolerations, DaemonSet pods won't schedule on tainted nodes (masters, GPU nodes, spot instances), leaving gaps in monitoring
+    and log collection. Without nodeSelector, they run on ALL nodes including nodes where they're not needed.
+  how_to_do_right: Add tolerations for all taints your DaemonSet must run on (including master/control-plane taints for cluster-wide
+    agents). Use nodeSelector or nodeAffinity to target specific node pools. Set updateStrategy to RollingUpdate with maxUnavailable=1
+    for safe rollouts. Always set priorityClassName to system-node-critical for infrastructure DaemonSets.
+  severity: medium
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [operations, devops, observability]
+  example_good: "apiVersion: apps/v1\nkind: DaemonSet\nmetadata:\n  name: fluent-bit\nspec:\n  updateStrategy:\n    type:\
+    \ RollingUpdate\n    rollingUpdate:\n      maxUnavailable: 1\n  template:\n    spec:\n      tolerations:\n        - operator:\
+    \ Exists    # Tolerate ALL taints\n      priorityClassName: system-node-critical\n      containers:\n        - name: fluent-bit\n\
+    \          image: fluent/fluent-bit:2.2\n          resources:\n            requests:\n              cpu: \"100m\"\n  \
+    \            memory: \"128Mi\"\n            limits:\n              cpu: \"500m\"\n              memory: \"256Mi\"\n"
+  example_bad: "apiVersion: apps/v1\nkind: DaemonSet\nmetadata:\n  name: fluent-bit\nspec:\n  template:\n    spec:\n     \
+    \ containers:\n        - name: fluent-bit\n          image: fluent/fluent-bit:2.2\n      # No tolerations — won't run\
+    \ on tainted nodes\n      # No resource limits — can consume entire node\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/"]
+- id: CR-K8S-CORE-011
+  text: Jobs must set backoffLimit, activeDeadlineSeconds, and ttlSecondsAfterFinished.
+  why: Without backoffLimit, a failing Job retries 6 times (default) with exponential backoff up to 6 minutes — this can be
+    too many retries for idempotent jobs or too few for flaky ones. Without activeDeadlineSeconds, a stuck Job runs forever
+    consuming resources. Without ttlSecondsAfterFinished, completed Job objects and their pods accumulate in etcd, eventually
+    degrading API server performance.
+  how_to_do_right: 'Set backoffLimit based on idempotency: 0 for non-idempotent jobs, 3-6 for idempotent ones. Set activeDeadlineSeconds
+    to 2x your expected max duration. Set ttlSecondsAfterFinished to 3600 (1h) for debugging, or 86400 (1d) for audit trails.
+    For parallel jobs, set completions and parallelism explicitly.'
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [operations, devops]
+  example_good: "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: db-migration\nspec:\n  backoffLimit: 0              #\
+    \ Don't retry migrations\n  activeDeadlineSeconds: 300   # Kill after 5 minutes\n  ttlSecondsAfterFinished: 3600\n  template:\n\
+    \    spec:\n      restartPolicy: Never\n      containers:\n        - name: migrate\n          image: myapp:v1.2.3\n  \
+    \        command: ['python', 'manage.py', 'migrate']\n"
+  example_bad: "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: db-migration\nspec:\n  template:\n    spec:\n      restartPolicy:\
+    \ Never\n      containers:\n        - name: migrate\n          image: myapp:v1.2.3\n  # No backoffLimit — retries 6 times\
+    \ (dangerous for migrations!)\n  # No activeDeadlineSeconds — runs forever if stuck\n  # No ttlSecondsAfterFinished —\
+    \ completed pods linger\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/workloads/controllers/job/"]
+- id: CR-K8S-CORE-012
+  text: CronJobs must set concurrencyPolicy and startingDeadlineSeconds to prevent overlapping runs.
+  why: Without concurrencyPolicy, the default is Allow — if a CronJob takes longer than its schedule interval, multiple instances
+    run concurrently. For jobs that hit the same database table or file, this causes data corruption, deadlocks, or duplicate
+    processing. Without startingDeadlineSeconds, missed schedules (e.g., during cluster upgrade) pile up and fire all at once
+    when the cluster recovers.
+  how_to_do_right: 'Set concurrencyPolicy to Forbid for jobs that must not overlap (most batch jobs). Use Replace for jobs
+    where only the latest run matters (reports, cleanups). Set startingDeadlineSeconds to your schedule interval (e.g., 3600
+    for hourly jobs) to drop missed runs. Use suspend: true to pause CronJobs during maintenance without deleting them.'
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [operations, devops]
+  example_good: "apiVersion: batch/v1\nkind: CronJob\nmetadata:\n  name: daily-report\nspec:\n  schedule: \"0 2 * * *\"\n\
+    \  concurrencyPolicy: Forbid\n  startingDeadlineSeconds: 3600\n  successfulJobsHistoryLimit: 3\n  failedJobsHistoryLimit:\
+    \ 3\n  suspend: false\n  jobTemplate:\n    spec:\n      backoffLimit: 2\n      activeDeadlineSeconds: 7200\n      ttlSecondsAfterFinished:\
+    \ 86400\n      template:\n        spec:\n          restartPolicy: Never\n"
+  example_bad: "apiVersion: batch/v1\nkind: CronJob\nmetadata:\n  name: daily-report\nspec:\n  schedule: \"0 2 * * *\"\n \
+    \ # concurrencyPolicy defaults to Allow — overlapping runs!\n  # No startingDeadlineSeconds — missed runs pile up\n  #\
+    \ No history limits — completed Jobs accumulate\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/"]
+- id: CR-K8S-CORE-013
+  text: Every namespace must have ResourceQuotas and LimitRanges to prevent resource starvation.
+  why: Without ResourceQuotas, a single namespace can consume the entire cluster's resources — one team's runaway deployment
+    starves everyone else. Without LimitRanges, developers forget to set resource requests/limits on individual pods, resulting
+    in BestEffort QoS pods that get evicted first under pressure. These two resources are your cluster's seatbelt.
+  how_to_do_right: Apply ResourceQuota to limit total CPU/memory/pod count per namespace. Apply LimitRange to set default
+    requests/limits for containers that don't specify them. Set both in every non-system namespace. Review quotas quarterly
+    based on actual usage. Use 'kubectl describe quota' to check current consumption.
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [operations, devops, security]
+  example_good: "apiVersion: v1\nkind: ResourceQuota\nmetadata:\n  name: team-quota\n  namespace: team-alpha\nspec:\n  hard:\n\
+    \    requests.cpu: \"10\"\n    requests.memory: \"20Gi\"\n    limits.cpu: \"20\"\n    limits.memory: \"40Gi\"\n    pods:\
+    \ \"50\"\n    services.loadbalancers: \"2\"\n---\napiVersion: v1\nkind: LimitRange\nmetadata:\n  name: default-limits\n\
+    \  namespace: team-alpha\nspec:\n  limits:\n    - default:\n        cpu: \"500m\"\n        memory: \"256Mi\"\n      defaultRequest:\n\
+    \        cpu: \"100m\"\n        memory: \"128Mi\"\n      type: Container\n"
+  example_bad: "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: team-alpha\n# No ResourceQuota — namespace can consume\
+    \ entire cluster\n# No LimitRange — pods without limits get BestEffort QoS\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/policy/resource-quotas/", "https://kubernetes.io/docs/concepts/policy/limit-range/"]
+- id: CR-K8S-CORE-014
+  text: Follow the Kubernetes recommended label conventions for all resources.
+  why: Without consistent labels, you cannot effectively query, monitor, or manage resources at scale. Custom ad-hoc labels
+    become inconsistent across teams, making it impossible to answer 'which team owns this pod?' or 'which version is deployed?'
+    Labels are also used by ServiceMonitors, NetworkPolicies, and PodDisruptionBudgets — inconsistent labels break all of
+    them.
+  how_to_do_right: 'Use the standard labels from kubernetes.io/docs: app.kubernetes.io/name, app.kubernetes.io/version, app.kubernetes.io/component,
+    app.kubernetes.io/part-of, app.kubernetes.io/managed-by. Add custom labels for team, environment, and cost-center. Apply
+    labels in Helm _helpers.tpl or Kustomize commonLabels for consistency. Never change labels used in selectors after creation.'
+  severity: medium
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [operations, devops]
+  example_good: "metadata:\n  labels:\n    app.kubernetes.io/name: api-gateway\n    app.kubernetes.io/version: \"1.2.3\"\n\
+    \    app.kubernetes.io/component: frontend\n    app.kubernetes.io/part-of: ecommerce\n    app.kubernetes.io/managed-by:\
+    \ helm\n    team: platform\n    environment: production\n"
+  example_bad: "metadata:\n  labels:\n    app: api    # Too generic, no version, no team\n    # Different teams use \"app\"\
+    , \"name\", \"service\" — no consistency\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/overview/working-with-objects/common-labels/"]
+- id: CR-K8S-CORE-015
+  text: Never use 'latest' tag in pod templates — always pin to specific immutable image tags or digests.
+  why: The 'latest' tag is mutable — it points to whatever was pushed last. With imagePullPolicy=Always, every pod restart
+    pulls a potentially different image, causing inconsistent behavior across replicas. With IfNotPresent (default for non-latest),
+    nodes cache different versions. Rollback with 'kubectl rollout undo' re-deploys the same tag pointing to the NEW image,
+    not the old one. Image digests are the only truly immutable reference.
+  how_to_do_right: 'Tag images with git SHA or semantic version. Best: use image digest (sha256:abc123). In CI/CD, resolve
+    tags to digests before deploying. Set imagePullPolicy to IfNotPresent for tagged images. Use admission controllers (Kyverno,
+    OPA) to reject ''latest'' tags. Sign images with cosign and verify at admission.'
+  severity: critical
+  technologies:
+    platform: [kubernetes, docker]
+  domains:
+    domain: [operations, devops, security]
+  example_good: "containers:\n  - name: api\n    image: registry.example.com/api:v1.2.3\n    imagePullPolicy: IfNotPresent\n\
+    \    # Even better — use digest:\n    # image: registry.example.com/api@sha256:a1b2c3d4...\n"
+  example_bad: "containers:\n  - name: api\n    image: myapp:latest\n    imagePullPolicy: Always\n    # Every restart may\
+    \ pull a different image\n    # Rollback is broken — \"latest\" still points to newest\n"
+  when_applies: Any project using Kubernetes-orchestrated deployments or containerized applications
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes or Docker
+  sources: ["https://kubernetes.io/docs/concepts/containers/images/#image-pull-policy"]
+- id: CR-K8S-CORE-016
+  text: Pods must handle SIGTERM gracefully and complete in-flight requests before shutdown.
+  why: When Kubernetes terminates a pod, it sends SIGTERM and waits terminationGracePeriodSeconds (default 30s) before SIGKILL.
+    If your app ignores SIGTERM, in-flight requests are dropped, WebSocket connections break, and database transactions are
+    left incomplete. During rolling updates, this causes errors for end users and data inconsistency.
+  how_to_do_right: 'Implement a SIGTERM handler that: (1) stops accepting new connections, (2) completes in-flight requests,
+    (3) closes database connections, (4) exits cleanly. Set terminationGracePeriodSeconds to at least 2x your longest request
+    timeout. Use a preStop lifecycle hook for apps that cannot handle SIGTERM natively. Combine with readiness probe removal
+    to stop traffic before shutdown.'
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [operations, devops, reliability]
+  example_good: "spec:\n  terminationGracePeriodSeconds: 60\n  containers:\n    - name: api\n      lifecycle:\n        preStop:\n\
+    \          exec:\n            command: [\"/bin/sh\", \"-c\", \"sleep 5\"]\n            # Sleep gives kube-proxy time to\
+    \ remove endpoints\n            # before the pod starts shutting down\n"
+  example_bad: "spec:\n  terminationGracePeriodSeconds: 5\n  containers:\n    - name: api\n      image: myapp:v1\n      #\
+    \ No preStop hook, 5s grace period\n      # Long-running requests get SIGKILL'd\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination"]
+- id: CR-K8S-CORE-017
+  text: Use Pod Disruption Budgets to protect availability during voluntary disruptions.
+  why: Node drains during upgrades, autoscaler scale-downs, and maintenance will evict pods. Without a PDB, all replicas of
+    a service can be evicted simultaneously, causing total downtime. PDBs tell Kubernetes 'you must keep at least N pods running'
+    during voluntary disruptions — it won't drain a node if doing so would violate the budget.
+  how_to_do_right: Create a PDB for every Deployment with 2+ replicas. Use minAvailable for 'keep at least N running' or maxUnavailable
+    for 'allow at most N down at a time'. For 3-replica services, use maxUnavailable=1 (always 2 running). Never set minAvailable
+    equal to replicas — it blocks all drains. Monitor PDB violations in cluster events.
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [operations, devops, reliability]
+  example_good: "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: api-pdb\nspec:\n  maxUnavailable: 1\
+    \    # At most 1 pod down at a time\n  selector:\n    matchLabels:\n      app.kubernetes.io/name: api\n"
+  example_bad: "# No PDB at all — node drain kills all replicas at once\n---\n# Or worse:\napiVersion: policy/v1\nkind: PodDisruptionBudget\n\
+    spec:\n  minAvailable: 3      # With 3 replicas = blocks ALL drains\n  selector:\n    matchLabels:\n      app: api\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/workloads/pods/disruptions/#pod-disruption-budgets"]
+- id: CR-K8S-CORE-018
+  text: Use topologySpreadConstraints to distribute pods across failure domains.
+  why: Without topology spread, the scheduler may place all replicas on the same node or availability zone. A single node
+    failure or AZ outage then takes down your entire service. Pod anti-affinity alone is too restrictive (hard anti-affinity)
+    or too weak (preferred anti-affinity). TopologySpreadConstraints give fine-grained control over distribution.
+  how_to_do_right: Spread across zones with topology.kubernetes.io/zone and maxSkew=1. Spread across nodes with kubernetes.io/hostname
+    for finer distribution. Use whenUnsatisfiable=DoNotSchedule for critical services (strict) or ScheduleAnyway for best-effort.
+    Combine zone spread (strict) with node spread (best-effort) for optimal resilience.
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [operations, devops, reliability]
+  example_good: "spec:\n  topologySpreadConstraints:\n    - maxSkew: 1\n      topologyKey: topology.kubernetes.io/zone\n \
+    \     whenUnsatisfiable: DoNotSchedule\n      labelSelector:\n        matchLabels:\n          app: api\n    - maxSkew:\
+    \ 1\n      topologyKey: kubernetes.io/hostname\n      whenUnsatisfiable: ScheduleAnyway\n      labelSelector:\n      \
+    \  matchLabels:\n          app: api\n"
+  example_bad: "spec:\n  # No topology constraints — all 5 replicas\n  # could land on the same node in the same AZ\n  affinity:\n\
+    \    podAntiAffinity:\n      preferredDuringSchedulingIgnoredDuringExecution:\n        - weight: 1\n          # Preferred\
+    \ = advisory only, often ignored\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/"]

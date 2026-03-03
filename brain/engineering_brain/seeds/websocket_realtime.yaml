@@ -1,0 +1,1053 @@
+layer: rules
+domain: realtime
+knowledge:
+- id: RT-WS-001
+  text: "WebSocket connection lifecycle must follow connect->authenticate->subscribe->message->close sequence. Never allow message processing before authentication completes."
+  why: >
+    Skipping authentication in the lifecycle allows unauthenticated clients to receive broadcasts,
+    observe event patterns, and inject messages. A fintech platform had an incident where price feed
+    data leaked to unauthenticated connections for 6 hours because auth was checked on first message,
+    not on connect. Attackers could observe real-time order flow without credentials.
+  how_to_do_right: |
+    1. On 'connect' event: validate token immediately, disconnect if invalid within 2s
+    2. On successful auth: store user context in connection state, join default rooms
+    3. On 'subscribe' event: check authorization for requested channel
+    4. On 'message' event: verify connection is authenticated (guard decorator)
+    5. On 'disconnect' event: clean up subscriptions, remove from rooms, log session duration
+  severity: critical
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, security]
+    concern: [web]
+  example_good: |
+    from fastapi import WebSocket, WebSocketDisconnect
+
+    async def websocket_endpoint(ws: WebSocket):
+        await ws.accept()
+        # Step 1: Authenticate immediately
+        try:
+            auth_msg = await asyncio.wait_for(ws.receive_json(), timeout=5.0)
+            user = await validate_token(auth_msg.get("token"))
+            if not user:
+                await ws.close(code=4001, reason="Invalid token")
+                return
+        except asyncio.TimeoutError:
+            await ws.close(code=4002, reason="Auth timeout")
+            return
+
+        # Step 2: Store user context
+        connection = ConnectionState(user=user, ws=ws)
+        manager.register(connection)
+
+        try:
+            while True:
+                data = await ws.receive_json()
+                await handle_message(connection, data)
+        except WebSocketDisconnect:
+            manager.unregister(connection)
+  example_bad: |
+    async def websocket_endpoint(ws: WebSocket):
+        await ws.accept()
+        # BAD: No authentication — anyone can connect and receive data
+        while True:
+            data = await ws.receive_json()
+            # Auth checked per-message — too late, broadcasts already sent
+            if data.get("type") == "auth":
+                user = validate_token(data["token"])
+            await handle_message(ws, data)
+  when_applies: Any WebSocket endpoint handling real-time data in financial, trading, or notification systems
+  sources: ["https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API"]
+
+- id: RT-WS-002
+  text: "WebSocket authentication must validate the token on connect and reject immediately if invalid. Never allow unauthenticated connections to linger."
+  why: >
+    An unauthenticated connection that stays open consumes server resources (memory, file descriptors)
+    and can be used for reconnaissance. In one incident, attackers opened 50,000 unauthenticated
+    WebSocket connections to exhaust server file descriptors, causing a denial-of-service for
+    legitimate users. The connections were never closed because auth was deferred.
+  how_to_do_right: |
+    1. Accept connection, start 5-second auth timeout
+    2. Expect first message to be auth payload with JWT or session token
+    3. Validate token signature, expiry, and claims
+    4. If invalid: send close frame with code 4001, disconnect immediately
+    5. If timeout: send close frame with code 4002, disconnect
+    6. Log all auth failures with client IP for rate limiting
+  severity: critical
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, security]
+    concern: [web]
+  example_good: |
+    import jwt
+    from fastapi import WebSocket
+
+    async def authenticate_ws(ws: WebSocket, timeout: float = 5.0) -> dict | None:
+        try:
+            msg = await asyncio.wait_for(ws.receive_json(), timeout=timeout)
+            token = msg.get("token", "")
+            payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+            return payload
+        except (jwt.InvalidTokenError, asyncio.TimeoutError, KeyError):
+            await ws.close(code=4001, reason="Authentication failed")
+            return None
+
+    async def ws_endpoint(ws: WebSocket):
+        await ws.accept()
+        user = await authenticate_ws(ws)
+        if not user:
+            return  # Connection already closed
+        # Proceed with authenticated connection
+  example_bad: |
+    async def ws_endpoint(ws: WebSocket):
+        await ws.accept()
+        # BAD: No auth at all — connection stays open indefinitely
+        while True:
+            data = await ws.receive_json()
+            # Maybe check auth later... maybe not
+            await process(data)
+  when_applies: All WebSocket endpoints in production systems, especially those handling sensitive data
+  sources: ["https://tools.ietf.org/html/rfc6455"]
+
+- id: RT-WS-003
+  text: "Room/channel-based messaging must enforce authorization checks on subscribe, not just on connect. A user authenticated for one channel must not automatically access all channels."
+  why: >
+    A prediction markets platform allowed any authenticated user to subscribe to any channel.
+    A user subscribed to the admin channel and received real-time moderation decisions, internal
+    pricing adjustments, and fraud detection alerts. The breach exposed sensitive business logic
+    for 2 weeks before detection.
+  how_to_do_right: |
+    1. Define channel authorization rules: which roles/users can access which channels
+    2. On subscribe request: check user's permissions against channel ACL
+    3. Reject with specific error if unauthorized (code 4003)
+    4. Use channel naming conventions: "public:*" open, "private:*" requires check, "admin:*" requires admin role
+    5. Re-validate on token refresh — if permissions changed, unsubscribe from revoked channels
+  severity: critical
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, security]
+    concern: [web]
+  example_good: |
+    CHANNEL_RULES = {
+        "public:prices": lambda user: True,
+        "private:portfolio": lambda user: True,  # own portfolio
+        "private:claims:*": lambda user: user.role in ("analyst", "admin"),
+        "admin:moderation": lambda user: user.role == "admin",
+    }
+
+    async def handle_subscribe(connection, channel: str):
+        rule = match_channel_rule(channel, CHANNEL_RULES)
+        if not rule or not rule(connection.user):
+            await connection.send_error(4003, f"Not authorized for {channel}")
+            return
+        manager.subscribe(connection, channel)
+        await connection.send_json({"type": "subscribed", "channel": channel})
+  example_bad: |
+    async def handle_subscribe(connection, channel: str):
+        # BAD: No authorization check — any authenticated user joins any channel
+        manager.subscribe(connection, channel)
+        await connection.send_json({"type": "subscribed", "channel": channel})
+  when_applies: Any system with multiple channels/rooms where different data has different sensitivity levels
+  sources: ["https://socket.io/docs/v4/rooms/"]
+
+- id: RT-WS-004
+  text: "Implement heartbeat/ping-pong for WebSocket connection health. Server must detect dead connections within 30 seconds to free resources and maintain accurate subscriber counts."
+  why: >
+    Without heartbeats, dead connections (client crashed, network dropped) stay open indefinitely.
+    A trading platform accumulated 200,000 zombie connections over a weekend, consuming 4GB of memory
+    and causing the server to OOM. The subscriber count showed 250,000 but only 50,000 were real,
+    making capacity planning impossible.
+  how_to_do_right: |
+    1. Server sends ping every 15 seconds
+    2. Client must respond with pong within 10 seconds
+    3. If 2 consecutive pings miss pong, close connection (30s total detection)
+    4. Track last_pong timestamp per connection
+    5. Run cleanup task every 10 seconds to reap dead connections
+    6. Log zombie connection count as a metric for monitoring
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, reliability]
+    concern: [web]
+  example_good: |
+    class ConnectionManager:
+        PING_INTERVAL = 15  # seconds
+        PONG_TIMEOUT = 10
+        MAX_MISSED_PONGS = 2
+
+        async def heartbeat_loop(self, conn: Connection):
+            missed = 0
+            while conn.is_alive:
+                await conn.ws.send_json({"type": "ping", "ts": time.time()})
+                conn.last_ping = time.time()
+                await asyncio.sleep(self.PING_INTERVAL)
+                if time.time() - conn.last_pong > self.PONG_TIMEOUT:
+                    missed += 1
+                    if missed >= self.MAX_MISSED_PONGS:
+                        logger.info(f"Dead connection detected: {conn.id}")
+                        await self.close_connection(conn, code=4004)
+                        return
+                else:
+                    missed = 0
+  example_bad: |
+    # BAD: No heartbeat — dead connections accumulate forever
+    async def websocket_endpoint(ws: WebSocket):
+        await ws.accept()
+        while True:
+            try:
+                data = await ws.receive_json()  # Blocks forever on dead connection
+                await process(data)
+            except Exception:
+                break  # Only detects when trying to send
+  when_applies: All WebSocket connections in production, especially long-lived connections for real-time feeds
+  sources: ["https://tools.ietf.org/html/rfc6455#section-5.5.2"]
+
+- id: RT-WS-005
+  text: "WebSocket reconnection must use exponential backoff with jitter starting at 1 second, capping at 30 seconds. Without jitter, all clients reconnect simultaneously after an outage (thundering herd)."
+  why: >
+    After a 5-minute server restart, 100,000 clients all reconnected at t=0 with fixed 1-second retry.
+    The server accepted 100,000 connections in 200ms, ran out of memory during auth processing,
+    and crashed again. This repeated 4 times before engineers added backoff. The outage lasted 45 minutes
+    instead of the planned 5-minute restart.
+  how_to_do_right: |
+    1. Base delay: 1 second
+    2. Multiply by 2 on each failure: 1s, 2s, 4s, 8s, 16s, 30s
+    3. Add random jitter: delay * (0.5 + random() * 0.5)
+    4. Cap at 30 seconds maximum
+    5. Reset backoff counter on successful connection lasting >60 seconds
+    6. Show reconnection status to user with countdown
+    7. On reconnect: re-authenticate, re-subscribe to previous channels
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, reliability]
+    concern: [web]
+  example_good: |
+    // Client-side reconnection with exponential backoff + jitter
+    class WebSocketClient {
+      constructor(url) {
+        this.url = url;
+        this.baseDelay = 1000;
+        this.maxDelay = 30000;
+        this.attempt = 0;
+        this.subscriptions = new Set();
+      }
+
+      getDelay() {
+        const exponential = Math.min(this.baseDelay * Math.pow(2, this.attempt), this.maxDelay);
+        const jitter = exponential * (0.5 + Math.random() * 0.5);
+        return Math.floor(jitter);
+      }
+
+      reconnect() {
+        const delay = this.getDelay();
+        this.attempt++;
+        console.log(`Reconnecting in ${delay}ms (attempt ${this.attempt})`);
+        setTimeout(() => this.connect(), delay);
+      }
+
+      onOpen() {
+        this.attempt = 0; // Reset on successful connection
+        this.resubscribe();
+      }
+    }
+  example_bad: |
+    // BAD: Fixed 1-second retry — thundering herd on server restart
+    function reconnect() {
+      setTimeout(() => connect(), 1000);  // All clients retry at exact same time
+    }
+
+    // BAD: Exponential but no jitter — still synchronized
+    function reconnect(attempt) {
+      setTimeout(() => connect(), Math.pow(2, attempt) * 1000);
+    }
+  when_applies: All client-side WebSocket implementations that need automatic reconnection
+  sources: ["https://cloud.google.com/blog/products/gcp/5-lessons-learned-from-building-a-real-time-bidding-platform"]
+
+- id: RT-WS-006
+  text: "WebSocket messages must include a monotonically increasing sequence number for ordering guarantees. Clients must detect gaps and request replay for missed messages."
+  why: >
+    A price ticker showed BTC at $45,000, then $44,500, then $45,200. The $44,500 was a delayed
+    message that arrived out of order. A trading bot executed a buy on the stale price, losing $12,000.
+    Without sequence numbers, neither client nor server can detect message reordering caused by
+    network buffering, load balancer routing changes, or concurrent server pushes.
+  how_to_do_right: |
+    1. Server assigns monotonic sequence number per channel
+    2. Include seq in every message: {"seq": 12345, "channel": "prices:btc", "data": {...}}
+    3. Client tracks last_seq per channel
+    4. If gap detected (received seq > last_seq + 1): request replay from server
+    5. If stale message (received seq <= last_seq): discard silently
+    6. Server maintains rolling buffer of last 1000 messages per channel for replay
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, reliability]
+    concern: [web]
+  example_good: |
+    # Server-side: assign sequence numbers
+    class Channel:
+        def __init__(self, name: str):
+            self.name = name
+            self.seq = 0
+            self.buffer: deque = deque(maxlen=1000)
+
+        async def publish(self, data: dict) -> dict:
+            self.seq += 1
+            message = {"seq": self.seq, "channel": self.name, "data": data, "ts": time.time()}
+            self.buffer.append(message)
+            await self.broadcast(message)
+            return message
+
+        async def replay(self, from_seq: int) -> list[dict]:
+            return [m for m in self.buffer if m["seq"] > from_seq]
+
+    # Client-side: detect gaps
+    // JavaScript
+    class ChannelSubscription {
+      constructor(channel) { this.lastSeq = 0; this.channel = channel; }
+      onMessage(msg) {
+        if (msg.seq <= this.lastSeq) return; // Stale, discard
+        if (msg.seq > this.lastSeq + 1) {
+          this.requestReplay(this.lastSeq); // Gap detected
+        }
+        this.lastSeq = msg.seq;
+        this.process(msg.data);
+      }
+    }
+  example_bad: |
+    # BAD: No sequence numbers — cannot detect out-of-order or missed messages
+    async def publish(channel, data):
+        message = {"channel": channel, "data": data}
+        await broadcast(message)  # No seq, no buffer, no replay capability
+  when_applies: Real-time financial data, order books, any system where message ordering affects correctness
+  sources: ["https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API/Writing_WebSocket_servers#pings_and_pongs_the_heartbeat_of_websockets"]
+
+- id: RT-WS-007
+  text: "Implement message acknowledgment for critical operations (trades, claims, bets). Fire-and-forget is acceptable for price ticks but not for state-changing operations."
+  why: >
+    A user placed a bet on a prediction market. The WebSocket message was sent but the server
+    never processed it (dropped during backpressure). No acknowledgment was sent, but the UI
+    showed "Bet placed" optimistically. The user lost their bet window and filed a complaint.
+    The platform had no audit trail proving the message was received.
+  how_to_do_right: |
+    1. Classify messages: fire-and-forget (prices, heartbeats) vs acknowledged (trades, bets, claims)
+    2. Client generates unique message_id (UUIDv7 for time-ordering)
+    3. Server responds with ack containing original message_id within 5 seconds
+    4. Client retries unacked messages up to 3 times with exponential backoff
+    5. Server deduplicates by message_id (idempotent processing)
+    6. After 3 retries without ack: show error to user, log for investigation
+  severity: critical
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, reliability]
+    concern: [web]
+  example_good: |
+    // Client: send with ack tracking
+    class AckedSender {
+      constructor(ws) {
+        this.ws = ws;
+        this.pending = new Map(); // messageId -> {resolve, reject, retries, timer}
+      }
+
+      async send(type, data, { timeout = 5000, maxRetries = 3 } = {}) {
+        const messageId = crypto.randomUUID();
+        return new Promise((resolve, reject) => {
+          const entry = { resolve, reject, retries: 0, maxRetries, timeout, type, data };
+          this.pending.set(messageId, entry);
+          this._send(messageId, entry);
+        });
+      }
+
+      _send(messageId, entry) {
+        this.ws.send(JSON.stringify({ messageId, type: entry.type, data: entry.data }));
+        entry.timer = setTimeout(() => this._retry(messageId, entry), entry.timeout);
+      }
+
+      onAck(messageId) {
+        const entry = this.pending.get(messageId);
+        if (entry) {
+          clearTimeout(entry.timer);
+          entry.resolve({ messageId, status: "acked" });
+          this.pending.delete(messageId);
+        }
+      }
+    }
+  example_bad: |
+    // BAD: Fire-and-forget for critical operations
+    function placeBet(market, amount) {
+      ws.send(JSON.stringify({ type: "place_bet", market, amount }));
+      showSuccess("Bet placed!"); // No ack — bet may have been dropped
+    }
+  when_applies: Any WebSocket message that changes state (trades, bets, claims, orders, account changes)
+  sources: ["https://socket.io/docs/v4/connection-state-recovery"]
+
+- id: RT-WS-008
+  text: "Fan-out architecture (one update to thousands of subscribers) must use a pub/sub layer (Redis Pub/Sub or Kafka) between the source and WebSocket servers. Never fan out directly from the application server."
+  why: >
+    A price update service running on a single FastAPI instance tried to send the same BTC price
+    update to 10,000 connected clients sequentially. Each send took ~0.1ms, so the full fan-out
+    took 1 second. By then, the next price update arrived, creating an ever-growing backlog.
+    After 5 minutes, the server was 30 seconds behind real-time and memory usage hit 8GB from
+    queued messages.
+  how_to_do_right: |
+    1. Price source publishes to Redis Pub/Sub channel (single write)
+    2. Each WebSocket server instance subscribes to Redis channel
+    3. Each server fans out only to its own connected clients (horizontal scaling)
+    4. Use asyncio.gather for parallel sends within one server
+    5. If a single send blocks >100ms, mark connection as slow (see backpressure RT-WS-009)
+    6. Monitor fan-out latency: p99 should be <50ms for 1000 subscribers per server
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, architecture]
+    concern: [message_broker]
+  example_good: |
+    import redis.asyncio as redis
+
+    class PriceFanOut:
+        def __init__(self, redis_url: str):
+            self.redis = redis.from_url(redis_url)
+            self.manager = ConnectionManager()
+
+        async def start_subscriber(self):
+            """Each WS server subscribes to Redis and fans out to its clients."""
+            pubsub = self.redis.pubsub()
+            await pubsub.subscribe("prices:*")
+            async for message in pubsub.listen():
+                if message["type"] == "message":
+                    channel = message["channel"].decode()
+                    data = json.loads(message["data"])
+                    # Fan out only to THIS server's subscribers
+                    await self.manager.broadcast(channel, data)
+
+        async def publish_price(self, symbol: str, price: float):
+            """Price source publishes once to Redis."""
+            await self.redis.publish(
+                f"prices:{symbol}",
+                json.dumps({"symbol": symbol, "price": price, "ts": time.time()})
+            )
+  example_bad: |
+    # BAD: Direct fan-out from application server
+    async def on_price_update(symbol, price):
+        for ws in all_connections:  # 10,000+ connections
+            await ws.send_json({"symbol": symbol, "price": price})  # Sequential, 1s+ latency
+  when_applies: Any system broadcasting updates to more than 100 simultaneous subscribers
+  sources: ["https://redis.io/docs/latest/develop/interact/pubsub/"]
+
+- id: RT-WS-009
+  text: "Implement backpressure handling for slow WebSocket clients. A slow consumer must not block the server or other consumers. Drop messages or disconnect after a configurable buffer threshold."
+  why: >
+    A client on a poor mobile connection received messages slower than the server produced them.
+    The server buffered messages in memory per-connection. After 10 minutes, 50 slow clients
+    consumed 2GB of server memory (40MB each of queued messages). The server OOM-killed, taking
+    down all 10,000 connections. One slow client should never affect other clients.
+  how_to_do_right: |
+    1. Set per-connection send buffer limit: 1000 messages or 5MB
+    2. Track buffer depth per connection
+    3. When buffer exceeds 80% threshold: start dropping non-critical messages (prices OK to drop)
+    4. When buffer exceeds 100%: disconnect with code 4008 "Slow consumer"
+    5. Log slow consumer events with connection metadata
+    6. Never use unbounded queues for per-connection buffers
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, reliability]
+    concern: [web]
+  example_good: |
+    class Connection:
+        MAX_BUFFER = 1000
+        DROP_THRESHOLD = 800  # 80%
+
+        def __init__(self, ws: WebSocket):
+            self.ws = ws
+            self.buffer: asyncio.Queue = asyncio.Queue(maxsize=self.MAX_BUFFER)
+            self.dropped_count = 0
+
+        async def enqueue(self, message: dict, critical: bool = False):
+            if self.buffer.qsize() >= self.MAX_BUFFER:
+                logger.warning(f"Disconnecting slow consumer {self.id}: buffer full")
+                await self.close(code=4008, reason="Slow consumer")
+                return
+            if self.buffer.qsize() >= self.DROP_THRESHOLD and not critical:
+                self.dropped_count += 1
+                return  # Drop non-critical messages
+            await self.buffer.put(message)
+
+        async def send_loop(self):
+            while self.is_alive:
+                message = await self.buffer.get()
+                try:
+                    await asyncio.wait_for(self.ws.send_json(message), timeout=5.0)
+                except (asyncio.TimeoutError, Exception):
+                    await self.close(code=4009, reason="Send timeout")
+                    return
+  example_bad: |
+    # BAD: Unbounded buffer — slow client causes OOM
+    async def broadcast(channel, data):
+        for conn in subscribers[channel]:
+            conn.pending_messages.append(data)  # No limit! Grows forever for slow clients
+  when_applies: Any WebSocket server with variable client connection speeds, especially mobile clients
+  sources: ["https://www.reactivemanifesto.org/glossary#Back-Pressure"]
+
+- id: RT-WS-010
+  text: "Enforce connection limits per user (max 5 connections) and per IP (max 20 connections). Without limits, a single user or attacker can exhaust server resources."
+  why: >
+    A bug in a React client caused it to open a new WebSocket on every route change without
+    closing the previous one. A power user navigating quickly opened 400 connections in 10 minutes.
+    Multiply by 1000 active users, and the server hit the 65,535 file descriptor limit.
+    All new connections (HTTP and WebSocket) were rejected for 20 minutes.
+  how_to_do_right: |
+    1. Track connections per user_id: max 5 concurrent connections
+    2. Track connections per IP: max 20 (allows shared offices)
+    3. On new connection exceeding limit: close the OLDEST connection for that user, accept new one
+    4. Return close code 4010 with reason "Connection limit exceeded" on the old connection
+    5. Log connection counts per user as a metric
+    6. Alert when any user exceeds 3 connections (may indicate client bug)
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, security]
+    concern: [web]
+  example_good: |
+    class ConnectionManager:
+        MAX_PER_USER = 5
+        MAX_PER_IP = 20
+
+        def __init__(self):
+            self.by_user: dict[str, list[Connection]] = defaultdict(list)
+            self.by_ip: dict[str, list[Connection]] = defaultdict(list)
+
+        async def register(self, conn: Connection):
+            user_conns = self.by_user[conn.user_id]
+            ip_conns = self.by_ip[conn.client_ip]
+
+            if len(ip_conns) >= self.MAX_PER_IP:
+                await conn.close(4010, "Too many connections from this IP")
+                return False
+
+            if len(user_conns) >= self.MAX_PER_USER:
+                oldest = user_conns.pop(0)
+                await oldest.close(4010, "Replaced by new connection")
+                logger.info(f"Evicted oldest connection for user {conn.user_id}")
+
+            user_conns.append(conn)
+            ip_conns.append(conn)
+            return True
+  example_bad: |
+    # BAD: No connection limits
+    connections = []
+
+    async def on_connect(ws):
+        connections.append(ws)  # No limit — one user can open thousands
+  when_applies: All WebSocket servers in production, especially user-facing applications
+  sources: ["https://cheatsheetseries.owasp.org/cheatsheets/Denial_of_Service_Cheat_Sheet.html"]
+
+- id: RT-WS-011
+  text: "Choose WebSocket over SSE when bidirectional communication is needed. Use SSE when server-to-client push is sufficient and you want simpler infrastructure (automatic reconnection, HTTP/2 multiplexing, no sticky sessions)."
+  why: >
+    A team used WebSocket for a notification system that only pushed from server to client.
+    They spent 3 weeks implementing reconnection logic, sticky session load balancing, and
+    connection state management. SSE would have provided automatic reconnection, worked through
+    HTTP proxies without upgrade, and required zero client-side connection management. The WebSocket
+    complexity introduced 4 bugs that SSE handles natively.
+  how_to_do_right: |
+    1. Use WebSocket when: client sends messages to server (chat, trading, interactive)
+    2. Use SSE when: server pushes to client only (notifications, price feeds, status updates)
+    3. SSE advantages: auto-reconnect, HTTP/2 multiplexing, works through proxies, simpler infra
+    4. WebSocket advantages: bidirectional, binary data, lower per-message overhead
+    5. SSE limitation: text only (use JSON), no binary. Max 6 connections per domain in HTTP/1.1
+    6. Consider SSE + REST POST as alternative to WebSocket for simple request/response patterns
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, architecture]
+    concern: [web, decision_making]
+  example_good: |
+    # SSE for server-to-client notifications (simpler, more reliable)
+    from fastapi import Request
+    from sse_starlette.sse import EventSourceResponse
+
+    async def notification_stream(request: Request):
+        user = await get_user(request)
+        async def event_generator():
+            async for notification in subscribe_notifications(user.id):
+                if await request.is_disconnected():
+                    break
+                yield {"event": "notification", "data": json.dumps(notification)}
+        return EventSourceResponse(event_generator())
+
+    # WebSocket for bidirectional trading (client sends orders, server sends fills)
+    async def trading_ws(ws: WebSocket):
+        await ws.accept()
+        user = await authenticate_ws(ws)
+        while True:
+            order = await ws.receive_json()  # Client sends orders
+            result = await process_order(order)
+            await ws.send_json(result)  # Server sends confirmation
+  example_bad: |
+    # BAD: Using WebSocket for server-only push — unnecessary complexity
+    async def notifications_ws(ws: WebSocket):
+        await ws.accept()
+        # Client never sends anything — this should be SSE
+        while True:
+            notification = await get_next_notification()
+            await ws.send_json(notification)
+  when_applies: Choosing between WebSocket and SSE for a new real-time feature
+  sources: ["https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events"]
+
+- id: RT-WS-012
+  text: "Use MessagePack instead of JSON for WebSocket message serialization when bandwidth is a concern and messages exceed 1KB average. MessagePack is 20-50% smaller and 2-5x faster to parse."
+  why: >
+    A real-time order book streaming 50 updates/second with JSON averaged 2.1KB per message.
+    With 10,000 subscribers, that is 1.02 GB/second of bandwidth. Switching to MessagePack
+    reduced message size to 1.3KB (38% smaller), saving 370 MB/second. Parse time dropped from
+    0.8ms to 0.2ms per message on the client, making the UI noticeably smoother.
+  how_to_do_right: |
+    1. Measure average message size first — if <500 bytes, JSON overhead is negligible
+    2. Use msgpack library (Python: msgpack, JS: @msgpack/msgpack)
+    3. Negotiate format on connect: client sends Accept header or first message with format preference
+    4. Support both JSON and MessagePack for backward compatibility
+    5. Use binary WebSocket frames for MessagePack (opcode 0x2)
+    6. Benchmark both in your specific use case before committing
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, performance]
+    concern: [web]
+  example_good: |
+    import msgpack
+
+    class MessageSerializer:
+        def __init__(self, format: str = "json"):
+            self.format = format
+
+        def encode(self, data: dict) -> bytes | str:
+            if self.format == "msgpack":
+                return msgpack.packb(data, use_bin_type=True)
+            return json.dumps(data)
+
+        def decode(self, raw: bytes | str) -> dict:
+            if self.format == "msgpack":
+                return msgpack.unpackb(raw, raw=False)
+            return json.loads(raw)
+
+    # Negotiate on connect
+    async def ws_endpoint(ws: WebSocket):
+        await ws.accept()
+        auth = await ws.receive_json()  # First message always JSON
+        fmt = auth.get("format", "json")
+        serializer = MessageSerializer(fmt)
+        # Use serializer for all subsequent messages
+  example_bad: |
+    # BAD: Always JSON even for high-throughput binary-friendly data
+    async def stream_orderbook(ws):
+        while True:
+            book = get_orderbook()  # 2KB+ of nested dicts
+            await ws.send_text(json.dumps(book))  # 50x/sec = 100KB/sec per client
+  when_applies: High-throughput WebSocket streams with messages >1KB, especially order books, market data, and game state
+  sources: ["https://msgpack.org/"]
+
+- id: RT-WS-013
+  text: "Real-time price ticker implementation must use last-write-wins with server timestamps, not client timestamps. Deduplicate by (symbol, server_timestamp) to prevent stale price display."
+  why: >
+    A price ticker used client-arrival timestamps for ordering. Due to network latency variance,
+    a BTC price of $45,100 (sent first) arrived after $45,000 (sent second but arrived first).
+    The UI displayed $45,100 then "corrected" to $45,000, confusing traders. Two users made trades
+    based on the stale displayed price, resulting in $8,000 in disputed losses.
+  how_to_do_right: |
+    1. Server assigns server_timestamp (monotonic clock) to every price update
+    2. Server assigns sequence number per symbol
+    3. Client stores last_seq per symbol
+    4. On receive: if new_seq <= last_seq, discard (stale update)
+    5. Display only the highest-seq update per symbol
+    6. Show staleness indicator if no update received in >5 seconds
+  severity: critical
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, fintech]
+    concern: [web]
+  example_good: |
+    // Client-side price ticker with ordering
+    class PriceTicker {
+      constructor() {
+        this.prices = new Map(); // symbol -> {price, seq, ts}
+      }
+
+      onPriceUpdate(msg) {
+        const current = this.prices.get(msg.symbol);
+        if (current && msg.seq <= current.seq) {
+          return; // Stale update, discard
+        }
+        this.prices.set(msg.symbol, {
+          price: msg.price,
+          seq: msg.seq,
+          ts: msg.server_ts,
+          receivedAt: Date.now(),
+        });
+        this.render(msg.symbol);
+      }
+
+      render(symbol) {
+        const data = this.prices.get(symbol);
+        const stale = Date.now() - data.receivedAt > 5000;
+        updateUI(symbol, data.price, { stale });
+      }
+    }
+  example_bad: |
+    // BAD: No ordering — stale prices can overwrite fresh ones
+    ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      prices[msg.symbol] = msg.price; // Last-arrived wins, not last-sent
+      updateUI(msg.symbol, msg.price);
+    };
+  when_applies: Any real-time price display, ticker, or financial data stream
+  sources: ["https://www.binance.com/en/binance-api"]
+
+- id: RT-WS-014
+  text: "Order book streaming must send snapshots periodically (every 60 seconds) and deltas between snapshots. The client must be able to rebuild the full order book from any snapshot plus subsequent deltas."
+  why: >
+    An order book stream sent only deltas. A client that missed 3 messages during a brief
+    disconnection had an order book permanently out of sync. The displayed bid-ask spread was
+    wrong by $200 for the rest of the session. The user placed a limit order at a price they
+    thought was the market price but was actually $200 away, resulting in an immediate $200 loss.
+  how_to_do_right: |
+    1. Send full snapshot on subscribe and every 60 seconds
+    2. Snapshot includes seq number: client verifies continuity
+    3. Between snapshots: send deltas (add, update, remove levels)
+    4. Each delta includes seq number for gap detection
+    5. If client detects gap: discard deltas, wait for next snapshot
+    6. Client checksum: hash top-10 levels, server includes checksum periodically for verification
+  severity: critical
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, fintech]
+    concern: [web]
+  example_good: |
+    class OrderBookStreamer:
+        SNAPSHOT_INTERVAL = 60  # seconds
+
+        async def subscribe(self, conn: Connection, symbol: str):
+            book = self.get_book(symbol)
+            # Send initial snapshot
+            await conn.send({
+                "type": "snapshot",
+                "symbol": symbol,
+                "seq": book.seq,
+                "bids": book.top_bids(50),
+                "asks": book.top_asks(50),
+                "checksum": book.checksum(),
+            })
+            # Subscribe to deltas
+            self.subscribers[symbol].add(conn)
+
+        async def on_book_change(self, symbol: str, change: dict):
+            book = self.get_book(symbol)
+            delta = {
+                "type": "delta",
+                "symbol": symbol,
+                "seq": book.seq,
+                "action": change["action"],  # "add", "update", "remove"
+                "side": change["side"],
+                "price": change["price"],
+                "quantity": change["quantity"],
+            }
+            await self.broadcast(symbol, delta)
+  example_bad: |
+    # BAD: Delta-only stream — client cannot recover from missed messages
+    async def stream_orderbook(ws, symbol):
+        async for change in book_changes(symbol):
+            await ws.send_json({"type": "delta", **change})
+            # No snapshots, no seq numbers, no recovery path
+  when_applies: Order book displays, market depth charts, any financial data requiring exact state reconstruction
+  sources: ["https://www.investopedia.com/terms/o/order-book.asp"]
+
+- id: RT-WS-015
+  text: "Live notification delivery must implement priority queues and coalescing. High-priority notifications (security alerts, trade fills) must not wait behind low-priority ones (likes, views)."
+  why: >
+    A user's account was compromised. The security alert notification was queued behind 200
+    marketing notifications being bulk-sent. The alert arrived 45 seconds late. In those 45 seconds,
+    the attacker withdrew funds. The user sued, arguing the platform failed to provide timely
+    notification of the security breach.
+  how_to_do_right: |
+    1. Define priority levels: P0 (security, trade fills), P1 (account changes), P2 (social), P3 (marketing)
+    2. Use priority queue per connection: P0 always sent first
+    3. Coalesce P2/P3 notifications: batch into groups of 5-10, send as single message
+    4. P0 notifications bypass all queues and rate limits
+    5. Rate limit P3: max 1 notification per 5 seconds per user
+    6. If connection is slow: drop P3, then P2. Never drop P0 or P1.
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, architecture]
+    concern: [web]
+  example_good: |
+    import heapq
+
+    class PriorityNotificationQueue:
+        PRIORITIES = {"security": 0, "trade": 0, "account": 1, "social": 2, "marketing": 3}
+
+        def __init__(self, conn: Connection):
+            self.conn = conn
+            self.heap: list = []
+            self.counter = 0
+
+        async def enqueue(self, notification: dict):
+            priority = self.PRIORITIES.get(notification["category"], 3)
+            self.counter += 1
+            heapq.heappush(self.heap, (priority, self.counter, notification))
+            if priority == 0:
+                await self.flush()  # P0 bypasses batching
+
+        async def flush(self):
+            batch = []
+            while self.heap:
+                _, _, notif = heapq.heappop(self.heap)
+                batch.append(notif)
+                if len(batch) >= 10:
+                    break
+            if batch:
+                await self.conn.send({"type": "notifications", "items": batch})
+  example_bad: |
+    # BAD: FIFO queue — security alerts wait behind marketing spam
+    async def send_notification(conn, notification):
+        conn.queue.append(notification)  # No priority, FIFO order
+  when_applies: Notification systems with mixed priority levels, especially financial platforms
+  sources: ["https://socket.io/docs/v4/adapter/"]
+
+- id: RT-WS-016
+  text: "WebSocket load balancing must use either sticky sessions (cookie/IP-based) or shared state (Redis). Without session affinity, a reconnecting client hits a different server and loses all subscriptions."
+  why: >
+    A platform used round-robin load balancing for WebSocket connections. When a client reconnected
+    after a brief network blip, it was routed to a different server. The new server had no knowledge
+    of the client's subscriptions, authentication state, or in-flight messages. The client appeared
+    connected but received no updates. Users reported "frozen" dashboards after every brief
+    disconnection, causing 200 support tickets per week.
+  how_to_do_right: |
+    1. Option A (Sticky sessions): Configure load balancer for cookie-based affinity
+       - NGINX: ip_hash or sticky cookie
+       - AWS ALB: stickiness enabled on target group
+       - Pro: Simple. Con: Uneven load distribution
+    2. Option B (Shared state): Store subscriptions in Redis
+       - On connect: register connection and subscriptions in Redis
+       - On reconnect to different server: restore state from Redis
+       - Pro: Even distribution. Con: Additional latency, Redis dependency
+    3. Prefer shared state for >10 servers (sticky sessions cause hot spots)
+    4. Always test reconnection across servers in staging
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, architecture]
+    concern: [web]
+  example_good: |
+    # Shared state approach: Redis-backed subscription manager
+    class DistributedConnectionManager:
+        def __init__(self, redis_client, server_id: str):
+            self.redis = redis_client
+            self.server_id = server_id
+            self.local_connections: dict[str, Connection] = {}
+
+        async def register(self, conn: Connection):
+            self.local_connections[conn.id] = conn
+            await self.redis.hset(f"ws:conn:{conn.user_id}", mapping={
+                "server": self.server_id,
+                "conn_id": conn.id,
+                "subscriptions": json.dumps(list(conn.subscriptions)),
+            })
+
+        async def restore_subscriptions(self, conn: Connection):
+            """Called on reconnect — restore from Redis."""
+            data = await self.redis.hgetall(f"ws:conn:{conn.user_id}")
+            if data:
+                subs = json.loads(data.get("subscriptions", "[]"))
+                for channel in subs:
+                    await self.subscribe(conn, channel)
+  example_bad: |
+    # BAD: Round-robin with no session affinity or shared state
+    # NGINX config:
+    # upstream websocket {
+    #     server ws1:8000;
+    #     server ws2:8000;
+    #     # No sticky sessions — reconnection breaks subscriptions
+    # }
+  when_applies: Any WebSocket deployment behind a load balancer with multiple server instances
+  sources: ["https://nginx.org/en/docs/http/websocket.html"]
+
+- id: RT-WS-017
+  text: "WebSocket testing must cover connection lifecycle, reconnection, message ordering, backpressure, and concurrent connections. Use deterministic sequences, not random data, to make failures reproducible."
+  why: >
+    A team tested WebSocket with simple "connect, send, receive, close" tests. In production,
+    they discovered: reconnection lost subscriptions, concurrent messages caused race conditions,
+    slow clients caused memory leaks, and authentication tokens expired mid-session. All 4 bugs
+    would have been caught with proper lifecycle tests. The bugs caused 3 production incidents
+    in the first week of launch.
+  how_to_do_right: |
+    1. Test connection lifecycle: connect, auth, subscribe, message, unsubscribe, disconnect
+    2. Test auth failures: invalid token, expired token, token refresh mid-session
+    3. Test reconnection: verify subscriptions restored, messages replayed from last seq
+    4. Test message ordering: send 1000 messages, verify client receives in order
+    5. Test backpressure: simulate slow client, verify server drops non-critical messages
+    6. Test concurrent connections: open 5 connections for same user, verify limits enforced
+    7. Test load: 100 concurrent connections sending/receiving for 60 seconds
+    8. Use pytest-asyncio for async WebSocket tests
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, testing]
+    concern: [web]
+  example_good: |
+    import pytest
+    from httpx import AsyncClient
+    from httpx_ws import aconnect_ws
+
+    @pytest.mark.asyncio
+    async def test_message_ordering():
+        """Verify messages arrive in sequence order."""
+        async with aconnect_ws("ws://localhost:8000/ws") as ws:
+            await ws.send_json({"type": "auth", "token": valid_token})
+            await ws.send_json({"type": "subscribe", "channel": "test"})
+
+            # Publish 100 messages server-side
+            for i in range(100):
+                await publish("test", {"seq": i, "data": f"msg-{i}"})
+
+            # Verify ordering
+            received = []
+            for _ in range(100):
+                msg = await asyncio.wait_for(ws.receive_json(), timeout=5.0)
+                received.append(msg["seq"])
+
+            assert received == list(range(100)), f"Out of order: {received[:10]}..."
+
+    @pytest.mark.asyncio
+    async def test_reconnection_restores_subscriptions():
+        """After reconnect, client should receive messages from subscribed channels."""
+        async with aconnect_ws("ws://localhost:8000/ws") as ws:
+            await ws.send_json({"type": "auth", "token": valid_token})
+            await ws.send_json({"type": "subscribe", "channel": "prices"})
+            last_seq = (await ws.receive_json())["seq"]
+
+        # Reconnect
+        async with aconnect_ws("ws://localhost:8000/ws") as ws:
+            await ws.send_json({"type": "auth", "token": valid_token})
+            await ws.send_json({"type": "subscribe", "channel": "prices", "last_seq": last_seq})
+            msg = await ws.receive_json()
+            assert msg["seq"] > last_seq  # Resumed from where we left off
+  example_bad: |
+    # BAD: Trivial test that misses all real-world failure modes
+    def test_websocket():
+        ws = connect("ws://localhost:8000/ws")
+        ws.send("hello")
+        assert ws.recv() == "hello"
+        ws.close()
+  when_applies: Any WebSocket implementation before going to production
+  sources: ["https://websockets.readthedocs.io/en/stable/topics/testing.html"]
+
+- id: RT-WS-018
+  text: "WebSocket monitoring must track connection count, message rate, error rate, latency percentiles, and buffer depth. Alert on connection count anomalies (sudden drop = server issue, sudden spike = potential attack)."
+  why: >
+    A WebSocket server silently stopped accepting new connections after a TLS certificate renewal
+    broke the upgrade handshake. Existing connections worked fine. For 4 hours, no new users could
+    connect, but there was no alert because the team only monitored HTTP endpoints. The connection
+    count metric slowly declined (users disconnecting naturally) but nobody noticed because there
+    was no anomaly detection on WebSocket metrics.
+  how_to_do_right: |
+    1. Track: active_connections (gauge), messages_sent/received (counter), errors (counter by type)
+    2. Track: message_latency_ms (histogram, p50/p95/p99), buffer_depth per connection (gauge)
+    3. Track: connections_opened/closed per minute (rate), auth_failures (counter)
+    4. Alert: connection count drops >20% in 5 minutes (server issue)
+    5. Alert: connection count spikes >50% in 1 minute (potential attack or client bug)
+    6. Alert: p99 message latency >500ms (backpressure or server overload)
+    7. Dashboard: show connection count, message rate, error rate, latency heatmap
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [websockets, socket.io]
+  domains:
+    domain: [realtime, observability]
+    concern: [metrics, dashboards]
+  example_good: |
+    from prometheus_client import Counter, Gauge, Histogram
+
+    ws_connections = Gauge("ws_active_connections", "Active WebSocket connections", ["server"])
+    ws_messages = Counter("ws_messages_total", "Total WebSocket messages", ["direction", "channel"])
+    ws_errors = Counter("ws_errors_total", "WebSocket errors", ["type"])
+    ws_latency = Histogram("ws_message_latency_seconds", "Message delivery latency",
+                           buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0])
+    ws_buffer_depth = Gauge("ws_buffer_depth", "Per-connection buffer depth", ["connection_id"])
+
+    class MonitoredConnectionManager:
+        async def register(self, conn):
+            ws_connections.labels(server=self.server_id).inc()
+
+        async def unregister(self, conn):
+            ws_connections.labels(server=self.server_id).dec()
+
+        async def send(self, conn, message, channel):
+            start = time.monotonic()
+            try:
+                await conn.ws.send_json(message)
+                ws_messages.labels(direction="out", channel=channel).inc()
+                ws_latency.observe(time.monotonic() - start)
+            except Exception as e:
+                ws_errors.labels(type=type(e).__name__).inc()
+                raise
+  example_bad: |
+    # BAD: No monitoring — silent failures go undetected for hours
+    async def send(conn, message):
+        try:
+            await conn.ws.send_json(message)
+        except:
+            pass  # Silently swallow errors, no metrics, no alerts
+  when_applies: All production WebSocket deployments
+  sources: ["https://opentelemetry.io/docs/specs/semconv/messaging/messaging-spans/"]

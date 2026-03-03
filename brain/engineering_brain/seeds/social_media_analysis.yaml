@@ -1,0 +1,1063 @@
+layer: rules
+domain: fact_checking
+knowledge:
+- id: FC-SOCIAL-001
+  text: "Social media API integration must use official APIs (Twitter/X API v2, Reddit API, YouTube Data API) with proper rate limiting and authentication — never scrape without API access."
+  why: >
+    Web scraping social media platforms violates ToS and breaks constantly (DOM changes weekly).
+    Twitter/X blocks scrapers aggressively and has sued multiple companies. Reddit's API changes
+    in 2023 killed dozens of third-party apps overnight. Official APIs provide stable endpoints,
+    rate limit headers, and legal protection. Without rate limiting, your API key gets banned
+    and all historical data collection stops — losing weeks of fact-checking context.
+  how_to_do_right: |
+    1. Use official SDKs: tweepy for Twitter/X, praw for Reddit, google-api-python-client for YouTube
+    2. Implement rate limit tracking using response headers (x-rate-limit-remaining, x-rate-limit-reset)
+    3. Use exponential backoff on 429 errors: wait 1s, 2s, 4s, max 60s
+    4. Store API credentials in environment variables, never in code
+    5. Cache API responses locally (SQLite or Redis) to avoid redundant calls
+    6. Log all API calls with timestamp and endpoint for audit trail
+  severity: high
+  technologies:
+    lang: [python]
+    library: [tweepy, praw]
+  domains:
+    domain: [fact_checking, integration]
+    concern: [domain_specific]
+  example_good: |
+    import tweepy
+    import os
+    import time
+    import logging
+
+    class TwitterClient:
+        def __init__(self):
+            self.client = tweepy.Client(
+                bearer_token=os.getenv("TWITTER_BEARER_TOKEN"),
+                wait_on_rate_limit=True,  # tweepy handles backoff automatically
+            )
+            self._cache: dict[str, dict] = {}
+
+        def get_tweet(self, tweet_id: str) -> dict | None:
+            if tweet_id in self._cache:
+                return self._cache[tweet_id]
+
+            try:
+                response = self.client.get_tweet(
+                    tweet_id,
+                    tweet_fields=["created_at", "public_metrics", "author_id", "context_annotations"],
+                    user_fields=["verified", "created_at", "public_metrics"],
+                    expansions=["author_id"],
+                )
+                if response.data:
+                    result = {
+                        "id": response.data.id,
+                        "text": response.data.text,
+                        "created_at": str(response.data.created_at),
+                        "metrics": response.data.public_metrics,
+                        "author": response.includes["users"][0].data if response.includes else None,
+                    }
+                    self._cache[tweet_id] = result
+                    return result
+                return None
+            except tweepy.TooManyRequests:
+                logging.warning("Twitter rate limit hit — waiting")
+                time.sleep(60)
+                return self.get_tweet(tweet_id)  # Retry once
+            except tweepy.TwitterServerError as e:
+                logging.error(f"Twitter API error: {e}")
+                return None
+  example_bad: |
+    import requests
+    from bs4 import BeautifulSoup
+
+    # Scraping Twitter — breaks constantly, violates ToS, gets IP banned
+    def get_tweet(url):
+        resp = requests.get(url)  # No auth, no rate limiting
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        return soup.find('div', class_='tweet-text').text  # DOM changes weekly
+  when_applies: Any fact-checking platform that needs to analyze social media content
+  sources:
+    - "https://docs.x.com/x-api/fundamentals/rate-limits"
+    - "https://developers.reddit.com/docs/api"
+
+- id: FC-SOCIAL-002
+  text: "Viral content detection must measure engagement velocity (likes/shares per hour) not just total counts — a 1-hour-old post with 10K shares is more urgent than a 1-week-old post with 50K."
+  why: >
+    Total engagement is a lagging indicator. By the time a misinformation post reaches 1M
+    shares, it has already caused damage. Velocity-based detection catches viral content in
+    the first 1-2 hours when fact-checking intervention is most effective. Research shows
+    that corrections issued within 4 hours of a viral claim reduce its spread by 40-60%,
+    while corrections after 24 hours have less than 10% effectiveness.
+  how_to_do_right: |
+    1. Calculate engagement velocity: (current_engagement - previous_engagement) / time_delta_hours
+    2. Track velocity over rolling windows: 15min, 1h, 4h, 24h
+    3. Flag content as "viral" when 1h velocity exceeds 2 standard deviations above category mean
+    4. Prioritize fact-checking queue by velocity, not total engagement
+    5. Store engagement snapshots every 15 minutes for velocity calculation
+    6. Weight shares/retweets 3x more than likes (shares amplify reach more)
+  severity: high
+  technologies:
+    lang: [python]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    from dataclasses import dataclass
+    from datetime import datetime, timedelta
+    from collections import deque
+    import statistics
+
+    @dataclass
+    class EngagementSnapshot:
+        timestamp: datetime
+        likes: int
+        shares: int
+        comments: int
+
+    class ViralDetector:
+        SHARE_WEIGHT = 3.0
+        LIKE_WEIGHT = 1.0
+        COMMENT_WEIGHT = 2.0
+        VIRAL_THRESHOLD_SIGMA = 2.0
+
+        def __init__(self):
+            self.snapshots: dict[str, deque[EngagementSnapshot]] = {}
+            self.category_velocities: dict[str, list[float]] = {}
+
+        def record_snapshot(self, content_id: str, snapshot: EngagementSnapshot):
+            if content_id not in self.snapshots:
+                self.snapshots[content_id] = deque(maxlen=100)
+            self.snapshots[content_id].append(snapshot)
+
+        def get_velocity(self, content_id: str, window_hours: float = 1.0) -> float:
+            """Weighted engagement velocity per hour."""
+            snaps = self.snapshots.get(content_id, deque())
+            if len(snaps) < 2:
+                return 0.0
+
+            cutoff = datetime.now() - timedelta(hours=window_hours)
+            recent = [s for s in snaps if s.timestamp >= cutoff]
+            if len(recent) < 2:
+                return 0.0
+
+            oldest, newest = recent[0], recent[-1]
+            hours = max((newest.timestamp - oldest.timestamp).total_seconds() / 3600, 0.01)
+
+            delta_engagement = (
+                (newest.shares - oldest.shares) * self.SHARE_WEIGHT +
+                (newest.likes - oldest.likes) * self.LIKE_WEIGHT +
+                (newest.comments - oldest.comments) * self.COMMENT_WEIGHT
+            )
+            return delta_engagement / hours
+
+        def is_viral(self, content_id: str, category: str) -> bool:
+            velocity = self.get_velocity(content_id, window_hours=1.0)
+            baselines = self.category_velocities.get(category, [1.0])
+            mean = statistics.mean(baselines)
+            std = statistics.stdev(baselines) if len(baselines) > 1 else mean * 0.5
+            return velocity > mean + self.VIRAL_THRESHOLD_SIGMA * std
+  example_bad: |
+    # Only checks total count — misses fast-spreading new content
+    def is_viral(post):
+        return post["likes"] > 10000  # A week-old post with 10K likes is NOT urgent
+  when_applies: Any fact-checking platform that monitors social media for misinformation
+  sources:
+    - "https://www.science.org/doi/10.1126/science.aap9559"
+
+- id: FC-SOCIAL-003
+  text: "Bot detection heuristics must check account age, posting frequency, content patterns, and network behavior — no single signal is reliable alone."
+  why: >
+    Bot-generated misinformation accounts for 30-50% of viral false content on social media.
+    Simple heuristics like "account age < 30 days" produce 40%+ false positives because
+    real users create new accounts too. Sophisticated bot farms use aged accounts purchased
+    in bulk. Multi-signal detection combining account metadata, posting patterns, and content
+    analysis achieves 85-90% accuracy while single-signal approaches barely reach 60%.
+  how_to_do_right: |
+    1. Check account age: score lower for <90 days, but do not reject solely on age
+    2. Check posting frequency: >50 posts/day or posting 24/7 without sleep patterns = suspicious
+    3. Check content diversity: >80% of posts containing URLs or >90% retweets = suspicious
+    4. Check profile completeness: no bio, default avatar, no followers = suspicious
+    5. Combine signals into a weighted bot score (0-100), flag at >70, investigate >50
+    6. Update heuristics quarterly — bot behavior evolves rapidly
+  severity: high
+  technologies:
+    lang: [python]
+    library: [tweepy, praw]
+  domains:
+    domain: [fact_checking, security]
+    concern: [domain_specific]
+  example_good: |
+    from dataclasses import dataclass
+    from datetime import datetime
+
+    @dataclass
+    class AccountMetrics:
+        created_at: datetime
+        followers: int
+        following: int
+        total_posts: int
+        posts_last_24h: int
+        retweet_ratio: float  # 0.0 to 1.0
+        url_ratio: float  # ratio of posts containing URLs
+        has_bio: bool
+        has_avatar: bool
+        posting_hours: list[int]  # hours of day when posts occur
+
+    class BotDetector:
+        WEIGHTS = {
+            "account_age": 15,
+            "posting_frequency": 20,
+            "content_diversity": 20,
+            "profile_completeness": 10,
+            "follower_ratio": 15,
+            "sleep_pattern": 20,
+        }
+
+        def calculate_bot_score(self, metrics: AccountMetrics) -> float:
+            """Returns bot probability score 0-100."""
+            score = 0.0
+
+            # Account age (newer = more suspicious)
+            age_days = (datetime.now() - metrics.created_at).days
+            if age_days < 30:
+                score += self.WEIGHTS["account_age"]
+            elif age_days < 90:
+                score += self.WEIGHTS["account_age"] * 0.5
+
+            # Posting frequency (>50/day is suspicious)
+            if metrics.posts_last_24h > 50:
+                score += self.WEIGHTS["posting_frequency"]
+            elif metrics.posts_last_24h > 30:
+                score += self.WEIGHTS["posting_frequency"] * 0.5
+
+            # Content diversity (high retweet/URL ratio = suspicious)
+            if metrics.retweet_ratio > 0.9:
+                score += self.WEIGHTS["content_diversity"] * 0.7
+            if metrics.url_ratio > 0.8:
+                score += self.WEIGHTS["content_diversity"] * 0.3
+
+            # Profile completeness
+            if not metrics.has_bio:
+                score += self.WEIGHTS["profile_completeness"] * 0.5
+            if not metrics.has_avatar:
+                score += self.WEIGHTS["profile_completeness"] * 0.5
+
+            # Follower/following ratio (bots follow many, have few followers)
+            if metrics.following > 0 and metrics.followers / max(metrics.following, 1) < 0.1:
+                score += self.WEIGHTS["follower_ratio"]
+
+            # Sleep pattern (humans sleep 6-8h, bots post 24/7)
+            active_hours = len(set(metrics.posting_hours))
+            if active_hours > 20:  # Active 20+ hours/day
+                score += self.WEIGHTS["sleep_pattern"]
+
+            return min(score, 100.0)
+  example_bad: |
+    # Single signal — massive false positive rate
+    def is_bot(account):
+        return account["followers"] < 100  # Many real users have <100 followers
+  when_applies: Any fact-checking platform that needs to assess source credibility on social media
+  sources:
+    - "https://arxiv.org/abs/1703.03107"
+
+- id: FC-SOCIAL-004
+  text: "Information cascade modeling must track how claims propagate across platforms and mutate over time — the same claim morphs as it spreads."
+  why: >
+    Misinformation rarely stays in its original form. A claim starts on Twitter, gets
+    screenshot-shared to Facebook, is discussed on Reddit with embellishments, and appears
+    on YouTube with additional false context. Tracking only the original source misses 70%
+    of the spread. Understanding the mutation pattern (what gets added, removed, or changed)
+    reveals the claim's evolution and helps predict future mutations. The "telephone game"
+    effect means the version seen by most people is often significantly different from the
+    original.
+  how_to_do_right: |
+    1. Create a claim cluster: group all variants of the same underlying claim
+    2. Track cross-platform propagation: original source -> reshares -> derivatives
+    3. Use semantic similarity (>0.85 cosine) to match claim variants
+    4. Record mutations: what changed between versions (added context, removed caveats, etc.)
+    5. Build a propagation graph: nodes = posts, edges = "derived from" with timestamp
+    6. Identify super-spreaders: accounts that bridge between platforms or communities
+  severity: high
+  technologies:
+    lang: [python]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    from dataclasses import dataclass, field
+    from datetime import datetime
+    from enum import Enum
+
+    class MutationType(Enum):
+        VERBATIM = "verbatim"          # Exact copy
+        PARAPHRASED = "paraphrased"    # Same meaning, different words
+        EMBELLISHED = "embellished"    # Added false details
+        STRIPPED = "stripped"          # Removed caveats/context
+        COMBINED = "combined"         # Merged with another claim
+
+    @dataclass
+    class ClaimInstance:
+        id: str
+        platform: str  # twitter, reddit, youtube, facebook
+        text: str
+        author_id: str
+        timestamp: datetime
+        engagement: dict
+        parent_id: str | None = None
+        mutation_type: MutationType = MutationType.VERBATIM
+
+    @dataclass
+    class ClaimCluster:
+        cluster_id: str
+        original: ClaimInstance
+        variants: list[ClaimInstance] = field(default_factory=list)
+        propagation_edges: list[tuple[str, str, MutationType]] = field(default_factory=list)
+
+        def add_variant(self, instance: ClaimInstance, parent_id: str, mutation: MutationType):
+            instance.parent_id = parent_id
+            instance.mutation_type = mutation
+            self.variants.append(instance)
+            self.propagation_edges.append((parent_id, instance.id, mutation))
+
+        @property
+        def total_reach(self) -> int:
+            all_instances = [self.original] + self.variants
+            return sum(
+                i.engagement.get("impressions", 0) or
+                i.engagement.get("views", 0) or
+                i.engagement.get("likes", 0) * 10  # estimate
+                for i in all_instances
+            )
+
+        @property
+        def platforms_reached(self) -> set[str]:
+            return {self.original.platform} | {v.platform for v in self.variants}
+
+        @property
+        def mutation_rate(self) -> float:
+            """Fraction of variants that mutated from original meaning."""
+            if not self.variants:
+                return 0.0
+            mutated = [v for v in self.variants if v.mutation_type in (MutationType.EMBELLISHED, MutationType.STRIPPED, MutationType.COMBINED)]
+            return len(mutated) / len(self.variants)
+  example_bad: |
+    # Only tracks original post — misses 70% of spread
+    def track_claim(tweet_id):
+        tweet = api.get_tweet(tweet_id)
+        return {"text": tweet.text, "likes": tweet.likes}
+  when_applies: Any fact-checking platform that tracks misinformation spread across social media
+  sources:
+    - "https://www.science.org/doi/10.1126/science.aap9559"
+
+- id: FC-SOCIAL-005
+  text: "Social graph analysis for credibility must assess an account's network neighborhood — accounts connected to known misinformation spreaders are higher risk."
+  why: >
+    Credibility is partially determined by who you associate with. Research from MIT's Media Lab
+    shows that accounts that regularly share content from known misinformation sources are
+    6x more likely to share misinformation themselves. Analyzing the 1-hop social graph
+    (who follows, who is followed by, who retweets) provides a credibility signal that
+    is harder to fake than individual account metrics. Bot networks often have dense
+    interconnections that are detectable through graph analysis.
+  how_to_do_right: |
+    1. Build 1-hop graph: followers, following, frequent retweet/reply targets
+    2. Cross-reference with known misinformation account database
+    3. Calculate "misinfo exposure score": % of connections linked to known misinfo spreaders
+    4. Identify clusters: densely connected groups sharing the same narratives
+    5. Weight recent interactions higher than old ones (6-month decay)
+    6. Do NOT use graph analysis alone — combine with content and account metrics
+  severity: high
+  technologies:
+    lang: [python]
+    library: [tweepy]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    from collections import Counter
+    from datetime import datetime, timedelta
+
+    class SocialGraphAnalyzer:
+        def __init__(self, known_misinfo_accounts: set[str]):
+            self.known_misinfo = known_misinfo_accounts
+
+        def analyze_credibility(self, account_id: str, connections: dict) -> dict:
+            """
+            connections = {
+                "following": [list of account IDs],
+                "followers": [list of account IDs],
+                "frequent_retweets": [list of (account_id, count, last_date)],
+            }
+            """
+            following = set(connections.get("following", []))
+            followers = set(connections.get("followers", []))
+            retweet_targets = connections.get("frequent_retweets", [])
+
+            # Misinfo exposure from following
+            misinfo_following = following & self.known_misinfo
+            following_exposure = len(misinfo_following) / max(len(following), 1)
+
+            # Misinfo exposure from retweet behavior (weighted by recency)
+            misinfo_rt_score = 0.0
+            total_rt_weight = 0.0
+            for target_id, count, last_date in retweet_targets:
+                recency_weight = max(0, 1 - (datetime.now() - last_date).days / 180)
+                weight = count * recency_weight
+                total_rt_weight += weight
+                if target_id in self.known_misinfo:
+                    misinfo_rt_score += weight
+
+            rt_exposure = misinfo_rt_score / max(total_rt_weight, 1)
+
+            # Combined score (0 = clean, 1 = high misinfo exposure)
+            combined_exposure = following_exposure * 0.3 + rt_exposure * 0.7
+
+            return {
+                "account_id": account_id,
+                "misinfo_exposure": round(combined_exposure, 3),
+                "misinfo_following_count": len(misinfo_following),
+                "misinfo_following_pct": round(following_exposure * 100, 1),
+                "retweet_exposure": round(rt_exposure * 100, 1),
+                "risk_level": "high" if combined_exposure > 0.3 else "medium" if combined_exposure > 0.1 else "low",
+            }
+  example_bad: |
+    # Checks only follower count — no graph analysis
+    def is_credible(account):
+        return account["followers"] > 1000  # Anyone can buy followers
+  when_applies: Any fact-checking platform that assesses source credibility on social media
+  sources:
+    - "https://arxiv.org/abs/1703.03107"
+
+- id: FC-SOCIAL-006
+  text: "Trending topic monitoring must detect emerging narratives within 15 minutes using keyword velocity, not just hashtag counts."
+  why: >
+    Hashtag tracking misses misinformation that spreads without hashtags (which is most of it).
+    Keyword velocity — measuring how fast specific phrases appear in new posts — catches
+    emerging narratives 30-60 minutes before they trend. Early detection is critical: a
+    fact-check published before a claim goes viral reaches 10x more people than one published
+    after. Monitoring only trending topics means you are always behind the misinformation curve.
+  how_to_do_right: |
+    1. Monitor keyword frequency in rolling 15-minute windows
+    2. Calculate velocity: keywords appearing 5x more than baseline in 15min = emerging trend
+    3. Cluster related keywords into narratives using co-occurrence analysis
+    4. Separate signal from noise: require minimum 100 unique accounts mentioning the keyword
+    5. Cross-reference with known claim patterns from previous fact-checks
+    6. Alert fact-checkers within 5 minutes of detecting an emerging narrative
+  severity: high
+  technologies:
+    lang: [python]
+  domains:
+    domain: [fact_checking, realtime]
+    concern: [domain_specific]
+  example_good: |
+    from collections import defaultdict, Counter
+    from datetime import datetime, timedelta
+    import re
+
+    class TrendDetector:
+        VELOCITY_THRESHOLD = 5.0  # 5x above baseline
+        MIN_UNIQUE_ACCOUNTS = 100
+        WINDOW_MINUTES = 15
+
+        def __init__(self):
+            self.keyword_windows: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
+            self.baseline_rates: dict[str, float] = {}  # keyword -> avg mentions per 15min
+
+        def ingest_post(self, text: str, author_id: str, timestamp: datetime):
+            keywords = self._extract_keywords(text)
+            for kw in keywords:
+                self.keyword_windows[kw].append((timestamp, author_id))
+
+        def detect_emerging(self) -> list[dict]:
+            cutoff = datetime.now() - timedelta(minutes=self.WINDOW_MINUTES)
+            emerging = []
+
+            for keyword, entries in self.keyword_windows.items():
+                recent = [(ts, aid) for ts, aid in entries if ts >= cutoff]
+                unique_accounts = len(set(aid for _, aid in recent))
+
+                if unique_accounts < self.MIN_UNIQUE_ACCOUNTS:
+                    continue
+
+                current_rate = len(recent)
+                baseline = self.baseline_rates.get(keyword, 10.0)
+                velocity = current_rate / max(baseline, 1.0)
+
+                if velocity >= self.VELOCITY_THRESHOLD:
+                    emerging.append({
+                        "keyword": keyword,
+                        "velocity": round(velocity, 1),
+                        "current_rate": current_rate,
+                        "baseline_rate": baseline,
+                        "unique_accounts": unique_accounts,
+                        "detected_at": datetime.now().isoformat(),
+                    })
+
+            return sorted(emerging, key=lambda x: x["velocity"], reverse=True)
+
+        def _extract_keywords(self, text: str) -> list[str]:
+            words = re.findall(r'\b[a-zA-Z]{4,}\b', text.lower())
+            # Return bigrams for better narrative detection
+            bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words) - 1)]
+            return words + bigrams
+  example_bad: |
+    # Only watches hashtags — misses most misinformation
+    def get_trends():
+        return twitter_api.get_trending_topics()  # Already viral by the time it trends
+  when_applies: Any fact-checking platform that needs to detect emerging misinformation narratives
+  sources:
+    - "https://www.science.org/doi/10.1126/science.aap9559"
+
+- id: FC-SOCIAL-007
+  text: "Social media archiving must capture and preserve content immediately — posts can be deleted within minutes of being flagged."
+  why: >
+    Misinformation spreaders routinely delete posts after being called out, destroying
+    evidence. During COVID-19, 25-30% of flagged misinformation posts were deleted within
+    24 hours. Without archival, fact-checkers cannot reference the original claim, and
+    the fact-check itself becomes unverifiable. Legal proceedings also require preserved
+    evidence. The Wayback Machine does not capture most social media posts.
+  how_to_do_right: |
+    1. Archive immediately upon detection: full HTML, screenshot, and API response JSON
+    2. Store original URL, capture timestamp, and cryptographic hash of content
+    3. Generate a screenshot with visible URL bar and timestamp (for visual evidence)
+    4. Store in append-only storage (S3 with Object Lock or similar)
+    5. Create a short verification URL that links to the archived version
+    6. Include thread context: capture parent post and top replies for context
+  severity: critical
+  technologies:
+    lang: [python]
+  domains:
+    domain: [fact_checking, compliance]
+    concern: [domain_specific]
+  example_good: |
+    import hashlib
+    import json
+    from datetime import datetime
+    from dataclasses import dataclass
+    from pathlib import Path
+
+    @dataclass
+    class ArchivedContent:
+        original_url: str
+        platform: str
+        capture_timestamp: datetime
+        content_hash: str
+        api_response: dict
+        screenshot_path: str | None
+        thread_context: list[dict] | None
+
+    class SocialMediaArchiver:
+        def __init__(self, storage_path: Path):
+            self.storage = storage_path
+            self.storage.mkdir(parents=True, exist_ok=True)
+
+        def archive(self, url: str, api_response: dict, screenshot_bytes: bytes | None = None) -> ArchivedContent:
+            """Archive content immediately. Returns archive record."""
+            timestamp = datetime.utcnow()
+            content_json = json.dumps(api_response, sort_keys=True, default=str)
+            content_hash = hashlib.sha256(content_json.encode()).hexdigest()
+
+            # Store API response
+            archive_id = f"{timestamp.strftime('%Y%m%d_%H%M%S')}_{content_hash[:12]}"
+            archive_dir = self.storage / archive_id
+            archive_dir.mkdir(exist_ok=True)
+
+            (archive_dir / "api_response.json").write_text(content_json)
+            (archive_dir / "metadata.json").write_text(json.dumps({
+                "original_url": url,
+                "capture_timestamp": timestamp.isoformat(),
+                "content_hash": content_hash,
+            }))
+
+            screenshot_path = None
+            if screenshot_bytes:
+                screenshot_path = str(archive_dir / "screenshot.png")
+                (archive_dir / "screenshot.png").write_bytes(screenshot_bytes)
+
+            return ArchivedContent(
+                original_url=url,
+                platform=self._detect_platform(url),
+                capture_timestamp=timestamp,
+                content_hash=content_hash,
+                api_response=api_response,
+                screenshot_path=screenshot_path,
+                thread_context=None,
+            )
+
+        def verify_integrity(self, archive_id: str) -> bool:
+            """Verify archived content has not been tampered with."""
+            archive_dir = self.storage / archive_id
+            content = (archive_dir / "api_response.json").read_text()
+            stored_hash = json.loads((archive_dir / "metadata.json").read_text())["content_hash"]
+            computed_hash = hashlib.sha256(content.encode()).hexdigest()
+            return stored_hash == computed_hash
+
+        def _detect_platform(self, url: str) -> str:
+            if "twitter.com" in url or "x.com" in url:
+                return "twitter"
+            if "reddit.com" in url:
+                return "reddit"
+            if "youtube.com" in url or "youtu.be" in url:
+                return "youtube"
+            return "unknown"
+  example_bad: |
+    # Just saves the URL — content is gone when deleted
+    def archive(url):
+        db.save({"url": url, "date": datetime.now()})
+        # Original content is NOT preserved — useless when post is deleted
+  when_applies: Any fact-checking platform that references social media content as evidence
+  sources:
+    - "https://web.archive.org/web/20240101000000*/https://developer.twitter.com/en/docs/twitter-api"
+
+- id: FC-SOCIAL-008
+  text: "Screenshot and URL verification must check for manipulation — screenshots can be fabricated in seconds with browser dev tools or image editors."
+  why: >
+    Fabricated screenshots are the most common form of social media misinformation evidence.
+    Anyone can use browser DevTools to change text on any webpage, take a screenshot, and
+    present it as real. During elections, fabricated screenshots of candidate tweets that
+    never existed spread widely. URL verification (checking if the content actually exists
+    at the claimed URL) catches 80% of fabricated screenshots.
+  how_to_do_right: |
+    1. Always verify by fetching the original URL — do not trust screenshots alone
+    2. If the URL returns 404, flag the screenshot as "unverified (original deleted or never existed)"
+    3. Compare screenshot text against API response text (exact match or >95% similarity)
+    4. Check URL structure for legitimacy (e.g., twitter.com/user/status/ID format)
+    5. Use reverse image search to check if the screenshot appears in known fabrication databases
+    6. Record both the screenshot AND the live verification result for transparency
+  severity: critical
+  technologies:
+    lang: [python]
+    library: [tweepy]
+  domains:
+    domain: [fact_checking, security]
+    concern: [domain_specific]
+  example_good: |
+    import re
+    from difflib import SequenceMatcher
+
+    class ScreenshotVerifier:
+        URL_PATTERNS = {
+            "twitter": r"https?://(twitter\.com|x\.com)/\w+/status/\d+",
+            "reddit": r"https?://(www\.)?reddit\.com/r/\w+/comments/\w+",
+            "youtube": r"https?://(www\.)?youtube\.com/watch\?v=[\w-]+",
+        }
+
+        def verify_claim(self, claimed_url: str, claimed_text: str) -> dict:
+            """Verify that a claimed screenshot matches real content."""
+            result = {
+                "url_valid": False,
+                "content_exists": False,
+                "text_matches": False,
+                "match_score": 0.0,
+                "verdict": "unverified",
+            }
+
+            # Step 1: Validate URL structure
+            platform = self._detect_platform(claimed_url)
+            if not platform:
+                result["verdict"] = "invalid_url"
+                return result
+            result["url_valid"] = True
+
+            # Step 2: Fetch actual content
+            try:
+                actual_content = self._fetch_content(claimed_url, platform)
+                if actual_content is None:
+                    result["verdict"] = "content_not_found"
+                    return result
+                result["content_exists"] = True
+            except Exception:
+                result["verdict"] = "fetch_failed"
+                return result
+
+            # Step 3: Compare text
+            match_score = SequenceMatcher(None, claimed_text.strip(), actual_content["text"].strip()).ratio()
+            result["match_score"] = round(match_score, 3)
+            result["text_matches"] = match_score > 0.95
+
+            if match_score > 0.95:
+                result["verdict"] = "verified"
+            elif match_score > 0.70:
+                result["verdict"] = "partially_matches"
+            else:
+                result["verdict"] = "text_mismatch"
+
+            return result
+
+        def _detect_platform(self, url: str) -> str | None:
+            for platform, pattern in self.URL_PATTERNS.items():
+                if re.match(pattern, url):
+                    return platform
+            return None
+
+        def _fetch_content(self, url: str, platform: str) -> dict | None:
+            # Use official API to fetch content
+            if platform == "twitter":
+                tweet_id = url.split("/")[-1]
+                return self.twitter_client.get_tweet(tweet_id)
+            # ... other platforms
+            return None
+  example_bad: |
+    # Trusts screenshot at face value — no verification
+    def check_claim(screenshot_url, claimed_text):
+        return {"verified": True, "text": claimed_text}  # Always "verified"
+  when_applies: Any fact-checking platform that receives social media screenshots as evidence
+  sources:
+    - "https://c2pa.org/"
+
+- id: FC-SOCIAL-009
+  text: "Social media sentiment analysis for fact-checking must detect stance (supports/denies/neutral) not just positive/negative polarity."
+  why: >
+    Standard sentiment analysis (positive/negative/neutral) is useless for fact-checking.
+    A tweet saying "This is great! Finally someone exposes the truth about vaccines!" has
+    positive sentiment but supports a misinformation claim. What fact-checkers need is stance
+    detection: does this post support, deny, or comment neutrally on a specific claim?
+    Stance detection enables measuring public belief in a claim, which prioritizes which
+    claims need fact-checking most urgently.
+  how_to_do_right: |
+    1. Use stance detection models (not sentiment models) trained on claim-post pairs
+    2. Classify as: SUPPORTS, DENIES, COMMENTS, UNRELATED
+    3. Aggregate stance distribution per claim: "60% support, 25% deny, 15% neutral"
+    4. Claims with >70% support and high velocity are fact-checking priorities
+    5. Track stance shift over time: if denial rate increases after fact-check, the fact-check is working
+    6. Use few-shot prompting with LLMs for stance detection if no fine-tuned model available
+  severity: high
+  technologies:
+    lang: [python]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    from enum import Enum
+    from dataclasses import dataclass
+
+    class Stance(Enum):
+        SUPPORTS = "supports"
+        DENIES = "denies"
+        COMMENTS = "comments"
+        UNRELATED = "unrelated"
+
+    @dataclass
+    class StanceResult:
+        stance: Stance
+        confidence: float
+        reasoning: str
+
+    class StanceDetector:
+        PROMPT_TEMPLATE = """Given a claim and a social media post, classify the post's stance toward the claim.
+
+    Claim: {claim}
+    Post: {post}
+
+    Classify as one of:
+    - SUPPORTS: The post agrees with or promotes the claim
+    - DENIES: The post disagrees with or debunks the claim
+    - COMMENTS: The post discusses the claim without taking a clear side
+    - UNRELATED: The post is not about this claim
+
+    Output JSON: {{"stance": "...", "confidence": 0.0-1.0, "reasoning": "..."}}"""
+
+        def detect_stance(self, claim: str, post: str) -> StanceResult:
+            prompt = self.PROMPT_TEMPLATE.format(claim=claim, post=post)
+            response = self.llm.generate(prompt)
+            parsed = json.loads(response)
+            return StanceResult(
+                stance=Stance(parsed["stance"].lower()),
+                confidence=parsed["confidence"],
+                reasoning=parsed["reasoning"],
+            )
+
+        def aggregate_stances(self, claim: str, posts: list[str]) -> dict:
+            stances = [self.detect_stance(claim, post) for post in posts]
+            distribution = {s.value: 0 for s in Stance}
+            for result in stances:
+                if result.confidence > 0.6:  # Only count confident classifications
+                    distribution[result.stance.value] += 1
+            total = sum(distribution.values())
+            return {k: round(v / max(total, 1), 3) for k, v in distribution.items()}
+  example_bad: |
+    # Sentiment analysis — useless for fact-checking
+    from textblob import TextBlob
+    def analyze(post):
+        blob = TextBlob(post)
+        return blob.sentiment.polarity  # "Positive" says nothing about truth
+  when_applies: Any fact-checking platform that analyzes public response to claims
+  sources:
+    - "https://arxiv.org/abs/1803.11175"
+
+- id: FC-SOCIAL-010
+  text: "Cross-platform claim tracking must use semantic matching, not exact string matching — the same claim is worded differently on each platform."
+  why: >
+    A claim on Twitter might be "Study shows ivermectin cures COVID" while the same claim
+    on Reddit is "New research proves horse dewormer works against coronavirus" and on YouTube
+    it becomes "BANNED study shows cheap drug cures virus". Exact string matching finds
+    zero of these connections. Semantic similarity with >0.8 cosine threshold catches
+    85%+ of cross-platform claim variants while keeping false positive rate below 5%.
+  how_to_do_right: |
+    1. Generate embeddings for each claim using a sentence transformer model
+    2. Store embeddings in a vector database (Qdrant, Pinecone) with platform metadata
+    3. For each new claim, search for semantically similar existing claims (cosine > 0.8)
+    4. Group matched claims into cross-platform clusters
+    5. Track cluster growth: which platforms are amplifying which claims
+    6. Use the cluster to propagate fact-check results across all platforms at once
+  severity: high
+  technologies:
+    lang: [python]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    from sentence_transformers import SentenceTransformer
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import PointStruct, VectorParams, Distance
+    import uuid
+
+    class CrossPlatformTracker:
+        SIMILARITY_THRESHOLD = 0.80
+
+        def __init__(self, qdrant_url: str = "localhost", qdrant_port: int = 6333):
+            self.model = SentenceTransformer("all-MiniLM-L6-v2")
+            self.qdrant = QdrantClient(host=qdrant_url, port=qdrant_port)
+            self._ensure_collection()
+
+        def _ensure_collection(self):
+            self.qdrant.recreate_collection(
+                collection_name="claims",
+                vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+            )
+
+        def track_claim(self, text: str, platform: str, url: str) -> dict:
+            """Track a claim, returning cluster info if it matches existing claims."""
+            embedding = self.model.encode(text).tolist()
+
+            # Search for similar existing claims
+            results = self.qdrant.search(
+                collection_name="claims",
+                query_vector=embedding,
+                limit=5,
+                score_threshold=self.SIMILARITY_THRESHOLD,
+            )
+
+            cluster_id = None
+            if results:
+                # Join existing cluster
+                cluster_id = results[0].payload["cluster_id"]
+                matched_platforms = set(r.payload["platform"] for r in results)
+            else:
+                # Start new cluster
+                cluster_id = str(uuid.uuid4())
+                matched_platforms = set()
+
+            # Store new claim
+            point_id = str(uuid.uuid4())
+            self.qdrant.upsert(
+                collection_name="claims",
+                points=[PointStruct(
+                    id=point_id,
+                    vector=embedding,
+                    payload={"text": text, "platform": platform, "url": url, "cluster_id": cluster_id},
+                )],
+            )
+
+            return {
+                "claim_id": point_id,
+                "cluster_id": cluster_id,
+                "is_new_claim": len(results) == 0,
+                "matched_count": len(results),
+                "platforms": matched_platforms | {platform},
+            }
+  example_bad: |
+    # Exact string match — misses all cross-platform variants
+    def find_matches(claim_text, database):
+        return [c for c in database if c["text"] == claim_text]  # Never matches anything
+  when_applies: Any fact-checking platform that operates across multiple social media platforms
+  sources:
+    - "https://arxiv.org/abs/1809.08193"
+
+- id: FC-SOCIAL-011
+  text: "Influencer credibility scoring must combine historical accuracy, domain expertise, and correction behavior — follower count is not credibility."
+  why: >
+    A health influencer with 5M followers who shares medical misinformation weekly is less
+    credible than a verified doctor with 5K followers. Follower count correlates with reach,
+    not accuracy. Research shows that accounts with the highest follower counts are responsible
+    for a disproportionate share of misinformation spread. Credibility scoring that tracks
+    past accuracy (were their claims true?) and correction behavior (do they retract when wrong?)
+    provides a meaningful signal for fact-checkers.
+  how_to_do_right: |
+    1. Track historical claims per account: how many were fact-checked as true vs false
+    2. Calculate accuracy score: (true claims) / (total fact-checked claims)
+    3. Track correction behavior: does the account retract/correct false claims?
+    4. Assess domain expertise: verified credentials, cited by experts, consistent topic
+    5. Penalize heavily for repeated sharing of debunked claims (willful misinformation)
+    6. Weight recent behavior more than historical (6-month exponential decay)
+  severity: high
+  technologies:
+    lang: [python]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    from dataclasses import dataclass, field
+    from datetime import datetime, timedelta
+    import math
+
+    @dataclass
+    class FactCheckRecord:
+        claim_text: str
+        verdict: str  # "true", "mostly_true", "mixed", "mostly_false", "false"
+        date: datetime
+        corrected: bool = False  # Did the account issue a correction?
+
+    @dataclass
+    class InfluencerProfile:
+        account_id: str
+        domain: str
+        fact_check_history: list[FactCheckRecord] = field(default_factory=list)
+
+    class CredibilityScorer:
+        VERDICT_SCORES = {"true": 1.0, "mostly_true": 0.75, "mixed": 0.5, "mostly_false": 0.25, "false": 0.0}
+        DECAY_HALF_LIFE_DAYS = 180
+        CORRECTION_BONUS = 0.15  # Bonus for correcting false claims
+        REPEAT_OFFENDER_PENALTY = 0.3  # Penalty for sharing debunked claims again
+
+        def score(self, profile: InfluencerProfile) -> dict:
+            if not profile.fact_check_history:
+                return {"score": 0.5, "confidence": "low", "records": 0}
+
+            weighted_sum = 0.0
+            total_weight = 0.0
+            false_count = 0
+            corrected_count = 0
+
+            for record in profile.fact_check_history:
+                # Recency weight (exponential decay)
+                days_ago = (datetime.now() - record.date).days
+                weight = math.exp(-0.693 * days_ago / self.DECAY_HALF_LIFE_DAYS)
+
+                base_score = self.VERDICT_SCORES.get(record.verdict, 0.5)
+
+                # Correction bonus
+                if record.verdict in ("mostly_false", "false") and record.corrected:
+                    base_score += self.CORRECTION_BONUS
+                    corrected_count += 1
+
+                if record.verdict in ("mostly_false", "false"):
+                    false_count += 1
+
+                weighted_sum += base_score * weight
+                total_weight += weight
+
+            accuracy = weighted_sum / max(total_weight, 0.01)
+
+            # Repeat offender penalty
+            if false_count >= 3:
+                accuracy -= self.REPEAT_OFFENDER_PENALTY
+
+            accuracy = max(0.0, min(1.0, accuracy))
+            confidence = "high" if len(profile.fact_check_history) >= 10 else "medium" if len(profile.fact_check_history) >= 3 else "low"
+
+            return {
+                "score": round(accuracy, 3),
+                "confidence": confidence,
+                "records": len(profile.fact_check_history),
+                "false_claims": false_count,
+                "corrections_made": corrected_count,
+            }
+  example_bad: |
+    # Follower count = credibility — completely wrong
+    def credibility_score(account):
+        return min(account["followers"] / 1000000, 1.0)
+  when_applies: Any fact-checking platform that assesses source credibility
+  sources:
+    - "https://ifcncodeofprinciples.poynter.org/the-commitments"
+
+- id: FC-SOCIAL-012
+  text: "Social media data collection must comply with platform ToS and data privacy regulations (GDPR, CCPA) — store only what you need and provide deletion capabilities."
+  why: >
+    Violating platform ToS results in API access revocation — Twitter banned multiple
+    academic researchers in 2023 for ToS violations. GDPR fines for unauthorized personal
+    data processing can reach 4% of global annual revenue or 20M euros, whichever is higher.
+    Storing social media usernames, profile pictures, and post content constitutes personal
+    data processing under GDPR. A fact-checking platform that cannot demonstrate data
+    minimization and deletion capabilities faces regulatory risk.
+  how_to_do_right: |
+    1. Store only data necessary for fact-checking: claim text, engagement metrics, timestamps
+    2. Anonymize user data when possible: use hashed account IDs instead of usernames for non-public figures
+    3. Implement data retention policy: delete raw data after fact-check is complete (keep only the verdict)
+    4. Implement right-to-deletion: if a user requests removal, delete their data within 30 days
+    5. Document your lawful basis for processing (legitimate interest for public interest fact-checking)
+    6. Never store private messages, protected tweets, or content from private accounts
+  severity: critical
+  technologies:
+    lang: [python]
+  domains:
+    domain: [fact_checking, compliance]
+    concern: [domain_specific]
+  example_good: |
+    import hashlib
+    from datetime import datetime, timedelta
+    from dataclasses import dataclass
+
+    @dataclass
+    class MinimalSocialRecord:
+        """Store only what's needed for fact-checking."""
+        content_hash: str           # SHA-256 of original content
+        claim_text: str             # The claim being checked
+        platform: str               # twitter, reddit, etc.
+        account_id_hash: str        # Hashed account ID (anonymized)
+        is_public_figure: bool      # Public figures get different treatment
+        engagement_metrics: dict    # likes, shares, etc.
+        captured_at: datetime
+        retention_expires: datetime # Auto-delete after this date
+
+    class PrivacyCompliantStorage:
+        DEFAULT_RETENTION_DAYS = 90
+
+        def store_for_factcheck(self, content: dict, is_public_figure: bool = False) -> MinimalSocialRecord:
+            account_id = content["author_id"]
+            # Anonymize non-public figures
+            account_id_hash = (
+                account_id if is_public_figure
+                else hashlib.sha256(account_id.encode()).hexdigest()[:16]
+            )
+
+            record = MinimalSocialRecord(
+                content_hash=hashlib.sha256(content["text"].encode()).hexdigest(),
+                claim_text=content["text"],
+                platform=content["platform"],
+                account_id_hash=account_id_hash,
+                is_public_figure=is_public_figure,
+                engagement_metrics={
+                    "likes": content.get("likes", 0),
+                    "shares": content.get("shares", 0),
+                },
+                captured_at=datetime.utcnow(),
+                retention_expires=datetime.utcnow() + timedelta(days=self.DEFAULT_RETENTION_DAYS),
+            )
+            self._save(record)
+            return record
+
+        def process_deletion_request(self, account_id: str) -> int:
+            """GDPR right to deletion — must complete within 30 days."""
+            account_hash = hashlib.sha256(account_id.encode()).hexdigest()[:16]
+            deleted_count = self._delete_by_account_hash(account_hash)
+            self._log_deletion_request(account_id, deleted_count)
+            return deleted_count
+
+        def cleanup_expired(self) -> int:
+            """Run daily to auto-delete expired records."""
+            return self._delete_expired_records(datetime.utcnow())
+  example_bad: |
+    # Stores everything including PII with no retention policy
+    def store_post(post):
+        db.save({
+            "username": post["username"],     # PII — not anonymized
+            "email": post.get("email"),       # PII — should never be stored
+            "full_text": post["text"],
+            "profile_image": post["avatar"],  # PII — unnecessary
+            # No retention policy, no deletion capability
+        })
+  when_applies: Any fact-checking platform that collects and processes social media data
+  sources:
+    - "https://gdpr-info.eu/art-17-gdpr/"
+    - "https://oag.ca.gov/privacy/ccpa"
+    - "https://developer.x.com/en/developer-terms/agreement-and-policy"

@@ -1,0 +1,430 @@
+layer: rules
+technology: SRE
+domain: antipatterns
+knowledge:
+- id: CR-SRE-ANTI-001
+  text: The "works on my machine" antipattern — any system behavior that depends on the local environment (OS version, installed
+    packages, environment variables, file system layout) WILL fail in production. Container images with pinned dependencies
+    are the minimum bar.
+  why: 'Google mandates hermetic builds (Chapter 8) because environment-dependent behavior is the root cause of the most time-consuming
+    debugging sessions. An application that works on the developer''s machine but fails in production has an implicit dependency
+    on something the developer''s machine has that production doesn''t. Common offenders: system library versions (OpenSSL,
+    glibc), Python/Node package versions installed globally, environment variables set in .bashrc but not in the container,
+    file paths that exist locally but not in the container, DNS resolution that works on the corporate network but not in
+    production. Google''s Bazel build system and container-based deployment eliminate this class of bugs by ensuring that
+    the build output depends ONLY on the source code and explicitly declared dependencies.
+
+    '
+  how_to_do_right: '1. Build AND test in containers identical to production. If it passes in the CI container, it will work
+    in production.
+
+    2. Pin ALL dependency versions explicitly. Never use "latest" — it changes without your knowledge.
+
+    3. Include system dependencies in the container image. Don''t assume the base image has what you need.
+
+    4. Environment variables must be documented and validated at startup. If a required env var is missing, fail FAST with
+    a clear error.
+
+    5. Use multi-stage Docker builds: build stage includes dev tools, runtime stage includes only production dependencies.
+
+    6. Test the PRODUCTION container image, not the development image. They are often different.
+
+    '
+  example_good: "# Dockerfile with pinned dependencies and multi-stage build\n# --- Build stage ---\nFROM python:3.11.7-slim AS builder\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\nCOPY . .\nRUN pytest tests/  # Test in the same container\n\n# --- Runtime stage ---\nFROM python:3.11.7-slim\nWORKDIR /app\nCOPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages\nCOPY --from=builder /app /app\n\n# Validate required env vars at startup\nENV REQUIRED_VARS='DATABASE_URL,REDIS_URL,API_KEY'\nCMD ['python', '-c', 'import os; missing=[v for v in os.environ[\"REQUIRED_VARS\"].split(\",\") if not os.getenv(v)]; assert not missing, f\"Missing env vars: {missing}\"; import app; app.run()']\n"
+  example_bad: "# requirements.txt with unpinned dependencies\nflask\nrequests\npsycopg2\n# 'flask' installs latest — which may break tomorrow\n# Developer's machine has OpenSSL 1.1, container has 3.0\n# .bashrc sets DATABASE_URL but container doesn't have it\n# Works locally, crashes in production with 'DATABASE_URL not set'\n"
+  when_applies: "When building any application that will be deployed to a different environment than where it was developed — containers with pinned deps are the minimum bar."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [deployment, docker, kubernetes]
+  domains:
+    domain: [deployment, reliability]
+    concern: [ci_cd, artifacts]
+  sources:
+  - url: https://sre.google/sre-book/release-engineering/
+    title: 'Google SRE Book — Chapter 8: Release Engineering'
+  validation_status: cross_checked
+- id: CR-SRE-ANTI-002
+  text: The "God service" antipattern — one service that does everything, has 100+ endpoints, and is a single point of failure
+    for the entire system. Every team depends on it, every deployment risks breaking everything, and no one fully understands
+    it.
+  why: 'Google''s Chapter 9 on Simplicity and Chapter 22 on Cascading Failures both warn against monolithic services that
+    accumulate responsibilities over time. A God service starts as a simple service that does one thing well. Then it gets
+    a second responsibility ("it already has the data, just add an endpoint"). Then a third. Then a tenth. Eventually, it
+    handles authentication, user profiles, billing, notifications, and analytics. It has 50 database tables, 100 endpoints,
+    and 200,000 lines of code. It deploys as a single unit — so a bug in billing takes down authentication. It scales as a
+    single unit — so the analytics load affects user-facing latency. It has a 45-minute deploy cycle because the test suite
+    is 2 hours long. Google''s advice: decompose by failure domain. If billing failing should not affect authentication, they
+    must be separate services.
+
+    '
+  how_to_do_right: '1. If a service has > 20 endpoints, evaluate decomposition. Not every service needs to be split, but >
+    20 is a warning sign.
+
+    2. Decompose by failure domain: components that should fail independently must be separate services.
+
+    3. Decompose by scaling needs: if one endpoint needs 100x the capacity of others, it should be a separate service that
+    can scale independently.
+
+    4. Decompose by deployment cadence: if team A deploys daily and team B deploys weekly, shared services create friction.
+
+    5. Extract shared data into a dedicated data service rather than sharing a database between decomposed services.
+
+    6. When decomposing, start with the LEAST coupled component. Extract one thing at a time, not everything at once.
+
+    '
+  example_good: "# Decomposed by failure domain — auth failing doesn't affect billing\n# service: auth-service (own DB, own deployment, own scaling)\nclass AuthService:\n    def authenticate(self, token: str) -> dict: ...\n\n# service: billing-service (own DB, own deployment, own scaling)\nclass BillingService:\n    def charge(self, user_id: str, amount: float) -> dict: ...\n\n# service: notification-service (own queue, own deployment)\nclass NotificationService:\n    def send(self, user_id: str, message: str) -> None: ...\n\n# Each service:\n# - Has its own database (no shared state)\n# - Deploys independently (no coordination needed)\n# - Scales independently (auth needs 100x billing capacity)\n# - Fails independently (billing down doesn't break auth)\n"
+  example_bad: "# God service — 100+ endpoints, single deployment, shared DB\nclass EverythingService:\n    def authenticate(self, token): ...       # Auth\n    def get_user_profile(self, uid): ...     # Profiles\n    def charge_user(self, uid, amount): ...  # Billing\n    def send_notification(self, uid, msg): ...  # Notifications\n    def run_analytics(self, query): ...      # Analytics\n    # 200K lines of code, 50 DB tables, 100 endpoints\n    # Bug in analytics takes down authentication\n    # Billing traffic spike degrades profile lookups\n    # 45-minute deploy cycle because test suite is 2 hours\n"
+  when_applies: "When a service accumulates more than 20 endpoints or when a bug in one feature impacts unrelated features — evaluate decomposition by failure domain."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kubernetes]
+  domains:
+    domain: [architecture, reliability]
+  sources:
+  - url: https://sre.google/sre-book/simplicity/
+    title: 'Google SRE Book — Chapter 9: Simplicity'
+  validation_status: cross_checked
+- id: CR-SRE-ANTI-003
+  text: The "alert on everything" antipattern — creating alerts for every possible anomaly results in alert fatigue. Engineers
+    learn to ignore alerts, and the critical alert that requires action is lost in a sea of noise. Every alert must require
+    action; if it doesn't, delete it.
+  why: 'Google''s Chapter 6 on Monitoring states this principle categorically: "Every time the pager goes off, I should be
+    able to react with a sense of urgency. I can only react with a sense of urgency a few times a day before I become fatigued."
+    If an alert fires and the on-call engineer looks at it and says "I can ignore this" or "there''s nothing to do about this,"
+    the alert is HARMFUL — it is training the engineer to ignore alerts. The next time an alert fires, they will hesitate
+    ("is this another false alarm?") instead of acting immediately. Google''s rule: every alert must be actionable (there
+    is a specific thing to do), urgent (it requires attention now, not tomorrow), and symptomatic (it detects user-facing
+    impact, not internal metrics). Alerts that don''t meet all three criteria should be demoted to dashboards or deleted.
+
+    '
+  how_to_do_right: '1. For every alert, answer: "What action should the on-call take?" If the answer is "nothing" or "just
+    watch it," delete the alert.
+
+    2. Review all alerts quarterly. Delete alerts that haven''t fired in 90 days (probably irrelevant) and alerts that fired
+    but required no action (noise).
+
+    3. Track "alert → no action taken" rate. If > 30% of alerts require no action, the alerting configuration is too noisy.
+
+    4. Alert on symptoms (user-facing impact) not causes (internal metrics). "Error rate > 1%" is a symptom. "CPU > 80%" is
+    a cause.
+
+    5. Group related alerts: if database latency alert AND application error alert fire simultaneously, show ONE incident,
+    not two alerts.
+
+    6. Every alert MUST link to a runbook. If you can''t write a runbook for an alert, the alert shouldn''t exist.
+
+    '
+  example_good: "ALERT_RULES = {\n    'high_error_rate': {\n        'condition': 'error_rate > 1% for 5 minutes',\n        'action': 'Check runbook: https://wiki/runbook/high-error-rate',\n        'urgency': 'page',  # Pages on-call immediately\n        'type': 'symptom',  # User-facing impact\n    },\n    'slo_burn_rate': {\n        'condition': 'error_budget_burn_rate > 10x for 1 hour',\n        'action': 'Check runbook: https://wiki/runbook/slo-burn',\n        'urgency': 'page',\n        'type': 'symptom',\n    },\n}\n\n# Quarterly alert hygiene review\ndef review_alerts(alert_history: list) -> list:\n    actions = []\n    for alert in alert_history:\n        if alert.last_fired_days_ago > 90:\n            actions.append(f'DELETE {alert.name}: not fired in 90 days')\n        elif alert.no_action_rate > 0.3:\n            actions.append(f'DEMOTE {alert.name}: {alert.no_action_rate:.0%} no-action rate')\n    return actions\n"
+  example_bad: "# Alert on everything — 50 alerts, most are noise\nALERT_RULES = {\n    'cpu_above_50': {'condition': 'cpu > 50%', 'urgency': 'page'},  # Normal load\n    'disk_above_60': {'condition': 'disk > 60%', 'urgency': 'page'},  # Not urgent\n    'gc_pause_any': {'condition': 'gc_pause > 0', 'urgency': 'page'},  # Always true\n    'connection_count': {'condition': 'connections > 10', 'urgency': 'page'},  # Normal\n    # On-call gets 20 alerts per night\n    # Learns to ignore ALL of them\n    # The one real alert (data corruption) is lost in the noise\n}\n"
+  when_applies: "When configuring alerting for any production system — every alert must be actionable, urgent, and symptom-based or it should be deleted."
+  severity: critical
+  technologies:
+    lang: [general]
+    platform: [pagerduty, prometheus]
+  domains:
+    domain: [observability, reliability]
+    concern: [monitoring]
+  sources:
+  - url: https://sre.google/sre-book/monitoring-distributed-systems/
+    title: 'Google SRE Book — Chapter 6: Monitoring Distributed Systems'
+  validation_status: cross_checked
+- id: CR-SRE-ANTI-004
+  text: The "premature optimization" antipattern in operations — optimizing for efficiency before optimizing for reliability.
+    A system that is 50% cheaper to run but has 10x the incident rate costs MORE when you include engineer time, user impact,
+    and reputation damage.
+  why: 'Google''s Chapter 3 on Embracing Risk quantifies this: engineer time costs $200+/hour, an incident consumes 6+ hours
+    (detection, diagnosis, remediation, postmortem), and user trust once lost requires enormous effort to rebuild. A "cost
+    optimization" that reduces server spend by $10,000/month but causes 2 additional incidents per month costs: 2 incidents
+    × 6 hours × $200/hour × 2 engineers = $4,800 in direct engineer cost, plus user impact, plus reputation damage — far exceeding
+    the savings. Google''s approach: first make it reliable (error budget is healthy, incidents are rare), then optimize cost.
+    Never optimize cost at the expense of reliability unless the error budget analysis explicitly supports it.
+
+    '
+  how_to_do_right: '1. Track the FULL cost of incidents: engineer hours × hourly rate + user impact (lost revenue, churn)
+    + reputation cost.
+
+    2. Before any cost optimization that reduces redundancy, compute: "How many additional incidents will this cause? What
+    is their cost?"
+
+    3. Reliability is table stakes. Cost optimization is worthwhile ONLY after reliability targets are met.
+
+    4. Use error budgets to quantify the tradeoff: "This optimization burns X% of error budget. Is the cost savings worth
+    X% of our reliability margin?"
+
+    5. Optimization that reduces toil (automation, better tooling) improves reliability AND reduces cost. Prioritize these.
+
+    6. Optimization that reduces redundancy (fewer replicas, smaller instances) reduces cost but may reduce reliability. Be
+    cautious.
+
+    '
+  example_good: "from dataclasses import dataclass\n\n@dataclass\nclass IncidentCost:\n    engineer_hours: float\n    hourly_rate: float = 200.0\n    users_affected: int = 0\n    revenue_lost: float = 0.0\n\n    @property\n    def total_cost(self) -> float:\n        return (self.engineer_hours * self.hourly_rate * 2  # 2 engineers typical\n                + self.revenue_lost)\n\ndef evaluate_cost_optimization(monthly_savings: float, estimated_additional_incidents_per_month: float):\n    \"\"\"Evaluate: does cost saving justify reliability risk?\"\"\"\n    avg_incident_cost = IncidentCost(engineer_hours=6, users_affected=1000, revenue_lost=500)\n    additional_cost = estimated_additional_incidents_per_month * avg_incident_cost.total_cost\n    net_savings = monthly_savings - additional_cost\n    recommendation = 'APPROVE' if net_savings > 0 else 'REJECT — reliability cost exceeds savings'\n    return {\n        'monthly_savings': monthly_savings,\n        'additional_incident_cost': additional_cost,\n        'net_savings': net_savings,\n        'recommendation': recommendation,\n    }\n\n# Example: removing a replica saves $500/month but may cause 2 more incidents/month\nresult = evaluate_cost_optimization(monthly_savings=500, estimated_additional_incidents_per_month=2)\n# net_savings = 500 - 2*(6*200*2+500) = 500 - 5400 = -4900 → REJECT\n"
+  example_bad: "# Premature optimization: reduce replicas to save $500/month\n# Without calculating the cost of additional incidents\nkubectl_scale('api-service', replicas=2)  # Was 3, saving ~$500/month\n# But now: N+0 capacity, any failure causes degradation\n# 2 additional incidents per month: 2 * (6h * $200/h * 2 engineers + $500 lost revenue) = $5400/month\n# Net loss: $4900/month — optimization COSTS more than it saves\n"
+  when_applies: "When considering any infrastructure cost optimization — always compute the full cost of incidents before reducing redundancy."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [cloud, kubernetes]
+  domains:
+    domain: [mathematics, reliability]
+    concern: [cost_modeling]
+  sources:
+  - url: https://sre.google/sre-book/embracing-risk/
+    title: 'Google SRE Book — Chapter 3: Embracing Risk'
+  validation_status: cross_checked
+- id: CR-SRE-ANTI-005
+  text: The "silent failure" antipattern — errors that are caught, logged, and swallowed without any user-visible indication
+    or operational alert. The system appears healthy while silently serving wrong results, dropping data, or degrading functionality.
+  why: 'Google considers silent failures more dangerous than loud failures because loud failures (crashes, error pages) are
+    detected immediately — by monitoring, by users, by probers. Silent failures can persist for hours, days, or weeks before
+    anyone notices. Examples: a cache that silently returns stale data instead of fetching fresh data (data is wrong but no
+    error is thrown), a queue consumer that drops messages on deserialization failure (data is lost but the queue appears
+    healthy), a search service that silently excludes results from one shard (results are incomplete but the response looks
+    normal). Google''s rule: every error path must either be visible to the user (error message), visible to operations (metric/alert),
+    or explicitly documented as expected behavior.
+
+    '
+  how_to_do_right: '1. Every catch block must either: re-raise the error, return an error to the caller, increment an error
+    counter, or be explicitly documented as intentionally swallowed.
+
+    2. Never use bare `except: pass` or `catch(Exception e) {}`. These hide bugs that will eventually cause data loss.
+
+    3. Track "partial failure" metrics: how many search results came from each shard? If one shard returns 0, that''s a silent
+    failure.
+
+    4. Use data quality metrics: expected record count vs actual record count, expected checksum vs actual checksum.
+
+    5. Production probers should validate response CONTENT, not just response status. A 200 OK with wrong data is a silent
+    failure.
+
+    6. Log ALL swallowed errors with severity WARNING, even if they are "expected." Unexpected increases in "expected" errors
+    indicate real problems.
+
+    '
+  example_good: "import logging\nfrom prometheus_client import Counter\n\nlogger = logging.getLogger(__name__)\nsilent_errors = Counter('silent_errors_total', 'Swallowed errors', ['error_type', 'endpoint'])\n\nclass SearchService:\n    def search(self, query: str) -> dict:\n        results = []\n        shard_failures = 0\n        for shard in self.shards:\n            try:\n                results.extend(shard.query(query))\n            except Exception as e:\n                shard_failures += 1\n                silent_errors.labels(error_type='shard_failure', endpoint='/search').inc()\n                logger.warning(f'Shard {shard.id} failed: {e}', exc_info=True)\n\n        return {\n            'results': results,\n            'total_shards': len(self.shards),\n            'failed_shards': shard_failures,  # Expose partial failure to caller\n            'partial': shard_failures > 0,\n        }\n\n    def validate_response(self, response: dict):\n        \"\"\"Prober validates content, not just status code.\"\"\"\n        if response['partial']:\n            self.alert(f'{response[\"failed_shards\"]} shards returned no results')\n"
+  example_bad: "class SearchService:\n    def search(self, query: str) -> dict:\n        results = []\n        for shard in self.shards:\n            try:\n                results.extend(shard.query(query))\n            except Exception:\n                pass  # Silently swallow shard failures\n        return {'results': results}  # Looks normal even with 50% shards missing\n        # No error counter — monitoring shows zero errors\n        # No partial failure indicator — client doesn't know results are incomplete\n        # No logging — when users report missing search results, no evidence exists\n"
+  when_applies: "When implementing error handling in any code path — every caught exception must be visible to either the user, operations, or explicitly documented as expected."
+  severity: critical
+  technologies:
+    lang: [general, go, java, javascript, typescript, python]
+  domains:
+    domain: [code_quality, reliability]
+    concern: [error_handling, data_integrity]
+  sources:
+  - url: https://sre.google/sre-book/monitoring-distributed-systems/
+    title: 'Google SRE Book — Chapter 6: Monitoring Distributed Systems'
+  validation_status: cross_checked
+- id: CR-SRE-ANTI-006
+  text: The "testing in production only" antipattern — if production is the first time code runs against real data at real
+    scale, every deployment is a gamble. You need a staging environment that mirrors production closely enough to catch scale-dependent
+    and data-dependent bugs.
+  why: 'Google has extensive pre-production testing (staging, shadow traffic, canary) because they know that certain bug classes
+    are INVISIBLE in unit tests: N+1 query problems (1 query in test, 10,000 queries in production), memory leaks (5 minutes
+    of testing vs 5 days of production), lock contention (1 concurrent request in test, 1,000 in production), data encoding
+    issues (ASCII test data vs UTF-8 production data), and timeout chain misconfigurations (fast local calls in test, cross-region
+    calls in production). A staging environment with production-like data volume and traffic patterns catches these bugs BEFORE
+    users are affected. The staging environment need not be identical to production — 10% of production scale is sufficient
+    to catch most scale-dependent bugs.
+
+    '
+  how_to_do_right: '1. Maintain a staging environment with production-like data (anonymized) and production-like traffic patterns
+    (replayed or synthetic).
+
+    2. Staging should be at least 10% of production scale. Smaller is useful for functional testing but misses scale-dependent
+    bugs.
+
+    3. Run shadow traffic: replay production requests against staging and compare responses. Divergences indicate bugs.
+
+    4. Every deployment goes through staging first, with a mandatory soak time (4-24 hours depending on risk).
+
+    5. Staging alerts should page the on-call — treat staging failures with urgency because they represent production bugs.
+
+    6. If staging and production diverge (different config, different schema), fix the divergence. A staging that doesn''t
+    mirror production is useless.
+
+    '
+  example_good: "# Staging environment: production-like data, production-like traffic\nclass StagingPipeline:\n    def deploy_to_staging(self, image: str):\n        # Deploy to staging first\n        kubectl_apply(image, namespace='staging')\n\n        # Run with production-like data (anonymized)\n        shadow_traffic_replayer.start(source='production', target='staging', rate=0.1)\n\n        # Soak for 24 hours\n        time.sleep(86400)\n\n        # Compare staging vs production responses\n        divergences = compare_responses(staging='staging', baseline='production')\n        if divergences > 0:\n            raise RuntimeError(f'{divergences} response divergences detected in staging')\n\n        # Only then deploy to production\n        self.deploy_to_production(image)\n\n    def deploy_to_production(self, image: str):\n        kubectl_apply(image, namespace='production')\n"
+  example_bad: "def deploy(image: str):\n    # Skip staging — deploy directly to production\n    kubectl_apply(image, namespace='production')\n    # First time code runs against real data at real scale\n    # N+1 query: 1 query in test, 10,000 in production\n    # Memory leak: invisible in 5-minute test, OOM after 5 hours\n    # UTF-8 encoding bug: ASCII test data passed, production data fails\n    # Every deployment is a gamble\n"
+  when_applies: "When deploying any service to production — a staging environment with production-like data must validate the change first."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [deployment, kubernetes]
+  domains:
+    domain: [operations, deployment, reliability, testing]
+  sources:
+  - url: https://sre.google/sre-book/testing-reliability/
+    title: 'Google SRE Book — Chapter 17: Testing for Reliability'
+  validation_status: cross_checked
+- id: CR-SRE-ANTI-007
+  text: The "distributed monolith" antipattern — splitting a monolith into microservices without changing the coupling, deployment,
+    or testing strategy. You get all the complexity of microservices (network failures, distributed tracing, service discovery)
+    with none of the benefits (independent deployment, independent scaling, independent failure).
+  why: 'Google''s simplicity chapter warns that decomposition is not automatically beneficial. A common mistake: take a monolith,
+    split each module into a separate service, and deploy them. The services still share a database (coupling), deploy together
+    (no independent deployment), fail together (cascading failures through shared state), and cannot be tested independently
+    (integration tests required for everything). The result is worse than the original monolith: the same coupling plus the
+    added complexity of network communication, service discovery, distributed transactions, and operational overhead of managing
+    20 services instead of 1. True microservices require loose coupling (each service owns its data), independent deployment
+    (deploying A does not require deploying B), and independent failure (A failing does not crash B).
+
+    '
+  how_to_do_right: '1. Before splitting, verify that services will be truly independent: separate databases, separate deployment,
+    separate failure domains.
+
+    2. If two services share a database, they are NOT microservices — they are a distributed monolith. Own the data or don''t
+    split.
+
+    3. If deploying service A requires deploying service B, they are NOT microservices. Fix the coupling before splitting.
+
+    4. Each service must be testable in isolation with mocked dependencies. If integration tests are the only way to test,
+    coupling is too high.
+
+    5. Start with the "strangler fig" pattern: extract one well-bounded module at a time, verify independence, then extract
+    the next.
+
+    6. Keep the monolith as an option. A well-structured monolith is better than a badly structured distributed system.
+
+    '
+  example_good: "# True microservices: independent data, deployment, and failure\nclass OrderService:\n    \"\"\"Owns orders table. Deploys independently. Fails independently.\"\"\"\n    def __init__(self, db: OrderDatabase):  # Own database\n        self.db = db\n\n    def create_order(self, user_id: str, items: list) -> dict:\n        # Communicates with other services via API, not shared DB\n        user = self.user_client.get_user(user_id)  # API call, not shared DB query\n        order = self.db.insert_order(user_id, items)\n        self.event_bus.publish('order.created', order)  # Async event, not direct call\n        return order\n\n# Each service:\n# - Owns its data (separate database)\n# - Deploys independently (no coordination)\n# - Testable in isolation (mock API calls)\n# - Fails independently (order service down doesn't break user service)\n"
+  example_bad: "# Distributed monolith: split into services but still coupled\nclass OrderService:\n    def __init__(self):\n        self.db = shared_database  # Same DB as UserService and PaymentService!\n\n    def create_order(self, user_id, items):\n        # Direct DB query to user table — owned by UserService\n        user = self.db.execute('SELECT * FROM users WHERE id = %s', (user_id,))\n        # Must deploy with UserService when users table schema changes\n        # If UserService migration runs, OrderService breaks\n        # Cannot test without the full shared database\n        # All the complexity of microservices, none of the benefits\n"
+  when_applies: "When decomposing a monolith into microservices — verify services are truly independent (own data, deploy independently, fail independently) or keep the monolith."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kubernetes]
+  domains:
+    domain: [architecture, reliability]
+    concern: [microservices]
+  sources:
+  - url: https://sre.google/sre-book/simplicity/
+    title: 'Google SRE Book — Chapter 9: Simplicity'
+  validation_status: cross_checked
+- id: CR-SRE-ANTI-008
+  text: The "snowflake server" antipattern — production servers that have been manually configured, patched, and modified
+    until no two are identical. Snowflake servers cannot be reproduced, cannot be scaled, and cannot be debugged because their
+    configuration is undocumented and unreproducible.
+  why: 'Google''s release engineering chapter (Chapter 8) mandates reproducible infrastructure because snowflake servers are
+    operational landmines. A server that was manually configured 3 years ago by an engineer who no longer works at the company
+    contains configuration that: is not documented (no one knows why that kernel parameter was changed), is not version controlled
+    (there is no config file to review), cannot be reproduced (spinning up a new server doesn''t include the manual changes),
+    and cannot be debugged (when the server behaves differently from others, no one knows why). Google treats servers as cattle,
+    not pets: every server is created from a versioned configuration, and no manual changes are allowed. If a server needs
+    a change, the change goes into the configuration management system and is applied to ALL servers consistently.
+
+    '
+  how_to_do_right: '1. ALL server configuration must be in code: Ansible, Terraform, Puppet, Chef, or Kubernetes manifests.
+    Zero manual changes.
+
+    2. Servers should be immutable: to change a server''s configuration, create a new server from the updated configuration
+    and destroy the old one.
+
+    3. Use configuration drift detection: periodically compare actual server state with desired state. Any drift is a bug.
+
+    4. If manual changes are required for emergency fixes, create a ticket to codify the change within 24 hours.
+
+    5. Destroy and recreate servers regularly (e.g., weekly) to verify that the configuration is truly reproducible.
+
+    6. Name servers by role (web-server-001), not by personality (production-box, old-faithful). Personalized names encourage
+    pet behavior.
+
+    '
+  example_good: "# All server configuration in version-controlled code\n# terraform/main.tf\nresource \"aws_instance\" \"api_server\" {\n  ami           = var.base_ami  # Immutable base image\n  instance_type = \"t3.large\"\n  # Configuration applied via user_data from versioned template\n  user_data = templatefile(\"${path.module}/templates/init.sh\", {\n    app_version = var.app_version\n    config_hash = filesha256(\"${path.module}/configs/app.yaml\")\n  })\n}\n\n# Configuration drift detection\nclass DriftDetector:\n    def check(self, server_id: str) -> dict:\n        actual = self.get_actual_state(server_id)\n        desired = self.get_desired_state(server_id)\n        drift = {k: (actual[k], desired[k]) for k in desired if actual.get(k) != desired[k]}\n        if drift:\n            self.alert(f'Configuration drift on {server_id}: {drift}')\n        return drift\n"
+  example_bad: "# Snowflake server — manually configured, unreproducible\n# ssh into-prod-server-1\n# sudo apt-get install libssl-dev  # Not documented\n# echo 'vm.swappiness=10' >> /etc/sysctl.conf  # Manual kernel tuning\n# vi /etc/nginx/nginx.conf  # Manual nginx config edit\n# systemctl restart nginx\n# 3 years later: nobody knows why this server behaves differently\n# Cannot reproduce: new server missing manual changes\n# Cannot debug: no record of what was changed\n"
+  when_applies: "When managing any production infrastructure — all configuration must be in code, version-controlled, and applied automatically."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [ansible, docker, kubernetes, terraform]
+  domains:
+    domain: [operations, deployment, reliability]
+  sources:
+  - url: https://sre.google/sre-book/release-engineering/
+    title: 'Google SRE Book — Chapter 8: Release Engineering'
+  validation_status: cross_checked
+- id: CR-SRE-ANTI-009
+  text: The "N+0 capacity" antipattern — running at 100% capacity utilization with no headroom. The first failure (server
+    crash, traffic spike, dependency slowdown) causes a cascade because there is no spare capacity to absorb the load shift.
+  why: 'Google''s cascading failure chapter (Chapter 22) uses capacity planning as the first line of defense. Running at 100%
+    utilization means every server is at maximum load. When one server fails, its load shifts to the remaining servers — which
+    are already at maximum. They can''t absorb additional load, so they also fail. A system running at 80% utilization can
+    absorb a 25% load increase (from losing 1 of 5 servers) without any server exceeding capacity. A system running at 100%
+    utilization cannot absorb ANY additional load. Google provisions for N-2 capacity at the failure domain level: the system
+    must handle peak traffic even after losing the two largest failure domains (racks, AZs). This typically means operating
+    at 50-70% utilization during peak — which seems wasteful until the first failure.
+
+    '
+  how_to_do_right: '1. Target steady-state utilization at 50-70% of capacity. The remaining 30-50% is not waste — it is insurance.
+
+    2. Set alarms at 70% utilization. At 70%, you have time to add capacity. At 90%, you don''t.
+
+    3. Load test to determine actual capacity limits, not theoretical maximums. Actual limits are usually 20-30% lower.
+
+    4. Account for traffic growth: if traffic grows 5% per month and you''re at 70% utilization, you have ~6 months before
+    capacity is critical.
+
+    5. Autoscaling helps but has limits: it takes minutes to add capacity, and during those minutes, existing servers must
+    absorb the load.
+
+    6. Plan capacity for peak + failure: can you handle Black Friday traffic with one AZ down? If not, you''re under-provisioned.
+
+    '
+  example_good: "class CapacityMonitor:\n    def __init__(self, total_capacity_qps: int, target_utilization: float = 0.7):\n        self.total_capacity = total_capacity_qps\n        self.target_utilization = target_utilization\n\n    def check_headroom(self, current_qps: int) -> dict:\n        utilization = current_qps / self.total_capacity\n        months_until_critical = None\n        if self.growth_rate_per_month > 0:\n            headroom_qps = self.total_capacity - current_qps\n            months_until_critical = headroom_qps / (current_qps * self.growth_rate_per_month)\n\n        return {\n            'utilization_pct': utilization * 100,\n            'status': 'OK' if utilization < 0.7 else 'WARNING' if utilization < 0.9 else 'CRITICAL',\n            'months_until_critical': months_until_critical,\n            'can_survive_failure': utilization < 0.7,  # 30% headroom absorbs 1-of-3 AZ failure\n        }\n\nmonitor = CapacityMonitor(total_capacity_qps=10000)\nresult = monitor.check_headroom(current_qps=5500)\n# utilization: 55%, status: OK, can_survive_failure: True\n"
+  example_bad: "# Running at 100% utilization — no headroom for failures\ntotal_servers = 5\ncurrent_load = 5  # Each server at 100%\n# Server 3 crashes → load redistributes to 4 servers\n# Each server now at 125% → they start failing too\n# Server 2 crashes → load on 3 servers at 167% → cascade\n# System down within minutes of first failure\n# $0 savings from 'efficient' provisioning, hours of downtime\n"
+  when_applies: "When provisioning capacity for any production system — target 50-70% utilization to maintain headroom for failures and traffic spikes."
+  severity: critical
+  technologies:
+    lang: [general]
+    platform: [aws, azure, gcp, kubernetes]
+  domains:
+    domain: [reliability, planning]
+    concern: [capacity]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-ANTI-010
+  text: The "toil acceptance" antipattern — treating repetitive manual work as normal instead of automating it. If an engineer
+    does the same manual task more than 3 times, the fourth time should be writing automation. Manual work scales linearly;
+    automation scales logarithmically.
+  why: 'Google''s Chapter 5 on Eliminating Toil defines toil as manual, repetitive, automatable, tactical, and lacking enduring
+    value. The danger is normalization: teams gradually accept increasing toil ("we''ve always done it this way") until engineers
+    spend 80% of their time on manual operations and 20% on engineering — the exact opposite of Google''s target ratio. Toil
+    compounds: as the system grows, manual work grows proportionally. 10 servers need 10 minutes of daily maintenance; 100
+    servers need 100 minutes; 1000 servers need a full-time engineer doing nothing but manual work. Automation breaks this
+    scaling: a script that handles daily maintenance for 10 servers handles it for 1000 servers in the same time. Google treats
+    toil reduction as a core engineering deliverable, not a nice-to-have.
+
+    '
+  how_to_do_right: '1. Track toil explicitly: what manual tasks are performed, how often, and how long they take. Report toil
+    hours monthly.
+
+    2. The "rule of three": the first time you do a task manually, note it. The second time, document it. The third time,
+    automate it.
+
+    3. Automation must be maintained: an automation script that breaks after 6 months is technical debt, not a solution.
+
+    4. Prioritize toil reduction by (frequency × time per occurrence × number of people affected). Automate the most expensive
+    toil first.
+
+    5. If toil exceeds 50% of an engineer''s time, this is an emergency. Dedicate resources to automation until the ratio
+    is restored.
+
+    6. Make toil reduction visible: track "toil hours saved" per quarter. Celebrate successful automation.
+
+    '
+  example_good: "import time\nfrom dataclasses import dataclass\nfrom typing import List\n\n@dataclass\nclass ToilEntry:\n    task: str\n    frequency_per_month: int\n    minutes_per_occurrence: int\n    people_affected: int\n    automated: bool = False\n\n    @property\n    def monthly_cost_hours(self) -> float:\n        if self.automated:\n            return 0\n        return (self.frequency_per_month * self.minutes_per_occurrence * self.people_affected) / 60\n\nclass ToilTracker:\n    def __init__(self):\n        self.entries: List[ToilEntry] = []\n\n    def add(self, entry: ToilEntry):\n        self.entries.append(entry)\n\n    def prioritize_automation(self) -> List[ToilEntry]:\n        \"\"\"Sort by monthly cost — automate most expensive first.\"\"\"\n        manual = [e for e in self.entries if not e.automated]\n        return sorted(manual, key=lambda e: e.monthly_cost_hours, reverse=True)\n\n    def report(self) -> dict:\n        total_hours = sum(e.monthly_cost_hours for e in self.entries)\n        return {\n            'total_toil_hours_per_month': total_hours,\n            'top_automation_target': self.prioritize_automation()[0].task if self.prioritize_automation() else None,\n            'status': 'EMERGENCY' if total_hours > 80 else 'OK',  # 50% of engineer's time\n        }\n"
+  example_bad: "# Toil accepted as normal — 'we've always done it this way'\n# Manual tasks performed weekly:\n# 1. SSH into each server, check disk space (30 min)\n# 2. Manually rotate log files (20 min)\n# 3. Copy certificates to new servers (15 min)\n# 4. Run database cleanup query (10 min)\n# 5. Generate weekly report from 3 dashboards (45 min)\n# Total: 2 hours/week, 8 hours/month — but nobody tracks it\n# Engineer spends 80% on toil, 20% on engineering\n# This is the exact opposite of Google's target ratio\n"
+  when_applies: "When any manual, repetitive task is performed more than twice — the third time should be spent writing automation instead."
+  severity: high
+  technologies:
+    lang: [general, python]
+    platform: [ansible, terraform]
+  domains:
+    domain: [operations, reliability]
+    concern: [maintenance, automation, toil]
+  sources:
+  - url: https://sre.google/sre-book/eliminating-toil/
+    title: 'Google SRE Book — Chapter 5: Eliminating Toil'
+  validation_status: cross_checked

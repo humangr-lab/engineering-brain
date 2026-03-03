@@ -1,0 +1,935 @@
+layer: rules
+domain: fact_checking
+knowledge:
+- id: FC-BR-001
+  text: "Access dados.gov.br through its CKAN API (v3) for programmatic dataset discovery, metadata retrieval, and resource download. Use package_search for discovery and package_show for details — never scrape the HTML portal."
+  why: >
+    dados.gov.br is Brazil's central open data portal running CKAN, with 10,000+ datasets from
+    federal agencies. The CKAN API is stable, versioned, and returns structured JSON with rich
+    metadata (update frequency, license, organization, format). HTML scraping breaks on portal
+    redesigns (happened twice in 2024-2025), misses metadata, and produces unreliable pagination.
+    The API supports complex queries, faceted search, and resource-level access that HTML cannot match.
+  how_to_do_right: |
+    1. Base URL: https://dados.gov.br/api/3/action/
+    2. Search: package_search?q=keyword&rows=50&sort=metadata_modified+desc
+    3. Details: package_show?id=dataset-slug-or-uuid
+    4. Resources: iterate package["resources"] for download URLs, check format field
+    5. Respect API rate limits: max 30 requests/minute, add 2s delay between calls
+    6. Cache dataset metadata locally (refresh daily), only re-download changed resources
+    7. Track dataset metadata_modified to detect updates without re-downloading
+    8. Handle pagination: use start parameter (start=0, start=50, etc.)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [domain_specific]
+  example_good: |
+    import httpx
+    from datetime import datetime
+
+    CKAN_API = "https://dados.gov.br/api/3/action"
+
+    class DadosGovBRClient:
+        def __init__(self):
+            self.client = httpx.AsyncClient(
+                base_url=CKAN_API,
+                timeout=30.0,
+                headers={"User-Agent": "VeritasFactCheck/1.0"},
+            )
+
+        async def search_datasets(
+            self, query: str, rows: int = 20, start: int = 0
+        ) -> dict:
+            resp = await self.client.get("/package_search", params={
+                "q": query, "rows": rows, "start": start,
+                "sort": "metadata_modified desc",
+            })
+            resp.raise_for_status()
+            result = resp.json()["result"]
+            return {
+                "total": result["count"],
+                "datasets": [
+                    {
+                        "id": pkg["id"],
+                        "title": pkg["title"],
+                        "org": pkg.get("organization", {}).get("title", ""),
+                        "modified": pkg.get("metadata_modified", ""),
+                        "resources": [
+                            {"url": r["url"], "format": r["format"].upper(), "size": r.get("size")}
+                            for r in pkg.get("resources", [])
+                        ],
+                    }
+                    for pkg in result["results"]
+                ],
+            }
+
+        async def get_dataset(self, dataset_id: str) -> dict:
+            resp = await self.client.get("/package_show", params={"id": dataset_id})
+            resp.raise_for_status()
+            return resp.json()["result"]
+  example_bad: |
+    import httpx
+    from bs4 import BeautifulSoup
+
+    # Scraping the HTML portal — fragile and misses metadata
+    resp = httpx.get("https://dados.gov.br/dados/conjuntos-dados?q=education")
+    soup = BeautifulSoup(resp.text, "html.parser")
+    links = soup.select(".dataset-item a")  # Breaks on portal redesign
+  when_applies: "Any fact-checking data collection from Brazilian government open data"
+  sources:
+    - "https://docs.ckan.org/en/latest/api/"
+    - "https://dados.gov.br/"
+
+- id: FC-BR-002
+  text: "Parse Diarios Oficiais (DOU, DOE, DOM) using structured XML/API endpoints where available, falling back to PDF+OCR pipeline for scanned editions. Track edition dates and section numbers for precise citation."
+  why: >
+    Diarios Oficiais are the official record of government actions (laws, decrees, contracts,
+    appointments). The DOU (Federal) has moved to digital-first with the IN (Imprensa Nacional)
+    API, but state (DOE) and municipal (DOM) gazettes are often scanned PDFs. Missing a gazette
+    entry means missing a government contract, appointment, or legal change. Precise citations
+    (edition date, section, page) are legally required when referencing official gazette content
+    in fact-checks.
+  how_to_do_right: |
+    1. Federal DOU: use IN API (https://www.in.gov.br/servicos/diario-oficial-da-uniao) with structured search
+    2. State DOEs: check for digital APIs first (SP, RJ, MG have APIs), fall back to PDF download
+    3. Municipal DOMs: most are PDF-only, use Querido Diario project API (querido-diario-api) when available
+    4. For PDF gazettes: run through OCR pipeline with Portuguese language model
+    5. Parse structure: identify section (Secao 1, 2, 3), page, date, issuing authority
+    6. Store citation metadata: {diario_type, edition_date, section, page, issuing_org, act_type}
+    7. Monitor for new editions daily — gazette publication is the legal start date for many government acts
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, compliance]
+    concern: [domain_specific]
+  example_good: |
+    import httpx
+    from datetime import date
+    from dataclasses import dataclass
+
+    @dataclass
+    class GazetteCitation:
+        diario_type: str  # DOU, DOE-SP, DOM-SAO_PAULO
+        edition_date: date
+        section: str | None  # "Secao 1", "Secao 2", etc.
+        page: int | None
+        issuing_org: str
+        act_type: str  # decreto, portaria, contrato, etc.
+        content_excerpt: str
+        source_url: str
+
+    class QueridoDiarioClient:
+        """Client for Querido Diario API — open gazette data."""
+        BASE_URL = "https://queridodiario.ok.org.br/api"
+
+        async def search(
+            self, territory_id: str, query: str, since: date, until: date
+        ) -> list[dict]:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(f"{self.BASE_URL}/gazettes", params={
+                    "territory_ids": territory_id,
+                    "querystring": query,
+                    "published_since": since.isoformat(),
+                    "published_until": until.isoformat(),
+                })
+                resp.raise_for_status()
+                return resp.json().get("gazettes", [])
+  example_bad: |
+    # Manually downloading PDFs with no structure or citation tracking
+    resp = httpx.get(f"https://some-gazette.gov.br/download/{date}")
+    with open(f"gazette_{date}.pdf", "wb") as f:
+        f.write(resp.content)
+    # No parsing, no citation metadata, no search capability
+  when_applies: "Accessing official government acts, decrees, contracts published in Brazilian gazettes"
+  sources:
+    - "https://github.com/okfn-brasil/querido-diario"
+    - "https://docs.queridodiario.ok.org.br/"
+
+- id: FC-BR-003
+  text: "Use IBGE APIs for authoritative demographic, geographic, and economic data. Access SIDRA for statistical tables, Localidades for geographic hierarchy, and Agregados for economic indicators."
+  why: >
+    IBGE (Instituto Brasileiro de Geografia e Estatistica) is the authoritative source for Brazilian
+    statistics. Claims about population, GDP, inflation, poverty rates, and geographic data must be
+    verified against IBGE, not secondary sources. IBGE has well-documented APIs with stable endpoints.
+    Using news articles or Wikipedia for IBGE data introduces telephone-game errors — each retelling
+    introduces inaccuracy. A fact-check citing "Brazil has X million people" must trace to IBGE census.
+  how_to_do_right: |
+    1. SIDRA API (statistical tables): https://apisidra.ibge.gov.br/ — Census, PNAD, economic surveys
+    2. Localidades API: https://servicodados.ibge.gov.br/api/v1/localidades/ — States, municipalities, regions
+    3. Agregados API: https://servicodados.ibge.gov.br/api/v3/agregados/ — Pre-computed indicators
+    4. IBGE Noticias API: https://servicodados.ibge.gov.br/api/v3/noticias/ — IBGE press releases
+    5. Cache geographic data (states/municipalities change rarely — every 5-10 years)
+    6. For SIDRA, specify: table number, variable, period, geographic level, classification
+    7. Always cite IBGE survey name and reference period (e.g., "PNAD Continua Q3/2025")
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [domain_specific]
+  example_good: |
+    import httpx
+
+    class IBGEClient:
+        LOCALIDADES = "https://servicodados.ibge.gov.br/api/v1/localidades"
+        AGREGADOS = "https://servicodados.ibge.gov.br/api/v3/agregados"
+        SIDRA = "https://apisidra.ibge.gov.br"
+
+        def __init__(self):
+            self.client = httpx.AsyncClient(timeout=30.0)
+
+        async def get_states(self) -> list[dict]:
+            resp = await self.client.get(f"{self.LOCALIDADES}/estados")
+            resp.raise_for_status()
+            return [
+                {"id": s["id"], "sigla": s["sigla"], "nome": s["nome"]}
+                for s in resp.json()
+            ]
+
+        async def get_municipalities(self, state_uf: str) -> list[dict]:
+            resp = await self.client.get(
+                f"{self.LOCALIDADES}/estados/{state_uf}/municipios"
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+        async def get_population(self, locality_id: int) -> dict:
+            """Get population from IBGE Census/estimates."""
+            resp = await self.client.get(
+                f"{self.AGREGADOS}/6579/periodos/-6/variaveis/9324",
+                params={"localidades": f"N6[{locality_id}]"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return {
+                "locality_id": locality_id,
+                "indicator": "population_estimate",
+                "source": "IBGE Agregados 6579",
+                "data": data,
+            }
+  example_bad: |
+    # Using Wikipedia or secondary sources for demographic data
+    resp = httpx.get("https://en.wikipedia.org/wiki/Demographics_of_Brazil")
+    # Parses Wikipedia HTML for population figures — may be outdated or wrong
+    soup = BeautifulSoup(resp.text, "html.parser")
+  when_applies: "Verifying claims about Brazilian demographics, geography, or economic statistics"
+  sources:
+    - "https://servicodados.ibge.gov.br/api/docs/"
+    - "https://servicodados.ibge.gov.br/api/docs/localidades"
+
+- id: FC-BR-004
+  text: "Access Portal da Transparencia for federal government spending, contracts, and public servant salary data. Use the API endpoints, not the web portal, and handle the 10,000-record pagination limit per request."
+  why: >
+    Portal da Transparencia (transparencia.gov.br) is the mandatory federal spending transparency
+    portal required by Lei de Acesso a Informacao (LAI). It contains: federal budget execution,
+    contracts, public servant salaries (servidores), transfer agreements (convenios), and sanctions
+    (CEIS/CNEP/CEPIM). Fact-checks about government spending MUST reference this portal. The web
+    interface is slow and limits exports; the API supports programmatic access but has a 10,000-record
+    page size limit that must be handled with pagination.
+  how_to_do_right: |
+    1. API base: https://api.portaldatransparencia.gov.br/api-de-dados/
+    2. Requires API key: register at https://portaldatransparencia.gov.br/api-de-dados/cadastrar-email
+    3. Key endpoints: /servidores, /contratos, /convenios, /despesas, /ceis, /cnep
+    4. Paginate with pagina parameter, max 10,000 records per page
+    5. Use filtros (filters): orgao, cpf, cnpj, periodo (date range)
+    6. Rate limit: 30 requests/minute per API key
+    7. Store API responses with full query parameters for reproducibility
+    8. Cross-reference CEIS (sanctioned companies) with contract data for red flag detection
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, compliance]
+    concern: [domain_specific]
+  example_good: |
+    import httpx
+    import os
+
+    class TransparenciaClient:
+        BASE_URL = "https://api.portaldatransparencia.gov.br/api-de-dados"
+
+        def __init__(self):
+            self.api_key = os.getenv("TRANSPARENCIA_API_KEY")
+            if not self.api_key:
+                raise ValueError("TRANSPARENCIA_API_KEY env var required")
+            self.client = httpx.AsyncClient(
+                base_url=self.BASE_URL,
+                headers={"chave-api-dados": self.api_key},
+                timeout=60.0,
+            )
+
+        async def get_contracts(
+            self, cnpj: str | None = None, year: int = 2025, page: int = 1
+        ) -> list[dict]:
+            params = {"pagina": page, "ano": year}
+            if cnpj:
+                params["cnpjContratado"] = cnpj
+            resp = await self.client.get("/contratos", params=params)
+            resp.raise_for_status()
+            return resp.json()
+
+        async def get_all_contracts(self, cnpj: str, year: int) -> list[dict]:
+            """Paginate through all results."""
+            all_records = []
+            page = 1
+            while True:
+                batch = await self.get_contracts(cnpj=cnpj, year=year, page=page)
+                if not batch:
+                    break
+                all_records.extend(batch)
+                page += 1
+            return all_records
+
+        async def check_sanctions(self, cnpj: str) -> dict:
+            """Check CEIS (sanctioned companies) and CNEP (penalized nonprofits)."""
+            ceis = await self.client.get("/ceis", params={"cnpjSancionado": cnpj})
+            cnep = await self.client.get("/cnep", params={"cnpjSancionado": cnpj})
+            return {
+                "cnpj": cnpj,
+                "ceis_sanctions": ceis.json() if ceis.status_code == 200 else [],
+                "cnep_penalties": cnep.json() if cnep.status_code == 200 else [],
+            }
+  example_bad: |
+    import httpx
+
+    # No API key, no pagination, no error handling
+    resp = httpx.get("https://api.portaldatransparencia.gov.br/api-de-dados/contratos")
+    contracts = resp.json()  # Returns 401 without API key, max 1 page if it works
+  when_applies: "Fact-checking claims about federal government spending, contracts, or public servant salaries"
+  sources:
+    - "https://portaldatransparencia.gov.br/api-de-dados"
+    - "https://api.portaldatransparencia.gov.br/"
+
+- id: FC-BR-005
+  text: "Use TSE (Tribunal Superior Eleitoral) data for election results, candidate information, party finances, and donation records. Access via TSE API and bulk data downloads on dados.tse.jus.br."
+  why: >
+    Election-related fact-checks are among the highest-impact: candidate claims, campaign finance,
+    vote counts, party switches. TSE is the sole authoritative source for Brazilian election data.
+    Using secondary sources (news articles) for election numbers introduces errors and lacks the
+    granularity needed (per-polling-station results, individual donations). TSE data is also critical
+    for verifying political claims — "Candidate X never voted for Y" can be verified via voting records.
+  how_to_do_right: |
+    1. Bulk data: https://dadosabertos.tse.jus.br/ (CSV files per election year)
+    2. API: https://divulgacandcontas.tse.jus.br/divulga/ (real-time election results)
+    3. Candidate info: candidatura API with name, party, assets declared
+    4. Campaign finance: prestacao de contas (donations received and spent)
+    5. Download bulk data annually, update during election periods
+    6. Cross-reference candidate CPF with Portal da Transparencia for conflicts of interest
+    7. Store election results at zone/section level for granular fact-checking
+    8. Handle encoding: TSE CSV files use Latin-1 encoding, not UTF-8
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [domain_specific]
+  example_good: |
+    import httpx
+    import csv
+    import io
+
+    class TSEClient:
+        DADOS_URL = "https://dadosabertos.tse.jus.br/dataset"
+        API_URL = "https://divulgacandcontas.tse.jus.br/divulga"
+
+        async def download_candidates(self, year: int) -> list[dict]:
+            """Download candidate data for a given election year."""
+            url = f"{self.DADOS_URL}/candidatos-{year}/resource/candidatos_{year}.csv"
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+
+            # TSE uses Latin-1 encoding
+            text = resp.content.decode("latin-1")
+            reader = csv.DictReader(io.StringIO(text), delimiter=";")
+            return [
+                {
+                    "cpf": row.get("NR_CPF_CANDIDATO", "").strip(),
+                    "name": row.get("NM_CANDIDATO", "").strip(),
+                    "party": row.get("SG_PARTIDO", "").strip(),
+                    "position": row.get("DS_CARGO", "").strip(),
+                    "state": row.get("SG_UF", "").strip(),
+                    "election_year": year,
+                }
+                for row in reader
+            ]
+
+        async def get_election_results(self, year: int, state: str, position: str) -> dict:
+            """Get election results from TSE API."""
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.get(
+                    f"{self.API_URL}/resultado/{year}/{state}/{position}"
+                )
+                resp.raise_for_status()
+                return resp.json()
+  example_bad: |
+    # Using news articles for election data — inaccurate and incomplete
+    resp = httpx.get("https://news-site.com/election-results-2024")
+    # Parses journalist's summary instead of official TSE data
+  when_applies: "Fact-checking election-related claims, campaign finance, candidate backgrounds"
+  sources:
+    - "https://dadosabertos.tse.jus.br/"
+
+- id: FC-BR-006
+  text: "Access BACEN (Banco Central) APIs for authoritative economic data: SELIC rate, IPCA inflation, exchange rates, and monetary policy decisions. Use the SGS (Sistema Gerenciador de Series Temporais) API for time series data."
+  why: >
+    Economic fact-checks ("inflation hit X%", "the real depreciated Y%", "interest rate is Z%") are
+    common and high-impact. BACEN is the sole authoritative source for Brazilian monetary data.
+    Using news articles or financial sites introduces lag (published hours after BACEN) and
+    rounding errors. The SGS API provides exact time series with daily granularity going back
+    decades. Wrong economic data in a fact-check destroys credibility instantly.
+  how_to_do_right: |
+    1. SGS API: https://api.bcb.gov.br/dados/serie/bcdata.sgs.{serie_id}/dados
+    2. Key series: SELIC (432), IPCA monthly (433), USD/BRL (1), CDI (12)
+    3. Parameters: formato=json, dataInicial=DD/MM/YYYY, dataFinal=DD/MM/YYYY
+    4. Cache frequently used series locally, update daily
+    5. PTAX (official exchange rate): dedicated endpoint at /ptax/cotacao/
+    6. Always cite series ID and reference date in fact-check provenance
+    7. Handle Brazilian date format in API parameters (DD/MM/YYYY)
+    8. Check for BACEN maintenance windows (weekends, holidays)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [domain_specific]
+  example_good: |
+    import httpx
+    from datetime import date, timedelta
+    from decimal import Decimal
+
+    BACEN_SERIES = {
+        "selic": 432,
+        "ipca_monthly": 433,
+        "usd_brl": 1,
+        "cdi": 12,
+        "igpm": 189,
+        "pib_monthly": 4380,
+    }
+
+    class BACENClient:
+        BASE_URL = "https://api.bcb.gov.br/dados/serie/bcdata.sgs"
+
+        async def get_series(
+            self, series_name: str, start: date, end: date | None = None
+        ) -> list[dict]:
+            series_id = BACEN_SERIES[series_name]
+            end = end or date.today()
+            url = f"{self.BASE_URL}.{series_id}/dados"
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(url, params={
+                    "formato": "json",
+                    "dataInicial": start.strftime("%d/%m/%Y"),
+                    "dataFinal": end.strftime("%d/%m/%Y"),
+                })
+                resp.raise_for_status()
+                return [
+                    {
+                        "date": item["data"],
+                        "value": Decimal(item["valor"]),
+                        "series": series_name,
+                        "series_id": series_id,
+                    }
+                    for item in resp.json()
+                ]
+
+        async def get_current_selic(self) -> Decimal:
+            data = await self.get_series("selic", date.today() - timedelta(days=7))
+            return data[-1]["value"] if data else Decimal("0")
+  example_bad: |
+    # Scraping financial news site for SELIC rate
+    resp = httpx.get("https://financial-news.com/selic-rate")
+    # Rate may be outdated, rounded, or wrong
+    rate = parse_rate_from_html(resp.text)
+  when_applies: "Fact-checking economic claims about interest rates, inflation, exchange rates, GDP"
+  sources:
+    - "https://api.bcb.gov.br/dados/serie/bcdata.sgs.432/dados?formato=json"
+    - "https://dadosabertos.bcb.gov.br/"
+
+- id: FC-BR-007
+  text: "Ensure LGPD (Lei Geral de Protecao de Dados) compliance when handling government data that contains personal information. Anonymize or pseudonymize PII before storage, apply data minimization, and maintain a legal basis register."
+  why: >
+    LGPD (Brazil's GDPR equivalent, Lei 13.709/2018) applies to all personal data processing,
+    including data obtained from public government sources. Public servant salary data contains
+    names and CPFs. TSE data contains candidate personal information. Fact-checking may involve
+    private citizens mentioned in government records. LGPD violations carry fines up to 2% of
+    revenue or R$50 million per infraction. The legal basis for processing must be documented
+    before data collection begins.
+  how_to_do_right: |
+    1. Document legal basis per data type: legitimate interest (Art. 7, X) for public interest fact-checking
+    2. Collect minimum necessary data (data minimization principle)
+    3. Hash or pseudonymize CPF in storage — use for linking, display truncated (***.***.XXX-XX)
+    4. Never store full CPF + name together in searchable indexes
+    5. Implement data retention policy: delete personal data when no longer needed for fact-check
+    6. Maintain a ROPA (Record of Processing Activities) per LGPD Art. 37
+    7. Provide data subject access endpoint (LGPD Art. 18) — ability to show/delete a person's data
+    8. Log all access to PII data for audit trail
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, compliance]
+    concern: [domain_specific]
+  example_good: |
+    import hashlib
+    from pydantic import BaseModel, field_validator
+
+    class PersonRecord(BaseModel):
+        """LGPD-compliant person record."""
+        cpf_hash: str  # SHA-256 of CPF — for linking, not display
+        cpf_display: str  # Truncated: "***.***. 123-45"
+        name: str
+        legal_basis: str  # e.g., "legitimate_interest_art7_x"
+        retention_until: str  # ISO date when data must be deleted
+        processing_purpose: str  # e.g., "fact_check_fc_2024_001"
+
+        @field_validator("cpf_display")
+        @classmethod
+        def must_be_truncated(cls, v: str) -> str:
+            if not v.startswith("*"):
+                raise ValueError("CPF must be truncated for storage")
+            return v
+
+    def pseudonymize_cpf(cpf: str) -> tuple[str, str]:
+        """Returns (hash, truncated_display)."""
+        clean = "".join(c for c in cpf if c.isdigit())
+        cpf_hash = hashlib.sha256(clean.encode()).hexdigest()
+        cpf_display = f"***.***. {clean[6:9]}-{clean[9:11]}"
+        return cpf_hash, cpf_display
+
+    def create_lgpd_record(cpf: str, name: str, purpose: str) -> PersonRecord:
+        cpf_hash, cpf_display = pseudonymize_cpf(cpf)
+        return PersonRecord(
+            cpf_hash=cpf_hash,
+            cpf_display=cpf_display,
+            name=name,
+            legal_basis="legitimate_interest_art7_x",
+            retention_until="2027-12-31",
+            processing_purpose=purpose,
+        )
+  example_bad: |
+    # Storing full CPF in plain text — LGPD violation
+    db.insert({
+        "cpf": "123.456.789-00",  # Full PII in searchable storage
+        "name": "Joao da Silva",
+        "salary": 15000.00,
+    })
+    # No legal basis documented, no retention policy, no access control
+  when_applies: "Any processing of Brazilian personal data, including data from public government sources"
+  sources:
+    - "https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2018/lei/L13709compilado.htm"
+
+- id: FC-BR-008
+  text: "Model Brazilian administrative divisions correctly: 5 Regioes, 26 Estados + 1 DF, 5,570 Municipios. Use IBGE codes (not names) as primary keys for geographic entities to avoid ambiguity."
+  why: >
+    Brazil has 5,570 municipalities, many sharing names across different states (e.g., there are
+    multiple cities named "Santa Cruz" in different states). Using city names as identifiers causes
+    data cross-contamination — attributing Sao Paulo city data to Sao Paulo state or vice versa.
+    IBGE assigns unique numeric codes: 2-digit state, 7-digit municipality. These codes are stable,
+    unambiguous, and used across all government APIs. Any geographic data without IBGE codes is
+    unmergeable with government sources.
+  how_to_do_right: |
+    1. Use IBGE 2-digit state codes (e.g., SP=35, RJ=33, MG=31) not abbreviations as primary keys
+    2. Use IBGE 7-digit municipality codes (e.g., Sao Paulo city=3550308) not names
+    3. Cache the IBGE Localidades API response: states and municipalities change rarely
+    4. For input normalization: map common name variants to IBGE codes
+    5. Store both IBGE code and name, but join/filter on code only
+    6. Handle special cases: Brasilia is both municipality and DF (IBGE code 5300108)
+    7. Track municipality creation/merging events (rare but happens)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [domain_specific]
+  example_good: |
+    import httpx
+    from functools import lru_cache
+
+    class IBGEGeoResolver:
+        LOCALIDADES_URL = "https://servicodados.ibge.gov.br/api/v1/localidades"
+
+        def __init__(self):
+            self._states: dict[str, dict] = {}
+            self._municipalities: dict[int, dict] = {}
+            self._name_index: dict[str, list[int]] = {}
+
+        async def load(self):
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Load states
+                resp = await client.get(f"{self.LOCALIDADES_URL}/estados")
+                for s in resp.json():
+                    self._states[s["sigla"]] = {
+                        "ibge_code": s["id"], "name": s["nome"], "sigla": s["sigla"],
+                    }
+
+                # Load municipalities
+                resp = await client.get(f"{self.LOCALIDADES_URL}/municipios")
+                for m in resp.json():
+                    code = m["id"]
+                    name = m["nome"]
+                    uf = m["microrregiao"]["mesorregiao"]["UF"]["sigla"]
+                    self._municipalities[code] = {
+                        "ibge_code": code, "name": name, "uf": uf,
+                    }
+                    key = name.lower()
+                    self._name_index.setdefault(key, []).append(code)
+
+        def resolve_municipality(self, name: str, uf: str | None = None) -> dict | None:
+            candidates = self._name_index.get(name.lower(), [])
+            if uf:
+                candidates = [c for c in candidates if self._municipalities[c]["uf"] == uf]
+            if len(candidates) == 1:
+                return self._municipalities[candidates[0]]
+            return None  # Ambiguous — require UF
+  example_bad: |
+    # Using city name as primary key — ambiguous
+    data = {"city": "Santa Cruz", "population": 50000}
+    # Which Santa Cruz? There are 7+ in Brazil
+    db.insert(data)
+  when_applies: "Any system that handles Brazilian geographic data, location-based fact-checking"
+  sources:
+    - "https://servicodados.ibge.gov.br/api/docs/localidades"
+
+- id: FC-BR-009
+  text: "Handle Brazilian government document formats correctly: expect PDF, CSV (semicolon-separated, Latin-1), XML (nota fiscal), XLS/XLSX (legacy), and ODS. Always detect encoding and delimiter before parsing."
+  why: >
+    Brazilian government data comes in inconsistent formats. CSV files often use semicolons (not
+    commas) as delimiters and Latin-1 (not UTF-8) encoding. PDF tables need structured extraction.
+    Nota fiscal (tax invoice) data is XML with Brazilian-specific schemas. Legacy systems export
+    XLS (not XLSX). Parsing with wrong encoding produces mojibake (accented characters garbled),
+    wrong delimiter produces single-column data, and wrong parser produces garbage. These are
+    silent failures — the parser succeeds but data is wrong.
+  how_to_do_right: |
+    1. Detect encoding first: try UTF-8, fall back to Latin-1/ISO-8859-1 for .csv
+    2. Detect CSV delimiter: try semicolon first for Brazilian files, then comma, then tab
+    3. For PDF tables: use pdfplumber, validate table dimensions match expected schema
+    4. For XML (nota fiscal): validate against NF-e schema (nfeDistribuicao)
+    5. For XLS: use openpyxl (XLSX) or xlrd (legacy XLS)
+    6. Always validate row count and column names after parsing
+    7. Store original file alongside parsed data for debugging
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [domain_specific]
+  example_good: |
+    import csv
+    import io
+    import chardet
+
+    def detect_csv_params(raw_bytes: bytes) -> tuple[str, str]:
+        """Detect encoding and delimiter for Brazilian CSV files."""
+        # Detect encoding
+        detection = chardet.detect(raw_bytes[:10000])
+        encoding = detection["encoding"] or "utf-8"
+        if encoding.lower() in ("ascii", "iso-8859-1", "windows-1252"):
+            encoding = "latin-1"  # Normalize to latin-1
+
+        # Detect delimiter
+        text = raw_bytes[:5000].decode(encoding, errors="replace")
+        semicolons = text.count(";")
+        commas = text.count(",")
+        delimiter = ";" if semicolons > commas else ","
+
+        return encoding, delimiter
+
+    def parse_gov_csv(file_bytes: bytes) -> list[dict]:
+        encoding, delimiter = detect_csv_params(file_bytes)
+        text = file_bytes.decode(encoding)
+        reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
+        records = list(reader)
+
+        if not records:
+            raise ValueError("CSV parsed but no records found — check delimiter/encoding")
+        if len(records[0]) < 2:
+            raise ValueError(f"Only {len(records[0])} columns — likely wrong delimiter")
+
+        return records
+  example_bad: |
+    import csv
+
+    # Assumes UTF-8 and comma delimiter — wrong for most Brazilian gov files
+    with open("governo.csv", "r") as f:
+        reader = csv.DictReader(f)  # Encoding error, wrong delimiter
+        data = list(reader)  # Single-column garbage or mojibake
+  when_applies: "Parsing any CSV, PDF, or XML data downloaded from Brazilian government sources"
+  sources:
+    - "https://docs.python.org/3/library/codecs.html"
+
+- id: FC-BR-010
+  text: "Implement resilient handling for government API rate limits and availability. Brazilian government APIs have strict rate limits, frequent maintenance windows, and inconsistent error responses."
+  why: >
+    Government APIs are not designed for high-throughput scraping. Portal da Transparencia limits
+    to 30 req/min. IBGE APIs return 503 during peak hours. Many government APIs return HTML error
+    pages instead of JSON 4xx/5xx responses. The APIs have unannounced maintenance windows
+    (usually weekends and holidays). Without resilient handling, the data pipeline breaks silently
+    and produces data gaps that go unnoticed until a fact-checker needs the missing data.
+  how_to_do_right: |
+    1. Per-API rate limits in configuration (not hardcoded)
+    2. Token bucket or sliding window rate limiter per API endpoint
+    3. Exponential backoff on 429/503: 5s, 20s, 60s, 300s
+    4. Detect HTML error pages: check Content-Type header before parsing JSON
+    5. Schedule heavy downloads for off-peak hours (02:00-06:00 BRT)
+    6. Circuit breaker per API: stop after 5 consecutive failures, retry after 15 minutes
+    7. Maintain per-API health dashboard: availability %, avg latency, error rate
+    8. Cache aggressively: government data changes daily at most, not hourly
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, reliability]
+    concern: [web]
+  example_good: |
+    import asyncio
+    import time
+    from dataclasses import dataclass, field
+
+    @dataclass
+    class RateLimiter:
+        max_requests: int
+        window_seconds: float
+        timestamps: list[float] = field(default_factory=list)
+
+        async def acquire(self):
+            now = time.monotonic()
+            self.timestamps = [t for t in self.timestamps if now - t < self.window_seconds]
+            if len(self.timestamps) >= self.max_requests:
+                wait = self.window_seconds - (now - self.timestamps[0])
+                await asyncio.sleep(wait)
+            self.timestamps.append(time.monotonic())
+
+    @dataclass
+    class CircuitBreaker:
+        failure_threshold: int = 5
+        reset_timeout: float = 900.0  # 15 minutes
+        failures: int = 0
+        last_failure: float = 0.0
+
+        @property
+        def is_open(self) -> bool:
+            if self.failures < self.failure_threshold:
+                return False
+            if time.monotonic() - self.last_failure > self.reset_timeout:
+                self.failures = 0
+                return False
+            return True
+
+        def record_failure(self):
+            self.failures += 1
+            self.last_failure = time.monotonic()
+
+        def record_success(self):
+            self.failures = 0
+
+    GOV_API_LIMITS = {
+        "transparencia": RateLimiter(max_requests=30, window_seconds=60),
+        "ibge": RateLimiter(max_requests=60, window_seconds=60),
+        "bacen": RateLimiter(max_requests=60, window_seconds=60),
+    }
+  example_bad: |
+    import httpx
+
+    # No rate limiting, no error handling, no circuit breaker
+    for endpoint in government_endpoints:
+        resp = httpx.get(endpoint)  # Hammers API, gets banned
+        data = resp.json()  # Crashes on HTML error page
+  when_applies: "Any integration with Brazilian government APIs"
+  sources:
+    - "https://portaldatransparencia.gov.br/api-de-dados"
+
+- id: FC-BR-011
+  text: "Track data freshness specifically for government sources, accounting for their distinct update schedules: daily (BACEN rates), monthly (IBGE IPCA), annual (Census, TSE elections), and irregular (Diarios Oficiais)."
+  why: >
+    Government data has predictable update schedules that differ widely by source. BACEN publishes
+    SELIC daily. IBGE publishes IPCA monthly (around the 10th). Census data updates every 10 years.
+    TSE election data is per-election cycle. If the freshness monitoring system uses one-size-fits-all
+    thresholds, it either over-alerts (Census data "stale" after 1 month) or under-alerts (BACEN
+    data actually stale for 3 days without notification). Fact-checkers need source-specific
+    freshness guarantees.
+  how_to_do_right: |
+    1. Define per-source expected update frequency in configuration
+    2. BACEN daily series: stale if > 3 business days old
+    3. IBGE monthly indicators: stale if > 45 days since last update
+    4. IBGE annual surveys: stale if > 400 days (allow buffer for publication delay)
+    5. TSE data: stale only during election year if > 7 days old
+    6. Diarios Oficiais: DOU stale if > 2 business days, DOE/DOM > 5 business days
+    7. Expose freshness metadata in all API responses and UIs
+    8. Dashboard: color-coded freshness per source (green/yellow/red)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, observability]
+    concern: [metrics]
+  example_good: |
+    from datetime import timedelta
+    from enum import Enum
+
+    class UpdateFrequency(str, Enum):
+        DAILY = "daily"
+        WEEKLY = "weekly"
+        MONTHLY = "monthly"
+        QUARTERLY = "quarterly"
+        ANNUAL = "annual"
+        PER_EVENT = "per_event"
+
+    GOV_SOURCE_FRESHNESS = {
+        "bacen_selic": {
+            "frequency": UpdateFrequency.DAILY,
+            "stale_threshold": timedelta(days=3),
+            "description": "BACEN SELIC target rate",
+        },
+        "bacen_ptax": {
+            "frequency": UpdateFrequency.DAILY,
+            "stale_threshold": timedelta(days=3),
+            "description": "BACEN PTAX exchange rate",
+        },
+        "ibge_ipca": {
+            "frequency": UpdateFrequency.MONTHLY,
+            "stale_threshold": timedelta(days=45),
+            "description": "IBGE IPCA consumer price index",
+        },
+        "ibge_pnad": {
+            "frequency": UpdateFrequency.QUARTERLY,
+            "stale_threshold": timedelta(days=120),
+            "description": "IBGE PNAD employment survey",
+        },
+        "ibge_census": {
+            "frequency": UpdateFrequency.ANNUAL,
+            "stale_threshold": timedelta(days=400),
+            "description": "IBGE Census population data",
+        },
+        "tse_elections": {
+            "frequency": UpdateFrequency.PER_EVENT,
+            "stale_threshold": timedelta(days=7),
+            "description": "TSE election results (active during election periods)",
+        },
+        "dou_federal": {
+            "frequency": UpdateFrequency.DAILY,
+            "stale_threshold": timedelta(days=2),
+            "description": "Diario Oficial da Uniao",
+        },
+        "transparencia_contratos": {
+            "frequency": UpdateFrequency.MONTHLY,
+            "stale_threshold": timedelta(days=35),
+            "description": "Portal da Transparencia contracts",
+        },
+    }
+  example_bad: |
+    # One threshold for all sources — either over-alerts or under-alerts
+    STALE_THRESHOLD = timedelta(days=7)  # Census data flagged stale constantly
+    for source in all_sources:
+        if source.last_update < now - STALE_THRESHOLD:
+            alert(f"{source.name} is stale!")  # Alert fatigue
+  when_applies: "Monitoring freshness of Brazilian government data sources in a fact-checking system"
+  sources:
+    - "https://dadosabertos.bcb.gov.br/"
+    - "https://servicodados.ibge.gov.br/api/docs/"
+
+- id: FC-BR-012
+  text: "Cross-reference multiple government data sources to validate facts and detect inconsistencies. Link data using shared identifiers (CPF, CNPJ, IBGE codes) and flag discrepancies for investigation."
+  why: >
+    No single government source tells the complete story. A politician's declared assets (TSE) must
+    be cross-referenced with their salary (Portal da Transparencia) and any contracts with their
+    companies (CNPJ lookup). Company sanctions (CEIS) must be checked against active contracts.
+    Cross-referencing catches: undeclared conflicts of interest, sanctioned companies receiving
+    contracts, claims contradicted by official data. This is where fact-checking adds value beyond
+    what any single source provides.
+  how_to_do_right: |
+    1. Define cross-reference rules: which sources should be linked and on what keys
+    2. Primary linking keys: CPF (persons), CNPJ (companies), IBGE code (geographic)
+    3. Common cross-references:
+       - TSE candidates x Transparencia servants (CPF) → public servant running for office
+       - CEIS sanctions x Transparencia contracts (CNPJ) → sanctioned company with active contract
+       - TSE donations x CNPJ registry → donation from related companies
+    4. Flag discrepancies with severity levels (critical: sanctions+contract, warning: data mismatch)
+    5. Store cross-reference results with timestamps and source versions for reproducibility
+    6. Update cross-references when any linked source updates
+    7. Expose cross-reference results via API for fact-checker consumption
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [domain_specific]
+  example_good: |
+    from dataclasses import dataclass
+    from enum import Enum
+    from datetime import datetime
+
+    class DiscrepancySeverity(str, Enum):
+        CRITICAL = "critical"
+        WARNING = "warning"
+        INFO = "info"
+
+    @dataclass
+    class CrossReferenceResult:
+        entity_id: str  # CPF or CNPJ
+        sources_checked: list[str]
+        discrepancies: list[dict]
+        checked_at: datetime
+
+    class GovernmentCrossReferencer:
+        def __init__(self, transparencia, tse, ceis):
+            self.transparencia = transparencia
+            self.tse = tse
+            self.ceis = ceis
+
+        async def check_company(self, cnpj: str) -> CrossReferenceResult:
+            discrepancies = []
+
+            # Check sanctions
+            sanctions = await self.ceis.check_sanctions(cnpj)
+            contracts = await self.transparencia.get_contracts(cnpj=cnpj)
+
+            if sanctions["ceis_sanctions"] and contracts:
+                discrepancies.append({
+                    "type": "sanctioned_company_with_contracts",
+                    "severity": DiscrepancySeverity.CRITICAL,
+                    "detail": f"CNPJ {cnpj} is CEIS-sanctioned but has {len(contracts)} active contracts",
+                    "sanctions": sanctions["ceis_sanctions"],
+                    "contracts": contracts[:5],
+                })
+
+            # Check TSE donations from sanctioned companies
+            donations = await self.tse.get_donations_by_cnpj(cnpj)
+            if sanctions["ceis_sanctions"] and donations:
+                discrepancies.append({
+                    "type": "sanctioned_company_donating",
+                    "severity": DiscrepancySeverity.CRITICAL,
+                    "detail": f"CNPJ {cnpj} is CEIS-sanctioned but made {len(donations)} political donations",
+                })
+
+            return CrossReferenceResult(
+                entity_id=cnpj,
+                sources_checked=["transparencia", "tse", "ceis"],
+                discrepancies=discrepancies,
+                checked_at=datetime.utcnow(),
+            )
+  example_bad: |
+    # Checking only one source — misses cross-source red flags
+    contracts = get_contracts(cnpj)
+    if contracts:
+        print(f"Company has {len(contracts)} contracts")
+    # Never checks if company is sanctioned in CEIS
+    # Never checks if company donated to campaigns of officials who awarded contracts
+  when_applies: "Investigative fact-checking involving government entities, spending, or political claims"
+  sources:
+    - "https://portaldatransparencia.gov.br/api-de-dados"
+    - "https://dadosabertos.tse.jus.br/"

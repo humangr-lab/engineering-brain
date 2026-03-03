@@ -1,0 +1,592 @@
+layer: rules
+technology: AWS
+domain: database
+knowledge:
+- id: CR-AWS-RDS-001
+  text: Always enable Multi-AZ for production RDS instances — single-AZ is only for dev/test.
+  why: Single-AZ RDS has a single point of failure. When the AZ goes down (hardware failure, network partition, or AWS maintenance),
+    your database is unavailable for 5-30 minutes while AWS provisions a replacement. Multi-AZ maintains a synchronous standby
+    replica in another AZ with automatic failover in 60-120 seconds. The cost is 2x, but downtime costs more.
+  how_to_do_right: Set multi_az = true for all production RDS instances. Ensure your application uses the RDS endpoint (not
+    the IP) so DNS failover works automatically. Test failover with 'aws rds reboot-db-instance --force-failover' in staging.
+    Configure Enhanced Monitoring (1-second granularity) to detect failover events.
+  severity: critical
+  technologies:
+    platform: [aws, rds, postgresql, mysql]
+  domains:
+    domain: [architecture, reliability]
+    concern: [data, database]
+  example_good: "resource \"aws_db_instance\" \"production\" {\n  identifier              = \"prod-postgres\"\n  engine  \
+    \                = \"postgres\"\n  engine_version          = \"15.4\"\n  instance_class          = \"db.r6g.xlarge\"\n\
+    \  multi_az                = true   # Synchronous standby in another AZ\n  storage_encrypted       = true\n  backup_retention_period\
+    \ = 35     # Max retention\n  monitoring_interval     = 1      # Enhanced Monitoring — 1 second\n  monitoring_role_arn\
+    \     = aws_iam_role.rds_monitoring.arn\n  performance_insights_enabled = true\n  deletion_protection     = true\n}\n"
+  example_bad: "resource \"aws_db_instance\" \"production\" {\n  identifier     = \"prod-postgres\"\n  engine         = \"\
+    postgres\"\n  instance_class = \"db.r6g.xlarge\"\n  multi_az       = false  # Single AZ — one hardware failure = downtime\n\
+    \  # backup_retention_period defaults to 0 (NO backups!)\n  # No monitoring — can't detect slow queries or failover\n\
+    }\n"
+  when_applies: Any project using AWS cloud infrastructure, AWS RDS managed databases, PostgreSQL databases, or MySQL/MariaDB
+    databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules
+  sources: ["https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.html"]
+- id: CR-AWS-RDS-002
+  text: Use read replicas for read-heavy workloads — separate read and write endpoints in application code.
+  why: A single RDS instance handles both reads and writes on the same CPU/memory/IOPS. For read-heavy applications (90% reads),
+    the primary instance becomes bottlenecked by reads, causing write latency to spike. Read replicas offload read traffic
+    to separate instances with their own compute resources. You can have up to 15 read replicas per primary.
+  how_to_do_right: Create 1-3 read replicas in different AZs. Use a connection pool or library that routes reads to replicas
+    and writes to the primary (e.g., pgpool-II, ProxySQL, or application-level routing). Accept eventual consistency for reads
+    (replication lag is typically <1 second). Monitor ReplicaLag CloudWatch metric.
+  severity: high
+  technologies:
+    platform: [aws, rds, postgresql, mysql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, scalability]
+  example_good: "# Primary with read replica\nresource \"aws_db_instance\" \"primary\" {\n  identifier     = \"prod-postgres-primary\"\
+    \n  engine         = \"postgres\"\n  instance_class = \"db.r6g.xlarge\"\n  multi_az       = true\n}\nresource \"aws_db_instance\"\
+    \ \"replica\" {\n  count                = 2\n  identifier           = \"prod-postgres-replica-${count.index}\"\n  replicate_source_db\
+    \  = aws_db_instance.primary.identifier\n  instance_class       = \"db.r6g.large\"  # Can be smaller than primary\n  multi_az\
+    \             = false            # Replicas don't need Multi-AZ\n}\n\n# Application-level read/write splitting (Python/SQLAlchemy)\n\
+    from sqlalchemy import create_engine\nwrite_engine = create_engine(PRIMARY_URL)\nread_engine = create_engine(REPLICA_URL)\n\
+    \ndef get_user(user_id):            # Read → replica\n    with read_engine.connect() as conn:\n        return conn.execute(select(users).where(users.c.id\
+    \ == user_id))\n\ndef update_user(user_id, data):   # Write → primary\n    with write_engine.connect() as conn:\n    \
+    \    conn.execute(update(users).where(users.c.id == user_id).values(**data))\n"
+  example_bad: '# All traffic hits the primary — reads starve writes
+
+    engine = create_engine(PRIMARY_URL)
+
+    # 100 concurrent report queries block 5 write transactions
+
+    # Write latency: 50ms → 2000ms during report generation
+
+    '
+  when_applies: Projects using AWS cloud infrastructure, AWS RDS managed databases, PostgreSQL databases, or MySQL/MariaDB
+    databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules
+  sources: ["https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_ReadRepl.html"]
+- id: CR-AWS-RDS-003
+  text: Use RDS Proxy for connection pooling — especially with Lambda or microservices that create many short-lived connections.
+  why: Each RDS connection consumes ~10MB of memory on the database server. Lambda functions can create hundreds of concurrent
+    connections during traffic spikes, exhausting the max_connections limit and causing 'too many connections' errors. RDS
+    Proxy maintains a warm connection pool, multiplexing application connections onto a smaller set of database connections.
+    It also handles failover transparently.
+  how_to_do_right: Create an RDS Proxy for every database accessed by Lambda or high-connection-count microservices. Configure
+    the proxy with IAM authentication. Point Lambda functions at the proxy endpoint, not the database endpoint. Set connection_borrow_timeout
+    to 120 seconds. Pin connections only when using session-level features (temp tables, SET statements).
+  severity: high
+  technologies:
+    library: [rds proxy]
+    platform: [aws, rds, lambda]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, serverless]
+  example_good: "resource \"aws_db_proxy\" \"app\" {\n  name                   = \"app-proxy\"\n  debug_logging          =\
+    \ false\n  engine_family          = \"POSTGRESQL\"\n  idle_client_timeout    = 1800\n  require_tls            = true\n\
+    \  role_arn               = aws_iam_role.proxy.arn\n  vpc_security_group_ids = [aws_security_group.proxy.id]\n  vpc_subnet_ids\
+    \         = aws_subnet.private[*].id\n\n  auth {\n    auth_scheme = \"SECRETS\"\n    iam_auth    = \"REQUIRED\"\n    secret_arn\
+    \  = aws_secretsmanager_secret.db_creds.arn\n  }\n}\nresource \"aws_db_proxy_default_target_group\" \"app\" {\n  db_proxy_name\
+    \ = aws_db_proxy.app.name\n  connection_pool_config {\n    max_connections_percent      = 80   # Use 80% of max_connections\n\
+    \    connection_borrow_timeout    = 120  # Wait up to 120s for connection\n  }\n}\n# Lambda connects to proxy endpoint,\
+    \ not DB endpoint\nresource \"aws_lambda_function\" \"api\" {\n  environment {\n    variables = {\n      DB_HOST = aws_db_proxy.app.endpoint\
+    \  # Proxy, not RDS\n    }\n  }\n}\n"
+  example_bad: "# Lambda connects directly to RDS — connection exhaustion\nresource \"aws_lambda_function\" \"api\" {\n  environment\
+    \ {\n    variables = {\n      DB_HOST = aws_db_instance.primary.endpoint  # Direct to DB!\n    }\n  }\n  reserved_concurrent_executions\
+    \ = 500\n  # 500 Lambda invocations = 500 database connections\n  # PostgreSQL max_connections default = 100\n  # Result:\
+    \ \"FATAL: too many connections\" errors\n}\n"
+  when_applies: Projects using AWS cloud infrastructure, AWS RDS managed databases, AWS Lambda serverless functions, or RDS
+    Proxy
+  when_not_applies: stateless microservices with no data persistence, pure computation modules
+  sources: ["https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.html"]
+- id: CR-AWS-RDS-004
+  text: Configure automated backups with maximum retention and test point-in-time recovery regularly.
+  why: The default backup retention is 0 days for some configurations (meaning NO automated backups). Without backups, accidental
+    DROP TABLE or data corruption is unrecoverable. Point-in-time recovery (PITR) restores to any second within the retention
+    window, but only if automated backups are enabled. Untested backups are not backups — they are assumptions.
+  how_to_do_right: Set backup_retention_period to 35 days (maximum). Enable PITR. Schedule quarterly restore tests to a temporary
+    instance — verify data integrity and measure restore time. Set preferred_backup_window during low-traffic hours. For critical
+    databases, also enable cross-region automated backups.
+  severity: critical
+  technologies:
+    platform: [aws, rds]
+  domains:
+    domain: [architecture, reliability]
+    concern: [data, database, disaster-recovery]
+  example_good: "resource \"aws_db_instance\" \"production\" {\n  identifier              = \"prod-postgres\"\n  engine  \
+    \                = \"postgres\"\n  backup_retention_period = 35              # Maximum retention\n  backup_window    \
+    \       = \"03:00-04:00\"   # Low-traffic window\n  copy_tags_to_snapshot   = true\n  delete_automated_backups = false\
+    \           # Keep backups after deletion\n  deletion_protection     = true             # Prevent accidental deletion\n\
+    }\n\n# Quarterly restore test script\n# aws rds restore-db-instance-to-point-in-time \\\n#   --source-db-instance-identifier\
+    \ prod-postgres \\\n#   --target-db-instance-identifier restore-test-$(date +%Y%m%d) \\\n#   --restore-time $(date -u\
+    \ +%Y-%m-%dT%H:%M:%SZ -d '1 hour ago') \\\n#   --db-instance-class db.t3.medium\n# Then: connect, run validation queries,\
+    \ delete test instance\n"
+  example_bad: "resource \"aws_db_instance\" \"production\" {\n  identifier              = \"prod-postgres\"\n  engine   \
+    \               = \"postgres\"\n  backup_retention_period = 1   # Only 1 day — corruption found on day 2 = lost\n  skip_final_snapshot\
+    \     = true  # No snapshot on deletion!\n  deletion_protection     = false # Can be accidentally deleted\n  # Never tested\
+    \ restore — backup might be corrupted\n}\n"
+  when_applies: Any project using AWS cloud infrastructure or AWS RDS managed databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using AWS or
+    RDS
+  sources: ["https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_WorkingWithAutomatedBackups.html"]
+- id: CR-AWS-RDS-005
+  text: Use Aurora Serverless v2 for variable workloads — it scales to zero ACUs during idle and handles spikes automatically.
+  why: Provisioned RDS instances charge by the hour regardless of usage. A staging database that runs 24/7 at db.r6g.large
+    costs ~$200/month even when idle. Aurora Serverless v2 scales between 0.5 and 128 ACUs (Aurora Capacity Units) in increments
+    of 0.5 ACU, billing per second of actual compute used. For variable workloads, this can reduce costs by 70-90% while handling
+    traffic spikes automatically.
+  how_to_do_right: 'Use Aurora Serverless v2 for: dev/staging environments, microservices with variable traffic, scheduled
+    batch processing, infrequent-access applications. Set min_capacity to 0.5 ACU and max_capacity based on peak needs. Monitor
+    ACU utilization with CloudWatch. For steady high-traffic production, provisioned is often cheaper.'
+  severity: medium
+  technologies:
+    platform: [aws, aurora, rds]
+  domains:
+    domain: [architecture, operations]
+    concern: [data, database, cost, serverless]
+  example_good: "resource \"aws_rds_cluster\" \"serverless\" {\n  cluster_identifier = \"app-staging\"\n  engine         \
+    \    = \"aurora-postgresql\"\n  engine_mode        = \"provisioned\"  # v2 uses provisioned mode\n  engine_version   \
+    \  = \"15.4\"\n\n  serverlessv2_scaling_configuration {\n    min_capacity = 0.5   # Scale down to 0.5 ACU when idle (~$43/month)\n\
+    \    max_capacity = 16    # Scale up to 16 ACU during peak\n  }\n}\nresource \"aws_rds_cluster_instance\" \"serverless\"\
+    \ {\n  cluster_identifier = aws_rds_cluster.serverless.id\n  instance_class     = \"db.serverless\"  # Serverless v2\n\
+    \  engine             = \"aurora-postgresql\"\n}\n# Staging cost: ~$43/month idle vs ~$200/month provisioned\n"
+  example_bad: "# Provisioned instance for staging — paying 24/7 for intermittent use\nresource \"aws_db_instance\" \"staging\"\
+    \ {\n  identifier     = \"staging-postgres\"\n  instance_class = \"db.r6g.large\"  # $0.26/hr * 730 hrs = $190/month\n\
+    \  # Used 2 hours/day for testing = 60 hours/month actual usage\n  # Paying for 730 hours, using 60 = 92% waste\n}\n"
+  when_applies: Projects using AWS cloud infrastructure, Aurora, or AWS RDS managed databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules
+  sources: ["https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.IAMDBAuth.html"]
+- id: CR-AWS-DDB-001
+  text: Design DynamoDB partition keys for high cardinality and even distribution — never use low-cardinality attributes.
+  why: 'DynamoDB distributes data across partitions based on the partition key hash. A low-cardinality key (status: ''ACTIVE''/''INACTIVE'',
+    country with 80% of users in one country) creates a hot partition that receives disproportionate traffic, hitting the
+    3,000 RCU / 1,000 WCU per-partition limit. This causes throttling even when the table''s total capacity is far from exhausted.'
+  how_to_do_right: 'Use naturally high-cardinality attributes as partition keys: user_id, order_id, device_id. If you must
+    use low-cardinality attributes, add a random suffix (write sharding) or use a composite key. Design access patterns first
+    (single-table design), then choose keys that support them. Use CloudWatch ContributedInsights to detect hot partitions.'
+  severity: critical
+  technologies:
+    platform: [aws, dynamodb]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database]
+  example_good: "# Good: high-cardinality partition key\nresource \"aws_dynamodb_table\" \"orders\" {\n  name     = \"orders\"\
+    \n  hash_key = \"order_id\"       # Millions of unique values — even distribution\n\n  attribute {\n    name = \"order_id\"\
+    \n    type = \"S\"\n  }\n}\n\n# Good: composite key for multi-entity access patterns\nresource \"aws_dynamodb_table\"\
+    \ \"single_table\" {\n  name      = \"app-data\"\n  hash_key  = \"PK\"           # \"USER#123\", \"ORDER#456\", \"PRODUCT#789\"\
+    \n  range_key = \"SK\"           # \"PROFILE\", \"ORDER#2024-01-01\", \"REVIEW#5\"\n\n  attribute {\n    name = \"PK\"\
+    \n    type = \"S\"\n  }\n  attribute {\n    name = \"SK\"\n    type = \"S\"\n  }\n}\n"
+  example_bad: "# Bad: low-cardinality partition key — hot partition guaranteed\nresource \"aws_dynamodb_table\" \"orders\"\
+    \ {\n  name     = \"orders\"\n  hash_key = \"status\"        # Only 4 values: PENDING, ACTIVE, SHIPPED, CANCELLED\n  #\
+    \ 80% of queries hit \"ACTIVE\" partition → throttling\n}\n\n# Bad: date as partition key — today's partition gets ALL\
+    \ traffic\nresource \"aws_dynamodb_table\" \"events\" {\n  name     = \"events\"\n  hash_key = \"event_date\"    # \"\
+    2026-02-17\" — all writes hit ONE partition\n}\n"
+  when_applies: Any project using AWS cloud infrastructure or AWS DynamoDB NoSQL
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using AWS or
+    DynamoDB
+  sources: ["https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html"]
+- id: CR-AWS-DDB-002
+  text: Prefer Global Secondary Indexes (GSI) over Local Secondary Indexes (LSI) — GSIs are more flexible and can be added
+    after table creation.
+  why: LSIs must be defined at table creation time and cannot be added or removed later. They share the partition's 10GB limit
+    and RCU/WCU allocation with the base table. GSIs have their own throughput, are created independently, and can have a
+    completely different partition key. If you realize you need an LSI after launch, you must recreate the entire table and
+    migrate data.
+  how_to_do_right: Use GSIs for all secondary access patterns. Design GSIs with the same high-cardinality principles as the
+    base table. Project only the attributes you need (KEYS_ONLY or INCLUDE) to minimize GSI storage and write costs. Monitor
+    GSI throttling separately — it has independent capacity.
+  severity: high
+  technologies:
+    platform: [aws, dynamodb]
+  domains:
+    domain: [architecture]
+    concern: [data, database, design]
+  example_good: "resource \"aws_dynamodb_table\" \"orders\" {\n  name      = \"orders\"\n  hash_key  = \"order_id\"\n  range_key\
+    \ = \"created_at\"\n\n  # GSI: query by customer — added any time\n  global_secondary_index {\n    name            = \"\
+    customer-index\"\n    hash_key        = \"customer_id\"\n    range_key       = \"created_at\"\n    projection_type = \"\
+    INCLUDE\"\n    non_key_attributes = [\"status\", \"total\", \"item_count\"]\n  }\n\n  # GSI: query by status — for admin\
+    \ dashboard\n  global_secondary_index {\n    name            = \"status-date-index\"\n    hash_key        = \"status\"\
+    \n    range_key       = \"created_at\"\n    projection_type = \"KEYS_ONLY\"\n  }\n}\n"
+  example_bad: "resource \"aws_dynamodb_table\" \"orders\" {\n  name      = \"orders\"\n  hash_key  = \"customer_id\"\n  range_key\
+    \ = \"order_id\"\n\n  # LSI: cannot be changed after table creation\n  local_secondary_index {\n    name            =\
+    \ \"status-index\"\n    range_key       = \"status\"\n    projection_type = \"ALL\"  # Projects ALL attributes — expensive\n\
+    \  }\n  # 6 months later: \"We also need to query by product_id\"\n  # Answer: recreate table + migrate all data\n}\n"
+  when_applies: Projects using AWS cloud infrastructure or AWS DynamoDB NoSQL
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using AWS or
+    DynamoDB
+  sources: ["https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html"]
+- id: CR-AWS-DDB-003
+  text: Use on-demand capacity for unpredictable workloads and provisioned with auto-scaling for steady traffic.
+  why: Provisioned capacity without auto-scaling either over-provisions (wasting money) or under-provisions (causing throttling).
+    On-demand automatically scales to any traffic level with no capacity planning, but costs 6.5x more per request than provisioned
+    at steady-state. The break-even point is approximately 14.4% average utilization — below that, on-demand is cheaper.
+  how_to_do_right: Start with on-demand for new tables (no traffic history). After 2 weeks of stable traffic, switch to provisioned
+    with auto-scaling (target 70% utilization). Keep on-demand for tables with unpredictable spikes (event-driven, marketing
+    campaigns). Use reserved capacity for high-volume tables to save an additional 50-75%.
+  severity: medium
+  technologies:
+    platform: [aws, dynamodb]
+  domains:
+    domain: [architecture, operations]
+    concern: [data, database, cost]
+  example_good: "# Steady traffic: provisioned with auto-scaling\nresource \"aws_dynamodb_table\" \"orders\" {\n  name   \
+    \      = \"orders\"\n  billing_mode = \"PROVISIONED\"\n  read_capacity  = 100\n  write_capacity = 50\n}\nresource \"aws_appautoscaling_target\"\
+    \ \"read\" {\n  max_capacity       = 1000\n  min_capacity       = 100\n  resource_id        = \"table/${aws_dynamodb_table.orders.name}\"\
+    \n  scalable_dimension = \"dynamodb:table:ReadCapacityUnits\"\n  service_namespace  = \"dynamodb\"\n}\nresource \"aws_appautoscaling_policy\"\
+    \ \"read\" {\n  name               = \"DynamoDBReadCapacityUtilization:${aws_appautoscaling_target.read.resource_id}\"\
+    \n  resource_id        = aws_appautoscaling_target.read.resource_id\n  scalable_dimension = aws_appautoscaling_target.read.scalable_dimension\n\
+    \  service_namespace  = aws_appautoscaling_target.read.service_namespace\n  policy_type        = \"TargetTrackingScaling\"\
+    \n  target_tracking_scaling_policy_configuration {\n    target_value = 70  # Scale at 70% utilization\n    predefined_metric_specification\
+    \ {\n      predefined_metric_type = \"DynamoDBReadCapacityUtilization\"\n    }\n  }\n}\n"
+  example_bad: "# Provisioned capacity with no auto-scaling — manual intervention required\nresource \"aws_dynamodb_table\"\
+    \ \"orders\" {\n  billing_mode   = \"PROVISIONED\"\n  read_capacity  = 500\n  write_capacity = 200\n  # Traffic doubles\
+    \ during Black Friday\n  # No auto-scaling → throttling → lost orders\n  # Or: over-provisioned at 500 RCU, actual usage\
+    \ 50 → 90% waste\n}\n"
+  when_applies: Projects using AWS cloud infrastructure or AWS DynamoDB NoSQL
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using AWS or
+    DynamoDB
+  sources: ["https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-query-scan.html"]
+- id: CR-AWS-DDB-004
+  text: Use DynamoDB Streams for change data capture (CDC) — enable triggers for downstream processing without polling.
+  why: 'Polling DynamoDB for changes wastes RCUs, adds latency, and misses concurrent modifications. DynamoDB Streams captures
+    every write (INSERT, MODIFY, DELETE) in order, providing exactly-once delivery to a Lambda trigger. This enables event-driven
+    architectures: order placed → stream → Lambda → send email + update analytics + sync to Elasticsearch.'
+  how_to_do_right: Enable streams with stream_view_type = NEW_AND_OLD_IMAGES (captures before and after state). Create a Lambda
+    trigger on the stream. Process records idempotently (duplicate delivery is possible). For high-throughput tables, use
+    Kinesis Data Streams integration instead (higher parallelism).
+  severity: high
+  technologies:
+    platform: [aws, dynamodb, lambda]
+  domains:
+    domain: [architecture]
+    concern: [data, database, event-driven]
+  example_good: "resource \"aws_dynamodb_table\" \"orders\" {\n  name             = \"orders\"\n  hash_key         = \"order_id\"\
+    \n  stream_enabled   = true\n  stream_view_type = \"NEW_AND_OLD_IMAGES\"  # Before + after state\n\n  attribute {\n  \
+    \  name = \"order_id\"\n    type = \"S\"\n  }\n}\nresource \"aws_lambda_event_source_mapping\" \"orders_stream\" {\n \
+    \ event_source_arn  = aws_dynamodb_table.orders.stream_arn\n  function_name     = aws_lambda_function.order_processor.arn\n\
+    \  starting_position = \"LATEST\"\n  batch_size        = 100\n  maximum_retry_attempts = 3\n  bisect_batch_on_function_error\
+    \ = true  # Isolate bad records\n  destination_config {\n    on_failure {\n      destination_arn = aws_sqs_queue.stream_dlq.arn\n\
+    \    }\n  }\n}\n"
+  example_bad: "# Polling DynamoDB for changes — wasteful and unreliable\nimport time, boto3\ndynamodb = boto3.resource('dynamodb')\n\
+    table = dynamodb.Table('orders')\nwhile True:\n    response = table.scan(\n        FilterExpression='updated_at > :ts',\n\
+    \        ExpressionAttributeValues={':ts': last_check}\n    )\n    # Scan reads ENTIRE table every poll — expensive\n\
+    \    # Concurrent writes between polls may be missed\n    # No ordering guarantee — race conditions\n    time.sleep(5)\n"
+  when_applies: Projects using AWS cloud infrastructure, AWS DynamoDB NoSQL, or AWS Lambda serverless functions
+  when_not_applies: stateless microservices with no data persistence, pure computation modules
+  sources: ["https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html"]
+- id: CR-AWS-DDB-005
+  text: Use TTL (Time to Live) for automatic cleanup of expired data — never rely on manual deletion jobs.
+  why: Stale data accumulates silently in DynamoDB, growing storage costs and slowing scans. Manual cleanup jobs consume WCUs
+    (delete operations cost the same as writes), require maintenance, and often fail silently. TTL deletes expired items for
+    free — no WCU cost, no Lambda, no cron jobs. Items are typically deleted within 48 hours of expiration.
+  how_to_do_right: Add a TTL attribute (Number type, Unix epoch seconds) to your table. Enable TTL on that attribute. Set
+    TTL values at write time based on your retention policy. Use DynamoDB Streams to capture TTL deletions if you need to
+    archive expired data before permanent deletion.
+  severity: medium
+  technologies:
+    platform: [aws, dynamodb]
+  domains:
+    domain: [architecture, operations]
+    concern: [data, database, cost]
+  example_good: "resource \"aws_dynamodb_table\" \"sessions\" {\n  name     = \"user-sessions\"\n  hash_key = \"session_id\"\
+    \n\n  attribute {\n    name = \"session_id\"\n    type = \"S\"\n  }\n\n  ttl {\n    attribute_name = \"expires_at\"\n\
+    \    enabled        = true\n  }\n}\n\n# Python: set TTL at write time\nimport time\ntable.put_item(Item={\n    'session_id':\
+    \ 'sess_abc123',\n    'user_id': 'user_456',\n    'data': {'cart': ['item1', 'item2']},\n    'expires_at': int(time.time())\
+    \ + 86400  # 24 hours from now\n})\n# DynamoDB automatically deletes after 24 hours — free, no code needed\n"
+  example_bad: "# Manual cleanup Lambda running every hour — expensive and fragile\ndef cleanup_handler(event, context):\n\
+    \    response = table.scan(\n        FilterExpression='expires_at < :now',\n        ExpressionAttributeValues={':now':\
+    \ int(time.time())}\n    )\n    for item in response['Items']:\n        table.delete_item(Key={'session_id': item['session_id']})\n\
+    \    # Full table scan = reads EVERY item ($$$)\n    # Delete operations cost WCUs ($$$)\n    # If Lambda times out, cleanup\
+    \ is incomplete\n    # TTL does this for FREE\n"
+  when_applies: Projects using AWS cloud infrastructure or AWS DynamoDB NoSQL
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using AWS or
+    DynamoDB
+  sources: ["https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html"]
+- id: CR-AWS-SQS-001
+  text: Choose FIFO queues for ordering guarantees and Standard queues for maximum throughput — understand the tradeoffs.
+  why: Standard queues offer nearly unlimited throughput but deliver messages at-least-once with best-effort ordering (messages
+    CAN arrive out of order or duplicated). FIFO queues guarantee exactly-once processing and strict ordering, but are limited
+    to 3,000 messages/second with batching (300 without). Using Standard when you need ordering causes data corruption. Using
+    FIFO when you need throughput causes bottlenecks.
+  how_to_do_right: 'Use FIFO for: financial transactions, order processing, commands that must execute in sequence. Use Standard
+    for: notifications, image processing, log ingestion, any workload that handles duplicates and reordering gracefully. FIFO
+    queue names MUST end in ''.fifo''. Enable content-based deduplication or provide MessageDeduplicationId.'
+  severity: high
+  technologies:
+    platform: [aws, sqs]
+  domains:
+    domain: [architecture, messaging]
+    concern: [data, database]
+  example_good: "# FIFO queue for order processing — ordering matters\nresource \"aws_sqs_queue\" \"orders\" {\n  name   \
+    \                     = \"order-processing.fifo\"\n  fifo_queue                  = true\n  content_based_deduplication\
+    \ = true\n  deduplication_scope         = \"messageGroup\"\n  fifo_throughput_limit       = \"perMessageGroupId\"  # High\
+    \ throughput\n}\n\n# Standard queue for image processing — ordering doesn't matter\nresource \"aws_sqs_queue\" \"images\"\
+    \ {\n  name                       = \"image-resize\"\n  visibility_timeout_seconds = 300  # 5 min for processing\n  message_retention_seconds\
+    \  = 86400\n}\n\n# Python: send to FIFO with message group\nsqs.send_message(\n    QueueUrl=fifo_url,\n    MessageBody=json.dumps(order),\n\
+    \    MessageGroupId=order['customer_id'],  # Orders per customer in sequence\n)\n"
+  example_bad: "# Standard queue for financial transactions — ordering not guaranteed\nresource \"aws_sqs_queue\" \"transactions\"\
+    \ {\n  name = \"financial-transactions\"  # Standard queue!\n  # Transaction: debit $100, credit $200, debit $50\n  #\
+    \ Arrives as: credit $200, debit $50, debit $100\n  # Customer balance is wrong until all messages processed\n}\n"
+  when_applies: Projects using AWS cloud infrastructure or AWS SQS message queues
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using AWS or
+    SQS
+  sources: ["https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html"]
+- id: CR-AWS-SQS-002
+  text: Always configure a Dead Letter Queue with maxReceiveCount to prevent poison messages from blocking the queue.
+  why: A poison message (malformed JSON, references deleted data, triggers a bug) fails processing, becomes visible again
+    after visibility timeout, gets picked up again, fails again — forever. This infinite retry loop consumes compute, generates
+    noise in logs, and blocks legitimate messages behind it. A DLQ moves messages that fail N times to a separate queue for
+    investigation.
+  how_to_do_right: Create a DLQ for every SQS queue. Set maxReceiveCount between 3-5 (enough retries for transient failures,
+    fast enough to stop poison messages). Monitor DLQ depth with CloudWatch alarms. Build a dashboard to inspect and replay
+    DLQ messages. For FIFO, the DLQ must also be FIFO.
+  severity: high
+  technologies:
+    platform: [aws, sqs]
+  domains:
+    domain: [architecture, messaging, reliability]
+    concern: [data, database]
+  example_good: "resource \"aws_sqs_queue\" \"processing_dlq\" {\n  name                       = \"processing-dlq\"\n  message_retention_seconds\
+    \  = 1209600  # 14 days for investigation\n}\nresource \"aws_sqs_queue\" \"processing\" {\n  name                    \
+    \   = \"processing\"\n  visibility_timeout_seconds = 300\n  redrive_policy = jsonencode({\n    deadLetterTargetArn = aws_sqs_queue.processing_dlq.arn\n\
+    \    maxReceiveCount     = 3  # Move to DLQ after 3 failures\n  })\n}\n# CloudWatch alarm on DLQ depth\nresource \"aws_cloudwatch_metric_alarm\"\
+    \ \"dlq_alert\" {\n  alarm_name          = \"processing-dlq-has-messages\"\n  namespace           = \"AWS/SQS\"\n  metric_name\
+    \         = \"ApproximateNumberOfMessagesVisible\"\n  dimensions          = { QueueName = \"processing-dlq\" }\n  comparison_operator\
+    \ = \"GreaterThanThreshold\"\n  threshold           = 0\n  evaluation_periods  = 1\n  period              = 300\n  statistic\
+    \           = \"Maximum\"\n  alarm_actions       = [aws_sns_topic.alerts.arn]\n}\n"
+  example_bad: "resource \"aws_sqs_queue\" \"processing\" {\n  name = \"processing\"\n  # No DLQ — poison message retried\
+    \ infinitely:\n  # 1. Message received → processing fails → visibility timeout\n  # 2. Message becomes visible → processing\
+    \ fails → visibility timeout\n  # 3. Repeat forever — 100% CPU, zero progress\n  # 4. All consumers stuck on poison message\n\
+    }\n"
+  when_applies: Projects using AWS cloud infrastructure or AWS SQS message queues
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using AWS or
+    SQS
+  sources: ["https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html"]
+- id: CR-AWS-SQS-003
+  text: Use long polling (WaitTimeSeconds=20) instead of short polling to reduce empty responses and costs.
+  why: Short polling (default) returns immediately even if no messages are available. With low-traffic queues, 99% of ReceiveMessage
+    calls return empty, and you pay for every API call ($0.40 per million). Long polling waits up to 20 seconds for a message
+    to arrive before returning empty. This reduces API calls by 90-99% on low-traffic queues and eliminates empty response
+    processing.
+  how_to_do_right: Set receive_message_wait_time_seconds = 20 on the queue (applies to all consumers). Alternatively, pass
+    WaitTimeSeconds=20 in each ReceiveMessage call. Also use MaxNumberOfMessages=10 to batch multiple messages per request,
+    further reducing API costs.
+  severity: medium
+  technologies:
+    platform: [aws, sqs]
+  domains:
+    domain: [architecture, messaging, operations]
+    concern: [data, database, cost]
+  example_good: "resource \"aws_sqs_queue\" \"events\" {\n  name                        = \"events\"\n  receive_message_wait_time_seconds\
+    \ = 20  # Long polling — wait up to 20s\n}\n\n# Python consumer with batching\nwhile True:\n    response = sqs.receive_message(\n\
+    \        QueueUrl=queue_url,\n        MaxNumberOfMessages=10,       # Batch up to 10\n        WaitTimeSeconds=20,    \
+    \       # Long poll 20 seconds\n        VisibilityTimeout=300,\n        MessageAttributeNames=['All'],\n    )\n    messages\
+    \ = response.get('Messages', [])\n    for msg in messages:\n        process(msg)\n        sqs.delete_message(QueueUrl=queue_url,\
+    \ ReceiptHandle=msg['ReceiptHandle'])\n"
+  example_bad: "# Short polling with no batching — maximum cost, minimum efficiency\nwhile True:\n    response = sqs.receive_message(\n\
+    \        QueueUrl=queue_url,\n        MaxNumberOfMessages=1,  # One at a time\n        # WaitTimeSeconds defaults to 0\
+    \ — short poll\n    )\n    messages = response.get('Messages', [])\n    if not messages:\n        time.sleep(1)  # Still\
+    \ making API calls every second\n    # Low traffic queue: 86,400 API calls/day = $0.035/day\n    # Long poll with batch:\
+    \ ~4,320 API calls/day = $0.002/day\n"
+  when_applies: Projects using AWS cloud infrastructure or AWS SQS message queues
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using AWS or
+    SQS
+  sources: ["https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues.html"]
+- id: CR-AWS-SNS-001
+  text: Use SNS fanout pattern (SNS to multiple SQS queues) for decoupled event-driven architectures.
+  why: Direct point-to-point integration (service A calls service B, C, D) creates tight coupling. Adding a new consumer requires
+    changing the producer. If one consumer is down, the producer must handle retries. SNS fanout lets one event trigger multiple
+    independent consumers through SQS subscriptions — each consumer processes at its own pace with its own DLQ and retry logic.
+  how_to_do_right: Create an SNS topic per event type (order-placed, user-registered, payment-completed). Subscribe one SQS
+    queue per consumer. Enable raw message delivery to avoid SNS envelope overhead. Use subscription filter policies to route
+    specific events to specific consumers.
+  severity: high
+  technologies:
+    platform: [aws, sns, sqs]
+  domains:
+    domain: [architecture, messaging]
+    concern: [data, database]
+  example_good: "# SNS topic for order events\nresource \"aws_sns_topic\" \"order_placed\" {\n  name = \"order-placed\"\n\
+    }\n# Email service subscribes\nresource \"aws_sqs_queue\" \"email_queue\" { name = \"order-email\" }\nresource \"aws_sns_topic_subscription\"\
+    \ \"email\" {\n  topic_arn            = aws_sns_topic.order_placed.arn\n  protocol             = \"sqs\"\n  endpoint \
+    \            = aws_sqs_queue.email_queue.arn\n  raw_message_delivery = true\n}\n# Analytics service subscribes\nresource\
+    \ \"aws_sqs_queue\" \"analytics_queue\" { name = \"order-analytics\" }\nresource \"aws_sns_topic_subscription\" \"analytics\"\
+    \ {\n  topic_arn            = aws_sns_topic.order_placed.arn\n  protocol             = \"sqs\"\n  endpoint           \
+    \  = aws_sqs_queue.analytics_queue.arn\n  raw_message_delivery = true\n  filter_policy        = jsonencode({ order_total\
+    \ = [{ numeric = [\">\", 100] }] })\n}\n# Adding a new consumer = add new SQS + subscription — zero producer changes\n"
+  example_bad: "# Direct coupling — producer knows about every consumer\ndef place_order(order):\n    save_to_db(order)\n\
+    \    send_email(order)          # Tight coupling to email service\n    update_analytics(order)    # Tight coupling to\
+    \ analytics\n    update_inventory(order)    # Tight coupling to inventory\n    # Adding new consumer = code change + deploy\n\
+    \    # Email service down = order placement fails or needs error handling\n"
+  when_applies: Projects using AWS cloud infrastructure, AWS SNS notification topics, or AWS SQS message queues
+  when_not_applies: stateless microservices with no data persistence, pure computation modules
+  sources: ["https://docs.aws.amazon.com/sns/latest/dg/sns-dead-letter-queues.html"]
+- id: CR-AWS-KIN-001
+  text: Use Kinesis Data Streams for real-time streaming with multiple consumers — use Kinesis Firehose for simple delivery
+    to S3/Redshift.
+  why: Kinesis Data Streams and Firehose solve different problems. Data Streams provides ordered, replayable real-time streams
+    for multiple consumers (analytics, ML, alerting simultaneously). Firehose is a zero-management delivery pipe that buffers
+    and writes to S3/Redshift/Elasticsearch. Using Data Streams when you just need S3 delivery adds unnecessary complexity.
+    Using Firehose when you need real-time processing adds unacceptable latency (60+ second buffering).
+  how_to_do_right: Real-time processing with <1s latency, multiple consumers, or replay needed → Kinesis Data Streams + enhanced
+    fan-out. Simple delivery to S3/Redshift/Elasticsearch → Kinesis Firehose (zero code, auto-scaling). Hybrid → Data Streams
+    with a Firehose consumer for archival.
+  severity: medium
+  technologies:
+    platform: [aws, kinesis]
+  domains:
+    domain: [architecture]
+    concern: [data, database, streaming]
+  example_good: "# Kinesis Data Streams for real-time processing\nresource \"aws_kinesis_stream\" \"events\" {\n  name   \
+    \          = \"user-events\"\n  shard_count      = 4           # 4 MB/s write, 8 MB/s read\n  retention_period = 168 \
+    \        # 7 days replay\n  stream_mode_details {\n    stream_mode = \"ON_DEMAND\"    # Auto-scales shards\n  }\n}\n\n\
+    # Kinesis Firehose for S3 delivery — zero code\nresource \"aws_kinesis_firehose_delivery_stream\" \"s3_archive\" {\n \
+    \ name        = \"events-to-s3\"\n  destination = \"extended_s3\"\n\n  kinesis_source_configuration {\n    kinesis_stream_arn\
+    \ = aws_kinesis_stream.events.arn\n    role_arn           = aws_iam_role.firehose.arn\n  }\n\n  extended_s3_configuration\
+    \ {\n    role_arn            = aws_iam_role.firehose.arn\n    bucket_arn          = aws_s3_bucket.data_lake.arn\n    prefix\
+    \              = \"events/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/\"\n    buffering_size    \
+    \  = 64     # MB — buffer before writing\n    buffering_interval  = 60     # seconds\n    compression_format  = \"GZIP\"\
+    \n  }\n}\n"
+  example_bad: "# Using Firehose for real-time alerting — 60s+ latency\nresource \"aws_kinesis_firehose_delivery_stream\"\
+    \ \"alerts\" {\n  name        = \"security-alerts\"\n  destination = \"extended_s3\"\n  # Firehose buffers for 60+ seconds\
+    \ before delivery\n  # Security alert arrives 60s late — attacker already inside\n  # Should use Kinesis Data Streams\
+    \ + Lambda for <1s processing\n}\n"
+  when_applies: Projects using AWS cloud infrastructure or Kinesis
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using AWS or
+    Kinesis
+  sources: ["https://docs.aws.amazon.com/streams/latest/dev/key-concepts.html"]
+- id: CR-AWS-SNS-002
+  text: Use SNS message filtering with subscription filter policies to route events to the right consumers — avoid filtering
+    in application code.
+  why: Without filter policies, every subscriber receives every message and must discard irrelevant ones in application code.
+    This wastes compute (Lambda invocations, SQS message processing), increases costs, and adds complexity to every consumer.
+    Filter policies offload filtering to SNS — subscribers only receive messages matching their criteria, reducing noise by
+    80-95% for multi-tenant or multi-event systems.
+  how_to_do_right: Define filter policies on each subscription, not in the publishing application. Use attribute-based filtering
+    (message attributes) for simple cases and payload-based filtering (message body) for complex JSON matching. Test filter
+    policies with the SNS console's message test feature before deploying.
+  severity: medium
+  technologies:
+    platform: [aws, sns, sqs, lambda]
+  domains:
+    domain: [architecture, messaging]
+    concern: [data, database]
+  example_good: "# Publisher sends with message attributes\nsns.publish(\n    TopicArn=topic_arn,\n    Message=json.dumps(order),\n\
+    \    MessageAttributes={\n        'order_type': {'DataType': 'String', 'StringValue': 'digital'},\n        'amount': \
+    \    {'DataType': 'Number', 'StringValue': '150'},\n        'country':    {'DataType': 'String', 'StringValue': 'US'},\n\
+    \    }\n)\n\n# Subscription: only digital orders over $100 in US\nresource \"aws_sns_topic_subscription\" \"us_digital\"\
+    \ {\n  topic_arn = aws_sns_topic.orders.arn\n  protocol  = \"sqs\"\n  endpoint  = aws_sqs_queue.us_digital_orders.arn\n\
+    \  filter_policy = jsonencode({\n    order_type = [\"digital\"]\n    country    = [\"US\"]\n    amount     = [{ numeric\
+    \ = [\">=\", 100] }]\n  })\n}\n# This queue only receives ~5% of all order events — 95% filtered out by SNS\n"
+  example_bad: "# No filter policy — every subscriber gets every message\nresource \"aws_sns_topic_subscription\" \"us_digital\"\
+    \ {\n  topic_arn = aws_sns_topic.orders.arn\n  protocol  = \"sqs\"\n  endpoint  = aws_sqs_queue.us_digital_orders.arn\n\
+    \  # No filter_policy — receives ALL orders\n}\n# Consumer code must filter:\ndef process(msg):\n    order = json.loads(msg)\n\
+    \    if order['type'] != 'digital' or order['country'] != 'US':\n        return  # 95% of messages discarded after Lambda\
+    \ invocation\n    # Each discarded message still costs: Lambda invocation + SQS read\n"
+  when_applies: Projects using AWS cloud infrastructure, AWS SNS notification topics, AWS SQS message queues, or AWS Lambda
+    serverless functions
+  when_not_applies: stateless microservices with no data persistence, pure computation modules
+  sources: ["https://docs.aws.amazon.com/sns/latest/dg/sns-message-filtering.html"]
+- id: CR-AWS-KIN-002
+  text: Use Kinesis enhanced fan-out for multiple consumers that need dedicated throughput — standard consumers share shard
+    read capacity.
+  why: Standard Kinesis consumers share 2 MB/s read capacity per shard across all consumers using GetRecords polling. With
+    5 consumers, each gets ~400 KB/s. Enhanced fan-out provides a dedicated 2 MB/s pipe per consumer per shard using HTTP/2
+    push (SubscribeToShard). This eliminates consumer contention and reduces latency from ~200ms to ~70ms. Without it, adding
+    consumers degrades ALL consumers.
+  how_to_do_right: 'Use enhanced fan-out when you have 2+ real-time consumers. Register each consumer with a unique name.
+    The Kinesis Client Library (KCL) v2 supports enhanced fan-out natively. Cost: $0.015/shard/consumer/hour + $0.013/GB data
+    retrieval. Break-even vs standard: 2+ consumers or latency-sensitive workloads.'
+  severity: medium
+  technologies:
+    platform: [aws, kinesis]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, streaming]
+  example_good: "# Register enhanced fan-out consumers\nresource \"aws_kinesis_stream_consumer\" \"analytics\" {\n  name \
+    \      = \"analytics-consumer\"\n  stream_arn = aws_kinesis_stream.events.arn\n  # Dedicated 2 MB/s per shard — not shared\
+    \ with other consumers\n}\nresource \"aws_kinesis_stream_consumer\" \"alerting\" {\n  name       = \"alerting-consumer\"\
+    \n  stream_arn = aws_kinesis_stream.events.arn\n  # Also gets dedicated 2 MB/s — independent of analytics consumer\n}\n\
+    \n# Lambda with enhanced fan-out\nresource \"aws_lambda_event_source_mapping\" \"alerting\" {\n  event_source_arn    \
+    \          = aws_kinesis_stream_consumer.alerting.arn\n  function_name                 = aws_lambda_function.alerting.arn\n\
+    \  starting_position             = \"LATEST\"\n  batch_size                    = 100\n  maximum_batching_window_in_seconds\
+    \ = 1  # Low latency\n}\n"
+  example_bad: '# 5 standard consumers sharing 2 MB/s per shard
+
+    # Each consumer polls with GetRecords — shared bandwidth
+
+    # Consumer A: reads → 400 KB/s (2 MB/s / 5 consumers)
+
+    # Consumer B: reads → 400 KB/s
+
+    # Adding consumer F → everyone drops to 333 KB/s
+
+    # Latency: 200-500ms per consumer
+
+    # Result: analytics lags, alerts delayed, all consumers degraded
+
+    '
+  when_applies: Projects using AWS cloud infrastructure or Kinesis
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using AWS or
+    Kinesis
+  sources: ["https://docs.aws.amazon.com/streams/latest/dev/kinesis-record-processor-scaling.html"]
+- id: CR-AWS-DDB-006
+  text: Use DynamoDB transactions (TransactWriteItems/TransactGetItems) for multi-item atomic operations — never use separate
+    PutItem calls for related data.
+  why: Separate PutItem calls are NOT atomic. If a Lambda crashes between writing order header and order items, you have an
+    inconsistent state (order exists but items are missing). DynamoDB transactions provide ACID guarantees across up to 100
+    items in a single atomic operation. Either all writes succeed or none do — exactly like database transactions.
+  how_to_do_right: Use TransactWriteItems for related writes that must all succeed or all fail (order + items, account debit
+    + credit, inventory decrement + order creation). Limit to 100 items per transaction. Transaction cost is 2x a normal write.
+    For read-then-write patterns, use condition expressions within the transaction to prevent race conditions.
+  severity: high
+  technologies:
+    platform: [aws, dynamodb]
+  domains:
+    domain: [architecture, reliability]
+    concern: [data, database]
+  example_good: "import boto3\ndynamodb = boto3.client('dynamodb')\n\n# Atomic: create order AND decrement inventory\ndynamodb.transact_write_items(\n\
+    \    TransactItems=[\n        {\n            'Put': {\n                'TableName': 'orders',\n                'Item':\
+    \ {\n                    'order_id': {'S': 'ORD-123'},\n                    'customer_id': {'S': 'CUST-456'},\n      \
+    \              'amount': {'N': '99.99'},\n                    'status': {'S': 'CONFIRMED'},\n                }\n     \
+    \       }\n        },\n        {\n            'Update': {\n                'TableName': 'inventory',\n               \
+    \ 'Key': {'product_id': {'S': 'PROD-789'}},\n                'UpdateExpression': 'SET stock = stock - :qty',\n       \
+    \         'ConditionExpression': 'stock >= :qty',\n                'ExpressionAttributeValues': {':qty': {'N': '1'}},\n\
+    \            }\n        }\n    ]\n)\n# Both succeed or both fail — no inconsistent state possible\n"
+  example_bad: "# Non-atomic — crash between calls = inconsistent state\ntable_orders.put_item(Item={'order_id': 'ORD-123',\
+    \ 'status': 'CONFIRMED'})\n# Lambda crashes here — order exists but inventory not decremented\ntable_inventory.update_item(\n\
+    \    Key={'product_id': 'PROD-789'},\n    UpdateExpression='SET stock = stock - :qty',\n    ExpressionAttributeValues={':qty':\
+    \ 1}\n)\n# Or: two concurrent orders decrement same inventory\n# without condition — oversold\n"
+  when_applies: Projects using AWS cloud infrastructure or AWS DynamoDB NoSQL
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using AWS or
+    DynamoDB
+  sources: ["https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html"]
+- id: CR-AWS-CACHE-001
+  text: Choose Redis over Memcached unless you specifically need multi-threaded simplicity — Redis covers 95% of caching use
+    cases.
+  why: Memcached is a simple key-value cache with multi-threaded architecture but NO persistence, NO replication, NO pub/sub,
+    NO data structures beyond strings. Redis provides sorted sets, lists, hashes, pub/sub, Lua scripting, persistence, replication,
+    and cluster mode. If Memcached goes down, the cache is completely cold. Redis recovers from backup. The only Memcached
+    advantage is multi-threaded performance for very simple key-value lookups.
+  how_to_do_right: Default to Redis. Use cluster mode enabled for >100GB data or >250K connections. Enable encryption in transit
+    and at rest. Set up automatic failover with Multi-AZ. Configure backup/restore. Only choose Memcached if you need simple
+    caching with no persistence requirements and want multi-threaded performance.
+  severity: medium
+  technologies:
+    platform: [aws, elasticache, redis]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, caching]
+  example_good: "resource \"aws_elasticache_replication_group\" \"redis\" {\n  replication_group_id = \"app-cache\"\n  description\
+    \          = \"Production Redis cache\"\n  engine               = \"redis\"\n  engine_version       = \"7.0\"\n  node_type\
+    \            = \"cache.r6g.large\"\n  num_cache_clusters   = 3        # 1 primary + 2 replicas\n  automatic_failover_enabled\
+    \ = true\n  multi_az_enabled     = true\n  at_rest_encryption_enabled = true\n  transit_encryption_enabled = true\n  snapshot_retention_limit\
+    \   = 7\n  snapshot_window     = \"03:00-05:00\"\n\n  parameter_group_name = aws_elasticache_parameter_group.redis7.name\n\
+    }\nresource \"aws_elasticache_parameter_group\" \"redis7\" {\n  family = \"redis7\"\n  name   = \"custom-redis7\"\n  parameter\
+    \ {\n    name  = \"maxmemory-policy\"\n    value = \"volatile-lru\"  # Evict keys with TTL first\n  }\n}\n"
+  example_bad: "# Memcached for session storage — no persistence, no failover\nresource \"aws_elasticache_cluster\" \"sessions\"\
+    \ {\n  cluster_id    = \"sessions\"\n  engine        = \"memcached\"\n  node_type     = \"cache.m5.large\"\n  num_cache_nodes\
+    \ = 1  # Single node, no replication\n  # Node restart = all sessions lost = all users logged out\n  # No backup/restore\
+    \ capability\n  # No encryption — session tokens in plaintext on wire\n}\n"
+  when_applies: Projects using AWS cloud infrastructure, ElastiCache, or Redis cache/pub-sub systems
+  when_not_applies: stateless microservices with no data persistence, pure computation modules
+  sources: ["https://docs.aws.amazon.com/AmazonElastiCache/latest/red-ug/Strategies.html"]

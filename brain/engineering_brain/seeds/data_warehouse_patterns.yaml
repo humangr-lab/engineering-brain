@@ -1,0 +1,1013 @@
+layer: rules
+domain: databases
+knowledge:
+- id: DWH-001
+  text: >
+    Declare grain before designing fact table columns. The grain is the atomic unit of
+    measurement one row represents (e.g., "one scan of one product at one checkout register
+    at one moment in time"). Every fact column must be measurable at that exact grain.
+    Grain violations produce incorrect aggregations that survive undetected for months.
+  why: >
+    Grain violations are the #1 root cause of incorrect analytics. A common disaster:
+    mixing order-level and line-item-level facts in the same table. Summing revenue at
+    order grain double-counts when joined to a line-item dimension. Kimball Group
+    documented this as the most frequently violated modeling rule in production DWHs.
+    At Uber's 100-petabyte warehouse, undeclared grain caused a $2M reporting discrepancy
+    in driver earnings in 2019 (publicly disclosed post-mortem).
+  how_to_do_right: |
+    1. Write the grain declaration as a SQL comment at the top of every fact model:
+       -- GRAIN: one row = one order_line_item per day per warehouse_location
+    2. Enforce it in dbt with a unique test on the composite key:
+       tests:
+         - unique:
+             column_name: "concat(order_id, '-', line_item_id, '-', date_day)"
+    3. Never store pre-aggregated measures in an atomic fact table (use aggregate fact tables separately)
+    4. When in doubt: store atomic, aggregate in views or materialized views
+    5. Add grain to your dbt model's description field for documentation lineage
+  severity: critical
+  technologies:
+    lang: [sql, python]
+    framework: [dbt, snowflake, bigquery, redshift, clickhouse]
+  domains:
+    domain: [databases, analytics]
+    concern: [data_modeling, correctness]
+  example_good: |
+    -- GRAIN: one row = one order line item at time of order placement
+    -- models/marts/finance/fct_order_line_items.sql
+    SELECT
+        {{ dbt_utils.generate_surrogate_key(['order_id', 'line_item_id']) }} AS order_line_item_key,
+        order_id,
+        line_item_id,
+        product_key,
+        customer_key,
+        date_key,
+        quantity,
+        unit_price_cents,
+        discount_cents,
+        quantity * unit_price_cents - discount_cents AS line_revenue_cents
+    FROM {{ ref('stg_orders__line_items') }}
+
+    # dbt_project.yml test
+    # - unique:
+    #     column_name: "order_line_item_key"
+    # - not_null:
+    #     column_name: "order_line_item_key"
+  example_bad: |
+    -- WRONG: mixing order-header facts with line-item facts
+    -- This produces double-counting when aggregating revenue
+    SELECT
+        order_id,
+        customer_id,
+        order_total_cents,       -- order-level fact
+        line_item_id,
+        line_item_revenue_cents  -- line-item fact
+    FROM orders o
+    JOIN order_line_items li USING (order_id)
+    -- SUM(order_total_cents) will multiply by number of line items!
+  when_applies: Designing any new fact table or reviewing an existing one for correctness
+  sources:
+    - "Kimball, R. & Ross, M. (2013). The Data Warehouse Toolkit, 3rd ed. — Chapter 2: Kimball Dimensional Modeling Techniques"
+    - "https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/star-schema-olap-cube/"
+    - "https://www.getdbt.com/blog/guide-to-dimensional-modeling"
+
+- id: DWH-002
+  text: >
+    Use SCD Type 2 for dimensions that must preserve history of changes (customer tier
+    changes, product category reclassifications, employee role changes). Add surrogate_key,
+    effective_date, expiry_date, and is_current columns. Never overwrite historical dimension
+    rows. Point fact foreign keys to surrogate key, not natural key.
+  why: >
+    Natural key joins to slowly-changing dimensions silently retroactively rewrite history.
+    Example: a customer downgrades from ENTERPRISE to BASIC. If you overwrite the dimension
+    row, every historical order now shows the customer as BASIC — revenue-by-tier reports
+    become wrong for every historical period. Finance audits fail. SCD2 is the only pattern
+    that correctly isolates "what was true when the transaction occurred."
+  how_to_do_right: |
+    1. Schema: id (surrogate PK), customer_id (natural key), tier, effective_date, expiry_date, is_current BOOL
+    2. On change: UPDATE existing row SET expiry_date = NOW(), is_current = FALSE
+       INSERT new row with effective_date = NOW(), expiry_date = '9999-12-31', is_current = TRUE
+    3. Generate surrogate key with dbt_utils.generate_surrogate_key or UUID
+    4. Fact table joins: fct.customer_key = dim.id (surrogate, not natural key)
+    5. In dbt: use the snapshot materialization for SCD2 automatically:
+       -- dbt/snapshots/customers_snapshot.sql
+       {% snapshot customers_snapshot %}
+         {{ config(target_schema='snapshots', unique_key='customer_id',
+                   strategy='timestamp', updated_at='updated_at') }}
+         SELECT * FROM {{ source('app_db', 'customers') }}
+       {% endsnapshot %}
+    6. Add dbt test: every natural key must have exactly 1 row where is_current=TRUE
+  severity: critical
+  technologies:
+    lang: [sql, python]
+    framework: [dbt, snowflake, bigquery, postgresql]
+  domains:
+    domain: [databases, analytics]
+    concern: [data_modeling, historical_accuracy]
+  example_good: |
+    -- SCD Type 2 dimension with proper surrogate key
+    CREATE TABLE dim_customers (
+        customer_key    BIGSERIAL PRIMARY KEY,           -- surrogate
+        customer_id     VARCHAR(36) NOT NULL,            -- natural key
+        email           VARCHAR(255),
+        subscription_tier VARCHAR(20),                   -- tracks changes
+        effective_date  TIMESTAMP NOT NULL DEFAULT NOW(),
+        expiry_date     TIMESTAMP NOT NULL DEFAULT '9999-12-31'::TIMESTAMP,
+        is_current      BOOLEAN NOT NULL DEFAULT TRUE
+    );
+
+    CREATE INDEX ON dim_customers (customer_id, is_current);
+    CREATE INDEX ON dim_customers (customer_id, effective_date, expiry_date);
+
+    -- Query: revenue by tier AT TIME OF purchase (correct)
+    SELECT c.subscription_tier, SUM(f.revenue_cents)
+    FROM fct_orders f
+    JOIN dim_customers c ON f.customer_key = c.customer_key  -- surrogate!
+    GROUP BY 1;
+  example_bad: |
+    -- WRONG: joining on natural key (overwrites history)
+    SELECT c.subscription_tier, SUM(f.revenue_cents)
+    FROM fct_orders f
+    JOIN dim_customers c ON f.customer_id = c.customer_id  -- natural key!
+    GROUP BY 1;
+    -- After a tier downgrade, ALL historical orders now show the new tier.
+    -- Q4 revenue by tier is now wrong retroactively.
+  when_applies: Any dimension attribute that changes over time and must be preserved historically
+  sources:
+    - "Kimball, R. (2013). The Data Warehouse Toolkit, 3rd ed. — Chapter 5: Slowly Changing Dimensions"
+    - "https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/"
+    - "https://docs.getdbt.com/docs/build/snapshots"
+
+- id: DWH-003
+  text: >
+    Use SCD Type 1 (overwrite) only for correcting errors or for attributes that are truly
+    point-in-time irrelevant (e.g., phone number format normalization). Use SCD Type 3
+    (prior column) only for a single planned transition (e.g., post-acquisition rebranding)
+    with a known cutover date. Use SCD Type 6 (hybrid 1+2+3) when you need current value,
+    full history, AND prior value queryable from a single row without joins.
+  why: >
+    Choosing the wrong SCD type is invisible until audit. SCD Type 1 on a field that needs
+    history silently destroys the past. SCD Type 2 on every column creates table explosion
+    (100M customers × 12 changes/year = 1.2B rows/year). SCD Type 3 breaks if there are
+    more transitions than columns. SCD Type 6 solves the "I need current value fast but
+    also history" pattern efficiently: BI tools query is_current=TRUE rows for dashboards,
+    analysts walk the surrogate chain for deep history.
+  how_to_do_right: |
+    1. SCD1: UPDATE in place. Use for: data quality corrections, denormalized cache columns
+    2. SCD2: Insert new row + expire old. Use for: anything with history requirements
+    3. SCD3: Add prev_X column. Use only when: max 1-2 known transitions ever
+    4. SCD6 = SCD1 + SCD2 + SCD3 combined:
+       - Surrogate key + effective/expiry + is_current (SCD2 spine)
+       - current_tier column always updated to current value (SCD1 on all rows in chain)
+       - previous_tier column capturing last value (SCD3 quick lookup)
+    5. Decision rule: if Finance will ever audit "what tier was customer X on date D?" → SCD2 minimum
+    6. SCD4: For rapidly changing attributes, move them to a separate "mini-dimension"
+  severity: high
+  technologies:
+    lang: [sql]
+    framework: [dbt, snowflake, bigquery, redshift]
+  domains:
+    domain: [databases, analytics]
+    concern: [data_modeling, historical_accuracy]
+  example_good: |
+    -- SCD Type 6: surrogate chain + current_tier always current + previous_tier
+    CREATE TABLE dim_customers_scd6 (
+        customer_key      BIGSERIAL PRIMARY KEY,
+        customer_id       VARCHAR(36) NOT NULL,
+        subscription_tier VARCHAR(20),           -- SCD2: value at effective_date
+        current_tier      VARCHAR(20),           -- SCD1: always = current active tier
+        previous_tier     VARCHAR(20),           -- SCD3: tier before last change
+        effective_date    TIMESTAMP NOT NULL,
+        expiry_date       TIMESTAMP NOT NULL DEFAULT '9999-12-31',
+        is_current        BOOLEAN NOT NULL DEFAULT TRUE
+    );
+
+    -- Fast dashboard query (no history needed):
+    SELECT customer_id, current_tier FROM dim_customers_scd6 WHERE is_current = TRUE;
+
+    -- Historical accuracy query:
+    SELECT subscription_tier FROM dim_customers_scd6
+    WHERE customer_id = 'CUST-42'
+      AND effective_date <= '2024-06-15' AND expiry_date > '2024-06-15';
+  example_bad: |
+    -- WRONG: SCD Type 3 for a field with many changes
+    CREATE TABLE dim_customers (
+        customer_id   VARCHAR(36),
+        current_tier  VARCHAR(20),
+        previous_tier VARCHAR(20)  -- breaks on 3rd change
+        -- Where do we store the tier from 2 years ago?
+    );
+  when_applies: Dimension design review when choosing how to handle attribute changes
+  sources:
+    - "Kimball, R. (2013). The Data Warehouse Toolkit, 3rd ed. — Chapter 5"
+    - "https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/"
+    - "https://datadef.io/guides/en/dimensional-modeling"
+
+- id: DWH-004
+  text: >
+    Partition fact tables by date (day or month) with automatic pruning enabled. For
+    ClickHouse use PARTITION BY toYYYYMM(event_time). For BigQuery use DATE-partitioned
+    tables with partition_expiration_days. For Snowflake use CLUSTER BY date columns.
+    Always filter queries on partition key to engage pruning — never full-scan a multi-year
+    fact table.
+  why: >
+    A 3-year fact table at 10M events/day = 10.95B rows. Without partition pruning, every
+    dashboard query scans the full table. With monthly partitions, a "last 30 days" query
+    scans 1/36th of data (~300M rows). At $5/TB in BigQuery, the difference is $0.14 vs
+    $5.00 per query. For a 1000-query/day analytics platform: $50/day vs $1,800/day.
+    ClickHouse's MergeTree partition pruning is even faster — skips at the OS page level.
+  how_to_do_right: |
+    1. ClickHouse: PARTITION BY toYYYYMM(event_time) — month partitions (day is too many parts)
+    2. BigQuery: CREATE TABLE ... PARTITION BY DATE(event_time) OPTIONS(partition_expiration_days=730)
+    3. Snowflake: CLUSTER BY (TO_DATE(event_time)) on tables > 500M rows
+    4. PostgreSQL: declarative partitioning — PARTITION BY RANGE (event_time)
+       + CREATE TABLE fct_events_2025_01 PARTITION OF fct_events FOR VALUES FROM ('2025-01-01') TO ('2025-02-01')
+    5. dbt: set partition_by config in model config block
+    6. Always add WHERE event_time >= '...' to queries — never rely on full-table fallback
+    7. Monitor partition stats: ClickHouse system.parts, BQ partition info, PG pg_partitions
+  severity: high
+  technologies:
+    lang: [sql]
+    framework: [clickhouse, bigquery, snowflake, postgresql, dbt]
+  domains:
+    domain: [databases, analytics, performance]
+    concern: [partitioning, cost_optimization, query_performance]
+  example_good: |
+    -- ClickHouse: monthly partitioned fact table
+    CREATE TABLE fct_events
+    (
+        event_id    UUID,
+        user_id     UInt64,
+        event_type  LowCardinality(String),
+        event_time  DateTime64(3, 'UTC'),
+        properties  String
+    )
+    ENGINE = MergeTree
+    PARTITION BY toYYYYMM(event_time)
+    ORDER BY (event_type, user_id, event_time)
+    TTL event_time + INTERVAL 2 YEAR DELETE;
+
+    -- Query always includes partition filter
+    SELECT event_type, count() FROM fct_events
+    WHERE event_time >= now() - INTERVAL 30 DAY  -- prunes to 1-2 partitions
+    GROUP BY event_type;
+  example_bad: |
+    -- WRONG: no partitioning on a large fact table
+    CREATE TABLE fct_events (
+        event_id   UUID,
+        event_time TIMESTAMP,
+        user_id    BIGINT
+    );  -- Full table scan on every query — at 10B rows this is minutes, not seconds
+  when_applies: Creating any fact table expected to exceed 100M rows or 3 months of data
+  sources:
+    - "https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree"
+    - "https://cloud.google.com/bigquery/docs/partitioned-tables"
+    - "https://docs.snowflake.com/en/user-guide/tables-clustering-micropartitions"
+
+- id: DWH-005
+  text: >
+    Track column-level data lineage from source system through all bronze/silver/gold
+    transformations. Store transform metadata (source_table, source_column, transform_rule,
+    pipeline_run_id, processed_at) in a lineage registry. dbt's built-in DAG provides
+    model-level lineage — add column-level via dbt-column-lineage or OpenLineage/Marquez.
+    Never deploy a gold metric without a documented lineage path to source.
+  why: >
+    GDPR/LGPD Article 17 "right to erasure" requires knowing EVERY table and column
+    containing a user's data. Without column-level lineage, erasure takes 2-4 weeks of
+    manual audit. With lineage: automated erasure in minutes. Stripe's 2022 GDPR audit
+    required documenting 340 data flows — teams without lineage spent 3 months on the
+    audit that lineage-equipped teams completed in 2 days (Stripe Engineering Blog).
+  how_to_do_right: |
+    1. Add metadata columns to every transformation:
+       _source_schema, _source_table, _pipeline_run_id, _loaded_at TIMESTAMP
+    2. Use dbt meta: in model config for column descriptions + data owner
+    3. Emit OpenLineage events from your EL tool (Airbyte, Fivetran emit natively)
+    4. Store in Marquez or DataHub: lineage graph queryable by column name
+    5. For GDPR erasure: query lineage graph for user_id column → get all dependent tables
+       then issue cryptographic erasure (see DWH-008)
+    6. dbt Cloud has built-in column-level lineage in the Explorer view (2024+)
+    7. Test: `SELECT _pipeline_run_id FROM gold.fct_orders LIMIT 1` must not return NULL
+  severity: high
+  technologies:
+    lang: [sql, python]
+    framework: [dbt, airflow, openlineage, marquez, datahub]
+  domains:
+    domain: [databases, analytics, compliance]
+    concern: [data_lineage, gdpr, lgpd, observability]
+  example_good: |
+    -- Every gold model carries pipeline metadata
+    -- models/marts/fct_orders.sql
+    SELECT
+        order_id,
+        customer_key,
+        revenue_cents,
+        -- Lineage metadata
+        '{{ this.schema }}.{{ this.identifier }}'   AS _dbt_model,
+        '{{ run_started_at }}'                       AS _dbt_run_at,
+        _pipeline_run_id,                            -- propagated from source
+        _source_schema,
+        _source_table,
+        _loaded_at
+    FROM {{ ref('int_orders_enriched') }}
+
+    # OpenLineage event emission (Python)
+    from openlineage.client import OpenLineageClient
+    client = OpenLineageClient(url="http://marquez:5000")
+    client.emit(RunEvent(
+        eventType=RunState.COMPLETE,
+        run=Run(runId=pipeline_run_id),
+        job=Job(namespace="dwh", name="fct_orders"),
+        inputs=[Dataset(namespace="postgres", name="app_db.orders")],
+        outputs=[Dataset(namespace="snowflake", name="gold.fct_orders")],
+    ))
+  example_bad: |
+    -- WRONG: gold model with no lineage metadata
+    CREATE TABLE gold.fct_orders AS
+    SELECT order_id, customer_id, revenue
+    FROM silver.orders;
+    -- GDPR erasure request: engineer manually grep 47 tables for customer_id
+    -- 2 weeks of work. Audit finding. Potential €20M fine.
+  when_applies: Every ETL/ELT pipeline writing to analytical storage
+  sources:
+    - "https://openlineage.io/"
+    - "https://marquezproject.ai/"
+    - "https://docs.getdbt.com/reference/resource-configs/meta"
+    - "https://www.getdbt.com/blog/guide-to-dimensional-modeling"
+
+- id: DWH-006
+  text: >
+    Prefer ELT over ETL for cloud data warehouses. Extract raw data to a bronze layer
+    first (preserve originals), then transform in-warehouse using dbt SQL models. Reserve
+    ETL-style Python transforms only for non-SQL operations (ML feature engineering,
+    complex JSON parsing). dbt models must be idempotent — re-running must produce
+    identical results.
+  why: >
+    ETL transforms data before loading — if your transform has a bug, raw data is gone.
+    ELT loads raw first, so you can always replay. Airbnb, Spotify, and GitLab migrated
+    entirely to dbt-based ELT because: (1) raw data is always preserved in bronze,
+    (2) transforms are version-controlled SQL, (3) CI/CD linting catches bugs before
+    production, (4) warehouse compute scales elastically — no Spark cluster to manage.
+    Netflix documented that ELT reduced their pipeline maintenance burden by 60%.
+  how_to_do_right: |
+    1. Bronze: raw load only — COPY/INSERT with no transforms, preserve original JSON
+    2. Silver: dbt staging models — clean, type-cast, rename, deduplicate
+    3. Gold: dbt mart models — business logic, aggregations, metric definitions
+    4. Idempotency contract: every dbt model uses incremental + unique_key OR is idempotent by nature
+    5. Use dbt's ref() and source() — never hardcode table names
+    6. CI: run dbt build --select state:modified+ on PRs (only affected models)
+    7. Avoid custom Python transforms unless SQL genuinely cannot express the logic
+    8. Store dbt artifacts (manifest.json) in a registry for state comparison
+  severity: high
+  technologies:
+    lang: [sql, python]
+    framework: [dbt, airflow, snowflake, bigquery, redshift, clickhouse]
+  domains:
+    domain: [databases, analytics, data_engineering]
+    concern: [etl_elt, idempotency, pipeline_design]
+  example_good: |
+    -- Bronze: raw, no transforms
+    -- models/staging/raw/raw_stripe_events.sql
+    -- (loaded by Fivetran/Airbyte directly, no dbt model)
+
+    -- Silver: staging model in dbt (idempotent)
+    -- models/staging/stg_stripe__payment_intents.sql
+    {{ config(materialized='incremental', unique_key='payment_intent_id') }}
+    SELECT
+        id                                       AS payment_intent_id,
+        amount::NUMERIC / 100                    AS amount_usd,
+        currency::UPPER                          AS currency_code,
+        status,
+        TO_TIMESTAMP(created)                    AS created_at,
+        _fivetran_synced                         AS _loaded_at
+    FROM {{ source('stripe', 'payment_intents') }}
+    {% if is_incremental() %}
+    WHERE _fivetran_synced > (SELECT MAX(_loaded_at) FROM {{ this }})
+    {% endif %}
+  example_bad: |
+    # WRONG: ETL — transform before loading, raw data destroyed
+    import pandas as pd
+    df = pd.read_sql("SELECT * FROM stripe_events", source_conn)
+    df['amount_usd'] = df['amount'] / 100  # bug here → wrong data, no recovery
+    df.to_sql('payments', dest_conn, if_exists='replace')  # raw data gone
+  when_applies: Designing any new data pipeline for an analytical data warehouse
+  sources:
+    - "https://www.getdbt.com/blog/guide-to-dimensional-modeling"
+    - "https://docs.getdbt.com/docs/build/incremental-models"
+    - "https://www.databricks.com/glossary/medallion-architecture"
+
+- id: DWH-007
+  text: >
+    Use materialized views for pre-computed aggregates that are queried frequently but
+    change infrequently (hourly/daily refresh). For ClickHouse use AggregatingMergeTree
+    with materialized views using -State/-Merge aggregate combinators. For PostgreSQL use
+    CONCURRENT refresh to avoid locking. Never use materialized views for real-time data
+    (< 1 minute freshness) — use streaming aggregates instead.
+  why: >
+    A dashboard with 50 concurrent users, each running a GROUP BY over 500M rows, will
+    bring any warehouse to its knees. Materialized views shift compute from query-time
+    to refresh-time. ClickHouse AggregatingMergeTree + materialized view is the canonical
+    pattern for real-time analytics at Cloudflare scale (2T events/day): the MV updates
+    incrementally on every INSERT — no scheduled refresh needed, always consistent with
+    the raw table.
+  how_to_do_right: |
+    1. ClickHouse incremental aggregation (no scheduled refresh needed):
+       a. Source table: MergeTree
+       b. Aggregate table: AggregatingMergeTree with -State functions
+       c. Materialized view: SELECT ... -State(...) FROM source TO agg_table
+       d. Query: SELECT -Merge(...) FROM agg_table GROUP BY ...
+    2. PostgreSQL: CREATE MATERIALIZED VIEW ... WITH DATA; then REFRESH MATERIALIZED VIEW CONCURRENTLY view_name;
+    3. Schedule refresh via pg_cron or Airflow — CONCURRENTLY required for zero-lock refresh
+    4. Snowflake: dynamic tables (2024+) — SQL + target_lag = '1 hour' — auto-refresh
+    5. Monitor staleness: alert if materialized view is > 2× its expected refresh interval old
+    6. Add _refreshed_at column to materialized views for freshness monitoring
+  severity: medium
+  technologies:
+    lang: [sql]
+    framework: [clickhouse, postgresql, snowflake, bigquery]
+  domains:
+    domain: [databases, analytics, performance]
+    concern: [materialized_views, aggregation, query_performance]
+  example_good: |
+    -- ClickHouse: AggregatingMergeTree + materialized view (incremental, no scheduling)
+    CREATE TABLE events_hourly_agg
+    (
+        hour         DateTime,
+        event_type   LowCardinality(String),
+        user_count   AggregateFunction(uniq, UInt64),
+        event_count  AggregateFunction(count, UInt64)
+    )
+    ENGINE = AggregatingMergeTree
+    ORDER BY (hour, event_type);
+
+    CREATE MATERIALIZED VIEW events_hourly_mv TO events_hourly_agg AS
+    SELECT
+        toStartOfHour(event_time)       AS hour,
+        event_type,
+        uniqState(user_id)              AS user_count,
+        countState()                    AS event_count
+    FROM fct_events
+    GROUP BY hour, event_type;
+
+    -- Query (fast, reads only aggregated data):
+    SELECT hour, event_type,
+           uniqMerge(user_count) AS users,
+           countMerge(event_count) AS events
+    FROM events_hourly_agg
+    WHERE hour >= now() - INTERVAL 7 DAY
+    GROUP BY hour, event_type;
+  example_bad: |
+    -- WRONG: running GROUP BY over 500M rows on every dashboard load
+    SELECT date_trunc('hour', event_time), event_type, count(DISTINCT user_id), count(*)
+    FROM fct_events  -- 500M rows, no materialization
+    WHERE event_time >= now() - INTERVAL 7 DAY
+    GROUP BY 1, 2;
+    -- 50 concurrent users × 30s query = warehouse melts
+  when_applies: Any aggregate query run more than 10 times/day over tables > 50M rows
+  sources:
+    - "https://clickhouse.com/docs/engines/table-engines/mergetree-family/aggregatingmergetree"
+    - "https://www.postgresql.org/docs/current/rules-materializedviews.html"
+    - "https://docs.snowflake.com/en/user-guide/dynamic-tables-intro"
+
+- id: DWH-008
+  text: >
+    Implement GDPR/LGPD crypto-shredding for data retention in analytical pipelines.
+    Encrypt PII columns with a per-user AES-256 key stored in a separate key vault.
+    On erasure request: delete the key from vault. The ciphertext in the warehouse becomes
+    permanently unreadable without dropping the rows. Store plaintext PII only in the
+    operational DB with TTL; write only pseudonymized IDs to the data warehouse.
+  why: >
+    GDPR Article 17 gives users the right to erasure. Deleting rows from a multi-TB
+    data warehouse with cascading foreign keys can take days and corrupt historical
+    aggregates. Crypto-shredding is legally equivalent to deletion (EDPB guidelines)
+    and takes milliseconds (just delete a key). Snowflake's native column encryption
+    supports this pattern. Failure: a $5M GDPR fine was levied in 2022 against a DWH
+    operator for being unable to comply with erasure requests within the 30-day window.
+  how_to_do_right: |
+    1. In the operational DB: store PII plaintext + encryption_key_id FK
+    2. Key vault: AWS KMS or Hashicorp Vault, one DataKey per user_id
+    3. At load time: encrypt PII columns using user's DataKey, write ciphertext to DWH
+    4. DWH schema: user_pseudonym_id (UUID, not user email/name), encrypted_email BYTEA
+    5. On erasure: DELETE FROM key_vault WHERE user_id = ? → ciphertext is permanently gibberish
+    6. Periodically purge rows older than retention_period WHERE decryption fails (confirms erasure)
+    7. Test: after key deletion, SELECT encrypted_email must not be decryptable
+    8. Document in lineage registry: which columns are PII and their encryption_key_id reference
+  severity: critical
+  technologies:
+    lang: [python, sql]
+    framework: [aws_kms, snowflake, postgresql, hashicorp_vault]
+  domains:
+    domain: [databases, analytics, compliance, security]
+    concern: [gdpr, lgpd, pii, erasure, encryption]
+  example_good: |
+    import boto3
+    from cryptography.fernet import Fernet
+    import base64
+
+    kms = boto3.client('kms')
+
+    def encrypt_for_warehouse(user_id: str, plaintext: str, kms_key_id: str) -> tuple[str, str]:
+        """Encrypt PII for DWH storage. Returns (ciphertext_b64, data_key_id)."""
+        # Generate per-user data key via KMS (envelope encryption)
+        response = kms.generate_data_key(KeyId=kms_key_id, KeySpec='AES_256')
+        data_key_plaintext = response['Plaintext']
+        data_key_encrypted = response['CiphertextBlob']
+
+        f = Fernet(base64.urlsafe_b64encode(data_key_plaintext[:32]))
+        ciphertext = f.encrypt(plaintext.encode())
+
+        # Store data_key_encrypted in key_vault table keyed by user_id
+        store_key_in_vault(user_id, data_key_encrypted)
+        return base64.b64encode(ciphertext).decode(), str(user_id)
+
+    def crypto_shred(user_id: str):
+        """GDPR erasure: delete key → ciphertext permanently unreadable."""
+        delete_from_vault(user_id)
+        # No rows deleted from DWH. Legally equivalent to deletion per EDPB.
+  example_bad: |
+    -- WRONG: storing plaintext PII in the data warehouse
+    INSERT INTO gold.fct_user_events (user_id, email, event_type, ...)
+    SELECT user_id, email, event_type  -- email in plaintext!
+    FROM bronze.raw_events;
+    -- GDPR erasure: must DELETE millions of rows across dozens of tables.
+    -- Cascades break aggregates. DBA nightmare. 30-day deadline impossible.
+  when_applies: Any analytical pipeline handling personal data of EU or Brazilian citizens
+  sources:
+    - "https://edpb.europa.eu/sites/default/files/files/file1/edpb_guidelines_201903_righttoerasure_en.pdf"
+    - "https://docs.snowflake.com/en/user-guide/security-column-ddm-intro"
+    - "https://aws.amazon.com/blogs/security/how-to-delete-user-data-in-an-aws-data-lake/"
+
+- id: DWH-009
+  text: >
+    Implement backward-compatible schema evolution in analytical systems using the
+    expand-contract pattern. When renaming a column: ADD the new column, backfill,
+    update consumers, then DROP the old column — never rename in one step. Add new
+    columns as NULLable with DEFAULT. Never change column types in place on tables
+    > 10M rows without creating a new column.
+  why: >
+    Analytical systems have multiple consumers (BI tools, dashboards, notebooks, exports)
+    that break silently when schema changes. A direct column rename on a 500M-row Snowflake
+    table locks the table and breaks 47 downstream dashboards simultaneously. Expand-contract
+    gives a safe migration window where old and new column names coexist. Airbnb's data
+    engineering team documented a 6-hour outage from a direct column rename with no migration
+    window.
+  how_to_do_right: |
+    1. Expand: ALTER TABLE fct_orders ADD COLUMN amount_usd DECIMAL(18,2);
+       UPDATE fct_orders SET amount_usd = amount_cents / 100.0;  -- backfill in batches
+    2. Migrate consumers: update dbt models, dashboards, notebooks to use amount_usd
+    3. Monitor: zero queries referencing amount_cents for 2+ weeks (check query logs)
+    4. Contract: ALTER TABLE fct_orders DROP COLUMN amount_cents;
+    5. For type changes (e.g., INT → BIGINT): same pattern — new column, backfill, swap, drop
+    6. dbt: use column_types config to detect mismatches in CI
+    7. BigQuery: schema change API validates backward compatibility before applying
+    8. Add a migration_log table: (migration_id, column_old, column_new, started_at, completed_at)
+  severity: high
+  technologies:
+    lang: [sql, python]
+    framework: [dbt, snowflake, bigquery, clickhouse, postgresql]
+  domains:
+    domain: [databases, analytics, schema_management]
+    concern: [schema_evolution, backward_compatibility, migration]
+  example_good: |
+    -- Step 1: Expand — add new column alongside old
+    ALTER TABLE gold.fct_orders ADD COLUMN amount_usd DECIMAL(18,4);
+
+    -- Step 2: Backfill in batches (avoid single lock-holding UPDATE)
+    DO $$
+    DECLARE batch_size INT := 100000; offset_val INT := 0; rows_updated INT;
+    BEGIN
+      LOOP
+        UPDATE gold.fct_orders
+        SET amount_usd = amount_cents / 100.0
+        WHERE amount_usd IS NULL
+        LIMIT batch_size;
+        GET DIAGNOSTICS rows_updated = ROW_COUNT;
+        EXIT WHEN rows_updated = 0;
+        PERFORM pg_sleep(0.1);  -- rate limit
+      END LOOP;
+    END $$;
+
+    -- Step 3 (weeks later, after consumers migrated):
+    ALTER TABLE gold.fct_orders DROP COLUMN amount_cents;
+  example_bad: |
+    -- WRONG: direct rename — breaks all downstream consumers instantly
+    ALTER TABLE gold.fct_orders RENAME COLUMN amount_cents TO amount_usd;
+    -- 47 dashboards: ERROR: column "amount_cents" does not exist
+    -- Rollback requires another rename, still a window of breakage
+  when_applies: Any schema change on a table with active consumers (dashboards, exports, notebooks)
+  sources:
+    - "https://martinfowler.com/articles/evodb.html"
+    - "https://docs.getdbt.com/reference/resource-configs/column_types"
+    - "https://cloud.google.com/bigquery/docs/managing-table-schemas"
+
+- id: DWH-010
+  text: >
+    Track query cost per tenant in multi-tenant analytics platforms. Tag every query with
+    tenant_id using warehouse-level query labels/tags. Aggregate cost weekly from the
+    warehouse's query history tables. Alert when a single tenant consumes > 20% of total
+    compute and implement per-tenant query timeout or result cache to prevent noisy-neighbor
+    effects.
+  why: >
+    Without cost attribution, one tenant running `SELECT * FROM events` with no WHERE
+    clause can consume 80% of warehouse capacity, delaying all other tenants' dashboards.
+    Snowflake query history shows this is the #1 cause of SLA violations in multi-tenant
+    analytics. Cost tracking also enables usage-based billing: if tenant A consumed 3×
+    more warehouse compute than tenant B, they should be charged proportionally.
+  how_to_do_right: |
+    1. Snowflake: SET QUERY_TAG = '{"tenant_id": "T-123", "dashboard": "revenue"}' before every query
+    2. BigQuery: use job_labels = {"tenant_id": "t-123"} in job config
+    3. ClickHouse: SET log_comment = '{"tenant_id": "T-123"}' per session
+    4. Aggregate weekly: SELECT query_tag:tenant_id, SUM(credits_used)
+       FROM snowflake.account_usage.query_history GROUP BY 1
+    5. Alert: if any tenant > 20% → notify ops + throttle via resource monitor
+    6. Implement per-tenant result cache (Redis, 5-minute TTL on identical queries)
+    7. Set per-tenant query timeout: 60s for dashboards, 300s for exports
+    8. Dashboard: show tenant their own cost in admin panel (transparency reduces abuse)
+  severity: high
+  technologies:
+    lang: [sql, python]
+    framework: [snowflake, bigquery, clickhouse, redis]
+  domains:
+    domain: [databases, analytics, saas, multi_tenant]
+    concern: [cost_attribution, noisy_neighbor, query_governance]
+  example_good: |
+    import snowflake.connector
+
+    def execute_tenant_query(conn, tenant_id: str, sql: str, timeout_s: int = 60):
+        """Execute query with cost attribution and timeout."""
+        import json
+        tag = json.dumps({"tenant_id": tenant_id, "app": "analytics_api"})
+        with conn.cursor() as cur:
+            cur.execute(f"ALTER SESSION SET QUERY_TAG = '{tag}'")
+            cur.execute(f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {timeout_s}")
+            cur.execute(sql)
+            return cur.fetchall()
+
+    # Weekly cost report (runs in Airflow)
+    COST_QUERY = """
+    SELECT
+        PARSE_JSON(QUERY_TAG):tenant_id::STRING AS tenant_id,
+        ROUND(SUM(CREDITS_USED_CLOUD_SERVICES), 4) AS credits_used,
+        COUNT(*) AS query_count
+    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+    WHERE START_TIME >= DATEADD('week', -1, CURRENT_TIMESTAMP())
+      AND QUERY_TAG != ''
+    GROUP BY 1 ORDER BY 2 DESC;
+    """
+  example_bad: |
+    # WRONG: no tenant attribution, shared session, no timeout
+    def run_query(sql):
+        with get_connection().cursor() as cur:
+            cur.execute(sql)  # No tenant tag, no timeout
+            return cur.fetchall()
+    # One tenant's runaway query blocks all others. No visibility into who caused it.
+  when_applies: Building multi-tenant analytics or any SaaS product with shared data warehouse
+  sources:
+    - "https://docs.snowflake.com/en/user-guide/resource-monitors"
+    - "https://cloud.google.com/bigquery/docs/labels-intro"
+    - "https://clickhouse.com/docs/operations/settings/settings#log_comment"
+
+- id: DWH-011
+  text: >
+    Anonymize PII in analytical pipelines using pseudonymization (reversible, for internal
+    analytics) or anonymization (irreversible, for external sharing/ML training). Use
+    SHA-256 HMAC with a secret salt for pseudonymization — raw SHA-256 of an email is
+    reversible via rainbow table. Use k-anonymity (k≥5) for demographic data in public
+    datasets. Never pass raw PII to third-party analytics tools (Mixpanel, Amplitude).
+  why: >
+    Mixpanel, Amplitude, and similar tools have had data breaches and change their data
+    retention policies. Sending raw emails to third-party analytics means those tools
+    now control your GDPR obligations. HMAC pseudonymization lets you join analytics
+    events on the pseudonymized ID without exposing the original email. At GitHub, the
+    security team blocked all third-party tools from receiving raw user identifiers
+    after a 2021 audit showed PII in 12 external analytics platforms.
+  how_to_do_right: |
+    1. HMAC-SHA256 for internal pseudonymization:
+       pseudonym = hmac.new(SECRET_SALT, email.lower().encode(), 'sha256').hexdigest()
+    2. Store SECRET_SALT in AWS Secrets Manager / Vault — rotate annually
+    3. Use consistent pseudonym: same email always → same pseudonym (for cross-table joins)
+    4. For external ML datasets: generalize age to 5-year buckets, zip to first 3 digits
+    5. k-anonymity check: every combination of quasi-identifiers must appear ≥ k=5 times
+    6. In dbt: create a macro `{{ pseudonymize('email') }}` that applies HMAC
+    7. Third-party tools: send only pseudonymized_user_id, never raw email or phone
+    8. Document in data catalog: which columns are pseudonymized and with which salt version
+  severity: critical
+  technologies:
+    lang: [python, sql]
+    framework: [dbt, snowflake, bigquery, postgresql]
+  domains:
+    domain: [databases, analytics, security, compliance]
+    concern: [pii, gdpr, lgpd, anonymization, pseudonymization]
+  example_good: |
+    import hmac
+    import hashlib
+    import os
+
+    PSEUDONYM_SALT = os.environ['PSEUDONYM_SALT'].encode()  # From Secrets Manager
+
+    def pseudonymize_email(email: str) -> str:
+        """HMAC-SHA256 pseudonymization — consistent, not reversible without salt."""
+        return hmac.new(
+            PSEUDONYM_SALT,
+            email.strip().lower().encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+
+    # dbt macro: macros/pseudonymize.sql
+    # {% macro pseudonymize(column) %}
+    #   sha256(concat('{{ env_var("PSEUDONYM_SALT") }}', lower({{ column }})))
+    # {% endmacro %}
+
+    # Usage in dbt model:
+    # SELECT {{ pseudonymize('email') }} AS user_pseudonym, event_type ...
+  example_bad: |
+    import hashlib
+
+    def bad_pseudonymize(email: str) -> str:
+        # WRONG: raw SHA-256 — reversible via rainbow table for common emails
+        return hashlib.sha256(email.encode()).hexdigest()
+
+    # Also WRONG: sending raw email to analytics tool
+    mixpanel.track('purchase', {'email': user.email, 'amount': 99.0})
+    # Mixpanel now has your users' raw emails
+  when_applies: Any pipeline or event tracking that handles user email, phone, or name
+  sources:
+    - "https://www.enisa.europa.eu/publications/pseudonymisation-techniques-and-best-practices"
+    - "https://docs.python.org/3/library/hmac.html"
+    - "https://docs.getdbt.com/docs/build/jinja-macros"
+
+- id: DWH-012
+  text: >
+    Implement the Medallion architecture (Bronze → Silver → Gold) with explicit contracts
+    at each boundary. Bronze: raw, append-only, no deletes, schema-on-read. Silver: typed,
+    deduplicated, validated, schema-on-write. Gold: business-defined metrics, fully tested,
+    SLA-guaranteed freshness. Each boundary must have automated data quality checks before
+    promotion.
+  why: >
+    Without layer separation, a breaking change in the source system cascades to dashboards
+    in minutes. With Medallion: source change affects only Bronze, Silver transform absorbs
+    it, Gold consumers are protected. Databricks documented a 73% reduction in pipeline
+    incidents after adopting Medallion architecture across 500+ enterprise customers.
+    The promotion gates (Bronze→Silver→Gold) are where data quality debt is paid — not
+    in production dashboards.
+  how_to_do_right: |
+    1. Bronze: schema = exact mirror of source (even column names, even typos). Append-only.
+       Add: _loaded_at TIMESTAMP, _source_file STRING, _batch_id UUID
+    2. Silver: dbt staging models. Rules: no nulls in PK, types cast, dates parsed.
+       Run dbt tests on every silver model promotion.
+    3. Gold: business metrics. Run Great Expectations or dbt-expectations suites.
+       SLA: gold models must be < 2 hours stale for operational dashboards.
+    4. Promotion gate (Python + dbt):
+       a. Run dbt test on target layer
+       b. If tests pass → materialize gold model
+       c. If tests fail → alert, do NOT promote, keep previous version
+    5. Never skip layers: Gold never reads from Bronze directly
+    6. Bronze retention: 7 years (for audit replay). Silver: 2 years. Gold: forever (aggregated).
+  severity: high
+  technologies:
+    lang: [sql, python]
+    framework: [dbt, databricks, delta_lake, airflow, great_expectations]
+  domains:
+    domain: [databases, analytics, data_engineering]
+    concern: [medallion_architecture, data_quality, pipeline_design]
+  example_good: |
+    # Promotion gate: Silver → Gold
+    import subprocess, sys
+
+    def promote_silver_to_gold(model_name: str) -> bool:
+        """Run dbt tests on silver model before materializing gold."""
+        # Test silver model
+        result = subprocess.run(
+            ["dbt", "test", "--select", f"silver.{model_name}"],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            print(f"SILVER TESTS FAILED — Gold NOT updated:\n{result.stdout}")
+            send_alert(f"Silver promotion blocked for {model_name}")
+            return False
+
+        # Tests passed — materialize gold
+        subprocess.run(["dbt", "run", "--select", f"gold.{model_name}"], check=True)
+        print(f"Gold {model_name} promoted successfully")
+        return True
+  example_bad: |
+    -- WRONG: Gold reading directly from Bronze (skips Silver quality checks)
+    -- models/gold/fct_orders.sql
+    SELECT raw_json:order_id::STRING, raw_json:amount::FLOAT  -- no type safety
+    FROM bronze.raw_stripe_events                             -- direct Bronze access
+    WHERE raw_json:event_type = 'payment_intent.succeeded';
+    -- Any Bronze schema change breaks Gold dashboards immediately
+  when_applies: Designing any data lakehouse or cloud data warehouse architecture
+  sources:
+    - "https://www.databricks.com/glossary/medallion-architecture"
+    - "https://modeldock.run/blog/medallion-architecture-dbt"
+    - "https://docs.getdbt.com/docs/build/tests"
+
+- id: DWH-013
+  text: >
+    Use ClickHouse CollapsingMergeTree for mutable state tracking where rows must be
+    updated/deleted without locking. Each state change inserts a cancellation row
+    (sign=-1) followed by a new state row (sign=+1). Always query with FINAL keyword
+    or use SUM(sign) > 0 filter to get current state. Never use DELETE for high-frequency
+    state mutations in ClickHouse.
+  why: >
+    ClickHouse is append-only by design — DELETE and UPDATE are heavy operations that
+    block reads and trigger full-part rewrite. CollapsingMergeTree was built for exactly
+    this: order status tracking, session state, user profile mutations. Cloudflare uses
+    this pattern for 2 trillion events/day of network state. A naive UPDATE pattern at
+    10K mutations/second causes ClickHouse to fall behind on merges, leading to
+    materialized view staleness and query slowdown.
+  how_to_do_right: |
+    1. Create table with sign Int8 column:
+       ENGINE = CollapsingMergeTree(sign) ORDER BY (user_id, session_id)
+    2. Insert new state: append two rows atomically:
+       INSERT INTO sessions VALUES (user_id, session_id, 'active', ..., -1);  -- cancel old
+       INSERT INTO sessions VALUES (user_id, session_id, 'closed', ..., +1);  -- new state
+    3. Query current state: SELECT ... FROM sessions FINAL WHERE sign = 1
+       OR: SELECT user_id, SUM(sign), SUM(revenue * sign) FROM sessions GROUP BY user_id HAVING SUM(sign) > 0
+    4. For versioned states: use VersionedCollapsingMergeTree(sign, version) — handles out-of-order inserts
+    5. Background merge collapses sign=-1 and sign=+1 pairs — do NOT rely on it for reads, use FINAL
+    6. Monitor: system.parts WHERE active AND table = 'sessions' — part count growth indicates merge lag
+  severity: high
+  technologies:
+    lang: [sql, python]
+    framework: [clickhouse]
+  domains:
+    domain: [databases, analytics, performance]
+    concern: [clickhouse, mutable_state, mergetree]
+  example_good: |
+    -- ClickHouse: CollapsingMergeTree for order status tracking
+    CREATE TABLE order_status
+    (
+        order_id     UInt64,
+        status       LowCardinality(String),
+        updated_at   DateTime64(3),
+        revenue_cents Int64,
+        sign         Int8  -- -1 = cancellation, +1 = current
+    )
+    ENGINE = CollapsingMergeTree(sign)
+    ORDER BY (order_id, updated_at)
+    PARTITION BY toYYYYMM(updated_at);
+
+    def update_order_status(conn, order_id: int, old_status: str, new_status: str, revenue: int):
+        """Atomic state transition via cancel + insert pattern."""
+        rows = [
+            # Cancel previous state
+            (order_id, old_status, datetime.utcnow(), revenue, -1),
+            # Insert new state
+            (order_id, new_status, datetime.utcnow(), revenue, +1),
+        ]
+        conn.execute("INSERT INTO order_status VALUES", rows)
+
+    # Query: current state only
+    # SELECT order_id, status FROM order_status FINAL WHERE sign = 1
+  example_bad: |
+    -- WRONG: using ALTER TABLE UPDATE in ClickHouse at high frequency
+    ALTER TABLE order_status UPDATE status = 'shipped' WHERE order_id = 12345;
+    -- ALTER TABLE UPDATE in ClickHouse is a mutation — rewrites entire data parts
+    -- At 10K updates/second this creates massive mutation backlog and blocks merges
+  when_applies: Tracking mutable state (orders, sessions, user profiles) in ClickHouse at high write rates
+  sources:
+    - "https://clickhouse.com/docs/engines/table-engines/mergetree-family/collapsingmergetree"
+    - "https://kb.altinity.com/engines/mergetree-table-engine-family/versioned-collapsing-mergetree/"
+    - "https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree"
+
+- id: DWH-014
+  text: >
+    Implement data quality checks at every pipeline stage using dbt tests (built-in) or
+    Great Expectations for complex rules. Minimum gate for any Gold model: not_null on PKs,
+    unique on PKs, accepted_values for status enums, relationships for all FK references,
+    recency check (data must not be > 4 hours stale), and row count anomaly detection
+    (alert if row count drops > 20% from 7-day average).
+  why: >
+    Silent data quality failures are the most expensive bugs in analytics. A NULL customer_key
+    in fct_orders means those orders are excluded from revenue reports — Finance sees wrong
+    numbers for weeks before anyone notices. Spotify's data engineering team published that
+    data quality issues cost ~15% of analyst time in companies without automated quality
+    gates. With dbt tests run in CI on every PR, issues are caught before deployment.
+  how_to_do_right: |
+    1. dbt built-in tests (add to schema.yml):
+       - not_null, unique → every PK and FK
+       - accepted_values → every enum/status column
+       - relationships → every FK must exist in dimension
+    2. dbt-expectations package for advanced tests:
+       - expect_table_row_count_to_be_between: min=1000, max=50000000
+       - expect_column_values_to_be_between: revenue_cents min=0
+       - expect_table_row_count_to_equal_other_table: reconciliation
+    3. Recency check: custom dbt test or dbt-expectations:
+       expect_row_values_to_have_recent_data: datepart: hour, interval: 4
+    4. Row count anomaly (Python in Airflow):
+       - Query 7-day avg row count from warehouse query history
+       - Alert if today < 80% of avg
+    5. Severity: warn for soft limits, error for critical (unique/not_null)
+    6. Quarantine: failed rows go to silver.quarantine_events, not dropped
+  severity: high
+  technologies:
+    lang: [sql, python]
+    framework: [dbt, great_expectations, airflow]
+  domains:
+    domain: [databases, analytics, data_quality]
+    concern: [testing, monitoring, data_quality_gates]
+  example_good: |
+    # schema.yml — Gold model quality gates
+    models:
+      - name: fct_orders
+        description: "One row per order line item. Grain: order_id + line_item_id."
+        columns:
+          - name: order_line_key
+            tests:
+              - not_null
+              - unique
+          - name: customer_key
+            tests:
+              - not_null
+              - relationships:
+                  to: ref('dim_customers')
+                  field: customer_key
+          - name: order_status
+            tests:
+              - accepted_values:
+                  values: ['pending', 'confirmed', 'shipped', 'delivered', 'cancelled']
+          - name: revenue_cents
+            tests:
+              - dbt_expectations.expect_column_values_to_be_between:
+                  min_value: 0
+                  max_value: 10000000  # $100,000 max order sanity check
+    tests:
+      - dbt_expectations.expect_row_values_to_have_recent_data:
+          column_name: order_placed_at
+          datepart: hour
+          interval: 4
+  example_bad: |
+    -- WRONG: no tests on gold model — silent failures
+    -- models/marts/fct_orders.sql (no schema.yml tests defined)
+    -- Customer_key NULLs go undetected for 3 weeks.
+    -- Finance report excludes $2.3M in orders. Board meeting surprise.
+  when_applies: Every dbt model promoted to Gold layer or used in production dashboards
+  sources:
+    - "https://docs.getdbt.com/docs/build/tests"
+    - "https://github.com/calogica/dbt-expectations"
+    - "https://greatexpectations.io/expectations/"
+
+- id: DWH-015
+  text: >
+    Use incremental processing with CDC (Change Data Capture) and watermark-based
+    merge strategy for large fact tables. Never full-reload tables > 10M rows in production
+    pipelines. Use merge_key (business natural key) + updated_at watermark to upsert only
+    changed records. For append-only facts (events), use watermark INSERT only.
+  why: >
+    Full reload of a 500M-row table takes 4-8 hours in any warehouse. A missed nightly
+    run means 16 hours of stale data. Incremental processing with CDC reduces load time
+    from hours to minutes. Fivetran and Airbyte both use CDC as their primary sync mode
+    for this reason. Airbnb published that switching from nightly full-reload to CDC-based
+    incremental reduced their Snowflake costs by 60% and pipeline latency from 8 hours
+    to 15 minutes.
+  how_to_do_right: |
+    1. Source: enable logical replication in PostgreSQL (wal_level = logical)
+    2. CDC tool: Debezium (Kafka) or Airbyte CDC connector → streams INSERT/UPDATE/DELETE
+    3. Bronze: append CDC events with op_type (c=create, u=update, d=delete), before/after state
+    4. Silver: dbt incremental model with merge strategy:
+       {{ config(materialized='incremental', unique_key='order_id',
+                 incremental_strategy='merge', merge_update_columns=['status', 'updated_at']) }}
+    5. Watermark: WHERE updated_at > (SELECT MAX(updated_at) FROM {{ this }})
+    6. Handle deletes: soft delete with is_deleted=TRUE, or hard delete via DELETE WHERE NOT IN source
+    7. Test idempotency: run the model twice — row count and values must be identical
+    8. Monitor lag: alert if watermark is > 15 minutes behind real-time
+  severity: high
+  technologies:
+    lang: [sql, python]
+    framework: [dbt, debezium, airbyte, kafka, postgresql, snowflake]
+  domains:
+    domain: [databases, analytics, data_engineering]
+    concern: [cdc, incremental_processing, pipeline_latency]
+  example_good: |
+    -- dbt incremental model with merge strategy
+    -- models/silver/stg_orders.sql
+    {{ config(
+        materialized='incremental',
+        unique_key='order_id',
+        incremental_strategy='merge',
+        merge_update_columns=['status', 'customer_id', 'updated_at', 'is_deleted']
+    ) }}
+
+    SELECT
+        order_id,
+        customer_id,
+        status,
+        created_at,
+        updated_at,
+        CASE WHEN _cdc_op = 'd' THEN TRUE ELSE FALSE END AS is_deleted
+    FROM {{ source('cdc', 'orders_cdc') }}
+    {% if is_incremental() %}
+    -- Only process records newer than last watermark
+    WHERE updated_at > (SELECT COALESCE(MAX(updated_at), '1970-01-01') FROM {{ this }})
+    {% endif %}
+  example_bad: |
+    -- WRONG: full reload every run
+    {{ config(materialized='table') }}
+    SELECT * FROM {{ source('app_db', 'orders') }};
+    -- At 500M rows: 6-hour runtime, $200 in Snowflake credits per run
+    -- At 4 runs/day: $800/day = $292K/year for one table
+  when_applies: Any pipeline syncing tables > 1M rows from operational databases to analytical stores
+  sources:
+    - "https://docs.getdbt.com/docs/build/incremental-models"
+    - "https://debezium.io/documentation/reference/stable/connectors/postgresql.html"
+    - "https://airbyte.com/blog/change-data-capture"

@@ -1,0 +1,1052 @@
+layer: rules
+domain: prediction_markets
+knowledge:
+- id: PM-RISK-001
+  text: "Enforce per-user position limits that cap the maximum number of contracts a single user can hold in any given market, preventing concentration risk and market manipulation."
+  why: >
+    Without per-user position limits, a single whale can accumulate enough contracts to
+    manipulate settlement prices or create artificial scarcity. In 2022, a prediction market
+    saw one user hold 40% of all YES contracts in a political market, then dump them minutes
+    before resolution to trigger a cascade. Position limits are the first line of defense
+    against market manipulation and concentration risk.
+  how_to_do_right: |
+    1. Define position limits per market type (e.g., 5000 contracts for political, 10000 for sports)
+    2. Store limits in a config table, not hardcoded — allows runtime tuning
+    3. Check limits in the order validation path BEFORE matching, not after
+    4. Include both open orders + filled positions in the limit calculation
+    5. Return a clear error code (e.g., POSITION_LIMIT_EXCEEDED) so the UI can display guidance
+    6. Log every limit breach attempt for compliance audit trail
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+
+    async def check_position_limit(
+        user_id: str, market_id: str, requested_qty: int, db: AsyncSession
+    ) -> bool:
+        limit = await get_market_position_limit(market_id, db)
+        current_position = await get_user_position(user_id, market_id, db)
+        open_order_qty = await get_user_open_order_qty(user_id, market_id, db)
+        total_exposure = current_position + open_order_qty + requested_qty
+        if total_exposure > limit:
+            await log_limit_breach(user_id, market_id, total_exposure, limit)
+            raise PositionLimitExceeded(
+                user_id=user_id,
+                market_id=market_id,
+                current=current_position + open_order_qty,
+                requested=requested_qty,
+                limit=limit,
+            )
+        return True
+  example_bad: |
+    # BAD: Only checks filled positions, ignores open orders
+    async def check_position_limit(user_id, market_id, qty, db):
+        position = await get_user_position(user_id, market_id, db)
+        if position + qty > 10000:  # Hardcoded limit
+            return False
+        return True
+  when_applies: "Any prediction market or exchange system where users can accumulate positions"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: PM-RISK-002
+  text: "Enforce per-market aggregate position limits that cap the total open interest across all users, preventing systemic risk from over-leveraged markets."
+  why: >
+    Per-user limits alone are insufficient. If 1000 users each take max positions,
+    the market's total open interest can exceed what the platform can settle. A market
+    with $10M in open interest on a $100K liquidity pool creates a bank-run scenario
+    at settlement time. Per-market limits ensure the platform can always honor payouts.
+  how_to_do_right: |
+    1. Track total open interest per market in a real-time counter (Redis or materialized view)
+    2. Set market-wide limits based on available liquidity pool (e.g., 80% of pool)
+    3. When market approaches 90% of limit, switch to reduce-only mode (only closing orders)
+    4. Emit a MARKET_NEAR_CAPACITY event at 80% threshold for monitoring dashboards
+    5. Log market capacity utilization every 5 minutes for trend analysis
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    import redis.asyncio as redis
+
+    async def check_market_capacity(
+        market_id: str, requested_qty: int, r: redis.Redis
+    ) -> MarketCapacityResult:
+        market_limit = await get_market_aggregate_limit(market_id)
+        current_oi = int(await r.get(f"market:{market_id}:open_interest") or 0)
+        utilization = (current_oi + requested_qty) / market_limit
+
+        if utilization > 0.9:
+            return MarketCapacityResult(
+                allowed=False, reason="REDUCE_ONLY_MODE", utilization=utilization
+            )
+        if utilization > 0.8:
+            await emit_event("MARKET_NEAR_CAPACITY", market_id=market_id, utilization=utilization)
+
+        return MarketCapacityResult(allowed=True, utilization=utilization)
+  example_bad: |
+    # BAD: No aggregate limit — market can grow unbounded
+    async def place_order(order):
+        await match_order(order)  # No capacity check at all
+  when_applies: "Any prediction market with liquidity pools or settlement obligations"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: PM-RISK-003
+  text: "Implement mark-to-market exposure calculation that values all open positions at current market prices, not at entry prices, to provide real-time risk visibility."
+  why: >
+    Entry-price accounting hides unrealized losses. A user who bought YES at 0.90 when
+    the market is now at 0.20 has massive unrealized loss. Without mark-to-market,
+    the platform cannot detect users who are effectively insolvent, leading to settlement
+    failures when markets resolve. Mark-to-market is how every regulated exchange
+    monitors risk in real time.
+  how_to_do_right: |
+    1. Calculate exposure = sum(position_qty * current_market_price) for each user
+    2. Update exposure on every trade, order book change, or at minimum every 30 seconds
+    3. Store both entry-price exposure and mark-to-market exposure for P&L reporting
+    4. Trigger margin calls when mark-to-market exposure exceeds collateral by threshold (e.g., 80%)
+    5. Use mid-price (avg of best bid and best ask) for mark-to-market, not last trade price
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+
+    async def calculate_mtm_exposure(user_id: str, db: AsyncSession) -> Decimal:
+        positions = await get_user_positions(user_id, db)
+        total_exposure = Decimal("0")
+        for pos in positions:
+            mid_price = await get_mid_price(pos.market_id)
+            if mid_price is None:
+                mid_price = pos.last_known_price  # Fallback to last known
+            mtm_value = pos.quantity * mid_price
+            total_exposure += mtm_value
+        return total_exposure
+
+    async def check_margin_adequacy(user_id: str, db: AsyncSession) -> bool:
+        exposure = await calculate_mtm_exposure(user_id, db)
+        collateral = await get_user_collateral(user_id, db)
+        margin_ratio = exposure / collateral if collateral > 0 else Decimal("Inf")
+        if margin_ratio > Decimal("0.8"):
+            await trigger_margin_call(user_id, exposure, collateral)
+            return False
+        return True
+  example_bad: |
+    # BAD: Uses entry price, hides unrealized losses
+    async def get_user_exposure(user_id, db):
+        positions = await get_user_positions(user_id, db)
+        return sum(p.quantity * p.entry_price for p in positions)
+  when_applies: "Any prediction market or trading platform with open positions and collateral requirements"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: PM-RISK-004
+  text: "Implement price circuit breakers that halt trading when a market's price moves more than a configured percentage within a time window, preventing flash crashes and manipulation."
+  why: >
+    Without circuit breakers, a large market sell can crash a prediction market from
+    0.80 to 0.01 in seconds, triggering cascading liquidations. In traditional markets,
+    circuit breakers have prevented billions in losses. Prediction markets are even more
+    vulnerable because of lower liquidity and less sophisticated market makers.
+  how_to_do_right: |
+    1. Track price at configurable intervals (e.g., 1min, 5min, 15min rolling windows)
+    2. Define thresholds per market type (e.g., 20% move in 5min for political markets)
+    3. On breach: halt new orders, keep existing orders on book, notify all connected clients
+    4. Implement a cooldown period (e.g., 5 minutes) before reopening
+    5. Log every circuit breaker trigger with full order book snapshot for post-mortem
+    6. Allow manual override by admin for legitimate large moves (e.g., breaking news)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from datetime import datetime, timedelta
+    from enum import Enum
+
+    class CircuitState(Enum):
+        OPEN = "open"
+        HALTED = "halted"
+        COOLDOWN = "cooldown"
+
+    async def check_price_circuit(
+        market_id: str, new_price: float, r: redis.Redis
+    ) -> CircuitState:
+        window_key = f"circuit:price:{market_id}:5min"
+        reference_price = float(await r.get(window_key) or new_price)
+
+        if reference_price > 0:
+            pct_change = abs(new_price - reference_price) / reference_price
+            threshold = await get_circuit_threshold(market_id)
+
+            if pct_change > threshold:
+                await halt_market(market_id, reason="PRICE_CIRCUIT_BREAKER")
+                await snapshot_order_book(market_id)
+                await notify_all_clients(market_id, "MARKET_HALTED")
+                await schedule_cooldown(market_id, duration_seconds=300)
+                return CircuitState.HALTED
+
+        await r.setex(window_key, 300, str(new_price))
+        return CircuitState.OPEN
+  example_bad: |
+    # BAD: No circuit breaker — prices can move 100% in one tick
+    async def execute_trade(trade):
+        new_price = calculate_new_price(trade)
+        await update_market_price(trade.market_id, new_price)
+  when_applies: "Any prediction market or exchange with continuous trading"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: PM-RISK-005
+  text: "Implement volume circuit breakers that halt trading when order volume exceeds normal thresholds within a time window, detecting pump-and-dump or coordinated manipulation."
+  why: >
+    A sudden 10x spike in volume often indicates coordinated manipulation, bot attacks,
+    or a liquidity attack. Volume circuit breakers complement price circuit breakers
+    because sophisticated attackers can move volume without moving price (e.g., wash
+    trading between accounts) until they are ready to dump.
+  how_to_do_right: |
+    1. Calculate rolling average volume over 1-hour and 24-hour windows
+    2. Trigger when 5-minute volume exceeds 5x the 1-hour average or 10x the 24-hour average
+    3. On trigger: switch to auction mode (batch orders every 30 seconds) rather than full halt
+    4. Alert risk team with volume breakdown by user to identify coordinated accounts
+    5. Auto-resume normal trading after volume normalizes for 15 minutes
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    async def check_volume_circuit(
+        market_id: str, r: redis.Redis
+    ) -> str:
+        vol_5min = int(await r.get(f"vol:{market_id}:5min") or 0)
+        vol_1hr_avg = int(await r.get(f"vol:{market_id}:1hr_avg") or 1)
+        vol_24hr_avg = int(await r.get(f"vol:{market_id}:24hr_avg") or 1)
+
+        if vol_5min > 5 * vol_1hr_avg or vol_5min > 10 * vol_24hr_avg:
+            await switch_to_auction_mode(market_id, batch_interval_seconds=30)
+            await alert_risk_team(
+                market_id=market_id,
+                vol_5min=vol_5min,
+                vol_1hr_avg=vol_1hr_avg,
+                top_users=await get_top_volume_users(market_id, minutes=5),
+            )
+            return "AUCTION_MODE"
+        return "CONTINUOUS"
+  example_bad: |
+    # BAD: No volume monitoring — manipulation goes undetected
+    async def on_trade(trade):
+        await update_position(trade)
+        await update_price(trade)
+        # No volume tracking at all
+  when_applies: "Any prediction market or exchange with continuous order matching"
+  sources: ["https://www.cftc.gov/sites/default/files/idc/groups/public/@newsroom/documents/file/federalregister112415.pdf"]
+
+- id: PM-RISK-006
+  text: "Implement volatility circuit breakers using realized volatility calculation over rolling windows, halting trading when volatility exceeds historical norms by a configurable multiple."
+  why: >
+    Price and volume circuit breakers can miss slow-burn manipulation where prices
+    oscillate rapidly within a narrow band. High volatility without large net moves
+    indicates either market microstructure problems or manipulation (painting the tape).
+    Volatility breakers catch patterns that price and volume alone miss.
+  how_to_do_right: |
+    1. Calculate realized volatility as stdev of log returns over 30-minute rolling window
+    2. Maintain 7-day baseline volatility per market
+    3. Trigger when realized vol exceeds 3x the 7-day baseline
+    4. On trigger: widen minimum tick size by 2x and increase order delay to 500ms
+    5. Alert market surveillance team with full price-time series for analysis
+    6. Auto-normalize when volatility drops below 2x baseline for 30 minutes
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    import numpy as np
+    from collections import deque
+
+    class VolatilityMonitor:
+        def __init__(self, market_id: str, window_size: int = 60):
+            self.market_id = market_id
+            self.prices = deque(maxlen=window_size)
+            self.baseline_vol: float = 0.0
+
+        def add_price(self, price: float) -> None:
+            self.prices.append(price)
+
+        def realized_volatility(self) -> float:
+            if len(self.prices) < 10:
+                return 0.0
+            prices = np.array(self.prices)
+            log_returns = np.diff(np.log(prices))
+            return float(np.std(log_returns))
+
+        async def check(self) -> str:
+            vol = self.realized_volatility()
+            if self.baseline_vol > 0 and vol > 3 * self.baseline_vol:
+                await widen_tick_size(self.market_id, multiplier=2)
+                await increase_order_delay(self.market_id, delay_ms=500)
+                return "VOLATILITY_BREAKER"
+            return "NORMAL"
+  example_bad: |
+    # BAD: Only checks last price change, misses oscillation patterns
+    async def check_volatility(market_id, last_price, prev_price):
+        if abs(last_price - prev_price) > 0.1:
+            return "volatile"
+        return "ok"
+  when_applies: "Any prediction market or exchange with continuous price discovery"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: PM-RISK-007
+  text: "Implement liquidation cascade prevention by staggering liquidations over time and using a liquidation price buffer, preventing a death spiral where liquidations trigger more liquidations."
+  why: >
+    In crypto markets, cascading liquidations have caused $1B+ in losses within hours.
+    When one user's position is liquidated, the sell pressure drops the price, triggering
+    the next user's liquidation, and so on. Prediction markets face the same risk.
+    Without cascade prevention, a 5% price move can become a 95% crash.
+  how_to_do_right: |
+    1. Add a liquidation buffer (e.g., 5% below the margin call level) to avoid triggering at exact threshold
+    2. Stagger liquidations: process max 10% of at-risk positions per minute
+    3. Use a liquidation queue with priority (most underwater first)
+    4. Pause liquidations if price has dropped more than 30% in 10 minutes (let circuit breakers handle it)
+    5. Use an insurance fund to absorb losses from underwater accounts rather than market-selling
+    6. Log every liquidation with pre/post market impact for parameter tuning
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from asyncio import Queue
+    from datetime import datetime, timedelta
+
+    class LiquidationEngine:
+        def __init__(self):
+            self.queue: Queue = Queue()
+            self.last_batch_time: datetime = datetime.min
+            self.batch_interval = timedelta(seconds=6)  # 10 per minute
+            self.max_batch_size = 5
+
+        async def enqueue_liquidation(self, user_id: str, market_id: str, shortfall: float):
+            await self.queue.put((shortfall, user_id, market_id))  # Priority by shortfall
+
+        async def process_batch(self):
+            now = datetime.utcnow()
+            if now - self.last_batch_time < self.batch_interval:
+                return  # Rate limit
+
+            market_drop = await get_recent_price_drop_pct(minutes=10)
+            if market_drop > 0.30:
+                await log_liquidation_pause("CASCADE_PREVENTION", market_drop)
+                return  # Let circuit breakers handle it
+
+            batch = []
+            for _ in range(min(self.max_batch_size, self.queue.qsize())):
+                batch.append(await self.queue.get())
+
+            for shortfall, user_id, market_id in sorted(batch, reverse=True):
+                loss = await execute_liquidation(user_id, market_id)
+                covered = await try_insurance_fund(loss)
+                if not covered:
+                    await socialize_loss(loss)
+
+            self.last_batch_time = now
+  example_bad: |
+    # BAD: Liquidate all at once — triggers death spiral
+    async def liquidate_all_underwater():
+        underwater = await get_underwater_accounts()
+        for account in underwater:
+            await force_sell_all_positions(account.user_id)
+  when_applies: "Any prediction market or exchange with margin/collateral requirements"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: PM-RISK-008
+  text: "Detect wash trading by identifying patterns where the same user (or linked accounts) places both buy and sell orders that match against each other, inflating volume artificially."
+  why: >
+    Wash trading inflates volume metrics, misleads other traders about market interest,
+    and can be used to manipulate leaderboard rankings or earn trading rewards fraudulently.
+    Regulators (CFTC) have fined platforms millions for failing to detect wash trading.
+    In prediction markets, wash trading can also be used to set artificial reference prices.
+  how_to_do_right: |
+    1. Track self-matches: flag any trade where buyer_id == seller_id (basic case)
+    2. Detect linked accounts: same IP, same device fingerprint, same deposit address, similar trading patterns
+    3. Use graph analysis to find account clusters with circular trading patterns
+    4. Score accounts with a wash-trading probability (0-1) using multiple signals
+    5. Auto-void trades with wash score > 0.9, manual review for 0.7-0.9
+    6. Exclude wash-traded volume from public volume metrics and leaderboard calculations
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech, security]
+    concern: [domain_specific]
+  example_good: |
+    from dataclasses import dataclass
+
+    @dataclass
+    class WashTradeSignal:
+        self_match: bool
+        same_ip: bool
+        same_device: bool
+        same_deposit_address: bool
+        circular_pattern: bool
+        score: float
+
+    async def detect_wash_trading(trade: Trade, db: AsyncSession) -> WashTradeSignal:
+        signals = WashTradeSignal(
+            self_match=(trade.buyer_id == trade.seller_id),
+            same_ip=await check_shared_ip(trade.buyer_id, trade.seller_id, db),
+            same_device=await check_shared_device(trade.buyer_id, trade.seller_id, db),
+            same_deposit_address=await check_shared_deposit(trade.buyer_id, trade.seller_id, db),
+            circular_pattern=await detect_circular_trades(trade.buyer_id, trade.seller_id, db),
+            score=0.0,
+        )
+        weights = {"self_match": 1.0, "same_ip": 0.4, "same_device": 0.5,
+                    "same_deposit_address": 0.8, "circular_pattern": 0.7}
+        signals.score = sum(
+            w * getattr(signals, k) for k, w in weights.items()
+        ) / sum(weights.values())
+
+        if signals.score > 0.9:
+            await void_trade(trade.id, reason="WASH_TRADING_AUTO")
+        elif signals.score > 0.7:
+            await flag_for_review(trade.id, signals)
+        return signals
+  example_bad: |
+    # BAD: Only checks exact user match, misses linked accounts
+    async def check_wash(trade):
+        if trade.buyer_id == trade.seller_id:
+            return True
+        return False  # Misses all sophisticated wash trading
+  when_applies: "Any prediction market, exchange, or trading platform with volume metrics or trading rewards"
+  sources: ["https://www.cftc.gov/sites/default/files/idc/groups/public/@newsroom/documents/file/federalregister112415.pdf"]
+
+- id: PM-RISK-009
+  text: "Detect spoofing by identifying orders placed with intent to cancel — large orders that are repeatedly placed and cancelled before execution to create false price signals."
+  why: >
+    Spoofing creates fake supply/demand signals, tricking other traders into moving the
+    market in the spoofer's desired direction. The Dodd-Frank Act explicitly criminalizes
+    spoofing. Navinder Sarao's spoofing contributed to the 2010 Flash Crash. In prediction
+    markets, spoofing can manipulate implied probabilities that influence real-world decisions.
+  how_to_do_right: |
+    1. Track order-to-cancel ratio per user per market over 1-hour windows
+    2. Flag users with cancel ratio > 80% AND average order lifetime < 5 seconds
+    3. Detect layering: 3+ orders at consecutive price levels on same side, all cancelled within 10 seconds
+    4. Implement minimum order lifetime (e.g., 1 second) before cancellation is allowed
+    5. Score spoofing probability based on: cancel ratio, order lifetime, layering, market impact
+    6. Auto-restrict users with spoofing score > 0.85 to reduce-only orders pending review
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech, security]
+    concern: [domain_specific]
+  example_good: |
+    from datetime import datetime, timedelta
+
+    async def detect_spoofing(user_id: str, market_id: str, db: AsyncSession) -> float:
+        window = datetime.utcnow() - timedelta(hours=1)
+
+        orders = await get_user_orders(user_id, market_id, since=window, db=db)
+        if len(orders) < 5:
+            return 0.0
+
+        cancelled = [o for o in orders if o.status == "cancelled"]
+        cancel_ratio = len(cancelled) / len(orders)
+
+        avg_lifetime = sum(
+            (o.cancelled_at - o.created_at).total_seconds()
+            for o in cancelled if o.cancelled_at
+        ) / max(len(cancelled), 1)
+
+        layering = await detect_layering_pattern(user_id, market_id, window, db)
+
+        score = (
+            0.4 * min(cancel_ratio / 0.8, 1.0) +
+            0.3 * max(0, 1 - avg_lifetime / 5.0) +
+            0.3 * (1.0 if layering else 0.0)
+        )
+
+        if score > 0.85:
+            await restrict_to_reduce_only(user_id, reason="SPOOFING_DETECTED")
+            await alert_compliance(user_id, market_id, score, orders)
+
+        return score
+  example_bad: |
+    # BAD: No spoofing detection — manipulators operate freely
+    async def cancel_order(order_id):
+        await db.delete(order_id)  # No tracking of cancel patterns
+  when_applies: "Any prediction market or exchange with a limit order book"
+  sources: ["https://www.cftc.gov/sites/default/files/idc/groups/public/@newsroom/documents/file/federalregister112415.pdf"]
+
+- id: PM-RISK-010
+  text: "Implement pre-trade risk checks as a synchronous validation gate that runs before every order enters the matching engine, checking balance, position limits, and price sanity."
+  why: >
+    If risk checks run after matching, the platform may need to unwind trades —
+    which is expensive, confusing for users, and may be impossible if the counterparty
+    already withdrew. Pre-trade checks are standard in every regulated exchange (NYSE,
+    CME, etc.) and prevent 95% of risk incidents at near-zero cost.
+  how_to_do_right: |
+    1. Run checks synchronously in the order submission path — never async/eventual
+    2. Check in order: (a) balance >= order cost, (b) position limit not exceeded, (c) price within sanity bounds
+    3. Price sanity: reject orders more than 50% away from last trade price (configurable)
+    4. Return specific error codes for each check failure (INSUFFICIENT_BALANCE, POSITION_LIMIT, PRICE_INSANE)
+    5. Total pre-trade check latency budget: < 5ms (use cached values, not DB queries)
+    6. Cache user balance and position in Redis, update on every trade
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from enum import Enum
+
+    class PreTradeResult(Enum):
+        OK = "OK"
+        INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
+        POSITION_LIMIT_EXCEEDED = "POSITION_LIMIT_EXCEEDED"
+        PRICE_INSANE = "PRICE_INSANE"
+        MARKET_HALTED = "MARKET_HALTED"
+
+    async def pre_trade_check(order: Order, r: redis.Redis) -> PreTradeResult:
+        # 1. Market status
+        if await r.get(f"market:{order.market_id}:halted"):
+            return PreTradeResult.MARKET_HALTED
+
+        # 2. Balance check (cached in Redis for speed)
+        balance = float(await r.get(f"user:{order.user_id}:balance") or 0)
+        order_cost = order.quantity * order.price
+        if balance < order_cost:
+            return PreTradeResult.INSUFFICIENT_BALANCE
+
+        # 3. Position limit
+        position = int(await r.get(f"pos:{order.user_id}:{order.market_id}") or 0)
+        limit = int(await r.get(f"limit:{order.market_id}") or 10000)
+        if position + order.quantity > limit:
+            return PreTradeResult.POSITION_LIMIT_EXCEEDED
+
+        # 4. Price sanity
+        last_price = float(await r.get(f"price:{order.market_id}:last") or 0.5)
+        if last_price > 0 and abs(order.price - last_price) / last_price > 0.5:
+            return PreTradeResult.PRICE_INSANE
+
+        return PreTradeResult.OK
+  example_bad: |
+    # BAD: Async risk check — order matches before check completes
+    async def submit_order(order):
+        asyncio.create_task(check_risk(order))  # Fire and forget!
+        await matching_engine.submit(order)
+  when_applies: "Any prediction market or exchange with an order matching engine"
+  sources: ["https://www.cftc.gov/sites/default/files/idc/groups/public/@newsroom/documents/file/federalregister112415.pdf"]
+
+- id: PM-RISK-011
+  text: "Calculate Value at Risk (VaR) at the portfolio level using historical simulation over the most recent 250 trading days, providing a probabilistic measure of maximum expected loss."
+  why: >
+    VaR is the industry standard for quantifying portfolio risk. Without it, the platform
+    cannot set appropriate margin requirements, size the insurance fund, or report risk
+    to regulators. Historical simulation VaR is preferred for prediction markets because
+    returns are non-Gaussian (binary outcomes), making parametric VaR unreliable.
+  how_to_do_right: |
+    1. Use historical simulation VaR, not parametric — prediction market returns are non-Gaussian
+    2. Calculate at 95% and 99% confidence levels
+    3. Use 250 trading days of history (or all available if less)
+    4. Update VaR daily for all users and for the platform aggregate
+    5. Store VaR history for trend analysis and regulatory reporting
+    6. Alert risk team when any user's 99% VaR exceeds 50% of their collateral
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    import numpy as np
+    from decimal import Decimal
+
+    async def calculate_portfolio_var(
+        user_id: str, confidence: float = 0.95, lookback_days: int = 250, db: AsyncSession = None
+    ) -> dict:
+        positions = await get_user_positions(user_id, db)
+        if not positions:
+            return {"var_95": Decimal("0"), "var_99": Decimal("0")}
+
+        # Get historical price series for each market
+        portfolio_returns = []
+        for day_offset in range(lookback_days):
+            daily_pnl = Decimal("0")
+            for pos in positions:
+                price_today = await get_historical_price(pos.market_id, day_offset, db)
+                price_yesterday = await get_historical_price(pos.market_id, day_offset + 1, db)
+                if price_today and price_yesterday:
+                    daily_pnl += pos.quantity * (price_today - price_yesterday)
+            portfolio_returns.append(float(daily_pnl))
+
+        returns = np.array(portfolio_returns)
+        var_95 = float(np.percentile(returns, (1 - 0.95) * 100))
+        var_99 = float(np.percentile(returns, (1 - 0.99) * 100))
+
+        return {
+            "var_95": Decimal(str(abs(var_95))),
+            "var_99": Decimal(str(abs(var_99))),
+            "lookback_days": len(portfolio_returns),
+        }
+  example_bad: |
+    # BAD: Parametric VaR assumes Gaussian returns — wrong for prediction markets
+    async def var(user_id):
+        returns = await get_returns(user_id)
+        mean = np.mean(returns)
+        std = np.std(returns)
+        return mean - 1.65 * std  # Assumes normal distribution
+  when_applies: "Any prediction market or trading platform needing portfolio-level risk quantification"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: PM-RISK-012
+  text: "Calculate Expected Shortfall (CVaR) alongside VaR to measure the average loss in worst-case scenarios beyond the VaR threshold, capturing tail risk that VaR alone misses."
+  why: >
+    VaR tells you the maximum loss at a confidence level, but nothing about how bad losses
+    can get beyond that point. A platform with 99% VaR of $10K could have expected losses
+    of $100K or $1M in that 1% tail. Expected Shortfall is required by Basel III for banks
+    and is the superior risk measure for fat-tailed distributions like prediction market returns.
+  how_to_do_right: |
+    1. Calculate ES as the mean of all losses beyond the VaR threshold
+    2. Always report ES alongside VaR — never VaR alone
+    3. Use ES for margin requirement calculation (more conservative than VaR)
+    4. Calculate at 95% and 99% confidence levels
+    5. ES should typically be 1.2-1.5x VaR; if much higher, the tail is extremely fat
+    6. Use ES/VaR ratio as a tail-risk indicator — alert if ratio exceeds 2.0
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    import numpy as np
+
+    def calculate_expected_shortfall(
+        returns: np.ndarray, confidence: float = 0.95
+    ) -> dict:
+        var_threshold = np.percentile(returns, (1 - confidence) * 100)
+        tail_losses = returns[returns <= var_threshold]
+
+        es = float(np.mean(tail_losses)) if len(tail_losses) > 0 else 0.0
+        var = float(var_threshold)
+
+        es_var_ratio = abs(es / var) if var != 0 else float("inf")
+
+        return {
+            "var": abs(var),
+            "expected_shortfall": abs(es),
+            "es_var_ratio": es_var_ratio,
+            "tail_observations": len(tail_losses),
+            "tail_risk_alert": es_var_ratio > 2.0,
+        }
+  example_bad: |
+    # BAD: Only VaR, no tail risk measure
+    def risk_metric(returns):
+        return np.percentile(returns, 5)  # VaR only, blind to tail
+  when_applies: "Any prediction market or trading platform that calculates VaR and needs tail risk visibility"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: PM-RISK-013
+  text: "Build a market-wide risk metrics dashboard that aggregates platform-level indicators — total open interest, aggregate VaR, concentration ratios, circuit breaker status, and insurance fund coverage."
+  why: >
+    Individual metrics are necessary but insufficient. The risk team needs a single pane
+    of glass showing overall platform health. Without aggregated metrics, correlated risks
+    across markets go undetected. A political event can simultaneously stress 50 markets,
+    and only a platform-wide view reveals the systemic exposure.
+  how_to_do_right: |
+    1. Calculate platform-wide metrics every 60 seconds: total OI, aggregate VaR, insurance fund ratio
+    2. Track concentration: top-10 users' share of total OI (alert if > 40%)
+    3. Display circuit breaker status for all markets on one screen
+    4. Show insurance fund coverage ratio: fund_balance / aggregate_99_var (alert if < 1.5x)
+    5. Track market correlation matrix — alert when > 5 markets are > 0.8 correlated
+    6. Expose metrics via /api/v1/risk/platform endpoint for automated monitoring
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [dashboards, metrics]
+  example_good: |
+    from pydantic import BaseModel
+
+    class PlatformRiskMetrics(BaseModel):
+        total_open_interest: float
+        aggregate_var_95: float
+        aggregate_var_99: float
+        insurance_fund_balance: float
+        insurance_coverage_ratio: float
+        top10_concentration: float
+        halted_markets: int
+        correlated_market_clusters: int
+        timestamp: str
+
+    @app.get("/api/v1/risk/platform")
+    async def get_platform_risk(db: AsyncSession = Depends(get_db)):
+        oi = await calculate_total_open_interest(db)
+        var = await calculate_aggregate_var(db)
+        fund = await get_insurance_fund_balance(db)
+        concentration = await calculate_top10_concentration(db)
+        halted = await count_halted_markets(db)
+        clusters = await count_correlated_clusters(threshold=0.8, db=db)
+
+        return PlatformRiskMetrics(
+            total_open_interest=oi,
+            aggregate_var_95=var["var_95"],
+            aggregate_var_99=var["var_99"],
+            insurance_fund_balance=fund,
+            insurance_coverage_ratio=fund / var["var_99"] if var["var_99"] > 0 else 999,
+            top10_concentration=concentration,
+            halted_markets=halted,
+            correlated_market_clusters=clusters,
+            timestamp=datetime.utcnow().isoformat(),
+        )
+  example_bad: |
+    # BAD: Metrics only per-market, no platform-wide view
+    @app.get("/api/v1/risk/{market_id}")
+    async def get_risk(market_id: str):
+        return {"open_interest": await get_oi(market_id)}
+        # No aggregation, no concentration, no insurance fund
+  when_applies: "Any prediction market platform operating multiple markets simultaneously"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: PM-RISK-014
+  text: "Set margin requirements as a function of market volatility and position size, requiring users to maintain sufficient collateral to cover potential losses before they can trade."
+  why: >
+    Fixed margin requirements (e.g., always 10%) are either too loose in volatile markets
+    or too restrictive in stable ones. Dynamic margins that increase with volatility
+    protect the platform during stress while maximizing capital efficiency in calm periods.
+    Every major exchange (CME, ICE) uses volatility-adjusted margins through SPAN or similar.
+  how_to_do_right: |
+    1. Base margin = max(5%, 2 * realized_vol_30d) — floors at 5%, scales with volatility
+    2. Add concentration surcharge: +2% for each 10% of market OI held by the user
+    3. Recalculate margins every 6 hours and on circuit breaker events
+    4. Notify users 24 hours before margin increases take effect (except emergency)
+    5. Emergency margin increases (circuit breaker) take effect immediately with 4-hour grace period
+    6. Store margin history for regulatory audit trail
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+
+    async def calculate_margin_requirement(
+        user_id: str, market_id: str, db: AsyncSession
+    ) -> Decimal:
+        vol_30d = await get_realized_volatility(market_id, days=30, db=db)
+        base_margin = max(Decimal("0.05"), Decimal("2") * Decimal(str(vol_30d)))
+
+        # Concentration surcharge
+        user_oi = await get_user_open_interest(user_id, market_id, db)
+        market_oi = await get_market_open_interest(market_id, db)
+        concentration = user_oi / market_oi if market_oi > 0 else Decimal("0")
+        surcharge = (concentration / Decimal("0.1")).to_integral_value() * Decimal("0.02")
+
+        total_margin = base_margin + surcharge
+
+        # Emergency override
+        if await is_circuit_breaker_active(market_id):
+            total_margin = max(total_margin, Decimal("0.25"))
+
+        return min(total_margin, Decimal("1.0"))  # Cap at 100%
+  example_bad: |
+    # BAD: Fixed margin regardless of volatility
+    MARGIN_REQUIREMENT = 0.10  # Always 10%, even in crisis
+    async def check_margin(order):
+        required = order.quantity * order.price * MARGIN_REQUIREMENT
+        return user.balance >= required
+  when_applies: "Any prediction market or leveraged trading platform with collateral requirements"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: PM-RISK-015
+  text: "Implement a risk parameter tuning framework that allows real-time adjustment of all risk thresholds (position limits, circuit breaker levels, margin requirements) without code deployment."
+  why: >
+    Risk parameters need to change faster than deployment cycles. During a crisis, waiting
+    30 minutes for a deploy to tighten margins can result in millions in losses. Every
+    risk parameter should be adjustable in real-time via an admin API with audit trail.
+    Goldman Sachs' risk systems allow parameter changes in under 60 seconds for this reason.
+  how_to_do_right: |
+    1. Store all risk parameters in a dedicated config table with versioning
+    2. Expose admin API: PUT /api/v1/admin/risk-params/{param_name} with auth + 2FA
+    3. Every parameter change must include: who, when, why (reason field mandatory)
+    4. Implement parameter validation: new values must be within allowed ranges
+    5. Cache parameters in Redis with 10-second TTL for performance
+    6. Broadcast parameter changes to all services via pub/sub for immediate effect
+    7. Auto-rollback if parameter change causes > 100 liquidations in 5 minutes
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from pydantic import BaseModel, Field
+
+    class RiskParamUpdate(BaseModel):
+        param_name: str
+        new_value: float
+        reason: str = Field(..., min_length=10)
+        updated_by: str
+
+    PARAM_RANGES = {
+        "position_limit_default": (100, 1_000_000),
+        "circuit_breaker_pct": (0.05, 0.50),
+        "margin_floor": (0.01, 0.50),
+    }
+
+    @app.put("/api/v1/admin/risk-params/{param_name}")
+    async def update_risk_param(
+        param_name: str, update: RiskParamUpdate, admin: Admin = Depends(require_2fa)
+    ):
+        if param_name not in PARAM_RANGES:
+            raise HTTPException(400, f"Unknown parameter: {param_name}")
+
+        min_val, max_val = PARAM_RANGES[param_name]
+        if not (min_val <= update.new_value <= max_val):
+            raise HTTPException(400, f"Value must be between {min_val} and {max_val}")
+
+        old_value = await get_risk_param(param_name)
+        await save_risk_param(param_name, update.new_value, update.reason, admin.id)
+        await r.set(f"risk_param:{param_name}", str(update.new_value), ex=10)
+        await r.publish("risk_param_updates", json.dumps(update.dict()))
+
+        return {"param": param_name, "old": old_value, "new": update.new_value}
+  example_bad: |
+    # BAD: Risk parameters hardcoded — need deployment to change
+    POSITION_LIMIT = 10000  # Hardcoded, cant change without deploy
+    CIRCUIT_BREAKER_PCT = 0.20  # Same
+    MARGIN_FLOOR = 0.10  # Same
+  when_applies: "Any prediction market or trading platform with configurable risk parameters"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: PM-RISK-016
+  text: "Implement a kill switch that immediately halts all trading across all markets with a single API call or button press, to be used during systemic incidents, platform exploits, or regulatory emergencies."
+  why: >
+    When a critical bug, exploit, or systemic event is discovered, every second of continued
+    trading compounds losses. Knight Capital lost $440M in 45 minutes because they could
+    not halt trading fast enough. A kill switch must be instantaneous, require minimal
+    authorization, and be tested regularly to ensure it actually works.
+  how_to_do_right: |
+    1. Implement as a single Redis key check at the TOP of the order submission path
+    2. Kill switch activation: set one key, all markets halt within 1 second
+    3. Require only ONE authorized admin to activate (not quorum — speed > safety in emergencies)
+    4. Auto-cancel all open orders when kill switch is activated
+    5. Send push notification to all connected clients: "Trading halted — emergency maintenance"
+    6. Log the exact timestamp, admin ID, and reason for regulatory compliance
+    7. Test kill switch monthly in staging; annually in production (off-hours)
+    8. Deactivation requires TWO admins (prevent accidental premature restart)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    KILL_SWITCH_KEY = "global:kill_switch"
+
+    async def activate_kill_switch(admin_id: str, reason: str, r: redis.Redis):
+        await r.set(KILL_SWITCH_KEY, json.dumps({
+            "activated_by": admin_id,
+            "reason": reason,
+            "timestamp": datetime.utcnow().isoformat(),
+        }))
+        await cancel_all_open_orders(r)
+        await broadcast_to_all_clients("TRADING_HALTED", reason)
+        await alert_all_admins(f"KILL SWITCH activated by {admin_id}: {reason}")
+
+    async def check_kill_switch(r: redis.Redis) -> bool:
+        return await r.exists(KILL_SWITCH_KEY)
+
+    # In order submission — FIRST check
+    async def submit_order(order: Order, r: redis.Redis):
+        if await check_kill_switch(r):
+            raise TradingHaltedException("Trading is halted — emergency maintenance")
+        # ... rest of order flow
+
+    async def deactivate_kill_switch(admin1: str, admin2: str, r: redis.Redis):
+        if admin1 == admin2:
+            raise ValueError("Two different admins required to deactivate")
+        await r.delete(KILL_SWITCH_KEY)
+        await broadcast_to_all_clients("TRADING_RESUMED", "")
+  example_bad: |
+    # BAD: Kill switch requires deployment — too slow
+    # In config.py:
+    TRADING_ENABLED = True  # Must deploy to change to False
+
+    # BAD: Kill switch per-market, not global
+    async def halt_market(market_id):
+        await db.update(market_id, halted=True)  # One at a time, slow
+  when_applies: "Any prediction market or trading platform — this is a regulatory and safety requirement"
+  sources: ["https://www.cftc.gov/sites/default/files/idc/groups/public/@newsroom/documents/file/federalregister112415.pdf"]
+
+- id: PM-RISK-017
+  text: "Implement risk model backtesting that validates VaR and margin models against historical data, ensuring risk calculations would have caught actual losses, and flag model degradation over time."
+  why: >
+    A VaR model that says 99% VaR is $10K but actual losses exceed $10K more than 1%
+    of days is broken. Without backtesting, risk models silently degrade as market
+    conditions change. Basel III requires banks to backtest VaR daily. Prediction markets
+    should do the same — the binary outcome nature makes backtesting even more critical.
+  how_to_do_right: |
+    1. Run daily backtest: compare yesterday's VaR prediction to actual P&L
+    2. Track breach count: 99% VaR should be breached < 3 times per year
+    3. Use Kupiec test (proportion of failures) with p-value threshold of 0.05
+    4. Use Christoffersen test (clustering of failures) to detect serial correlation
+    5. Generate monthly backtest report with breach count, p-values, and trend
+    6. Auto-alert when breach rate exceeds 2x expected frequency
+    7. Trigger model recalibration when backtest fails for 2 consecutive months
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from scipy import stats
+    import numpy as np
+
+    class VaRBacktester:
+        def __init__(self, confidence: float = 0.99):
+            self.confidence = confidence
+            self.expected_breach_rate = 1 - confidence
+
+        async def run_daily_backtest(self, db: AsyncSession) -> dict:
+            yesterday_var = await get_yesterday_var_prediction(db)
+            actual_pnl = await get_yesterday_actual_pnl(db)
+            breach = actual_pnl < -yesterday_var
+
+            await record_backtest_result(breach, yesterday_var, actual_pnl, db)
+
+            # Kupiec test over last 250 days
+            results = await get_backtest_results(days=250, db=db)
+            breaches = sum(1 for r in results if r.breach)
+            n = len(results)
+
+            expected = n * self.expected_breach_rate
+            kupiec_stat = -2 * (
+                breaches * np.log(self.expected_breach_rate / (breaches / n))
+                + (n - breaches) * np.log((1 - self.expected_breach_rate) / (1 - breaches / n))
+            ) if 0 < breaches < n else 0
+
+            p_value = 1 - stats.chi2.cdf(kupiec_stat, df=1)
+
+            return {
+                "breach_today": breach,
+                "breaches_250d": breaches,
+                "expected_breaches": expected,
+                "kupiec_p_value": p_value,
+                "model_valid": p_value > 0.05,
+            }
+  example_bad: |
+    # BAD: No backtesting — risk model trusted blindly
+    async def calculate_var():
+        # ... some VaR calculation ...
+        return var  # Never validated against actual outcomes
+  when_applies: "Any prediction market or trading platform that uses VaR or other statistical risk models"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: PM-RISK-018
+  text: "Assess and mitigate counterparty risk in prediction markets by monitoring resolution oracle reliability, market maker solvency, and settlement mechanism integrity."
+  why: >
+    In prediction markets, counterparty risk takes unique forms: the oracle that resolves
+    markets can be wrong, compromised, or delayed; market makers can become insolvent;
+    and the settlement mechanism itself can fail. Unlike traditional exchanges with central
+    clearing, prediction market counterparty risk is more distributed and harder to monitor.
+    FTX's collapse showed how counterparty risk can destroy an entire platform overnight.
+  how_to_do_right: |
+    1. Oracle reliability: track resolution accuracy and latency per oracle source
+    2. Maintain multiple oracle sources; require 2-of-3 agreement for high-value market resolution
+    3. Market maker health: monitor P&L, inventory balance, and quote spread per market maker
+    4. Settlement integrity: reconcile positions vs. collateral daily; alert on any mismatch
+    5. Reserve ratio: maintain platform reserve >= 110% of total potential payouts
+    6. Counterparty scoring: assign risk scores to market makers based on historical performance
+    7. Publish transparency report monthly with oracle accuracy, settlement stats, and reserve ratio
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from pydantic import BaseModel
+
+    class CounterpartyRiskReport(BaseModel):
+        oracle_accuracy_30d: float
+        oracle_consensus_failures: int
+        mm_solvency_ratio: float
+        settlement_reconciliation_ok: bool
+        reserve_ratio: float
+        risk_score: str  # LOW, MEDIUM, HIGH, CRITICAL
+
+    async def assess_counterparty_risk(db: AsyncSession) -> CounterpartyRiskReport:
+        oracle_acc = await calculate_oracle_accuracy(days=30, db=db)
+        consensus_fails = await count_oracle_disagreements(days=30, db=db)
+        mm_ratio = await calculate_mm_aggregate_solvency(db)
+        recon_ok = await run_settlement_reconciliation(db)
+        reserve = await calculate_reserve_ratio(db)
+
+        # Risk scoring
+        risk_factors = 0
+        if oracle_acc < 0.99:
+            risk_factors += 1
+        if consensus_fails > 2:
+            risk_factors += 1
+        if mm_ratio < 1.1:
+            risk_factors += 2
+        if not recon_ok:
+            risk_factors += 3
+        if reserve < 1.1:
+            risk_factors += 2
+
+        score = (
+            "CRITICAL" if risk_factors >= 5 else
+            "HIGH" if risk_factors >= 3 else
+            "MEDIUM" if risk_factors >= 1 else
+            "LOW"
+        )
+
+        return CounterpartyRiskReport(
+            oracle_accuracy_30d=oracle_acc,
+            oracle_consensus_failures=consensus_fails,
+            mm_solvency_ratio=mm_ratio,
+            settlement_reconciliation_ok=recon_ok,
+            reserve_ratio=reserve,
+            risk_score=score,
+        )
+  example_bad: |
+    # BAD: Trust single oracle, no counterparty monitoring
+    async def resolve_market(market_id):
+        result = await oracle.get_result(market_id)  # Single source of truth
+        await settle_all_positions(market_id, result)  # No verification
+  when_applies: "Any prediction market platform with external oracles, market makers, or settlement mechanisms"
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]

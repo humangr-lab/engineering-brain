@@ -1,0 +1,748 @@
+layer: rules
+domain: agent_orchestration
+knowledge:
+- id: LETTA-001
+  text: >
+    Letta agent architecture has three memory tiers: Core Memory (in-context, ~2K tokens),
+    Recall Memory (searchable conversation history), and Archival Memory (external vector DB).
+    Core Memory is the only tier always in the context window — treat it as precious RAM.
+    Design personas and human blocks to fit in <500 tokens each.
+  why: >
+    Core memory is always injected into the LLM context window on every message. Bloated
+    core memory wastes tokens that could be used for reasoning. Recall memory stores the
+    full conversation history but is only retrieved on demand (semantic search). Archival
+    memory is the external vector store for long-term knowledge. Developers who store
+    ephemeral session data in core memory instead of recall memory inflate every prompt cost
+    and eventually overflow the context window, causing Letta to error.
+  how_to_do_right: |
+    1. Core Memory blocks: persona (~200 tokens), human (~300 tokens), optional custom blocks (<500 tokens each).
+    2. Store persistent agent identity in persona block — never put conversation history here.
+    3. Store what the agent knows about the user in human block.
+    4. Store structured agent knowledge (preferences, goals) in custom blocks.
+    5. Ephemeral conversation context → recall memory (automatic, no code needed).
+    6. Long-term documents, FAQs, domain knowledge → archival memory (vector search).
+    7. When core memory is full, use inner monologue to decide what to archive: call archival_memory_insert.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [letta]
+  domains:
+    domain: [agent_orchestration, memory_management]
+    concern: [memory_architecture, context_window, token_efficiency]
+  example_good: |
+    from letta import create_client
+
+    client = create_client()
+
+    # Well-designed core memory blocks — concise and purposeful
+    agent = client.create_agent(
+        name="customer_support_agent",
+        memory_blocks=[
+            {
+                "label": "persona",
+                "value": (
+                    "I am a customer support specialist for Acme Corp. "
+                    "I am empathetic, concise, and solution-focused. "
+                    "I escalate to human agents when issues are unresolved after 3 attempts."
+                )
+                # ~50 tokens — leaves room for dynamic content
+            },
+            {
+                "label": "human",
+                "value": "Name: [unknown]. Account tier: [unknown]. Last interaction: [unknown]."
+                # Template updated dynamically via inner monologue on first user message
+            },
+        ],
+        system="You are a customer support agent. Use your tools to search knowledge and update memory."
+    )
+  example_bad: |
+    # Bloated core memory — stores conversation summaries in core (should be recall)
+    agent = client.create_agent(
+        memory_blocks=[
+            {
+                "label": "persona",
+                "value": """
+                I am a support agent. Here is a summary of all past interactions:
+                - 2025-01-15: User asked about billing. Resolved.
+                - 2025-01-22: User reported bug #1234. Escalated.
+                - [... 50 more entries, ~2000 tokens ...]
+                """
+                # This should be in archival memory, not core!
+                # Every message now costs 2000+ extra tokens
+            },
+        ]
+    )
+  when_applies: When designing any Letta agent — memory architecture must be decided before creation
+  sources:
+    - "https://docs.letta.com/guides/agents/memory/"
+    - "https://docs.letta.com/guides/agents/memory-blocks/"
+    - "https://docs.letta.com/concepts/memgpt/"
+
+- id: LETTA-002
+  text: >
+    Design custom memory blocks for structured agent state. Use blocks with explicit labels
+    (not just "human" and "persona") to segment different concerns.
+    Each block has a limit (default 2000 chars); set it explicitly per block based on
+    expected content size.
+  why: >
+    The default "human" and "persona" blocks are generic. Production agents need structured
+    state — user preferences, agent goals, task context, team assignments. Cramming all
+    state into two generic blocks makes it hard for the agent to reason about structured
+    fields and causes confusion about what to update where. Custom blocks with semantic
+    labels give the agent clear contracts: "this block is for user preferences," "this
+    block is for current task state."
+  how_to_do_right: |
+    1. Define blocks per concern: persona, user_profile, current_task, team_context.
+    2. Set limit explicitly per block: persona=1000, user_profile=2000, current_task=1500.
+    3. Use JSON-like structure within blocks for structured state — agent can parse it.
+    4. Never store binary data or large payloads in core memory blocks.
+    5. Update blocks via agent's inner monologue (preferred) or via the Python client API
+       (for external system updates).
+    6. Retrieve block content via client.get_block(agent_id, block_label).
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [letta]
+  domains:
+    domain: [agent_orchestration, memory_management]
+    concern: [memory_blocks, agent_state, structured_memory]
+  example_good: |
+    from letta import create_client
+
+    client = create_client()
+
+    agent = client.create_agent(
+        name="project_manager_agent",
+        memory_blocks=[
+            {
+                "label": "persona",
+                "value": "I am a project management assistant. I track tasks, dependencies, and deadlines.",
+                "limit": 500,
+            },
+            {
+                "label": "user_profile",
+                "value": "Name: [unknown] | Role: [unknown] | Team: [unknown] | Timezone: [unknown]",
+                "limit": 1000,
+            },
+            {
+                "label": "current_sprint",
+                "value": "Sprint: [none] | Deadline: [unknown] | Active tasks: [] | Blockers: []",
+                "limit": 2000,
+            },
+        ],
+    )
+
+    # Read current sprint state from outside the agent
+    sprint_block = client.get_in_context_memory(agent.id)
+    sprint_content = next(b.value for b in sprint_block if b.label == "current_sprint")
+  example_bad: |
+    # All state crammed into "human" block — agent can't reason about structure
+    agent = client.create_agent(
+        memory_blocks=[
+            {
+                "label": "persona",
+                "value": "I am a project manager."
+            },
+            {
+                "label": "human",
+                "value": """
+                User info, sprint info, task list, team context, blockers, preferences,
+                timezone, deadlines, dependencies, meeting schedule, budget, stakeholders...
+                """
+                # 1 undifferentiated block — agent doesn't know what to update where
+            },
+        ]
+    )
+  when_applies: Any Letta agent with more than simple Q&A — task tracking, CRM, project management
+  sources:
+    - "https://docs.letta.com/guides/agents/memory-blocks/"
+    - "https://docs.letta.com/core-concepts/"
+
+- id: LETTA-003
+  text: >
+    Create Letta agents via the Python SDK or REST API — never copy-paste agent IDs.
+    Use agent names as stable identifiers; retrieve by name if the agent already exists.
+    Always handle the case where the agent already exists on idempotent setup scripts.
+  why: >
+    Agent IDs are UUIDs generated at creation time — they change across environments
+    (dev/staging/prod). Code that hardcodes an agent ID breaks on every environment
+    migration. Agent names are user-defined and stable. The Letta Python SDK provides
+    get_agent_by_name() — use it in setup scripts to check if an agent exists before
+    creating it. Creation of duplicate agents wastes money and creates confusion about
+    which agent is the "real" one.
+  how_to_do_right: |
+    1. Always check if agent exists by name before creating.
+    2. Use environment-specific name prefixes: f"{ENV}_customer_support_agent".
+    3. Store the agent_id in application config (database/cache), not source code.
+    4. Use client.get_agents() filtered by name for idempotent scripts.
+    5. On startup: resolve agent_id from name, cache it in memory for the process lifetime.
+    6. Never hardcode agent_id in source code or environment variables.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [letta, fastapi]
+  domains:
+    domain: [agent_orchestration, deployment]
+    concern: [agent_lifecycle, idempotency, configuration]
+  example_good: |
+    import os
+    from letta import create_client
+
+    client = create_client()
+
+    def get_or_create_agent(name: str, **creation_kwargs) -> str:
+        """Idempotent: returns existing agent or creates new one."""
+        existing = [a for a in client.list_agents() if a.name == name]
+        if existing:
+            print(f"Reusing existing agent: {name} (id: {existing[0].id})")
+            return existing[0].id
+
+        agent = client.create_agent(name=name, **creation_kwargs)
+        print(f"Created new agent: {name} (id: {agent.id})")
+        return agent.id
+
+    ENV = os.getenv("ENVIRONMENT", "dev")
+    AGENT_ID = get_or_create_agent(
+        name=f"{ENV}_support_agent",
+        memory_blocks=[
+            {"label": "persona", "value": "I am a support agent."},
+        ],
+    )
+  example_bad: |
+    # Hardcoded agent ID — breaks on every environment change
+    AGENT_ID = "agent-abc123-def456"  # From dev environment — doesn't exist in prod
+
+    def send_message(user_message: str):
+        client.send_message(
+            agent_id=AGENT_ID,  # KeyError in production
+            message=user_message,
+            role="user",
+        )
+  when_applies: All Letta agent initialization code, especially in CI/CD and multi-environment setups
+  sources:
+    - "https://docs.letta.com/api/python/"
+    - "https://docs.letta.com/introduction/"
+
+- id: LETTA-004
+  text: >
+    Send messages to Letta agents with explicit role context. Use role="user" for user
+    messages, role="system" for injecting context updates from external systems.
+    Always await the response and check for tool_calls in the response messages to
+    understand what the agent did.
+  why: >
+    Letta agents return structured response objects containing multiple message types:
+    inner monologue (agent reasoning), tool calls (what the agent decided to do), and
+    assistant messages (what the user sees). Developers who only read the last message
+    miss that the agent called archival_memory_insert and think the message was ignored.
+    Injecting context via role="system" allows external systems to update the agent's
+    knowledge without appearing in the conversation history as user messages.
+  how_to_do_right: |
+    1. For user input: send_message(agent_id, role="user", message=text).
+    2. For system context injection: send_message(agent_id, role="system", message=context_update).
+    3. Parse response.messages to find:
+       - MessageType.ASSISTANT_MESSAGE: the user-visible response
+       - MessageType.TOOL_CALL: tool invocations (memory ops, external APIs)
+       - MessageType.TOOL_RETURN: tool results
+       - MessageType.INTERNAL_MONOLOGUE: agent reasoning (for debugging)
+    4. Check for errors: any message where role=="tool" and is_error==True.
+    5. Set stream=True for long-running responses in production (avoids timeouts).
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [letta, fastapi]
+  domains:
+    domain: [agent_orchestration, messaging]
+    concern: [message_handling, response_parsing, tool_calls]
+  example_good: |
+    from letta import create_client
+    from letta.schemas.letta_message import AssistantMessage, ToolCallMessage
+
+    client = create_client()
+
+    def chat_with_agent(agent_id: str, user_text: str) -> str:
+        response = client.send_message(
+            agent_id=agent_id,
+            message=user_text,
+            role="user",
+        )
+
+        # Extract user-visible response
+        assistant_msgs = [
+            m for m in response.messages
+            if isinstance(m, AssistantMessage)
+        ]
+
+        # Log tool calls for observability
+        tool_calls = [
+            m for m in response.messages
+            if isinstance(m, ToolCallMessage)
+        ]
+        for call in tool_calls:
+            print(f"Agent called tool: {call.tool_call.name}({call.tool_call.arguments})")
+
+        return assistant_msgs[-1].content if assistant_msgs else ""
+
+    # Inject external context update (won't appear in conversation as user message)
+    def inject_system_context(agent_id: str, context: str):
+        client.send_message(
+            agent_id=agent_id,
+            message=f"[System update] {context}",
+            role="system",
+        )
+  example_bad: |
+    def bad_chat(agent_id: str, text: str) -> str:
+        response = client.send_message(agent_id=agent_id, message=text, role="user")
+        # Only reads last message — misses inner monologue and tool calls
+        return response.messages[-1].content  # May be a tool call result, not the user response
+        # Bug: when agent calls archival_memory_search, response.messages[-1] is the tool result
+        # User sees the raw tool JSON instead of the assistant's reply
+  when_applies: All Letta agent interaction code — message sending and response handling
+  sources:
+    - "https://docs.letta.com/guides/agents/memory/"
+    - "https://docs.letta.com/api/python/"
+
+- id: LETTA-005
+  text: >
+    Register custom tools with the Letta agent to extend its capabilities beyond memory operations.
+    Tools are Python functions decorated with proper docstrings — Letta uses the docstring
+    to generate the JSON schema for the LLM. Never register tools that require more than 30 seconds
+    to execute — use async background jobs instead.
+  why: >
+    Tool execution blocks the agent's inner loop: if a tool takes 60 seconds, the entire
+    conversation stalls for 60 seconds. The LLM generates tool calls based on the function
+    signature and docstring — a vague docstring produces incorrect tool invocations.
+    Letta serializes tool arguments as JSON; tools that accept complex non-serializable types
+    (datetime, bytes) will fail with cryptic serialization errors. Type hints are mandatory —
+    Letta uses them to generate JSON schema.
+  how_to_do_right: |
+    1. Keep tools fast: <5 seconds. Anything longer → enqueue to background worker, return job_id.
+    2. Use simple JSON-serializable types: str, int, float, bool, list, dict.
+    3. Write detailed docstrings — they become the tool's LLM description.
+    4. Return a dict or str — the agent reads the return value as tool result.
+    5. Raise ValueError for validation errors — Letta surfaces these to the agent as tool errors.
+    6. Register tools at agent creation or add them later via client.add_tool_to_agent().
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [letta]
+  domains:
+    domain: [agent_orchestration, tool_use]
+    concern: [custom_tools, tool_design, agent_capabilities]
+  example_good: |
+    from letta import create_client
+    from letta.schemas.tool import Tool
+
+    def search_knowledge_base(query: str, max_results: int = 5) -> dict:
+        """
+        Search the product knowledge base for information relevant to the query.
+
+        Args:
+            query: Natural language search query (e.g., "how to reset password")
+            max_results: Maximum number of results to return (1-10)
+
+        Returns:
+            dict with 'results' list (each having 'title', 'content', 'url') and 'count'.
+        """
+        if not query.strip():
+            raise ValueError("Query must not be empty")
+        if not (1 <= max_results <= 10):
+            raise ValueError("max_results must be between 1 and 10")
+
+        # Fast: typically <200ms
+        results = vector_db.search(query, limit=max_results)
+        return {
+            "results": [{"title": r.title, "content": r.content[:500], "url": r.url} for r in results],
+            "count": len(results),
+        }
+
+    client = create_client()
+
+    # Create tool from function
+    kb_tool = client.create_tool(search_knowledge_base)
+
+    # Attach to agent
+    client.add_tool_to_agent(agent_id=agent.id, tool_id=kb_tool.id)
+  example_bad: |
+    def bad_tool(data: dict) -> bytes:
+        """Does stuff."""  # Vague docstring — agent won't know when/how to call this
+        # Non-serializable return type: bytes
+        # No input validation
+        # Potentially long-running — might block agent for minutes
+        result = expensive_ml_model.process(data)  # Could take 120 seconds
+        return result.serialize()  # Returns bytes — Letta can't deserialize this
+  when_applies: Any Letta agent that needs to interact with external systems beyond memory operations
+  sources:
+    - "https://docs.letta.com/guides/agents/memory/"
+    - "https://docs.letta.com/introduction/"
+
+- id: LETTA-006
+  text: >
+    The Letta agent's inner monologue is where it reasons before acting. Read it for debugging
+    but never rely on it for application logic. Use it to detect when the agent is confused
+    (repeated failed tool calls, looping behavior). Set inner_thoughts_in_kwargs=True for
+    structured reasoning.
+  why: >
+    The inner monologue is the agent's "scratch pad" — it contains reasoning chains, self-corrections,
+    and decision-making. Teams that ignore it miss when agents get stuck in retry loops
+    (calling archival_memory_search 10 times with the same query because results never satisfy).
+    The inner monologue reveals this immediately. However, parsing inner monologue content
+    for application logic is fragile — the agent decides what to write there, not you.
+    Use tool call return values for reliable data extraction.
+  how_to_do_right: |
+    1. Log inner monologue to your observability system (Langfuse) on every exchange.
+    2. Alert if the agent makes the same tool call >3 times without progression.
+    3. Alert if inner monologue word count is >1,500 tokens (agent stuck in over-analysis).
+    4. Never parse inner monologue text for extracting structured data — use tool returns.
+    5. Use inner monologue length as a proxy for task difficulty — long reasoning on simple tasks
+       suggests the agent lacks context (core memory needs updating).
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [letta, langfuse]
+  domains:
+    domain: [agent_orchestration, observability]
+    concern: [inner_monologue, debugging, monitoring]
+  example_good: |
+    from collections import Counter
+    from letta.schemas.letta_message import InternalMonologue, ToolCallMessage
+
+    def process_and_monitor(agent_id: str, message: str):
+        response = client.send_message(agent_id=agent_id, message=message, role="user")
+
+        # Extract and log inner monologue
+        monologues = [m for m in response.messages if isinstance(m, InternalMonologue)]
+        tool_calls = [m for m in response.messages if isinstance(m, ToolCallMessage)]
+
+        # Detect stuck-agent pattern: same tool called repeatedly
+        tool_names = [m.tool_call.name for m in tool_calls]
+        repeated = {t: c for t, c in Counter(tool_names).items() if c >= 3}
+        if repeated:
+            alert_oncall(f"Agent {agent_id} called {repeated} repeatedly — possibly stuck")
+
+        # Log to observability
+        langfuse.trace(
+            name="letta_agent_turn",
+            metadata={
+                "agent_id": agent_id,
+                "inner_monologue_tokens": sum(len(m.internal_thought.split()) for m in monologues),
+                "tool_calls": tool_names,
+                "repeated_tools": repeated,
+            }
+        )
+  example_bad: |
+    def extract_from_monologue(response):
+        # Parsing inner monologue for structured data — fragile
+        for msg in response.messages:
+            if hasattr(msg, 'internal_thought'):
+                # Agent might say "I think the answer is 42" or "The result: 42" or just "42"
+                # There is no stable format — this will break
+                if 'the answer is' in msg.internal_thought.lower():
+                    return msg.internal_thought.split('the answer is')[-1].strip()
+  when_applies: All production Letta deployments — monitoring agent behavior is essential
+  sources:
+    - "https://docs.letta.com/concepts/letta/"
+    - "https://www.letta.com/blog/agent-memory"
+
+- id: LETTA-007
+  text: >
+    Attach data sources to Letta agents for retrieval-augmented generation. Upload files
+    via the Letta client, create a source, and attach it to agents. The agent
+    automatically searches the source via archival_memory_search when relevant.
+    Index updates are eventual — expect up to 60 seconds for new files to be searchable.
+  why: >
+    Letta's archival memory is backed by a vector database (Qdrant or pgvector). When you
+    attach a data source, Letta indexes the files and makes them searchable via the
+    archival_memory_search tool that is automatically available to the agent.
+    Developers who expect newly uploaded files to be searchable within milliseconds get
+    wrong results because indexing is asynchronous. Attaching the same source to multiple
+    agents is the correct multi-agent knowledge sharing pattern — not duplicating sources.
+  how_to_do_right: |
+    1. Create source once, attach to multiple agents — never duplicate sources.
+    2. Upload files before attaching source to agent.
+    3. After uploading, wait for source.status == "complete" before relying on search.
+    4. Poll source status with exponential backoff: 1s, 2s, 4s, 8s, max 60s.
+    5. For real-time data: use a custom tool that queries your live system instead of archival.
+    6. Chunk large documents before uploading (max 512 tokens per chunk for best retrieval).
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [letta]
+  domains:
+    domain: [agent_orchestration, rag, knowledge_management]
+    concern: [data_sources, knowledge_indexing, archival_memory]
+  example_good: |
+    import time
+    from letta import create_client
+
+    client = create_client()
+
+    def create_and_attach_knowledge_base(agent_id: str, file_paths: list[str]) -> str:
+        # Create source once
+        source = client.create_source(name="product_knowledge_base")
+
+        # Upload all files
+        for path in file_paths:
+            with open(path, 'rb') as f:
+                client.load_file_to_source(source_id=source.id, file=f, source_id=source.id)
+
+        # Wait for indexing with exponential backoff
+        delay = 1
+        for attempt in range(7):  # max ~64 seconds total
+            source = client.get_source(source_id=source.id)
+            if source.embedding_config is not None:
+                print(f"Source indexed after {attempt + 1} attempts")
+                break
+            time.sleep(delay)
+            delay = min(delay * 2, 16)
+        else:
+            raise TimeoutError("Source indexing timed out after 64 seconds")
+
+        # Attach to agent
+        client.attach_source_to_agent(agent_id=agent_id, source_id=source.id)
+        return source.id
+
+    # Reuse same source for multiple agents — no duplication
+    source_id = create_and_attach_knowledge_base(agent_a_id, ['faq.pdf', 'manual.txt'])
+    client.attach_source_to_agent(agent_id=agent_b_id, source_id=source_id)
+  example_bad: |
+    def bad_setup(agent_id: str, file_path: str):
+        source = client.create_source(name=f"kb_{agent_id}")  # Duplicated source per agent
+        client.load_file_to_source(source_id=source.id, file=open(file_path))
+        client.attach_source_to_agent(agent_id=agent_id, source_id=source.id)
+        # No wait for indexing — agent immediately searches and gets 0 results
+        # Developer thinks archival search is broken; it's just still indexing
+  when_applies: Any Letta agent that needs access to documents, FAQs, or knowledge bases
+  sources:
+    - "https://docs.letta.com/guides/agents/memory/"
+    - "https://docs.letta.com/overview"
+
+- id: LETTA-008
+  text: >
+    Deploy Letta server with Docker for production. Use environment variables for all secrets.
+    Enable E2B sandbox for untrusted tool execution. Configure PostgreSQL as the backend
+    (not SQLite — SQLite does not support concurrent writes from multiple workers).
+  why: >
+    Letta's default SQLite backend serializes writes: only one request can write at a time.
+    In production with multiple concurrent users, SQLite causes "database is locked" errors.
+    PostgreSQL handles concurrent writes correctly and scales to millions of agents.
+    Without E2B sandbox, user-created tools run in the Letta server process with full OS access —
+    a security vulnerability. E2B provides isolated containers for each tool execution.
+  how_to_do_right: |
+    1. Use docker-compose with letta/letta image + postgres:15 service.
+    2. Set LETTA_PG_DB, LETTA_PG_USER, LETTA_PG_PASSWORD, LETTA_PG_HOST, LETTA_PG_PORT.
+    3. Set E2B_API_KEY if users can create custom tools.
+    4. Set LETTA_SERVER_PASSWORD for API authentication.
+    5. Configure LETTA_CORS_ORIGINS to restrict which frontends can connect.
+    6. Run behind a reverse proxy (Nginx/Caddy) — never expose Letta directly on port 80.
+    7. Back up PostgreSQL with pg_dump on a schedule — agent memory is persistent state.
+  severity: critical
+  technologies:
+    lang: [python, yaml]
+    framework: [letta, docker, postgres]
+  domains:
+    domain: [agent_orchestration, deployment, security]
+    concern: [production_deployment, database, sandbox, security]
+  example_good: |
+    # docker-compose.yml for production Letta
+    # version: "3.8"
+    # services:
+    #   postgres:
+    #     image: postgres:15
+    #     environment:
+    #       POSTGRES_DB: letta
+    #       POSTGRES_USER: ${LETTA_PG_USER}
+    #       POSTGRES_PASSWORD: ${LETTA_PG_PASSWORD}
+    #     volumes:
+    #       - postgres_data:/var/lib/postgresql/data
+    #     healthcheck:
+    #       test: ["CMD-SHELL", "pg_isready -U ${LETTA_PG_USER}"]
+    #       interval: 10s
+    #       retries: 5
+    #
+    #   letta:
+    #     image: letta/letta:latest
+    #     ports:
+    #       - "8283:8283"
+    #     environment:
+    #       LETTA_PG_DB: letta
+    #       LETTA_PG_USER: ${LETTA_PG_USER}
+    #       LETTA_PG_PASSWORD: ${LETTA_PG_PASSWORD}
+    #       LETTA_PG_HOST: postgres
+    #       LETTA_PG_PORT: "5432"
+    #       LETTA_SERVER_PASSWORD: ${LETTA_SERVER_PASSWORD}
+    #       E2B_API_KEY: ${E2B_API_KEY}  # Required if users create custom tools
+    #     depends_on:
+    #       postgres:
+    #         condition: service_healthy
+    #
+    # volumes:
+    #   postgres_data:
+
+    # Connect from Python SDK
+    from letta import create_client
+    import os
+
+    client = create_client(
+        base_url=os.getenv("LETTA_BASE_URL", "http://localhost:8283"),
+        token=os.getenv("LETTA_SERVER_PASSWORD"),
+    )
+  example_bad: |
+    # Running Letta with SQLite in production (default if no PG config)
+    # docker run -p 8283:8283 letta/letta:latest
+    # Results in "database is locked" errors under concurrent load
+    # All agent memory stored in SQLite file inside container — lost on container restart
+    # No authentication — any client can access any agent
+  when_applies: Any Letta deployment serving more than 1 concurrent user or agent
+  sources:
+    - "https://docs.letta.com/guides/docker/"
+    - "https://hub.docker.com/r/letta/letta"
+    - "https://aws.amazon.com/blogs/database/how-letta-builds-production-ready-ai-agents-with-amazon-aurora-postgresql/"
+
+- id: LETTA-009
+  text: >
+    Monitor Letta agent behavior by tracking: messages per turn, tool calls per turn,
+    core memory utilization (chars used / chars limit), and archival memory size.
+    Alert when core memory exceeds 80% capacity — the agent will start making errors
+    trying to fit content in an overfull block.
+  why: >
+    Letta agents can silently degrade: a core memory block that reaches its character limit
+    causes the agent to fail memory updates, losing new information without error. Agents
+    that make >10 tool calls per turn are stuck in a reasoning loop, burning tokens.
+    Without monitoring, these issues are invisible until a user reports that "the bot forgot
+    everything" or "it doesn't respond properly." Token cost per turn is a direct proxy
+    for agent confusion — confused agents reason more and cost more.
+  how_to_do_right: |
+    1. After each agent turn, record: n_messages, n_tool_calls, response_latency_ms.
+    2. Compute core memory utilization: sum(len(b.value) / b.limit for each block).
+    3. If any block utilization >80%: alert + trigger agent's memory compaction.
+    4. If n_tool_calls >10 per turn: alert (agent stuck) + optionally interrupt.
+    5. Track archival memory size (vector count) — alert if it exceeds expected growth rate.
+    6. Export metrics to Langfuse or Prometheus for dashboarding.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [letta, langfuse]
+  domains:
+    domain: [agent_orchestration, observability, monitoring]
+    concern: [memory_utilization, agent_health, alerting]
+  example_good: |
+    from letta import create_client
+    from dataclasses import dataclass
+
+    client = create_client()
+
+    @dataclass
+    class AgentHealthMetrics:
+        agent_id: str
+        n_tool_calls: int
+        core_memory_utilization: float  # 0.0–1.0
+        archival_memory_count: int
+        response_latency_ms: float
+
+    def check_agent_health(agent_id: str) -> AgentHealthMetrics:
+        # Core memory utilization
+        memory = client.get_in_context_memory(agent_id)
+        utilized = sum(len(b.value) / b.limit for b in memory if b.limit)
+        avg_utilization = utilized / max(len(memory), 1)
+
+        # Archival memory size (vector count)
+        archival_count = client.get_archival_memory_summary(agent_id).size
+
+        if avg_utilization > 0.8:
+            alert(f"WARN: Agent {agent_id} core memory at {avg_utilization:.0%} capacity")
+
+        return AgentHealthMetrics(
+            agent_id=agent_id,
+            n_tool_calls=0,  # Set from last turn response
+            core_memory_utilization=avg_utilization,
+            archival_memory_count=archival_count,
+            response_latency_ms=0.0,  # Set from timing wrapper
+        )
+  example_bad: |
+    # Fire and forget — no monitoring
+    def chat(agent_id: str, message: str) -> str:
+        response = client.send_message(agent_id=agent_id, message=message, role="user")
+        # Core memory is at 99% — agent silently stops updating human block
+        # No alerts, no metrics — discovered only when user reports "bot forgot my name"
+        return response.messages[-1].content
+  when_applies: All production Letta deployments — monitoring is non-optional for persistent agents
+  sources:
+    - "https://docs.letta.com/overview"
+    - "https://www.letta.com/blog/agent-memory"
+
+- id: LETTA-010
+  text: >
+    Build multi-agent Letta systems by having agents send messages to each other via
+    shared tools or direct API calls. Never share core memory blocks between agents —
+    each agent owns its own memory. Share knowledge via data sources attached to multiple agents.
+  why: >
+    Core memory is per-agent and not thread-safe for cross-agent writes. Attempts to have
+    two agents update the same memory block via direct API calls will cause race conditions
+    and data corruption. The correct pattern is: shared knowledge (documents, FAQs) via
+    shared data sources; agent-to-agent communication via message passing (one agent calls
+    a tool that sends a message to another agent via the Letta API). This maintains
+    isolation while enabling coordination.
+  how_to_do_right: |
+    1. Shared knowledge: attach the same data source to all agents in a team.
+    2. Agent communication: create a "send_to_agent" tool that calls client.send_message()
+       on the target agent and returns its response.
+    3. Manager agent: one agent routes tasks to specialist agents via tools.
+    4. Shared state: use a database (PostgreSQL table) as the coordination point — not
+       cross-agent memory writes.
+    5. Beware of agent-to-agent message loops: set max_rounds=10 in multi-agent orchestration.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [letta]
+  domains:
+    domain: [agent_orchestration, multi_agent, memory_management]
+    concern: [agent_isolation, message_passing, multi_agent_patterns]
+  example_good: |
+    from letta import create_client
+    import os
+
+    client = create_client()
+
+    # Tool for manager agent to delegate to specialist
+    def delegate_to_specialist(specialist_name: str, task: str) -> str:
+        """
+        Delegate a task to a specialist agent and return its response.
+
+        Args:
+            specialist_name: Name of the specialist agent (e.g., "billing_specialist")
+            task: Detailed description of the task to delegate
+
+        Returns:
+            The specialist agent's response as a string.
+        """
+        # Resolve agent ID from name
+        agents = client.list_agents()
+        specialist = next((a for a in agents if a.name == specialist_name), None)
+        if not specialist:
+            return f"Error: specialist '{specialist_name}' not found"
+
+        response = client.send_message(
+            agent_id=specialist.id,
+            message=f"[Delegation from manager] {task}",
+            role="user",
+        )
+
+        # Return specialist's user-visible response
+        from letta.schemas.letta_message import AssistantMessage
+        replies = [m for m in response.messages if isinstance(m, AssistantMessage)]
+        return replies[-1].content if replies else "No response from specialist"
+  example_bad: |
+    # Cross-agent memory write — race condition and data corruption
+    agent_a_memory = client.get_in_context_memory(agent_a_id)
+    shared_block = next(b for b in agent_a_memory if b.label == "shared_state")
+
+    # Agent B also does this simultaneously — last write wins, silently corrupts state
+    client.update_in_context_memory_block(
+        agent_id=agent_b_id,  # Wrong: writing to agent_a's memory via agent_b
+        block_id=shared_block.id,
+        value="Updated by agent B",
+    )
+  when_applies: Any system with 2+ Letta agents that need to coordinate or share knowledge
+  sources:
+    - "https://docs.letta.com/overview"
+    - "https://docs.letta.com/concepts/letta/"

@@ -1,0 +1,1197 @@
+layer: rules
+domain: architecture
+knowledge:
+- id: FF-001
+  text: >
+    Categorize every feature flag at creation time into exactly one of four
+    types — Release, Experiment, Ops, or Permission — and enforce lifecycle
+    constraints per type. Release flags die within 30 days of 100% rollout.
+    Experiment flags die after winner is declared. Ops flags are permanent but
+    must have an owner. Permission flags live as long as the entitlement exists.
+  why: >
+    Treating all flags as identical leads to stale flags accumulating
+    indefinitely. The Knight Capital incident (2012) cost $440M in 45 minutes
+    because a stale release flag was accidentally reactivated, sending a
+    deprecated code path live. Teams with no flag taxonomy struggle to manage
+    even 30 flags; teams with types manage 80+ cleanly because cleanup
+    obligations are clear from day one.
+  how_to_do_right: |
+    1. At flag creation, require: type=(release|experiment|ops|permission),
+       owner=<team-or-person>, expires=<ISO date based on type>.
+    2. Release flags: expires = creation_date + 60 days max.
+    3. Experiment flags: expires = experiment_end_date + 7 days.
+    4. Ops flags: no expiry, but require quarterly review confirmation.
+    5. Permission flags: no expiry, tied to subscription/entitlement model.
+    6. Fail CI on any flag reference that is past its expiration date.
+    7. Enforce via decorator or schema: FlagMetadata(id, type, owner, expires).
+    8. Log flag type in every evaluation for observability.
+  severity: high
+  technologies:
+    lang: [python, typescript, go, java]
+    framework: [openfeature, launchdarkly, flagsmith, unleash]
+  domains:
+    domain: [architecture, feature_management]
+    concern: [technical_debt, lifecycle_management]
+  example_good: |
+    from dataclasses import dataclass
+    from enum import Enum
+    from datetime import date
+
+    class FlagType(Enum):
+        RELEASE = "release"      # max 30 days after 100% rollout
+        EXPERIMENT = "experiment" # until winner declared + 7 days
+        OPS = "ops"              # permanent, quarterly review required
+        PERMISSION = "permission" # permanent, tied to entitlement
+
+    @dataclass
+    class FlagMetadata:
+        id: str
+        type: FlagType
+        owner: str
+        expires: date | None  # None only for ops/permission
+        description: str
+
+    # Registration enforces type contract
+    FLAG_REGISTRY = {
+        "enable-new-checkout-flow": FlagMetadata(
+            id="enable-new-checkout-flow",
+            type=FlagType.RELEASE,
+            owner="checkout-team",
+            expires=date(2025, 3, 15),
+            description="New React checkout, replaces legacy Jinja form",
+        ),
+        "kill-switch-payments": FlagMetadata(
+            id="kill-switch-payments",
+            type=FlagType.OPS,
+            owner="platform-team",
+            expires=None,
+            description="Emergency disable for payment processing",
+        ),
+    }
+
+    def evaluate_flag(flag_id: str) -> bool:
+        meta = FLAG_REGISTRY[flag_id]
+        if meta.expires and meta.expires < date.today():
+            raise RuntimeError(
+                f"FLAG EXPIRED: {flag_id} expired {meta.expires}. "
+                "Remove from codebase immediately."
+            )
+        # ... actual evaluation logic
+  example_bad: |
+    # No type, no owner, no expiry — typical flag graveyard entry
+    flags = {
+        "new_checkout": True,         # When was this? Who owns it?
+        "beta_dashboard": False,       # Is this still needed?
+        "experimental_algo": True,     # Which experiment? What's the result?
+        "old_payment_flow": False,     # Leftover from 2021 migration
+        "temp_disable_emails": True,   # "temp" since 18 months ago
+    }
+    # Six months later: 40 flags, no one knows which are safe to delete
+    # Knight Capital scenario: someone re-enables "old_payment_flow" during deploy
+  when_applies: "Every time a feature flag is created, regardless of the tool or platform."
+  sources:
+    - "Fowler, M. (2023). Feature Toggles (aka Feature Flags) — https://martinfowler.com/articles/feature-toggles.html"
+    - "OpenFeature Blog. Feature Flags: With Great Power Comes Great Responsibility — https://openfeature.dev/blog/feature-flags-with-great-power-comes-great-responsibility/"
+    - "DesignRevision. Feature Flags Best Practices: Complete Guide (2026) — https://designrevision.com/blog/feature-flags-best-practices"
+
+- id: FF-002
+  text: >
+    Use progressive canary rollout with explicit exit criteria at each ring:
+    Internal (team only) → Canary (1-5%) → Beta (10-25%) → GA (100%).
+    Do not advance a ring until the previous ring's error rate delta is below
+    0.1% and p99 latency increase is below 50ms.
+  why: >
+    Progressive delivery reduces production incidents by 70-90% compared to
+    big-bang deploys. At 1-5% canary, a catastrophic regression affects
+    hundreds of users instead of millions. Each ring is an automated gate;
+    without exit criteria the "canary" is just theater — teams eyeball logs
+    and promote prematurely. The exit criteria must be quantitative and
+    checked automatically, not based on "looks good."
+  how_to_do_right: |
+    1. Define exit criteria before starting rollout (not during).
+       error_rate_delta_max = 0.001  (0.1% increase allowed)
+       p99_latency_delta_max_ms = 50
+       min_duration_per_ring = {"internal": "24h", "canary": "48h",
+                                 "beta": "72h", "ga": "7d"}
+    2. Automate ring advancement: query metrics at ring end, only
+       promote if both thresholds pass.
+    3. Roll back immediately if error_rate_delta > 0.5% at any ring.
+    4. Keep canary at 1% (not 5%) for high-risk changes (payment, auth).
+    5. Log ring transitions with metrics snapshot for audit trail.
+    6. Internal ring MUST include at least 2 engineers who are not the author.
+  severity: high
+  technologies:
+    lang: [python, go, typescript]
+    framework: [launchdarkly, flagsmith, unleash, kubernetes]
+  domains:
+    domain: [architecture, reliability]
+    concern: [progressive_delivery, incident_reduction]
+  example_good: |
+    from dataclasses import dataclass
+    from enum import Enum
+    import time
+
+    class Ring(Enum):
+        INTERNAL = ("internal", 0.0)   # 0% — team only via targeting
+        CANARY   = ("canary",   0.01)  # 1%
+        BETA     = ("beta",     0.10)  # 10%
+        GA       = ("ga",       1.00)  # 100%
+
+    @dataclass
+    class RingMetrics:
+        error_rate_delta: float
+        p99_latency_delta_ms: float
+        duration_hours: float
+
+    def can_advance_ring(current: Ring, metrics: RingMetrics) -> tuple[bool, str]:
+        """Returns (ok, reason). Never advance if not ok."""
+        min_durations = {Ring.INTERNAL: 24, Ring.CANARY: 48,
+                         Ring.BETA: 72, Ring.GA: 168}
+        if metrics.duration_hours < min_durations[current]:
+            return False, f"Too early: need {min_durations[current]}h, have {metrics.duration_hours:.1f}h"
+        if metrics.error_rate_delta > 0.001:
+            return False, f"Error delta too high: {metrics.error_rate_delta:.4f} > 0.001"
+        if metrics.p99_latency_delta_ms > 50:
+            return False, f"p99 latency delta too high: {metrics.p99_latency_delta_ms:.1f}ms > 50ms"
+        return True, "all exit criteria passed"
+  example_bad: |
+    # "Canary at 50% for 2 hours then YOLO to 100%"
+    flag_client.update_rollout_percentage("new-checkout", 50)
+    time.sleep(7200)  # 2 hours
+    # Engineer: "Sentry looks quiet, let's go"
+    flag_client.update_rollout_percentage("new-checkout", 100)
+    # 3 hours later: p99 blows up, rollback costs 40 minutes, 5k affected users
+    # Because 50% → 100% in 2h is not canary, it's a delayed big-bang
+  when_applies: "All production rollouts of user-facing features or infrastructure changes that can affect user experience."
+  sources:
+    - "DesignRevision. Feature Flags Best Practices: Complete Guide (2026) — https://designrevision.com/blog/feature-flags-best-practices"
+    - "Fowler, M. (2023). Feature Toggles — https://martinfowler.com/articles/feature-toggles.html"
+    - "LaunchDarkly. Feature flags documentation — https://launchdarkly.com/docs/guides/flags"
+
+- id: FF-003
+  text: >
+    Enforce a hard limit of 50 active flags per service. When the limit is
+    reached, block new flag creation until an existing flag is deleted. Add
+    automated CI checks that fail the build if any flag reference is expired
+    or if flag count exceeds the limit.
+  why: >
+    With N flags there are 2^N possible code paths. At 10 flags you have
+    1,024 combinations — impossible to fully test. At 20 flags: 1 million.
+    Teams that exceed 50 active flags report measurable slowdown in code
+    review, increased flaky tests from flag-state interference, and
+    difficulty onboarding new engineers. The CI hard stop forces the
+    team to pay cleanup debt before taking on new debt — the same
+    discipline as a WIP limit in Kanban.
+  how_to_do_right: |
+    1. Count active flags per service in CI with a dedicated script.
+    2. Define "active" = not expired + referenced in at least one code file.
+    3. Fail CI (not just warn) if count > 50.
+    4. Fail CI if any flag ID referenced in code is past its expiry date.
+    5. Weekly Slack report: top 5 oldest release flags with days since creation.
+    6. Automate flag cleanup ticket creation in Jira/Linear at expiry + 7 days.
+    7. Default limit: 50 for monolith, 20 per microservice.
+  severity: medium
+  technologies:
+    lang: [python, typescript, go]
+    framework: [pytest, jest, github-actions]
+  domains:
+    domain: [architecture, code_quality]
+    concern: [technical_debt, maintainability]
+  example_good: |
+    # ci_flag_check.py — runs in CI pipeline
+    import ast
+    import sys
+    from pathlib import Path
+    from datetime import date
+
+    FLAG_REGISTRY_PATH = "config/feature_flags.json"
+    MAX_ACTIVE_FLAGS = 50
+
+    def check_flag_limits():
+        import json
+        registry = json.loads(Path(FLAG_REGISTRY_PATH).read_text())
+        today = date.today().isoformat()
+
+        active = [f for f in registry["flags"] if not f.get("deleted")]
+        expired = [f for f in active if f.get("expires") and f["expires"] < today]
+
+        errors = []
+        if len(active) > MAX_ACTIVE_FLAGS:
+            errors.append(
+                f"FAIL: {len(active)} active flags exceeds limit of {MAX_ACTIVE_FLAGS}. "
+                f"Remove {len(active) - MAX_ACTIVE_FLAGS} flags before adding new ones."
+            )
+        for f in expired:
+            errors.append(
+                f"FAIL: Flag '{f['id']}' expired on {f['expires']}. "
+                "Remove from code and registry."
+            )
+
+        if errors:
+            print("\n".join(errors))
+            sys.exit(1)
+        print(f"OK: {len(active)}/{MAX_ACTIVE_FLAGS} active flags, 0 expired")
+
+    if __name__ == "__main__":
+        check_flag_limits()
+  example_bad: |
+    # No limits, no CI checks. Results after 18 months:
+    # service-a: 127 active flags (43 are dead code from 2023)
+    # CI is green because nobody checks flag count
+    # New engineer: "Which flags are safe to delete? Who owns 'temp_v2_algo'?"
+    # CTO: "Just don't touch the flags you don't understand"
+    # Result: 5% of production code never runs because flags are permanently off
+  when_applies: "Any service that uses feature flags in production, especially services in active development with frequent releases."
+  sources:
+    - "OpenFeature Blog. Feature Flags: With Great Power Comes Great Responsibility — https://openfeature.dev/blog/feature-flags-with-great-power-comes-great-responsibility/"
+    - "DesignRevision. Feature Flags Best Practices (2026) — https://designrevision.com/blog/feature-flags-best-practices"
+
+- id: FF-004
+  text: >
+    Store flag evaluation logic outside the application binary using the
+    OpenFeature standard API. Your code calls `client.get_boolean_value(flag_id,
+    default)` and a pluggable provider resolves it — never call a vendor SDK
+    directly. This decouples the vendor from every call site.
+  why: >
+    Teams that call LaunchDarkly/Statsig/Flagsmith SDKs directly have
+    vendor logic scattered across hundreds of files. Migrating providers
+    requires touching every call site. A company migrating from LaunchDarkly
+    to Unleash without OpenFeature reported 3 weeks of refactoring across
+    47 microservices. With OpenFeature, the migration is changing one provider
+    registration line. OpenFeature is CNCF-incubated (2022), has SDKs for
+    Python, Go, Java, .NET, and Node.js, and is the de-facto standard.
+  how_to_do_right: |
+    1. Install: pip install openfeature-sdk
+    2. Implement or install a provider (LaunchDarkly, Flagsmith, in-memory).
+    3. Register provider once at app startup:
+       from openfeature import api
+       api.set_provider(LaunchDarklyProvider(sdk_key=os.getenv("LD_SDK_KEY")))
+    4. Evaluate flags ONLY through the OpenFeature client:
+       client = api.get_client()
+       enabled = client.get_boolean_value("flag-id", False, ctx)
+    5. NEVER import vendor SDK in business logic — only in the provider adapter.
+    6. For local dev: use InMemoryProvider with hardcoded defaults.
+    7. For tests: use InMemoryProvider with per-test overrides.
+  severity: high
+  technologies:
+    lang: [python, typescript, go, java]
+    framework: [openfeature]
+  domains:
+    domain: [architecture, vendor_independence]
+    concern: [abstraction, portability]
+  example_good: |
+    # app_startup.py — vendor wired here, nowhere else
+    import os
+    from openfeature import api
+    from openfeature.contrib.provider.launchdarkly import LaunchDarklyProvider
+
+    def configure_flags():
+        provider = LaunchDarklyProvider(sdk_key=os.getenv("LD_SDK_KEY"))
+        api.set_provider(provider)
+
+    # business_logic.py — vendor-agnostic
+    from openfeature import api
+    from openfeature.evaluation_context import EvaluationContext
+
+    def process_checkout(user_id: str, cart: dict) -> dict:
+        client = api.get_client("checkout-service")
+        ctx = EvaluationContext(targeting_key=user_id, attributes={"plan": "pro"})
+
+        if client.get_boolean_value("enable-new-checkout-flow", False, ctx):
+            return new_checkout_logic(cart)
+        return legacy_checkout_logic(cart)
+
+    # test_checkout.py — swap provider in tests, zero vendor coupling
+    from openfeature import api
+    from openfeature.provider.in_memory_provider import InMemoryProvider, InMemoryFlag
+
+    def test_new_checkout_flow():
+        api.set_provider(InMemoryProvider({
+            "enable-new-checkout-flow": InMemoryFlag(default_variant="on",
+                                                     variants={"on": True, "off": False})
+        }))
+        result = process_checkout("user_1", {"item": "book"})
+        assert result["path"] == "new"
+  example_bad: |
+    # business_logic.py — direct vendor coupling everywhere
+    import ldclient  # LaunchDarkly SDK imported directly in business logic
+
+    def process_checkout(user_id: str, cart: dict) -> dict:
+        ld = ldclient.get()
+        user = {"key": user_id}
+        if ld.variation("enable-new-checkout-flow", user, False):
+            return new_checkout_logic(cart)
+        return legacy_checkout_logic(cart)
+
+    # This same pattern repeated in 47 services.
+    # Migrating to Unleash: grep -r "ldclient" src/ → 234 matches
+    # Estimated refactor: 3 weeks, regression risk at every touch point
+  when_applies: "Any new service implementing feature flags, and any existing service migrating to a new flag provider."
+  sources:
+    - "OpenFeature Python SDK — https://openfeature.dev/docs/reference/sdks/server/python/"
+    - "OpenFeature Introduction — https://openfeature.dev/docs/reference/intro/"
+    - "SigNoz. OpenFeature: A Guide to Open-Source Feature Flagging — https://signoz.io/blog/openfeature/"
+
+- id: FF-005
+  text: >
+    Evaluate feature flags locally (client-side evaluation) using a cached
+    copy of flag rules, never via remote RPC per request. Cache TTL: 30
+    seconds for ops/kill-switch flags, 60 seconds for release/permission flags.
+    Fall back to hardcoded defaults if the flag service is unreachable.
+  why: >
+    Remote RPC flag evaluation adds 5-50ms per request and creates an
+    availability dependency: if the flag service is down, your app is
+    down. LaunchDarkly reports that streaming SDK maintains a local copy
+    with sub-millisecond evaluation time. Teams using HTTP-per-request
+    evaluation have reported 3-8% of requests timing out during flag
+    service incidents, cascading into partial outages. The cache TTL of
+    30s for kill switches is the SRE-acceptable tradeoff: at most 30s
+    of exposure before a kill switch takes effect.
+  how_to_do_right: |
+    1. Use a streaming SDK (LaunchDarkly, Flagsmith) that maintains
+       local rule cache via SSE/WebSocket — never HTTP poll per request.
+    2. Set cache TTL per flag type:
+       OPS / kill-switch: 30s max
+       RELEASE / EXPERIMENT: 60s
+       PERMISSION: 300s (permissions change rarely)
+    3. Implement circuit breaker: if flag service unreachable for >5s,
+       switch to hardcoded safe defaults (usually all flags OFF).
+    4. Never call flag evaluation inside a tight loop or per-item in batch.
+       Evaluate once, cache result for the duration of the operation.
+    5. For serverless (Lambda, Cloud Run): initialize SDK in global scope
+       to survive across invocations, not inside the handler.
+    6. Benchmark: flag evaluation must be <1ms p99 locally; alert if >5ms.
+  severity: high
+  technologies:
+    lang: [python, go, typescript, java]
+    framework: [launchdarkly, flagsmith, openfeature]
+  domains:
+    domain: [architecture, performance, reliability]
+    concern: [latency, availability]
+  example_good: |
+    # Streaming SDK — local cache, sub-millisecond evaluation
+    import ldclient
+    from ldclient.config import Config
+
+    # Initialize ONCE at application startup (global scope)
+    ldclient.set_config(Config(sdk_key=os.getenv("LD_SDK_KEY")))
+    _ld_client = ldclient.get()
+
+    def is_feature_enabled(flag_id: str, user_key: str,
+                            default: bool = False) -> bool:
+        """<1ms — reads from in-memory rule cache, no network call."""
+        try:
+            return _ld_client.variation(flag_id, {"key": user_key}, default)
+        except Exception:
+            # Flag service unreachable → safe default
+            return default
+
+    # In AWS Lambda: put initialization OUTSIDE handler
+    # lambda_function.py
+    _ld_client = ldclient.get()  # warm on cold start, reused on warm
+
+    def handler(event, context):
+        # Evaluation is <1ms because rules are cached locally
+        if is_feature_enabled("new-algorithm", event["user_id"]):
+            return new_algorithm(event["data"])
+        return legacy_algorithm(event["data"])
+  example_bad: |
+    # HTTP call per request — 10-50ms overhead, availability dependency
+    import httpx
+
+    async def is_feature_enabled(flag_id: str, user_id: str) -> bool:
+        # This HTTP call happens EVERY request
+        async with httpx.AsyncClient(timeout=0.5) as client:
+            resp = await client.get(
+                f"https://flags.internal.company.com/evaluate/{flag_id}",
+                params={"user_id": user_id}
+            )
+            return resp.json()["enabled"]
+        # If flags.internal is down → TimeoutException → feature fails
+        # Under load: 10k req/s × 30ms = flag service is the bottleneck
+  when_applies: "Any application making more than 1 request per second that uses feature flags."
+  sources:
+    - "LaunchDarkly. Feature flags documentation — https://launchdarkly.com/docs/guides/flags"
+    - "Fowler, M. (2023). Feature Toggles — https://martinfowler.com/articles/feature-toggles.html"
+
+- id: FF-006
+  text: >
+    Test both the enabled AND disabled states of every feature flag in your
+    test suite. Write the disabled-state test first — it validates the
+    rollback path and catches regressions that only surface during emergency
+    disables. Flag state must be injectable via InMemoryProvider, never via
+    environment variables or mocked globals.
+  why: >
+    Teams that only test the "flag on" path discover rollback regressions
+    in production. When a kill switch is activated under incident pressure,
+    the disabled code path often has subtle bugs (null pointer, missing
+    migration, removed API contract) that were never exercised because tests
+    assumed the flag was always on. The Knight Capital failure pattern
+    involved activating old code paths that had never been tested in the
+    new deployment context. Injectable flag state eliminates test brittleness
+    from process-level environment variables.
+  how_to_do_right: |
+    1. For every flag, write two test groups: test_with_flag_on, test_with_flag_off.
+    2. Use InMemoryProvider for test injection — never os.environ or monkeypatch.
+    3. Write disabled-state test FIRST to document expected legacy behavior.
+    4. Parameterize tests to cover both states where business logic diverges:
+       @pytest.mark.parametrize("flag_on", [True, False])
+    5. Include a "flag combination" test for flags that can interact:
+       test_checkout_with_all_flags_off (regression safety net).
+    6. CI must run tests with all flags OFF as a mandatory job (not optional).
+    7. Never skip or xfail a disabled-state test without a documented reason.
+  severity: high
+  technologies:
+    lang: [python, typescript, java]
+    framework: [pytest, jest, openfeature, junit]
+  domains:
+    domain: [architecture, testing]
+    concern: [test_coverage, rollback_safety]
+  example_good: |
+    import pytest
+    from openfeature import api
+    from openfeature.provider.in_memory_provider import InMemoryProvider, InMemoryFlag
+
+    def make_provider(checkout_enabled: bool) -> InMemoryProvider:
+        return InMemoryProvider({
+            "enable-new-checkout-flow": InMemoryFlag(
+                default_variant="on" if checkout_enabled else "off",
+                variants={"on": True, "off": False},
+            )
+        })
+
+    class TestCheckoutFlagOff:
+        """Disabled-state tests — written FIRST, documents rollback behavior."""
+
+        def setup_method(self):
+            api.set_provider(make_provider(checkout_enabled=False))
+
+        def test_legacy_flow_used(self, cart_fixture):
+            result = process_checkout("user_1", cart_fixture)
+            assert result["engine"] == "legacy"
+
+        def test_legacy_flow_handles_empty_cart(self):
+            result = process_checkout("user_1", {"items": []})
+            assert result["status"] == "empty_cart_error"  # legacy behavior
+
+    class TestCheckoutFlagOn:
+        """Enabled-state tests — new behavior under flag."""
+
+        def setup_method(self):
+            api.set_provider(make_provider(checkout_enabled=True))
+
+        def test_new_flow_used(self, cart_fixture):
+            result = process_checkout("user_1", cart_fixture)
+            assert result["engine"] == "new"
+  example_bad: |
+    # Only tests the "on" state, disabled path never exercised
+    def test_checkout():
+        os.environ["ENABLE_NEW_CHECKOUT"] = "true"  # global state mutation
+        result = process_checkout("user_1", cart)
+        assert result["engine"] == "new"
+        # No test for ENABLE_NEW_CHECKOUT=false
+        # Emergency disable at 2am → null pointer in legacy_checkout_logic()
+        # Because it was refactored assuming it would never run again
+  when_applies: "All feature flags, especially release flags approaching production rollout and ops kill-switch flags."
+  sources:
+    - "Fowler, M. (2023). Feature Toggles — https://martinfowler.com/articles/feature-toggles.html"
+    - "OpenFeature Python SDK — https://openfeature.dev/docs/reference/sdks/server/python/"
+    - "DesignRevision. Feature Flags Best Practices (2026) — https://designrevision.com/blog/feature-flags-best-practices"
+
+- id: FF-007
+  text: >
+    Use trunk-based development with feature flags instead of long-lived
+    feature branches. Every developer merges to main daily, with incomplete
+    features hidden behind flags that are OFF in production. Flag-based
+    trunk development eliminates the 20-30% merge rework caused by
+    divergent branches.
+  why: >
+    Long-lived feature branches accumulate merge conflicts at a rate
+    proportional to their age. Google's internal data (from the SRE Book's
+    development chapter) shows branches older than 2 days require
+    disproportionate merge effort. Feature flags allow continuous integration
+    while decoupling integration from deployment: code is always integrated,
+    features are deployed independently when ready. Teams using trunk-based
+    development with flags ship 2-3x more frequently with fewer incidents.
+  how_to_do_right: |
+    1. Branch lifetime policy: feature branches die in ≤1 day; hotfix branches in ≤2h.
+    2. Every PR that adds incomplete feature code MUST wrap it behind a new flag (OFF by default).
+    3. PR template checklist:
+       [ ] Flag is OFF in production config
+       [ ] Flag metadata registered (type, owner, expires)
+       [ ] Both flag states tested
+       [ ] Flag count CI check passes
+    4. Main branch must always be deployable (all tests pass with all flags OFF).
+    5. Rollback = flip flag OFF, not revert commit.
+    6. Deploy and release are separate events: deploy = push binary; release = enable flag.
+    7. Enforce with CI: block merges that increase branch age beyond 24h.
+  severity: medium
+  technologies:
+    lang: [python, typescript, go, java]
+    framework: [github-actions, gitlab-ci, jenkins]
+  domains:
+    domain: [architecture, devops]
+    concern: [continuous_integration, trunk_based_development]
+  example_good: |
+    # PR adds new payment method — incomplete, behind flag (OFF by default)
+    # config/feature_flags.json (committed to main)
+    {
+      "flags": [
+        {
+          "id": "enable-crypto-payment",
+          "type": "release",
+          "owner": "payments-team",
+          "expires": "2025-04-01",
+          "default_value": false  // OFF in all environments until team enables
+        }
+      ]
+    }
+
+    # payment_service.py — merged to main, no long-lived branch
+    def process_payment(method: str, amount: float) -> dict:
+        client = api.get_client()
+        if (method == "crypto" and
+                client.get_boolean_value("enable-crypto-payment", False)):
+            return _crypto_payment(amount)   # new, incomplete, safe behind flag
+        return _standard_payment(method, amount)  # always tested, always works
+    # Main is deployable at every commit. Feature ships when flag is enabled.
+  example_bad: |
+    # Long-lived branch: feature/crypto-payments (3 weeks old)
+    # git log --oneline main..feature/crypto-payments → 47 commits
+    # git diff main...feature/crypto-payments --stat → 234 files changed
+    # git merge feature/crypto-payments
+    # CONFLICT (content): Merge conflict in payment_service.py
+    # CONFLICT (content): Merge conflict in models.py
+    # 2 days of merge conflict resolution
+    # CI: 12 tests failing due to incompatible model changes
+    # Result: 20-30% of sprint capacity consumed by merge work
+  when_applies: "All engineering teams working on shared codebases with multiple concurrent features."
+  sources:
+    - "Fowler, M. (2023). Feature Toggles — https://martinfowler.com/articles/feature-toggles.html"
+    - "DesignRevision. Feature Flags Best Practices (2026) — https://designrevision.com/blog/feature-flags-best-practices"
+
+- id: FF-008
+  text: >
+    Expose flag evaluation metrics in your observability stack: log every
+    flag evaluation with (flag_id, variant, user_segment, timestamp). Build
+    a before/after dashboard comparing the primary business metric (conversion,
+    error rate, latency) between flag variants. Instrument the flag system
+    itself: alert if flag evaluation latency exceeds 5ms or if flag service
+    becomes unreachable.
+  why: >
+    Without flag-level observability you cannot answer: "Is the new checkout
+    hurting conversion?" or "Are errors correlated with the new algorithm flag?"
+    Post-incident analysis repeatedly shows that engineers lacked data to
+    attribute production anomalies to specific flags. Instrumenting the flag
+    system itself prevents a class of silent failures where the flag service
+    is degraded but not fully down — evaluations return stale data without
+    alerting anyone.
+  how_to_do_right: |
+    1. Log every flag evaluation: flag_id, variant_returned, user_id_hash,
+       latency_ms, was_default_used (boolean — true if provider unavailable).
+    2. Index flag_id in your logging system for fast dashboard queries.
+    3. Build a Grafana/Datadog dashboard per flag: variant=on vs variant=off
+       plotted against error_rate, p99_latency, conversion_rate.
+    4. Alert conditions:
+       - flag_evaluation_latency_p99 > 5ms → warn
+       - was_default_used_rate > 1% in 5-min window → alert (provider degraded)
+       - flag_evaluation_errors > 0.1% → alert
+    5. Automate baseline capture: when flag advances to a new ring, capture
+       metrics snapshot as the baseline for that ring's exit criteria.
+    6. Expose /flags/status endpoint: lists all active flags, current variant
+       percentages, last-updated-time, and evaluation count (last 1h).
+  severity: medium
+  technologies:
+    lang: [python, typescript, go]
+    framework: [prometheus, grafana, datadog, opentelemetry]
+  domains:
+    domain: [architecture, observability]
+    concern: [metrics, alerting]
+  example_good: |
+    import time
+    import logging
+    from openfeature import api
+    from openfeature.evaluation_context import EvaluationContext
+
+    logger = logging.getLogger("feature_flags")
+
+    def evaluate_flag_with_observability(
+        flag_id: str,
+        default: bool,
+        user_id: str,
+        extra_attrs: dict | None = None,
+    ) -> bool:
+        ctx = EvaluationContext(
+            targeting_key=user_id,
+            attributes=extra_attrs or {},
+        )
+        start = time.perf_counter()
+        client = api.get_client()
+        detail = client.get_boolean_details(flag_id, default, ctx)
+        latency_ms = (time.perf_counter() - start) * 1000
+
+        # Structured log — queryable in Datadog/CloudWatch/Splunk
+        logger.info("flag_evaluation", extra={
+            "flag_id": flag_id,
+            "variant": str(detail.value),
+            "reason": detail.reason,
+            "user_id_hash": hash(user_id) % 10**9,  # never log raw user_id
+            "latency_ms": round(latency_ms, 3),
+            "was_default_used": detail.reason == "DEFAULT",
+        })
+
+        # Prometheus counter (if using prometheus_client)
+        FLAG_EVAL_COUNTER.labels(
+            flag_id=flag_id, variant=str(detail.value)
+        ).inc()
+
+        return detail.value
+  example_bad: |
+    # No observability — silent failures and no business correlation
+    def process_checkout(user_id: str, cart: dict) -> dict:
+        client = api.get_client()
+        # Flag evaluated, but nothing logged, nothing measured
+        if client.get_boolean_value("enable-new-checkout", False):
+            return new_checkout(cart)
+        return legacy_checkout(cart)
+    # Conversion drops 8% over 3 days. No one knows why.
+    # "Is it the new checkout flag? Was it enabled? For which users?"
+    # Answer: unknown. Rollback required as a precaution.
+  when_applies: "All production services using feature flags, especially experiment and release flags during active rollouts."
+  sources:
+    - "OpenFeature. Evaluation Context specification — https://openfeature.dev/specification/sections/evaluation-context/"
+    - "LaunchDarkly. Feature flags documentation — https://launchdarkly.com/docs/guides/flags"
+    - "DesignRevision. Feature Flags Best Practices (2026) — https://designrevision.com/blog/feature-flags-best-practices"
+
+- id: FF-009
+  text: >
+    Automate stale flag detection and removal. A flag is stale if it is: (a)
+    a release flag at 100% rollout for >30 days, or (b) an experiment flag
+    whose experiment ended >7 days ago. Automate ticket creation for stale
+    flags, block new flags from the same team if their stale count exceeds 3,
+    and delete unused flags from the flag service registry on a 90-day schedule.
+  why: >
+    Stale flags are silent technical debt that compounds. Every stale flag adds
+    one more code path that must be understood during debugging, one more
+    conditional that slows comprehension, and one more potential failure point
+    during emergencies. A codebase with 40 stale flags has 40 potential Knight
+    Capital-style accidents waiting to happen. Automation is required because
+    manual cleanup never happens under sprint pressure — every team intends to
+    clean up and never does without enforcement.
+  how_to_do_right: |
+    1. Daily cron job: scan flag registry for stale conditions:
+       SELECT id, type, owner, created_at, last_modified_at
+       FROM flags
+       WHERE (type = 'release' AND rollout_pct = 100
+              AND last_modified_at < NOW() - INTERVAL '30 days')
+         OR  (type = 'experiment' AND experiment_ended_at < NOW() - INTERVAL '7 days');
+    2. For each stale flag: create a Linear/Jira ticket assigned to owner.
+    3. If stale_count(team) > 3: block that team from creating new flags
+       via flag service API (return 403 with cleanup instructions).
+    4. 90-day registry cleanup: archive flags deleted from code but still
+       in flag service registry (prevents ghost flag re-activation).
+    5. Quarterly audit: report percentage of flags cleaned up on time.
+       Target: >80% of release flags removed within 45 days of 100% rollout.
+  severity: medium
+  technologies:
+    lang: [python, sql]
+    framework: [launchdarkly, flagsmith, postgresql, jira, linear]
+  domains:
+    domain: [architecture, code_quality]
+    concern: [technical_debt, automation]
+  example_good: |
+    # scripts/stale_flag_cleanup.py — runs daily in CI
+    from datetime import datetime, timedelta
+    import json
+
+    STALE_THRESHOLDS = {
+        "release": timedelta(days=30),    # after reaching 100% rollout
+        "experiment": timedelta(days=7),  # after experiment conclusion
+    }
+    MAX_STALE_FLAGS_BEFORE_BLOCK = 3
+
+    def find_stale_flags(registry: list[dict]) -> list[dict]:
+        now = datetime.utcnow()
+        stale = []
+        for flag in registry:
+            ftype = flag.get("type")
+            if ftype == "release" and flag.get("rollout_pct", 0) == 100:
+                full_rollout_at = datetime.fromisoformat(flag["full_rollout_at"])
+                if now - full_rollout_at > STALE_THRESHOLDS["release"]:
+                    stale.append({**flag, "stale_reason": "release_at_100pct_30d"})
+            elif ftype == "experiment" and flag.get("experiment_ended_at"):
+                ended_at = datetime.fromisoformat(flag["experiment_ended_at"])
+                if now - ended_at > STALE_THRESHOLDS["experiment"]:
+                    stale.append({**flag, "stale_reason": "experiment_ended_7d"})
+        return stale
+
+    def enforce_team_stale_limit(stale: list[dict], limit: int = 3) -> list[str]:
+        """Returns list of teams that should be blocked from creating new flags."""
+        from collections import Counter
+        counts = Counter(f["owner_team"] for f in stale)
+        return [team for team, count in counts.items() if count > limit]
+  example_bad: |
+    # Manual cleanup in sprint planning (never happens in practice)
+    # Sprint planning notes (2024-10-14):
+    # TODO: clean up stale flags (added 2024-03-01 — still here)
+    # TODO: remove "enable-new-algo" (at 100% since June) (added 2024-07-02)
+    # TODO: audit flag registry (added 2024-01-15 — overdue by 9 months)
+    # Sprint ends with 0 flags cleaned up because P0 bugs took priority
+    # Result: 60 stale flags, 3 engineers who understand them all left
+  when_applies: "Any service with more than 10 cumulative feature flags created over its lifetime."
+  sources:
+    - "Fowler, M. (2023). Feature Toggles — https://martinfowler.com/articles/feature-toggles.html"
+    - "OpenFeature Blog. Feature Flags: With Great Power — https://openfeature.dev/blog/feature-flags-with-great-power-comes-great-responsibility/"
+
+- id: FF-010
+  text: >
+    Implement flag-scoped kill switches as a distinct class: a single toggle
+    that disables an entire feature subsystem regardless of other flags.
+    Kill switches must evaluate in under 1ms, must use the lowest possible
+    cache TTL (30 seconds), and must be testable by on-call engineers without
+    code deployment or database changes.
+  why: >
+    During production incidents, engineers need to act in under 5 minutes.
+    A kill switch that requires a code deploy (15-30 minutes), a DB migration,
+    or a feature-flag-service restart is useless under fire. Netflix Chaos
+    Engineering principles show that kill switches must be tested in production
+    regularly (not just in staging) to ensure they work when needed. A kill
+    switch that hasn't been exercised in 3 months is likely broken or has
+    an inactive dependency.
+  how_to_do_right: |
+    1. Name kill switches with a standard prefix: "kill-switch-<subsystem>".
+       Examples: kill-switch-payments, kill-switch-notifications, kill-switch-ai-agent.
+    2. Kill switches are type=OPS, permanent, no expiry.
+    3. Cache TTL must be ≤30 seconds (streaming SDK handles this).
+    4. Kill switch scope: when OFF, the entire subsystem returns a safe default
+       (queue item, cached response, graceful degradation) — never an error.
+    5. Add kill switch checks at subsystem boundaries, not deep in call stacks:
+       if not is_subsystem_enabled("payments"): return PAYMENT_QUEUED_RESPONSE
+    6. Test monthly: flip kill switch ON→OFF in staging, verify graceful degradation.
+    7. Document recovery procedure (how to re-enable) in a runbook.
+    8. Add kill switch status to /health endpoint (not just /flags/status).
+  severity: critical
+  technologies:
+    lang: [python, go, typescript, java]
+    framework: [launchdarkly, flagsmith, openfeature]
+  domains:
+    domain: [architecture, reliability, incident_response]
+    concern: [kill_switch, graceful_degradation]
+  example_good: |
+    from enum import Enum
+    from openfeature import api
+
+    class SubsystemStatus(Enum):
+        ENABLED = "enabled"
+        DISABLED_GRACEFUL = "disabled_graceful"
+
+    def check_kill_switch(subsystem: str) -> SubsystemStatus:
+        """
+        Check kill switch at subsystem boundary — evaluates in <1ms.
+        Fail-safe: if flag service unreachable, default=True means subsystem ENABLED.
+        """
+        client = api.get_client()
+        # Default=True is intentional: system stays UP if flag service is down
+        enabled = client.get_boolean_value(f"kill-switch-{subsystem}", True)
+        return SubsystemStatus.ENABLED if enabled else SubsystemStatus.DISABLED_GRACEFUL
+
+    # payment_gateway.py — kill switch at the subsystem entry point
+    def initiate_payment(order_id: str, amount: float) -> dict:
+        status = check_kill_switch("payments")
+        if status == SubsystemStatus.DISABLED_GRACEFUL:
+            # Safe fallback: queue for later processing, no error to user
+            enqueue_payment_for_retry(order_id, amount)
+            return {"status": "queued", "message": "Processing momentarily delayed"}
+        return _execute_payment(order_id, amount)
+  example_bad: |
+    # Kill switch that requires a deploy to activate
+    PAYMENTS_ENABLED = os.getenv("PAYMENTS_ENABLED", "true") == "true"
+    # To disable: change env var in Kubernetes manifest → PR → CI → deploy (20 min)
+    # During incident at 2am: "We need to disable payments NOW"
+    # SRE: "I need to update the helm chart, wait for CI..."
+    # 3,000 failed payment transactions later: deploy completes
+    # Lesson: environment variables are not kill switches
+  when_applies: "Any feature or subsystem that can cause user-facing failures and needs emergency disable capability."
+  sources:
+    - "LaunchDarkly. What Are Feature Flags — https://launchdarkly.com/blog/what-are-feature-flags/"
+    - "DesignRevision. Feature Flags Best Practices (2026) — https://designrevision.com/blog/feature-flags-best-practices"
+
+- id: FF-011
+  text: >
+    Multi-environment flag management requires environment-specific overrides
+    with a strict promotion order: local → dev → staging → production.
+    Flags must be OFF by default in all environments. Enabling a flag in
+    production requires it to have been ON in staging for a minimum of
+    48 hours without errors.
+  why: >
+    Teams that treat flag configuration as identical across environments
+    have staging drift: flags enabled in staging "for testing" that were
+    never properly validated propagate to production. The reverse is also
+    dangerous: enabling flags in production that were never on in staging
+    means you have no baseline to compare against. The 48-hour staging
+    requirement is the minimum to capture a full business day cycle
+    (weekday morning rush, evening traffic, next-day batch jobs).
+  how_to_do_right: |
+    1. Flag service must support environment namespacing:
+       dev/enable-new-checkout, staging/enable-new-checkout, prod/enable-new-checkout.
+    2. Default in ALL environments: false (off).
+    3. Promotion gate: before enabling in prod, query staging metrics:
+       - staging ON for ≥48 hours
+       - staging error_rate_delta ≤ 0.1%
+       - staging p99_latency_delta_ms ≤ 50ms
+    4. Never enable a flag in prod before it has been tested in staging.
+    5. Local dev: use InMemoryProvider with flags ON for the feature under dev.
+    6. Never copy production flag state to staging (they diverge intentionally).
+    7. Each environment has its own SDK key/token; never share across envs.
+  severity: high
+  technologies:
+    lang: [python, typescript, go]
+    framework: [launchdarkly, flagsmith, openfeature, unleash]
+  domains:
+    domain: [architecture, devops, environments]
+    concern: [environment_promotion, staging_validation]
+  example_good: |
+    import os
+    from openfeature import api
+    from openfeature.evaluation_context import EvaluationContext
+
+    # Each environment uses a different SDK key — enforced by deployment config
+    ENV_PROVIDERS = {
+        "local":   "in-memory",
+        "dev":     os.getenv("FLAG_SDK_KEY_DEV"),
+        "staging": os.getenv("FLAG_SDK_KEY_STAGING"),
+        "prod":    os.getenv("FLAG_SDK_KEY_PROD"),
+    }
+
+    # Promotion check script — run before enabling flag in prod
+    def can_promote_to_prod(flag_id: str, staging_metrics: dict) -> tuple[bool, str]:
+        hours_on = staging_metrics.get("hours_enabled_in_staging", 0)
+        error_delta = staging_metrics.get("error_rate_delta", 999)
+        latency_delta = staging_metrics.get("p99_latency_delta_ms", 999)
+
+        if hours_on < 48:
+            return False, f"Only {hours_on}h in staging (need 48h)"
+        if error_delta > 0.001:
+            return False, f"Error delta {error_delta:.4f} > 0.001 in staging"
+        if latency_delta > 50:
+            return False, f"Latency delta {latency_delta}ms > 50ms in staging"
+        return True, "promotion criteria met"
+  example_bad: |
+    # Same flag config in all environments — classic mistake
+    ALL_FLAGS = {
+        "enable-new-checkout": True,   # "we're testing it in staging" but prod too?
+        "debug-mode": True,             # debug mode in production!
+        "use-mock-payments": True,      # was enabled for staging testing, oops
+    }
+    # deploy script copies ALL_FLAGS directly to prod
+    # Monday morning: production uses mock payments, debug logs leak PII
+  when_applies: "All services with production feature flags, especially those with staging environments used for pre-production validation."
+  sources:
+    - "Flagsmith. Top 7 Feature Flag Tools — https://www.flagsmith.com/blog/top-7-feature-flag-tools"
+    - "LaunchDarkly. Feature flags documentation — https://launchdarkly.com/docs/guides/flags"
+
+- id: FF-012
+  text: >
+    Implement server-side flag evaluation for security-sensitive flags
+    (access control, pricing, feature entitlements). Client-side evaluation
+    of security flags enables user manipulation of flag state via browser
+    devtools or intercepted API calls. Server-side flags must never be
+    exposed in JavaScript bundles.
+  why: >
+    Client-side feature flags in JavaScript are visible in the bundle and
+    overridable via browser console. In 2023, a widely-reported incident
+    involved users enabling a "premium feature" client-side flag by
+    modifying localStorage, accessing paid features for free. Revenue
+    impact: 6-figure loss before detection. Any flag that gates paid
+    content, pricing tiers, or security controls must be evaluated
+    server-side only. Client-side flags are appropriate only for pure
+    UX decisions (color, layout, copy) with no security implication.
+  how_to_do_right: |
+    1. Classify flags by security sensitivity:
+       SERVER_SIDE_REQUIRED: pricing, entitlements, security controls, admin features
+       CLIENT_SIDE_OK: UI layout, color schemes, copy text, animation variants
+    2. For server-side flags: evaluate in API handler, inject result into response.
+       Never send raw flag state to client; send the resolved outcome only.
+    3. For client-side (UI) flags: only expose flags of type EXPERIMENT or UI.
+       Never expose OPS or PERMISSION flags to the client.
+    4. Audit flag exposure: scan JavaScript bundles for flag_id strings
+       that correspond to server-side-required flags.
+    5. Server response: include resolved capability, not flag state:
+       {"can_access_premium": true}  NOT  {"enable_premium_flag": true}
+  severity: critical
+  technologies:
+    lang: [python, typescript, go, javascript]
+    framework: [fastapi, nextjs, openfeature]
+  domains:
+    domain: [architecture, security]
+    concern: [access_control, client_side_security]
+  example_good: |
+    # FastAPI server-side evaluation — user never sees raw flag state
+    from fastapi import APIRouter, Depends
+    from openfeature import api
+
+    router = APIRouter()
+
+    @router.get("/api/user/capabilities")
+    async def get_user_capabilities(user: User = Depends(get_current_user)):
+        client = api.get_client()
+        ctx = EvaluationContext(
+            targeting_key=user.id,
+            attributes={"plan": user.subscription_plan}
+        )
+        # Server evaluates flag with user context — client gets resolved BOOLEAN
+        can_access_premium = client.get_boolean_value(
+            "enable-premium-analytics",  # security-sensitive flag
+            False,
+            ctx
+        )
+        # Return capability, NOT flag state. Client cannot manipulate this.
+        return {
+            "can_access_premium_analytics": can_access_premium,
+            # Never: "enable_premium_analytics_flag": True  ← client could copy this
+        }
+  example_bad: |
+    // frontend/app.ts — security flag exposed client-side
+    const flags = await fetchFlags(userId);
+    // flags.enable_premium_analytics is now in browser memory
+    // User opens devtools: localStorage.setItem("enable_premium_analytics", "true")
+    // Next render: premium features unlocked with zero server validation
+    if (flags.enable_premium_analytics || localStorage.getItem("enable_premium_analytics")) {
+        showPremiumDashboard();  // Revenue loss
+    }
+  when_applies: "Any flag that controls access to paid features, administrative capabilities, or security-sensitive functionality."
+  sources:
+    - "OWASP. Broken Access Control — https://owasp.org/Top10/A01_2021-Broken_Access_Control/"
+    - "Fowler, M. (2023). Feature Toggles — https://martinfowler.com/articles/feature-toggles.html"
+    - "LaunchDarkly. Feature flags documentation — https://launchdarkly.com/docs/guides/flags"
+
+- id: FF-013
+  text: >
+    Use flag dependencies explicitly when one flag gates access to another.
+    Never allow flag B to be enabled if flag A is disabled — enforce this
+    at the flag service level using dependency rules, not ad-hoc if/elif
+    chains in application code. Document all flag dependencies in the registry.
+  why: >
+    Implicit flag dependencies in code create invisible coupling: engineer A
+    enables flag B without knowing flag A must be ON first. In production,
+    this surfaces as mysterious errors ("why is the new checkout broken when
+    the payment V2 flag is off?"). Flag service-level dependency enforcement
+    prevents this class of misconfiguration with zero runtime cost. PostMortems
+    from teams at Spotify and Airbnb both cite flag dependency violations as
+    root causes of multi-hour outages.
+  how_to_do_right: |
+    1. In flag registry, define explicit dependencies:
+       flag_id: "enable-checkout-v2"
+       depends_on: ["enable-payment-v2"]
+       # Service refuses to enable checkout-v2 if payment-v2 is off
+    2. Flag service validates dependency graph on flag creation and on enable.
+    3. In application code, check parent flag first (defensive):
+       if not is_enabled("enable-payment-v2"): return legacy_payment()
+       if not is_enabled("enable-checkout-v2"): return legacy_checkout()
+    4. Visualize dependency graph in flag dashboard (even simple ASCII tree).
+    5. Block circular dependencies at registration time.
+    6. When rolling back, respect reverse dependency order:
+       roll back checkout-v2 BEFORE payment-v2.
+  severity: high
+  technologies:
+    lang: [python, typescript, go]
+    framework: [launchdarkly, flagsmith, openfeature]
+  domains:
+    domain: [architecture, flag_dependencies]
+    concern: [dependency_management, misconfiguration_prevention]
+  example_good: |
+    from dataclasses import dataclass, field
+
+    @dataclass
+    class FlagDependency:
+        flag_id: str
+        depends_on: list[str] = field(default_factory=list)
+
+    DEPENDENCIES = [
+        FlagDependency("enable-checkout-v2", depends_on=["enable-payment-v2"]),
+        FlagDependency("enable-express-checkout", depends_on=["enable-checkout-v2"]),
+        # Dependency graph: payment-v2 → checkout-v2 → express-checkout
+    ]
+
+    def can_enable_flag(flag_id: str, currently_enabled: set[str]) -> tuple[bool, str]:
+        """Validate all dependencies are enabled before allowing flag activation."""
+        dep = next((d for d in DEPENDENCIES if d.flag_id == flag_id), None)
+        if dep is None:
+            return True, "no dependencies"
+        missing = [d for d in dep.depends_on if d not in currently_enabled]
+        if missing:
+            return False, f"Dependencies not enabled: {missing}. Enable them first."
+        return True, "all dependencies satisfied"
+
+    # Usage in flag management CLI / API:
+    ok, reason = can_enable_flag("enable-checkout-v2", currently_enabled={"enable-payment-v2"})
+    assert ok  # payment-v2 is enabled, so checkout-v2 can be enabled
+  example_bad: |
+    # Implicit dependency scattered in application code — invisible to operators
+    def process_order(order_id: str) -> dict:
+        # Engineer who wrote this knows checkout-v2 requires payment-v2
+        # Operator who enables checkout-v2 at 11pm does not know this
+        if is_enabled("enable-checkout-v2") and is_enabled("enable-payment-v2"):
+            return new_checkout_with_new_payment(order_id)
+        elif is_enabled("enable-checkout-v2"):
+            # This branch is a bug: checkout-v2 silently falls back to legacy payment
+            return new_checkout_with_legacy_payment(order_id)  # data inconsistency
+        return legacy_checkout(order_id)
+  when_applies: "Any system with more than 5 feature flags where some flags build on capabilities exposed by other flags."
+  sources:
+    - "Fowler, M. (2023). Feature Toggles — https://martinfowler.com/articles/feature-toggles.html"
+    - "LaunchDarkly. Feature flags documentation — https://launchdarkly.com/docs/guides/flags"
+
+- id: FF-014
+  text: >
+    For A/B experiment flags, calculate required sample size before rollout
+    and do not read results until statistical significance is reached.
+    Minimum detectable effect (MDE) = 5% relative change, power = 0.80,
+    alpha = 0.05. Stopping experiments early due to "promising early results"
+    is a p-hacking pattern that produces false positives 30-40% of the time.
+  why: >
+    Experiment flags without statistical discipline are worse than no
+    experiments — they give false confidence in wrong decisions. A/B test
+    results read at 2 days with 10% traffic appear statistically significant
+    due to novelty effect (new feature gets attention, not because it's
+    better). Teams at Booking.com and Etsy have documented that experiments
+    stopped early based on "looks great" gut checks led to shipping features
+    that hurt long-term retention. Pre-calculate sample size, commit to it
+    before launch, do not peek.
+  how_to_do_right: |
+    1. Pre-calculate sample size BEFORE enabling the experiment flag:
+       from scipy.stats import norm
+       z_alpha = norm.ppf(1 - 0.05/2)  # 1.96
+       z_beta = norm.ppf(0.80)         # 0.84
+       baseline_rate = 0.05            # current conversion
+       mde_relative = 0.05             # detect 5% relative change
+       effect_size = baseline_rate * mde_relative
+       n_per_group = 2 * ((z_alpha + z_beta) / effect_size) ** 2
+    2. Document required_n, expected_duration, and end_date in flag metadata.
+    3. Do NOT read experiment results until required_n is reached per group.
+    4. Use a decision rule at experiment end: p < 0.05 AND |effect| > MDE.
+    5. After winner declared, remove loser code path within 7 days.
+    6. For revenue-critical experiments: use sequential testing (O'Brien-Fleming
+       boundaries) to allow early stopping with controlled error rate.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [scipy, statsmodels, launchdarkly, openfeature]
+  domains:
+    domain: [architecture, experimentation, statistics]
+    concern: [a_b_testing, statistical_validity]
+  example_good: |
+    from scipy.stats import norm, chi2_contingency
+    import math
+
+    def calculate_sample_size(
+        baseline_rate: float,   # current conversion rate (e.g., 0.05 = 5%)
+        mde_relative: float,    # minimum detectable effect as relative change (e.g., 0.05 = 5%)
+        alpha: float = 0.05,    # type I error rate
+        power: float = 0.80,    # 1 - type II error rate
+    ) -> int:
+        effect_absolute = baseline_rate * mde_relative
+        z_alpha = norm.ppf(1 - alpha / 2)
+        z_beta = norm.ppf(power)
+        p1, p2 = baseline_rate, baseline_rate + effect_absolute
+        p_avg = (p1 + p2) / 2
+        n = (2 * p_avg * (1 - p_avg) * (z_alpha + z_beta) ** 2) / effect_absolute**2
+        return math.ceil(n)
+
+    # Before enabling experiment flag:
+    n_required = calculate_sample_size(baseline_rate=0.05, mde_relative=0.05)
+    print(f"Required per group: {n_required}")  # ~6,100 per group at 5% baseline
+    # Set experiment end date based on traffic: 6100 / (daily_traffic * 0.10)
+    # COMMIT to this end date. Do not read results before then.
+  example_bad: |
+    # Day 2 of experiment, 500 users per group
+    control_conversions, treatment_conversions = 23, 31
+    # "31 vs 23! That's 35% lift! Ship it!"
+    # p-value with 500 samples: 0.14 → NOT significant
+    # But engineer reads early, sees "promising" results, ends experiment
+    # Ships treatment → 6 weeks later: conversion identical to control
+    # Because the early "signal" was noise (p-hacking)
+    # 3 engineering weeks invested in feature that provided zero value
+  when_applies: "Any experiment (A/B test) using feature flags to gate variant assignment, particularly for conversion, retention, or revenue metrics."
+  sources:
+    - "Kohavi, R., Tang, D., Xu, Y. (2020). Trustworthy Online Controlled Experiments. Cambridge University Press."
+    - "Fowler, M. (2023). Feature Toggles — https://martinfowler.com/articles/feature-toggles.html"
+    - "LaunchDarkly. What Are Feature Flags — https://launchdarkly.com/blog/what-are-feature-flags/"
+
+- id: FF-015
+  text: >
+    Implement user-targeted flags for beta access and gradual rollout using
+    deterministic hashing, not random assignment. Hash (user_id + flag_id)
+    modulo 100 to get a bucket number. This guarantees consistency: the
+    same user always gets the same variant across all sessions, servers,
+    and restarts — without storing per-user assignments in the database.
+  why: >
+    Random per-request assignment (rand() < rollout_pct) causes the same
+    user to see different variants on page refresh, creating an inconsistent
+    UX that destroys experiment validity and confuses users ("the button
+    keeps changing"). Database-per-user assignment is consistent but requires
+    a DB lookup per request (10-50ms). Deterministic hashing is consistent,
+    database-free, stateless, and reproducible — you can always recompute
+    what variant any user was in at any past timestamp.
+  how_to_do_right: |
+    1. Compute bucket from HMAC-SHA256(key=flag_id, message=user_id) mod 100.
+    2. Use HMAC to prevent enumeration of bucket boundaries.
+    3. Bucket assignment is stable: same inputs → same bucket always.
+    4. For cohort isolation in sequential A/B tests, salt the key:
+       HMAC-SHA256(key=f"{flag_id}:{experiment_version}", message=user_id)
+    5. Evaluate at request time from cached flag rules (no DB call).
+    6. For beta lists: combine bucket check with explicit beta_users set:
+       is_enabled = user_id in beta_users OR bucket(user_id, flag_id) < rollout_pct
+    7. Log bucket assignment alongside variant for reproducibility in analysis.
+  severity: medium
+  technologies:
+    lang: [python, go, typescript, java]
+    framework: [openfeature, launchdarkly]
+  domains:
+    domain: [architecture, experimentation]
+    concern: [user_targeting, deterministic_rollout]
+  example_good: |
+    import hmac
+    import hashlib
+
+    def get_user_bucket(user_id: str, flag_id: str) -> int:
+        """
+        Deterministic bucket 0-99. Same user+flag always → same bucket.
+        Uses HMAC to prevent bucket boundary enumeration.
+        """
+        key = flag_id.encode()
+        msg = user_id.encode()
+        digest = hmac.new(key, msg, hashlib.sha256).hexdigest()
+        # Use first 8 hex chars (32 bits) for uniform distribution
+        return int(digest[:8], 16) % 100
+
+    def is_flag_enabled(flag_id: str, user_id: str,
+                         rollout_pct: int,
+                         beta_users: set[str] | None = None) -> bool:
+        """
+        Deterministic, consistent per user. No DB lookup, no random().
+        """
+        if beta_users and user_id in beta_users:
+            return True  # explicit beta access
+        bucket = get_user_bucket(user_id, flag_id)
+        return bucket < rollout_pct
+
+    # Test: same user always gets same bucket
+    assert get_user_bucket("user_42", "enable-new-checkout") == \
+           get_user_bucket("user_42", "enable-new-checkout")  # always True
+  example_bad: |
+    import random
+
+    def is_flag_enabled(user_id: str, rollout_pct: int) -> bool:
+        # Random per call — user sees variant A on one request, B on the next
+        return random.random() < rollout_pct / 100
+
+    # User: "Why does the new checkout appear and disappear randomly?"
+    # Experiment data: contaminated (same user in both control and treatment)
+    # Analysis: "Why is treatment effect negative for 30% of users?"
+    # Answer: those users saw both variants — their behavior is uninterpretable
+  when_applies: "Any feature flag used for gradual rollout, A/B experiments, or beta access where user experience consistency matters."
+  sources:
+    - "Fowler, M. (2023). Feature Toggles — https://martinfowler.com/articles/feature-toggles.html"
+    - "LaunchDarkly. What Are Feature Flags — https://launchdarkly.com/blog/what-are-feature-flags/"
+    - "OpenFeature. Evaluation Context specification — https://openfeature.dev/specification/sections/evaluation-context/"

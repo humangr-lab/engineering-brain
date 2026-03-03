@@ -1,0 +1,1138 @@
+layer: rules
+domain: fintech
+knowledge:
+- id: FIN-PAY-001
+  text: "Stripe PaymentIntents lifecycle: always create with capture_method='manual' for marketplaces, then confirm, capture, and refund as separate steps. Never use Charges API for new integrations."
+  why: >
+    The Charges API is legacy and does not support SCA (Strong Customer Authentication) required in the EU.
+    PaymentIntents handle 3DS, authentication retries, and partial captures natively. Teams that started
+    with Charges had to rewrite entire payment flows when SCA enforcement began, losing 2-4 weeks.
+  how_to_do_right: |
+    1. Create PaymentIntent with amount, currency, capture_method='manual'
+    2. Confirm on client side using Stripe.js confirmCardPayment()
+    3. Capture server-side after business logic validates (e.g., market resolved)
+    4. Use separate refund endpoint — never modify the original PaymentIntent
+    5. Always store payment_intent.id in your database linked to the domain entity
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, architecture]
+    concern: [domain_specific]
+  example_good: |
+    import stripe
+
+    async def create_payment(amount_cents: int, currency: str, customer_id: str) -> str:
+        intent = stripe.PaymentIntent.create(
+            amount=amount_cents,
+            currency=currency,
+            customer=customer_id,
+            capture_method="manual",
+            metadata={"order_id": order_id},
+            idempotency_key=f"create-{order_id}",
+        )
+        return intent.id
+
+    async def capture_payment(payment_intent_id: str, amount_cents: int) -> None:
+        stripe.PaymentIntent.capture(
+            payment_intent_id,
+            amount_to_capture=amount_cents,
+        )
+  example_bad: |
+    # WRONG: Using legacy Charges API — no SCA support
+    charge = stripe.Charge.create(
+        amount=amount_cents,
+        currency=currency,
+        source=token,  # Deprecated token-based flow
+    )
+  when_applies: "Any new payment integration, marketplace payments, prediction market deposits"
+  sources: ["https://stripe.com/docs/payments/payment-intents"]
+
+- id: FIN-PAY-002
+  text: "Stripe webhook signature verification: always verify the webhook-signing secret using stripe.Webhook.construct_event(). Never trust raw webhook payloads without cryptographic verification."
+  why: >
+    Without signature verification, any attacker who discovers your webhook URL can send fake events
+    (e.g., payment_intent.succeeded for unpaid orders). This has caused real financial losses in
+    production — one fintech lost $47K before detecting forged webhook events.
+  how_to_do_right: |
+    1. Store STRIPE_WEBHOOK_SECRET in environment variables, never in code
+    2. Read the raw request body as bytes (not parsed JSON)
+    3. Extract the Stripe-Signature header
+    4. Call stripe.Webhook.construct_event(payload, sig_header, secret)
+    5. Reject with 400 if verification fails — do not process the event
+    6. Set webhook tolerance to 300 seconds max to prevent replay attacks
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, security]
+    concern: [web]
+  example_good: |
+    from fastapi import Request, HTTPException
+    import stripe
+    import os
+
+    WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+    @app.post("/webhooks/stripe")
+    async def stripe_webhook(request: Request):
+        payload = await request.body()
+        sig_header = request.headers.get("stripe-signature")
+        try:
+            event = stripe.Webhook.construct_event(
+                payload, sig_header, WEBHOOK_SECRET
+            )
+        except stripe.error.SignatureVerificationError:
+            raise HTTPException(status_code=400, detail="Invalid signature")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid payload")
+
+        await handle_event(event)
+        return {"status": "ok"}
+  example_bad: |
+    # DANGEROUS: No signature verification — anyone can forge events
+    @app.post("/webhooks/stripe")
+    async def stripe_webhook(request: Request):
+        event = await request.json()  # Trusting raw JSON!
+        if event["type"] == "payment_intent.succeeded":
+            await mark_as_paid(event["data"]["object"]["id"])
+        return {"status": "ok"}
+  when_applies: "Any Stripe webhook endpoint, payment confirmation flows, subscription events"
+  sources: ["https://stripe.com/docs/webhooks/signatures"]
+
+- id: FIN-PAY-003
+  text: "Stripe Connect for marketplaces: use destination charges or separate charges with transfers. The platform collects the payment and splits funds to connected accounts."
+  why: >
+    Prediction markets and marketplaces need to hold funds centrally, then distribute to winners.
+    Direct charges to connected accounts make refunds and disputes unmanageable. Destination charges
+    let the platform control the flow — hold, split, refund — from a single PaymentIntent.
+  how_to_do_right: |
+    1. Onboard sellers/counterparties as Stripe Connected Accounts (Standard or Express)
+    2. Create PaymentIntent with transfer_data.destination for simple splits
+    3. For complex splits (multiple winners), use separate charges + manual transfers
+    4. Set application_fee_amount for platform revenue
+    5. Handle account.updated webhooks for compliance status changes
+    6. Store connected_account_id linked to user in your database
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, architecture]
+    concern: [domain_specific]
+  example_good: |
+    # Destination charge — platform collects, transfers to winner
+    intent = stripe.PaymentIntent.create(
+        amount=10000,  # $100.00
+        currency="usd",
+        customer=customer_id,
+        transfer_data={"destination": winner_connected_account_id},
+        application_fee_amount=500,  # $5.00 platform fee
+        idempotency_key=f"market-{market_id}-resolution",
+    )
+
+    # For multi-winner splits, use separate transfers after capture
+    stripe.Transfer.create(
+        amount=6000,
+        currency="usd",
+        destination=winner_1_account_id,
+        transfer_group=f"market_{market_id}",
+    )
+  example_bad: |
+    # WRONG: Direct charge to connected account — platform loses control
+    intent = stripe.PaymentIntent.create(
+        amount=10000,
+        currency="usd",
+        stripe_account=connected_account_id,  # Funds go directly, no platform control
+    )
+  when_applies: "Prediction markets, marketplaces, any platform distributing funds to multiple parties"
+  sources: ["https://stripe.com/docs/connect/charges"]
+
+- id: FIN-PAY-004
+  text: "PIX integration via BACEN API: generate QR codes with proper expiration, handle instant settlement notifications via webhook, and always validate the PIX key format before initiating transfers."
+  why: >
+    PIX settles in under 10 seconds (T+0), making it ideal for prediction market deposits in Brazil.
+    However, expired QR codes cause user confusion and support tickets. Invalid PIX keys cause failed
+    transfers that take days to reconcile. A Brazilian fintech lost R$200K in stuck funds due to
+    malformed PIX key validation.
+  how_to_do_right: |
+    1. Generate PIX QR codes with txid (unique), expiration (30-60 min for deposits)
+    2. Register webhook with BACEN PSP for instant settlement notifications
+    3. Validate PIX key format: CPF (11 digits), CNPJ (14), email, phone (+55), or EVP (UUID)
+    4. Store the e2eid (end-to-end ID) for every PIX transaction — it is the canonical reference
+    5. Implement idempotent handler for PIX confirmation webhooks (BACEN may send duplicates)
+    6. Handle PIX devolution (refund) within 90 days per BACEN regulation
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fintech, integration]
+    concern: [domain_specific]
+  example_good: |
+    import re
+    from enum import Enum
+
+    class PixKeyType(str, Enum):
+        CPF = "cpf"
+        CNPJ = "cnpj"
+        EMAIL = "email"
+        PHONE = "phone"
+        EVP = "evp"  # Random key (UUID)
+
+    PIX_KEY_PATTERNS = {
+        PixKeyType.CPF: re.compile(r"^\d{11}$"),
+        PixKeyType.CNPJ: re.compile(r"^\d{14}$"),
+        PixKeyType.EMAIL: re.compile(r"^[^@]+@[^@]+\.[^@]+$"),
+        PixKeyType.PHONE: re.compile(r"^\+55\d{10,11}$"),
+        PixKeyType.EVP: re.compile(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        ),
+    }
+
+    def validate_pix_key(key: str, key_type: PixKeyType) -> bool:
+        return bool(PIX_KEY_PATTERNS[key_type].match(key))
+  example_bad: |
+    # WRONG: No PIX key validation — transfer will fail silently
+    def send_pix(key: str, amount: int):
+        api.create_transfer(pix_key=key, amount=amount)  # No format check!
+
+    # WRONG: QR code without expiration — stale codes cause confusion
+    qr = api.create_qr_code(amount=100, txid=txid)  # No expiration set
+  when_applies: "Brazilian fintech, any platform accepting BRL payments, prediction market deposits in Brazil"
+  sources: ["https://www.bcb.gov.br/estabilidadefinanceira/pix"]
+
+- id: FIN-PAY-005
+  text: "Payment state machine: model payment lifecycle as an explicit FSM with states pending, processing, succeeded, failed, refunded, partially_refunded, disputed. Every state transition must be validated and logged."
+  why: >
+    Without an explicit state machine, payments end up in impossible states (e.g., refunded but never
+    succeeded) causing accounting nightmares. One fintech had $1.2M in phantom revenue because
+    'processing' payments were counted as income. State machines make invalid transitions impossible
+    at the code level.
+  how_to_do_right: |
+    1. Define all valid states as an Enum
+    2. Define allowed transitions as a dict mapping current_state -> set of valid next_states
+    3. Validate every transition before applying — raise if invalid
+    4. Log every transition with timestamp, actor, and reason
+    5. Store the full transition history (append-only) for audit
+    6. Never allow direct state assignment — always go through transition method
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, architecture]
+    concern: [domain_specific]
+  example_good: |
+    from enum import Enum
+
+    class PaymentState(str, Enum):
+        PENDING = "pending"
+        PROCESSING = "processing"
+        SUCCEEDED = "succeeded"
+        FAILED = "failed"
+        REFUNDED = "refunded"
+        PARTIALLY_REFUNDED = "partially_refunded"
+        DISPUTED = "disputed"
+
+    VALID_TRANSITIONS: dict[PaymentState, set[PaymentState]] = {
+        PaymentState.PENDING: {PaymentState.PROCESSING, PaymentState.FAILED},
+        PaymentState.PROCESSING: {PaymentState.SUCCEEDED, PaymentState.FAILED},
+        PaymentState.SUCCEEDED: {
+            PaymentState.REFUNDED,
+            PaymentState.PARTIALLY_REFUNDED,
+            PaymentState.DISPUTED,
+        },
+        PaymentState.PARTIALLY_REFUNDED: {
+            PaymentState.REFUNDED,
+            PaymentState.DISPUTED,
+        },
+        PaymentState.FAILED: set(),
+        PaymentState.REFUNDED: set(),
+        PaymentState.DISPUTED: {PaymentState.SUCCEEDED, PaymentState.REFUNDED},
+    }
+
+    def transition(current: PaymentState, target: PaymentState) -> PaymentState:
+        if target not in VALID_TRANSITIONS.get(current, set()):
+            raise ValueError(f"Invalid transition: {current} -> {target}")
+        return target
+  example_bad: |
+    # WRONG: Direct state assignment — no validation
+    payment.status = "refunded"  # What if it was never succeeded?
+    db.session.commit()
+  when_applies: "Any payment processing system, prediction market deposits and withdrawals"
+  sources: ["https://stripe.com/docs/payments/payment-intents"]
+
+- id: FIN-PAY-006
+  text: "Idempotency keys for payment operations: every mutating Stripe API call must include an idempotency_key derived from your domain entity ID. Never generate random idempotency keys."
+  why: >
+    Network retries, timeouts, and duplicate webhook deliveries can cause double charges. A prediction
+    market platform double-charged 340 users during a deploy because payment creation retried without
+    idempotency keys. Stripe's idempotency window is 24 hours — random UUIDs defeat the purpose
+    because retries generate new keys.
+  how_to_do_right: |
+    1. Derive idempotency_key from your domain: f"deposit-{user_id}-{market_id}-{amount}-{timestamp_bucket}"
+    2. Include the key in every stripe.PaymentIntent.create(), capture(), refund()
+    3. Use deterministic keys so retries hit the same Stripe idempotency cache
+    4. Log the idempotency_key alongside the payment for debugging
+    5. For webhooks, use the event.id as your deduplication key in the handler
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, reliability]
+    concern: [consistency]
+  example_good: |
+    import hashlib
+
+    def make_idempotency_key(operation: str, *parts: str) -> str:
+        """Deterministic idempotency key from domain entities."""
+        raw = f"{operation}:{':'.join(str(p) for p in parts)}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:64]
+
+    # Same inputs always produce same key — safe to retry
+    key = make_idempotency_key("deposit", user_id, market_id, str(amount_cents))
+    intent = stripe.PaymentIntent.create(
+        amount=amount_cents,
+        currency="usd",
+        idempotency_key=key,
+    )
+  example_bad: |
+    import uuid
+
+    # WRONG: Random key — retries create NEW payments instead of being idempotent
+    intent = stripe.PaymentIntent.create(
+        amount=amount_cents,
+        currency="usd",
+        idempotency_key=str(uuid.uuid4()),  # Different every time!
+    )
+  when_applies: "Every Stripe API call that creates, modifies, or refunds payments"
+  sources: ["https://stripe.com/docs/api/idempotent_requests"]
+
+- id: FIN-PAY-007
+  text: "PCI DSS compliance: never log, store, or transmit raw card numbers. Use Stripe.js or Stripe Elements to tokenize on the client side. The server must never see the PAN."
+  why: >
+    Storing raw card data makes you PCI DSS Level 1 compliant — requiring annual on-site audits
+    costing $50K-$500K. Using Stripe.js keeps you at SAQ-A (self-assessment questionnaire), the
+    simplest level. A startup stored card numbers in their database 'temporarily' and faced a
+    $200K fine plus mandatory forensic investigation after a breach.
+  how_to_do_right: |
+    1. Use Stripe Elements or Stripe.js on frontend — card data goes directly to Stripe
+    2. Server receives only a PaymentMethod ID or SetupIntent — never raw card data
+    3. Never log request bodies that might contain card data
+    4. Set up Content-Security-Policy to only allow Stripe's JavaScript domains
+    5. Use stripe.PaymentMethod.attach() with the tokenized ID
+    6. Audit your logging — grep for patterns like \d{13,19} in logs
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, security, compliance]
+    concern: [domain_specific]
+  example_good: |
+    # Server only receives the token — never the card number
+    @app.post("/api/payments/method")
+    async def attach_payment_method(
+        payment_method_id: str,  # pm_xxx from Stripe.js
+        current_user: User = Depends(get_current_user),
+    ):
+        stripe.PaymentMethod.attach(
+            payment_method_id,
+            customer=current_user.stripe_customer_id,
+        )
+        return {"status": "attached"}
+  example_bad: |
+    # CATASTROPHIC: Server receives raw card data
+    @app.post("/api/payments/charge")
+    async def charge(card_number: str, cvv: str, expiry: str):
+        # You are now PCI DSS Level 1 — enjoy the $200K audit
+        logger.info(f"Charging card {card_number}")  # Logged PAN!
+        stripe.Charge.create(source={"number": card_number, "cvc": cvv})
+  when_applies: "Any system that processes card payments"
+  sources: ["https://stripe.com/docs/security/guide"]
+
+- id: FIN-PAY-008
+  text: "Escrow patterns for prediction markets: hold funds in a platform-controlled account until market resolution. Never transfer funds directly between participants until the outcome is verified."
+  why: >
+    In prediction markets, funds must be held until the market resolves. Direct P2P transfers create
+    irrecoverable states if a market is voided or disputed. Escrow ensures the platform can always
+    refund all participants if needed. Without escrow, a voided market with 500 participants required
+    manual reconciliation taking 3 weeks.
+  how_to_do_right: |
+    1. On bet placement: capture funds into platform's Stripe balance (not connected account)
+    2. Store the escrow amount per market in a dedicated ledger table
+    3. On resolution: calculate payouts, then batch-transfer to winners
+    4. On void: refund all participants from escrowed funds
+    5. Reconcile: sum of escrowed funds must equal sum of all active positions
+    6. Never commingle escrow funds with platform operating funds
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, architecture]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+
+    class EscrowService:
+        async def deposit_to_escrow(
+            self, market_id: str, user_id: str, amount_cents: int
+        ) -> str:
+            """Capture funds and record in escrow ledger."""
+            payment_intent = await self.capture_payment(user_id, amount_cents)
+
+            await self.ledger.record(
+                market_id=market_id,
+                user_id=user_id,
+                amount_cents=amount_cents,
+                type="ESCROW_DEPOSIT",
+                payment_ref=payment_intent.id,
+            )
+            return payment_intent.id
+
+        async def release_escrow(self, market_id: str, payouts: dict[str, int]):
+            """Distribute escrowed funds to winners after resolution."""
+            total_escrowed = await self.ledger.get_escrow_balance(market_id)
+            total_payout = sum(payouts.values())
+            assert total_payout <= total_escrowed, "Payout exceeds escrow!"
+
+            for user_id, amount_cents in payouts.items():
+                await self.transfer_to_user(user_id, amount_cents)
+                await self.ledger.record(
+                    market_id=market_id,
+                    user_id=user_id,
+                    amount_cents=amount_cents,
+                    type="ESCROW_RELEASE",
+                )
+  example_bad: |
+    # WRONG: Direct P2P transfer — no escrow, no refund capability
+    async def place_bet(user_id: str, counterparty_id: str, amount: int):
+        stripe.Transfer.create(
+            amount=amount,
+            destination=counterparty_id,  # Funds gone immediately!
+        )
+  when_applies: "Prediction markets, marketplaces with delayed fulfillment, any platform holding funds on behalf of users"
+  sources: ["https://docs.stripe.com/connect"]
+
+- id: FIN-PAY-009
+  text: "Partial refunds: always track the cumulative refunded amount per PaymentIntent and validate that total refunds never exceed the original captured amount. Use Stripe's built-in partial refund support."
+  why: >
+    Without tracking cumulative refunds, concurrent refund requests can exceed the captured amount,
+    causing Stripe API errors and inconsistent ledger state. A marketplace processed two simultaneous
+    partial refunds totaling 120% of the original amount — Stripe rejected the second, but the
+    internal ledger showed it as refunded, causing a $15K accounting discrepancy.
+  how_to_do_right: |
+    1. Store refund history per payment: amount, reason, timestamp, refund_id
+    2. Before refunding, query total_refunded = sum of previous refund amounts
+    3. Validate: total_refunded + new_refund_amount <= original_captured_amount
+    4. Use database-level locking (SELECT FOR UPDATE) to prevent concurrent over-refunds
+    5. Call stripe.Refund.create(payment_intent=pi_id, amount=refund_cents)
+    6. Update payment state to PARTIALLY_REFUNDED or REFUNDED based on remaining
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, reliability]
+    concern: [consistency]
+  example_good: |
+    async def partial_refund(
+        db: AsyncSession,
+        payment_id: str,
+        refund_amount_cents: int,
+        reason: str,
+    ) -> str:
+        async with db.begin():
+            payment = await db.execute(
+                select(Payment)
+                .where(Payment.id == payment_id)
+                .with_for_update()  # Lock row to prevent concurrent refunds
+            )
+            payment = payment.scalar_one()
+
+            total_refunded = await get_total_refunded(db, payment_id)
+            remaining = payment.captured_amount_cents - total_refunded
+
+            if refund_amount_cents > remaining:
+                raise ValueError(
+                    f"Refund {refund_amount_cents} exceeds remaining {remaining}"
+                )
+
+            refund = stripe.Refund.create(
+                payment_intent=payment.stripe_payment_intent_id,
+                amount=refund_amount_cents,
+                reason=reason,
+                idempotency_key=f"refund-{payment_id}-{total_refunded}",
+            )
+            return refund.id
+  example_bad: |
+    # WRONG: No cumulative tracking — can over-refund
+    async def refund(payment_id: str, amount: int):
+        payment = await get_payment(payment_id)
+        stripe.Refund.create(
+            payment_intent=payment.stripe_pi_id,
+            amount=amount,  # No check if this exceeds captured amount!
+        )
+  when_applies: "Any payment system supporting partial refunds, prediction market partial position exits"
+  sources: ["https://docs.stripe.com/api/refunds"]
+
+- id: FIN-PAY-010
+  text: "Payment reconciliation: match every Stripe event to an internal ledger entry. Run daily reconciliation comparing Stripe balance transactions against your internal ledger to detect discrepancies within 24 hours."
+  why: >
+    Without reconciliation, silent failures accumulate: missed webhooks, double-processed events,
+    or timezone bugs cause the internal ledger to drift from Stripe's truth. A fintech discovered
+    a $89K discrepancy after 3 months because they never reconciled — a bug in webhook processing
+    had been silently dropping 2% of payment confirmations.
+  how_to_do_right: |
+    1. Store every Stripe event ID processed (for deduplication)
+    2. For each payment, store: stripe_payment_intent_id, amount, status, timestamps
+    3. Run daily batch: fetch Stripe balance transactions via API for the past 24h
+    4. Compare each Stripe transaction against internal ledger entries
+    5. Flag discrepancies immediately: missing in ledger, amount mismatch, status mismatch
+    6. Alert on any discrepancy > $0.01 — investigate within 24 hours
+    7. Keep reconciliation reports for 7 years (regulatory requirement)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, reliability]
+    concern: [consistency]
+  example_good: |
+    async def daily_reconciliation(date: datetime.date) -> ReconciliationReport:
+        """Compare Stripe balance transactions against internal ledger."""
+        stripe_txns = stripe.BalanceTransaction.list(
+            created={"gte": int(datetime.combine(date, time.min).timestamp())},
+            limit=100,
+        )
+
+        discrepancies = []
+        for txn in stripe_txns.auto_paging_iter():
+            ledger_entry = await db.get_by_stripe_ref(txn.source)
+            if not ledger_entry:
+                discrepancies.append({
+                    "type": "MISSING_IN_LEDGER",
+                    "stripe_ref": txn.source,
+                    "amount": txn.amount,
+                })
+            elif ledger_entry.amount_cents != txn.amount:
+                discrepancies.append({
+                    "type": "AMOUNT_MISMATCH",
+                    "stripe_ref": txn.source,
+                    "stripe_amount": txn.amount,
+                    "ledger_amount": ledger_entry.amount_cents,
+                })
+
+        if discrepancies:
+            await alert_finance_team(discrepancies)
+        return ReconciliationReport(date=date, discrepancies=discrepancies)
+  example_bad: |
+    # WRONG: No reconciliation — discrepancies accumulate silently
+    # "We trust Stripe webhooks to always arrive" — they don't
+  when_applies: "Any payment system, required for financial compliance and audit readiness"
+  sources: ["https://stripe.com/docs/payments/payment-intents"]
+
+- id: FIN-PAY-011
+  text: "Currency handling: always store monetary amounts as integer cents (or the smallest currency unit). Use Decimal for display calculations, never float. Define currency precision per currency code."
+  why: >
+    Floating-point arithmetic causes rounding errors that accumulate into real financial discrepancies.
+    0.1 + 0.2 = 0.30000000000000004 in IEEE 754. A trading platform lost $12K over 6 months due to
+    float rounding in fee calculations. Integer cents are exact and avoid this entirely.
+  how_to_do_right: |
+    1. Store all amounts as integers in the smallest currency unit (cents for USD, centavos for BRL)
+    2. Use Python Decimal for any intermediate calculations that need fractions
+    3. Convert to display format only at the API boundary: amount_cents / 100
+    4. Define a CURRENCY_PRECISION dict for multi-currency (JPY has 0 decimals, BHD has 3)
+    5. Never use float for money — not in code, not in database, not in API responses
+    6. Stripe already uses integer cents — match their convention
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, code_quality]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal, ROUND_HALF_UP
+
+    CURRENCY_DECIMALS = {"USD": 2, "BRL": 2, "JPY": 0, "BHD": 3}
+
+    def cents_to_display(amount_cents: int, currency: str) -> Decimal:
+        decimals = CURRENCY_DECIMALS.get(currency, 2)
+        return Decimal(amount_cents) / Decimal(10 ** decimals)
+
+    def display_to_cents(amount: Decimal, currency: str) -> int:
+        decimals = CURRENCY_DECIMALS.get(currency, 2)
+        return int(
+            (amount * Decimal(10 ** decimals)).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+        )
+
+    # Always integer cents in storage and Stripe calls
+    fee_cents = 500  # $5.00
+    stripe.PaymentIntent.create(amount=fee_cents, currency="usd")
+  example_bad: |
+    # CATASTROPHIC: Float arithmetic for money
+    price = 19.99
+    tax = price * 0.0825  # 1.649175 — which cent is it?
+    total = price + tax   # 21.639175 — rounds differently per context
+
+    # Store as float in DB — rounding errors accumulate
+    payment.amount = 19.99  # NOT integer cents
+  when_applies: "Any system handling monetary amounts, multi-currency platforms, financial calculations"
+  sources: ["https://docs.stripe.com/currencies"]
+
+- id: FIN-PAY-012
+  text: "Payment retry strategy: implement exponential backoff with jitter for transient failures, but never retry hard declines. Distinguish between soft declines (retry-worthy) and hard declines (permanent)."
+  why: >
+    Retrying hard declines (stolen card, invalid number) wastes API calls and annoys users.
+    Retrying soft declines (insufficient funds, temporary bank issue) without backoff triggers
+    Stripe's rate limiter. A platform that retried every failure every 5 seconds got rate-limited
+    and blocked ALL payment processing for 15 minutes during peak hours.
+  how_to_do_right: |
+    1. Classify decline codes: soft (insufficient_funds, processing_error) vs hard (stolen_card, invalid_number)
+    2. For soft declines: retry up to 3 times with exponential backoff (1min, 5min, 30min)
+    3. For hard declines: fail immediately, notify user to update payment method
+    4. Add jitter to backoff to avoid thundering herd on recovery
+    5. Log every retry attempt with the decline code and attempt number
+    6. After max retries, mark payment as failed and trigger user notification
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, reliability]
+    concern: [failure]
+  example_good: |
+    SOFT_DECLINE_CODES = {
+        "insufficient_funds", "processing_error", "try_again_later",
+        "card_velocity_exceeded", "generic_decline",
+    }
+    HARD_DECLINE_CODES = {
+        "stolen_card", "lost_card", "invalid_number", "expired_card",
+        "card_not_supported", "do_not_honor",
+    }
+
+    async def process_with_retry(
+        payment_intent_id: str, max_retries: int = 3
+    ) -> bool:
+        for attempt in range(max_retries + 1):
+            try:
+                stripe.PaymentIntent.confirm(payment_intent_id)
+                return True
+            except stripe.error.CardError as e:
+                code = e.error.decline_code
+                if code in HARD_DECLINE_CODES:
+                    await notify_user_update_card(payment_intent_id)
+                    return False
+                if attempt == max_retries:
+                    return False
+                delay = (2 ** attempt) * 60 + random.uniform(0, 30)
+                await asyncio.sleep(delay)
+        return False
+  example_bad: |
+    # WRONG: Retries everything immediately — triggers rate limiting
+    for i in range(10):
+        try:
+            stripe.PaymentIntent.confirm(pi_id)
+            break
+        except stripe.error.CardError:
+            time.sleep(1)  # Too fast, no decline code check
+  when_applies: "Payment confirmation flows, subscription billing retries"
+  sources: ["https://stripe.com/docs/declines/codes"]
+
+- id: FIN-PAY-013
+  text: "Payment failure handling: capture the specific Stripe error type and decline code, map it to a user-friendly message, and store the raw error for debugging. Never expose Stripe internals to users."
+  why: >
+    Showing raw Stripe errors to users (e.g., 'card_declined: insufficient_funds') is a bad UX
+    and potential information leak. But swallowing errors without logging makes debugging impossible.
+    A fintech spent 2 days debugging a payment issue because they only stored 'payment failed'
+    without the decline code.
+  how_to_do_right: |
+    1. Catch stripe.error.CardError, stripe.error.InvalidRequestError separately
+    2. Extract error.code, error.decline_code, error.message from the exception
+    3. Map decline codes to user-friendly messages in a translation dict
+    4. Store the full error details (code, decline_code, message) in your database
+    5. Return only the friendly message to the user
+    6. Alert on unusual error rates (>5% failure rate in 1 hour)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, code_quality]
+    concern: [failure]
+  example_good: |
+    USER_FRIENDLY_MESSAGES = {
+        "insufficient_funds": "Your card has insufficient funds. Please try another card.",
+        "expired_card": "Your card has expired. Please update your payment method.",
+        "stolen_card": "This card cannot be used. Please contact your bank.",
+        "processing_error": "A temporary error occurred. Please try again in a few minutes.",
+    }
+
+    async def handle_payment_error(
+        e: stripe.error.CardError, payment_id: str
+    ) -> dict:
+        decline_code = e.error.decline_code or "unknown"
+        # Store full details for debugging
+        await db.store_payment_error(
+            payment_id=payment_id,
+            error_code=e.error.code,
+            decline_code=decline_code,
+            raw_message=e.error.message,
+        )
+        # Return friendly message to user
+        user_message = USER_FRIENDLY_MESSAGES.get(
+            decline_code, "Payment could not be processed. Please try again."
+        )
+        return {"error": user_message, "retry_allowed": decline_code not in HARD_DECLINE_CODES}
+  example_bad: |
+    # WRONG: Exposing raw Stripe errors
+    except stripe.error.CardError as e:
+        return {"error": str(e)}  # Leaks internal details!
+
+    # WRONG: Swallowing errors without logging
+    except stripe.error.CardError:
+        return {"error": "Payment failed"}  # No debugging info stored!
+  when_applies: "Any payment error handling, user-facing payment flows"
+  sources: ["https://stripe.com/docs/declines/codes"]
+
+- id: FIN-PAY-014
+  text: "Payment fraud detection signals: monitor velocity (transactions per hour per user), amount anomalies (sudden large amounts), geographic mismatches (IP vs billing address), and card testing patterns (small amounts followed by large). Use Stripe Radar as first line of defense."
+  why: >
+    Fraud losses in prediction markets are amplified because winnings can be withdrawn. A platform
+    lost $85K in one weekend to a card testing attack: fraudsters tested stolen cards with $1 bets,
+    then made large deposits with valid cards and immediately withdrew via PIX. Stripe Radar catches
+    80% of common fraud, but platform-specific signals (velocity, pattern) catch the rest.
+  how_to_do_right: |
+    1. Enable Stripe Radar (included in Stripe fees) as the first layer
+    2. Track per-user: transactions in last 1h, 24h; max single transaction; total volume
+    3. Flag if tx_count_1h > 5 or single_amount > 10x user average
+    4. Compare IP geolocation with billing address country
+    5. Detect card testing: 3+ transactions < $5 in 10 minutes
+    6. Require 3DS for flagged transactions (Stripe PaymentIntent requires_action)
+    7. Implement cooling-off period: new accounts cannot withdraw for 72 hours
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, security]
+    concern: [domain_specific]
+  example_good: |
+    from datetime import datetime, timedelta
+
+    class FraudDetector:
+        async def check_velocity(self, user_id: str, amount_cents: int) -> list[str]:
+            flags = []
+            now = datetime.utcnow()
+
+            tx_1h = await self.db.count_transactions(
+                user_id, since=now - timedelta(hours=1)
+            )
+            if tx_1h >= 5:
+                flags.append("HIGH_VELOCITY_1H")
+
+            avg_amount = await self.db.avg_transaction_amount(user_id)
+            if avg_amount and amount_cents > avg_amount * 10:
+                flags.append("AMOUNT_ANOMALY")
+
+            small_recent = await self.db.count_transactions(
+                user_id, since=now - timedelta(minutes=10), max_amount=500
+            )
+            if small_recent >= 3:
+                flags.append("CARD_TESTING_PATTERN")
+
+            return flags
+  example_bad: |
+    # WRONG: No fraud checks — just process everything
+    async def deposit(user_id: str, amount: int):
+        intent = stripe.PaymentIntent.create(amount=amount, currency="usd")
+        # No velocity check, no amount check, no card testing detection
+        return intent
+  when_applies: "Any platform accepting payments, especially prediction markets where winnings are withdrawable"
+  sources: ["https://stripe.com/docs/radar"]
+
+- id: FIN-PAY-015
+  text: "Subscription billing: use Stripe Billing with price objects and subscription schedules. Handle subscription lifecycle events (created, updated, canceled, past_due) via webhooks, not polling."
+  why: >
+    Polling Stripe for subscription status wastes API calls and misses state changes between polls.
+    A SaaS platform polled every 5 minutes and missed a critical 'past_due' event, continuing to
+    serve a customer for 2 months without payment ($8K loss). Webhooks deliver events in near
+    real-time with guaranteed delivery.
+  how_to_do_right: |
+    1. Create Products and Prices in Stripe (not hardcoded amounts)
+    2. Use stripe.Subscription.create() with the price_id
+    3. Handle webhooks: customer.subscription.updated, invoice.payment_failed
+    4. On past_due: grace period (3 days), then restrict access, then cancel
+    5. Store subscription status in your database, updated only via webhooks
+    6. Use Stripe Customer Portal for self-service management
+    7. Test with Stripe test clocks for time-dependent billing scenarios
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, architecture]
+    concern: [domain_specific]
+  example_good: |
+    SUBSCRIPTION_HANDLERS = {
+        "customer.subscription.created": handle_subscription_created,
+        "customer.subscription.updated": handle_subscription_updated,
+        "customer.subscription.deleted": handle_subscription_canceled,
+        "invoice.payment_failed": handle_payment_failed,
+        "invoice.paid": handle_invoice_paid,
+    }
+
+    async def handle_subscription_updated(event: dict):
+        subscription = event["data"]["object"]
+        await db.update_subscription(
+            stripe_subscription_id=subscription["id"],
+            status=subscription["status"],  # active, past_due, canceled, etc.
+            current_period_end=subscription["current_period_end"],
+        )
+        if subscription["status"] == "past_due":
+            await start_grace_period(subscription["customer"])
+  example_bad: |
+    # WRONG: Polling for subscription status
+    while True:
+        sub = stripe.Subscription.retrieve(sub_id)
+        if sub.status == "past_due":
+            restrict_access(user_id)
+        time.sleep(300)  # 5 min poll — misses events, wastes API calls
+  when_applies: "SaaS platforms, premium tiers in prediction markets, any recurring billing"
+  sources: ["https://stripe.com/docs/billing/subscriptions/overview"]
+
+- id: FIN-PAY-016
+  text: "Payment webhook reliability: implement at-least-once delivery handling with idempotent event processing. Store processed event IDs to deduplicate, and always return 200 before processing to avoid Stripe retries."
+  why: >
+    Stripe retries webhooks up to 8 times over 72 hours if it does not receive a 200 response.
+    If your handler takes 30+ seconds (e.g., complex settlement), Stripe times out and retries,
+    causing duplicate processing. A prediction market double-credited winners because the settlement
+    webhook was processed twice — the handler took 45 seconds and Stripe retried.
+  how_to_do_right: |
+    1. Return 200 immediately after signature verification and event ID storage
+    2. Process the event asynchronously (background task, queue)
+    3. Before processing, check if event.id was already processed (deduplication table)
+    4. Make handler logic idempotent: processing the same event twice has the same result
+    5. Use a database unique constraint on event_id to prevent race conditions
+    6. Monitor webhook latency — alert if processing time > 10 seconds
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, reliability]
+    concern: [consistency]
+  example_good: |
+    from fastapi import BackgroundTasks
+
+    @app.post("/webhooks/stripe")
+    async def stripe_webhook(
+        request: Request, background_tasks: BackgroundTasks
+    ):
+        payload = await request.body()
+        sig = request.headers.get("stripe-signature")
+        event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
+
+        # Deduplication: skip if already processed
+        if await db.event_already_processed(event["id"]):
+            return {"status": "already_processed"}
+
+        # Store event ID immediately (with unique constraint)
+        await db.store_event_id(event["id"])
+
+        # Return 200 BEFORE processing — prevents Stripe retry
+        background_tasks.add_task(process_event, event)
+        return {"status": "accepted"}
+
+    async def process_event(event: dict):
+        """Idempotent event processing in background."""
+        handler = EVENT_HANDLERS.get(event["type"])
+        if handler:
+            await handler(event["data"]["object"])
+  example_bad: |
+    # WRONG: Synchronous processing — Stripe times out and retries
+    @app.post("/webhooks/stripe")
+    async def stripe_webhook(request: Request):
+        event = verify_and_parse(request)
+        await settle_market(event)  # Takes 30 seconds!
+        # Stripe already retried because it timed out at 20s
+        return {"status": "ok"}
+  when_applies: "Any Stripe webhook handler, especially for payment confirmations and settlements"
+  sources: ["https://stripe.com/docs/webhooks/best-practices"]
+
+- id: FIN-PAY-017
+  text: "Payment testing: use Stripe test mode with specific test card numbers to simulate success, decline, 3DS, and error scenarios. Never use production keys in test environments."
+  why: >
+    Testing payments against production creates real charges and regulatory audit entries. Using only
+    the success test card (4242...) misses failure paths. A team shipped without testing 3DS and
+    100% of European users could not complete payment — the confirm flow did not handle
+    requires_action status, causing a 3-day outage for EU users.
+  how_to_do_right: |
+    1. Use Stripe test mode API keys (sk_test_*) in all non-production environments
+    2. Test with specific cards: 4242424242424242 (success), 4000000000000002 (decline)
+    3. Test 3DS: 4000002500003155 (requires authentication)
+    4. Test insufficient funds: 4000000000009995
+    5. Test webhook delivery using Stripe CLI: stripe listen --forward-to localhost:8000/webhooks
+    6. Write integration tests that cover all PaymentIntent statuses
+    7. Use Stripe test clocks for subscription and time-dependent scenarios
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, testing]
+    concern: [domain_specific]
+  example_good: |
+    import pytest
+
+    @pytest.fixture
+    def stripe_test_mode():
+        """Ensure tests use test mode keys."""
+        import stripe
+        assert stripe.api_key.startswith("sk_test_"), (
+            "DANGER: Production key detected in test environment!"
+        )
+
+    TEST_CARDS = {
+        "success": "4242424242424242",
+        "decline": "4000000000000002",
+        "insufficient_funds": "4000000000009995",
+        "requires_3ds": "4000002500003155",
+        "expired": "4000000000000069",
+    }
+
+    async def test_payment_decline(stripe_test_mode):
+        pm = stripe.PaymentMethod.create(
+            type="card",
+            card={"number": TEST_CARDS["decline"], "exp_month": 12, "exp_year": 2030, "cvc": "123"},
+        )
+        intent = stripe.PaymentIntent.create(
+            amount=1000, currency="usd", payment_method=pm.id, confirm=True,
+        )
+        assert intent.status == "requires_payment_method"  # Declined
+  example_bad: |
+    # WRONG: Only testing happy path with success card
+    def test_payment():
+        # Only tests success — never tests decline, 3DS, or errors
+        result = process_payment("4242424242424242", 1000)
+        assert result.success
+
+    # CATASTROPHIC: Using production keys in tests
+    stripe.api_key = "sk_live_..."  # Real charges!
+  when_applies: "Payment integration tests, CI/CD pipelines, QA environments"
+  sources: ["https://stripe.com/docs/testing"]
+
+- id: FIN-PAY-018
+  text: "Multi-currency support: store the currency code alongside every monetary amount. Never assume USD. Use Stripe's supported currency list and handle zero-decimal currencies (JPY, KRW) separately."
+  why: >
+    Assuming USD causes silent bugs when expanding to new markets. A Brazilian fintech treated BRL
+    amounts as USD, overcharging users 5x due to the exchange rate difference. Zero-decimal currencies
+    (JPY) have no 'cents' — sending 1000 for JPY means 1000 yen, not 10 yen. Mishandling this caused
+    a 100x overcharge for Japanese users.
+  how_to_do_right: |
+    1. Always store (amount_cents, currency_code) as a pair — never amount alone
+    2. Define zero-decimal currencies: JPY, KRW, VND, CLP, etc.
+    3. For zero-decimal: amount passed to Stripe IS the full amount (no multiplication)
+    4. For two-decimal: amount passed to Stripe is cents (multiply by 100)
+    5. Validate currency against Stripe's supported list before creating PaymentIntent
+    6. Display amounts with proper locale formatting (R$ 1.000,00 for BRL, $1,000.00 for USD)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, architecture]
+    concern: [domain_specific]
+  example_good: |
+    ZERO_DECIMAL_CURRENCIES = {
+        "BIF", "CLP", "DJF", "GNF", "JPY", "KMF", "KRW",
+        "MGA", "PYG", "RWF", "UGX", "VND", "VUV", "XAF", "XOF", "XPF",
+    }
+
+    def to_stripe_amount(amount: Decimal, currency: str) -> int:
+        currency = currency.upper()
+        if currency in ZERO_DECIMAL_CURRENCIES:
+            return int(amount)
+        return int(amount * 100)
+
+    def from_stripe_amount(stripe_amount: int, currency: str) -> Decimal:
+        currency = currency.upper()
+        if currency in ZERO_DECIMAL_CURRENCIES:
+            return Decimal(stripe_amount)
+        return Decimal(stripe_amount) / Decimal(100)
+
+    class Money:
+        def __init__(self, amount_minor: int, currency: str):
+            self.amount_minor = amount_minor
+            self.currency = currency.upper()
+  example_bad: |
+    # WRONG: No currency tracking — assumes USD everywhere
+    payment.amount = 1000  # 1000 what? Cents? Yen? BRL centavos?
+
+    # WRONG: Treating JPY like USD — 100x overcharge
+    jpy_amount = 1000  # User wants 1000 yen
+    stripe.PaymentIntent.create(amount=jpy_amount * 100, currency="jpy")  # Charges 100,000 yen!
+  when_applies: "Multi-currency platforms, any fintech expanding beyond a single currency"
+  sources: ["https://stripe.com/docs/currencies"]
+
+- id: FIN-PAY-019
+  text: "Payment audit trail: log every payment-related action with actor, timestamp, IP address, and the full before/after state. Use an append-only audit log table that is never modified or deleted."
+  why: >
+    Regulators (BACEN, FinCEN) require a complete audit trail for all financial transactions.
+    During a regulatory audit, a fintech could not prove the sequence of events for a disputed
+    transaction because their logs were in application log files that had rotated. The audit
+    took 6 months instead of 2 weeks, costing $150K in legal and compliance fees.
+  how_to_do_right: |
+    1. Create a dedicated audit_log table with columns: id, entity_type, entity_id, action, actor_id, actor_ip, before_state, after_state, timestamp
+    2. Insert a row for every payment state change, refund, dispute, or manual intervention
+    3. Make the table append-only: no UPDATE or DELETE permissions for the application user
+    4. Store before_state and after_state as JSON for full traceability
+    5. Include the actor (user, system, admin) and their IP address
+    6. Retain audit logs for minimum 5 years (7 years recommended)
+    7. Index on entity_id and timestamp for fast lookups during audits
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, compliance]
+    concern: [domain_specific]
+  example_good: |
+    from datetime import datetime
+    import json
+
+    class AuditLogger:
+        async def log_payment_action(
+            self,
+            entity_type: str,
+            entity_id: str,
+            action: str,
+            actor_id: str,
+            actor_ip: str,
+            before_state: dict | None,
+            after_state: dict,
+        ):
+            await self.db.execute(
+                """
+                INSERT INTO audit_log (
+                    entity_type, entity_id, action, actor_id, actor_ip,
+                    before_state, after_state, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """,
+                entity_type, entity_id, action, actor_id, actor_ip,
+                json.dumps(before_state), json.dumps(after_state),
+                datetime.utcnow(),
+            )
+
+    # Usage: every payment state change gets logged
+    await audit.log_payment_action(
+        entity_type="payment",
+        entity_id=payment.id,
+        action="REFUND_PARTIAL",
+        actor_id=admin_user.id,
+        actor_ip=request.client.host,
+        before_state={"status": "succeeded", "amount": 10000},
+        after_state={"status": "partially_refunded", "refunded": 3000},
+    )
+  example_bad: |
+    # WRONG: Logging to application logs — will be rotated and lost
+    logger.info(f"Refunded payment {payment_id}")  # No structure, no retention
+
+    # WRONG: Mutable audit table
+    UPDATE audit_log SET action = 'corrected' WHERE id = 123;  # Tampering!
+  when_applies: "Any financial system, required for regulatory compliance in all jurisdictions"
+  sources: ["https://www.fatf-gafi.org/content/dam/fatf-gafi/recommendations/FATF%20Recommendations%202012.pdf.coredownload.inline.pdf"]
+
+- id: FIN-PAY-020
+  text: "Payment dispute and chargeback handling: implement a webhook handler for charge.dispute.created, freeze the disputed amount immediately, gather evidence programmatically, and respond within Stripe's deadline (typically 7-21 days)."
+  why: >
+    Ignoring disputes means automatic loss — Stripe rules in the customer's favor if you do not
+    respond. Each lost dispute costs the transaction amount plus a $15 dispute fee, and high dispute
+    rates (>1%) can get your Stripe account terminated. A prediction market had a 2.3% dispute rate
+    and Stripe suspended their account for 30 days, blocking all payments.
+  how_to_do_right: |
+    1. Handle charge.dispute.created webhook immediately
+    2. Freeze the disputed amount in your ledger (do not pay out to winners)
+    3. Automatically gather evidence: transaction logs, user activity, IP addresses
+    4. Submit evidence via stripe.Dispute.modify() with evidence fields
+    5. Track dispute deadlines — alert team 48 hours before expiry
+    6. Monitor dispute rate — alert if it approaches 0.75% (Stripe warns at 1%)
+    7. Implement prevention: clear billing descriptors, email receipts, 3DS for risky transactions
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [stripe]
+  domains:
+    domain: [fintech, security]
+    concern: [domain_specific]
+  example_good: |
+    async def handle_dispute_created(event: dict):
+        dispute = event["data"]["object"]
+        payment_intent_id = dispute["payment_intent"]
+
+        # 1. Freeze disputed amount in ledger
+        await ledger.freeze_amount(
+            payment_intent_id=payment_intent_id,
+            disputed_amount=dispute["amount"],
+            reason=dispute["reason"],
+        )
+
+        # 2. Gather evidence automatically
+        payment = await db.get_payment_by_stripe_pi(payment_intent_id)
+        user_activity = await db.get_user_activity_log(
+            payment.user_id,
+            since=payment.created_at - timedelta(hours=24),
+        )
+
+        evidence = {
+            "customer_email_address": payment.user_email,
+            "billing_address": payment.billing_address_json,
+            "product_description": f"Prediction market position: {payment.market_title}",
+            "uncategorized_text": json.dumps(user_activity[:10]),
+        }
+
+        # 3. Submit evidence
+        stripe.Dispute.modify(dispute["id"], evidence=evidence, submit=True)
+
+        # 4. Alert team
+        await alert_compliance_team(
+            f"Dispute {dispute['id']} for ${dispute['amount']/100:.2f}. "
+            f"Reason: {dispute['reason']}. Deadline: {dispute['evidence_details']['due_by']}"
+        )
+  example_bad: |
+    # WRONG: Ignoring disputes — automatic loss
+    # No handler for charge.dispute.created
+    # Stripe auto-resolves in customer's favor after deadline
+
+    # WRONG: Paying out while disputed
+    async def handle_dispute(dispute):
+        pass  # "We'll deal with it later" — you won't
+  when_applies: "Any platform accepting card payments, prediction markets with withdrawals"
+  sources: ["https://stripe.com/docs/disputes"]

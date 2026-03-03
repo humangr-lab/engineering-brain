@@ -1,0 +1,892 @@
+layer: rules
+domain: testing
+knowledge:
+- id: PYTEST-001
+  text: >
+    Scope fixtures at the highest level that preserves test isolation: session scope for
+    expensive immutable resources (database engines, containers, compiled schemas), module scope
+    for shared mutable state reset between modules, and function scope (default) for anything
+    that must be fresh per test. Never default everything to function scope — a test suite
+    that creates a Docker container per test takes 10 minutes instead of 10 seconds.
+  why: >
+    Fixture scope directly controls test suite speed. Creating a PostgreSQL test engine per test
+    function (function scope) costs ~50-200ms per test — a 500-test suite takes 100 seconds in
+    setup alone. Session-scoped engine creation costs ~200ms total. A team reduced their CI
+    time from 18 minutes to 4 minutes by changing only the database engine fixture from function
+    to session scope, while keeping the session transaction fixture at function scope for isolation.
+    Wrong scoping is the single largest controllable factor in test suite speed.
+  how_to_do_right: |
+    1. session scope: database engine, compiled regex, JWT keys, Docker containers, test data seeds
+    2. module scope: rarely needed — use when resetting between modules is cheaper than per-function
+    3. class scope: when test class methods share state across methods but not other classes
+    4. function scope (default): database sessions (with rollback), HTTP clients, temporary files
+    5. Explicit scope on fixture: @pytest.fixture(scope="session")
+    6. Scope mismatch error: lower-scope fixture cannot depend on higher-scope fixture — pytest enforces this
+    7. Dynamic scope (pytest >=5.2): @pytest.fixture(scope=lambda name, config: "session" if not config.option.fast else "function")
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pytest, sqlalchemy, docker]
+  domains:
+    domain: [testing, code_quality]
+    concern: [fixture_scoping, performance, test_isolation]
+  example_good: |
+    # conftest.py
+    import pytest
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from myapp.models import Base
+
+    @pytest.fixture(scope="session")  # Created ONCE for entire test suite
+    def db_engine():
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        yield engine
+        engine.dispose()
+
+    @pytest.fixture(scope="session")
+    def session_factory(db_engine):
+        return sessionmaker(db_engine)
+
+    @pytest.fixture()  # function scope — fresh transaction per test
+    def db_session(session_factory):
+        with session_factory() as session:
+            session.begin_nested()
+            yield session
+            session.rollback()  # Ensures test isolation without engine recreation
+  example_bad: |
+    @pytest.fixture()  # function scope — wasteful for engine
+    def db_engine():
+        engine = create_engine("sqlite:///:memory:")  # 50-200ms EVERY test
+        Base.metadata.create_all(engine)              # DDL EVERY test
+        yield engine
+        engine.dispose()
+    # 500 tests × 100ms = 50 seconds wasted on engine creation alone
+  when_applies: "Designing any pytest fixture hierarchy. Review scope choices during code review for all conftest.py changes."
+  sources:
+    - "https://docs.pytest.org/en/stable/how-to/fixtures.html#fixture-scopes"
+    - "https://docs.pytest.org/en/stable/reference/fixtures.html#fixture-availability"
+
+- id: PYTEST-002
+  text: >
+    Structure conftest.py files hierarchically: project-root conftest for infrastructure
+    (database engine, test client, auth tokens), package-level conftest for domain-specific
+    fixtures (user factories, order factories), and test-file-level conftest only when truly
+    local. Never put all fixtures in one root conftest.py — it creates a 2,000-line monster
+    that nobody can navigate and slows fixture resolution.
+  why: >
+    Pytest discovers conftest.py files from test file directory up to root. A fixture defined
+    in tests/orders/conftest.py is only available to tests in tests/orders/. Putting
+    everything in root conftest.py means order-specific fixtures pollute the namespace of
+    auth tests, making fixture conflicts and "fixture X redefined" warnings common. One team
+    had 2,847 lines in root conftest.py and 23 duplicate fixture names that caused
+    non-deterministic test failures depending on import order. Hierarchical conftest
+    reduces this to zero conflicts.
+  how_to_do_right: |
+    1. Root conftest.py: db_engine, http_client, auth_headers, event_loop (asyncio)
+    2. tests/users/conftest.py: user_factory, admin_user, regular_user
+    3. tests/orders/conftest.py: order_factory, order_with_items, pending_order
+    4. Keep each conftest.py under 100 lines — split if larger
+    5. Never import fixtures explicitly — pytest discovers them automatically from conftest.py
+    6. Use pytest.ini [tool:pytest] testpaths to control discovery root
+    7. Shared test utilities that are NOT fixtures: put in tests/helpers.py, import explicitly
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [pytest]
+  domains:
+    domain: [testing, code_quality]
+    concern: [test_organization, fixture_management, maintainability]
+  example_good: |
+    # Project layout:
+    # tests/
+    # ├── conftest.py          ← infrastructure: engine, client
+    # ├── users/
+    # │   ├── conftest.py      ← user fixtures only
+    # │   └── test_users.py
+    # └── orders/
+    #     ├── conftest.py      ← order fixtures only
+    #     └── test_orders.py
+
+    # tests/conftest.py — infrastructure only
+    @pytest.fixture(scope="session")
+    def db_engine(): ...
+
+    @pytest.fixture()
+    def client(app): return TestClient(app)
+
+    # tests/users/conftest.py — domain-specific
+    @pytest.fixture()
+    def regular_user(db_session):
+        return UserFactory(is_active=True, _session=db_session)
+
+    # tests/orders/conftest.py — order domain only
+    @pytest.fixture()
+    def paid_order(db_session, regular_user):
+        return OrderFactory(user=regular_user, status="paid", _session=db_session)
+  example_bad: |
+    # tests/conftest.py — 2,000-line monster
+    # Everything in one file: infrastructure + all domains + utilities
+    @pytest.fixture()
+    def engine(): ...
+    @pytest.fixture()
+    def user(): ...
+    @pytest.fixture()
+    def admin(): ...
+    @pytest.fixture()
+    def order(): ...
+    @pytest.fixture()
+    def paid_order(): ...
+    # 250+ fixtures, namespace collisions, slow to navigate
+  when_applies: "Any project with more than 20 test files or 50 fixtures. Structure before writing the 20th fixture."
+  sources:
+    - "https://docs.pytest.org/en/stable/reference/fixtures.html#conftest-py-sharing-fixtures-across-files"
+    - "https://docs.pytest.org/en/stable/how-to/fixtures.html#conftest-py-sharing-fixtures-across-files"
+
+- id: PYTEST-003
+  text: >
+    Use @pytest.mark.parametrize for data-driven tests, but follow the rule: parametrize
+    the INPUTS and EXPECTED OUTPUTS, never the test logic. Use indirect parametrize to pass
+    parameters through fixtures when test setup is complex. Use pytest.param(..., id="name")
+    for all parametrized cases to make failure output readable.
+  why: >
+    Without id= on parametrize cases, pytest generates IDs like test_price[0.1-0.9-1.0]
+    from parameter values — unreadable when a test fails. A test named
+    test_trade_calculation[0.1-0.9-True-1.0-0.5] vs test_trade_calculation[case:buy_fills_full]
+    takes 30 seconds vs 3 seconds to understand from a CI log. When parametrize is used for
+    logic branching (if param == "admin": do_admin_thing), it creates coupling that makes
+    tests fragile. Data variation should be in params, logic variation should be separate tests.
+  how_to_do_right: |
+    1. @pytest.mark.parametrize("input,expected", [...]) for simple data variation
+    2. Use pytest.param(input, expected, id="meaningful-name") for every case
+    3. For complex setup: @pytest.mark.parametrize("user_type", ["admin", "user"], indirect=True)
+    4. With indirect=True: the parameter is passed to a fixture of the same name
+    5. Cartesian product: @pytest.mark.parametrize("a", [1,2]) @pytest.mark.parametrize("b", [3,4]) → 4 tests
+    6. pytest-lazy-fixture for parametrize + fixtures (without indirect indirection)
+    7. Keep parameter lists short (< 20) — long parameter lists are a sign of insufficient test design
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [pytest]
+  domains:
+    domain: [testing, code_quality]
+    concern: [parametrize, test_readability, data_driven_testing]
+  example_good: |
+    import pytest
+    from decimal import Decimal
+
+    @pytest.mark.parametrize("amount,currency,expected_usd", [
+        pytest.param(Decimal("100"), "USD", Decimal("100.00"), id="usd-passthrough"),
+        pytest.param(Decimal("100"), "EUR", Decimal("108.50"), id="eur-to-usd"),
+        pytest.param(Decimal("0"), "EUR", Decimal("0.00"), id="zero-amount"),
+        pytest.param(Decimal("0.01"), "JPY", Decimal("0.000067"), id="yen-micro-amount"),
+    ])
+    def test_currency_conversion(amount, currency, expected_usd, mock_exchange_rate):
+        result = convert_to_usd(amount, currency)
+        assert result == pytest.approx(expected_usd, rel=1e-4)
+        # Failure: "FAILED test_currency_conversion[eur-to-usd]" — instantly clear
+
+    # Indirect parametrize for complex setup
+    @pytest.fixture()
+    def user_type(request):  # Name matches parametrize parameter
+        if request.param == "admin":
+            return UserFactory(role="admin", permissions=["read", "write", "delete"])
+        return UserFactory(role="user", permissions=["read"])
+
+    @pytest.mark.parametrize("user_type", ["admin", "user"], indirect=True)
+    def test_access_control(user_type, client):
+        response = client.get("/admin/users", headers=auth_headers(user_type))
+        expected = 200 if user_type.role == "admin" else 403
+        assert response.status_code == expected
+  example_bad: |
+    # No IDs — unreadable failures
+    @pytest.mark.parametrize("amount,currency,expected", [
+        (100, "USD", 100.0),
+        (100, "EUR", 108.5),  # Failure: test_conversion[100-EUR-108.5] — cryptic
+    ])
+    def test_conversion(amount, currency, expected):
+        ...
+
+    # Logic in parametrize — coupling
+    @pytest.mark.parametrize("scenario", ["happy_path", "error", "edge_case"])
+    def test_payment(scenario):
+        if scenario == "happy_path":   # Logic variation — use separate test functions
+            ...
+        elif scenario == "error":
+            ...
+  when_applies: "Any test that runs the same logic with different data. Also: any time you copy-paste a test and only change values."
+  sources:
+    - "https://docs.pytest.org/en/stable/how-to/parametrize.html"
+    - "https://docs.pytest.org/en/stable/example/parametrize.html#indirect-parametrization"
+
+- id: PYTEST-004
+  text: >
+    Use pytest-asyncio with asyncio_mode="auto" for async test functions, and define a single
+    event_loop fixture at session scope when async fixtures need to share state across tests.
+    Never mix sync and async fixtures in the same dependency chain without explicit bridging.
+  why: >
+    Without asyncio_mode="auto", every async test requires @pytest.mark.asyncio decorator —
+    forgetting it causes the test to not actually run (it returns a coroutine that pytest
+    silently ignores, giving a false pass). Teams have shipped broken async code because
+    tests "passed" but never ran. The event_loop scope issue: by default, each async test
+    gets its own event loop, which means async database connections and clients created in
+    session-scoped fixtures get destroyed and recreated per test — killing the performance
+    benefit of session scope.
+  how_to_do_right: |
+    1. Add asyncio_mode = "auto" to pytest.ini or pyproject.toml [tool.pytest.ini_options]
+    2. For shared async fixtures: override event_loop at session scope in root conftest.py
+    3. event_loop_policy: use uvloop in CI for consistency with production if uvloop is used
+    4. pytest.ini_options: asyncio_mode = "auto", markers = ["asyncio: async test"]
+    5. For async generators: use async def fixture() → async generator (yield syntax)
+    6. Test async context managers: use async with in test body, not in fixture
+    7. pytest-anyio as alternative if you use anyio instead of asyncio directly
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pytest, pytest-asyncio, fastapi]
+  domains:
+    domain: [testing, backend]
+    concern: [async_testing, event_loop, fixture_lifecycle]
+  example_good: |
+    # pyproject.toml
+    # [tool.pytest.ini_options]
+    # asyncio_mode = "auto"
+
+    # conftest.py
+    import pytest
+    import asyncio
+
+    @pytest.fixture(scope="session")
+    def event_loop():  # Session-scoped event loop for shared async fixtures
+        policy = asyncio.get_event_loop_policy()
+        loop = policy.new_event_loop()
+        yield loop
+        loop.close()
+
+    @pytest.fixture(scope="session")
+    async def async_db_engine(event_loop):  # Shared engine for all async tests
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        yield engine
+        await engine.dispose()
+
+    # test_users.py — no @pytest.mark.asyncio needed with asyncio_mode="auto"
+    async def test_create_user(async_db_session):
+        user = User(email="test@example.com")
+        async_db_session.add(user)
+        await async_db_session.flush()
+        assert user.id is not None
+  example_bad: |
+    # Without asyncio_mode="auto" — easy to forget decorator
+    def test_create_user(db_session):  # Missing async — pytest runs it as sync
+        result = create_user(db_session, "test@example.com")  # Returns coroutine
+        assert result is not None  # PASSES: coroutine is truthy — but never awaited!
+        # Code was never tested. False green.
+  when_applies: >
+    Any codebase with async code. Set asyncio_mode="auto" from day 1 — retrofitting it
+    later requires auditing every async test for the missing decorator.
+  sources:
+    - "https://pytest-asyncio.readthedocs.io/en/latest/reference/modes/index.html"
+    - "https://pytest-asyncio.readthedocs.io/en/latest/reference/fixtures/index.html"
+
+- id: PYTEST-005
+  text: >
+    Use pytest-xdist with -n auto for parallel test execution, but ensure test isolation
+    first: no shared mutable file state, no sequential database IDs used as test data,
+    and no tests that depend on other tests running first. Parallel testing on non-isolated
+    tests produces intermittent failures that are harder to debug than slow sequential tests.
+  why: >
+    pytest-xdist distributes tests across worker processes, each with its own Python interpreter.
+    Tests that share state through files, global variables, or sequential database IDs fail
+    non-deterministically under parallelism. A test that creates a file /tmp/test_output.json
+    and another that reads it will fail when run in parallel unless uniquely named. A team
+    saw 30% of tests "randomly" failing under -n 4 because tests assumed auto-increment IDs
+    were sequential (user_id=1 was used as a constant). After fixing isolation, parallel
+    execution cut CI from 12 minutes to 3 minutes.
+  how_to_do_right: |
+    1. Install: pip install pytest-xdist
+    2. Run: pytest -n auto (uses all CPU cores) or -n 4 (specific count)
+    3. For database tests: use transactions with rollback (each worker gets its own connection)
+    4. For file I/O: use tmp_path fixture (pytest creates unique directory per test)
+    5. For ports/sockets: use random available ports (socket.bind(("", 0)))
+    6. For sequential IDs: never hardcode ID=1 in assertions — query by name or unique field
+    7. pytest.ini: addopts = "-n auto" for permanent parallel execution
+    8. @pytest.mark.serial for tests that must run sequentially: use pytest-ordering
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pytest, pytest-xdist]
+  domains:
+    domain: [testing, devops]
+    concern: [parallel_testing, ci_performance, test_isolation]
+  example_good: |
+    # Properly isolated parallel-safe test
+    def test_export_report(tmp_path):
+        output_file = tmp_path / "report.json"  # Unique dir per test worker
+        generate_report(output_path=output_file)
+        data = json.loads(output_file.read_text())
+        assert data["total"] > 0
+
+    # Never use hardcoded IDs — query by unique field
+    def test_user_deactivation(db_session, user_factory):
+        user = user_factory(email="deactivate-test@example.com")
+        deactivate_user(db_session, user.id)
+        found = db_session.execute(
+            select(User).where(User.email == "deactivate-test@example.com")
+        ).scalar_one()
+        assert not found.is_active  # Use unique field, not hardcoded ID=1
+  example_bad: |
+    def test_export_report():
+        generate_report(output_path="/tmp/test_output.json")  # Shared across workers!
+        data = json.loads(open("/tmp/test_output.json").read())
+        # Worker 1 writes, Worker 2 reads stale data — intermittent failure
+
+    def test_first_user_is_admin(db_session):
+        user = db_session.get(User, 1)  # ID=1 only exists if test ran in order 1
+        assert user.role == "admin"     # Fails randomly under parallel execution
+  when_applies: "Any test suite taking more than 60 seconds to run. Enable parallel execution before suite grows large."
+  sources:
+    - "https://pytest-xdist.readthedocs.io/en/stable/"
+    - "https://docs.pytest.org/en/stable/how-to/tmp_path.html"
+
+- id: PYTEST-006
+  text: >
+    Choose the right mocking tool for each situation: use monkeypatch for environment variables,
+    module-level attributes, and OS functions; use unittest.mock.patch for class methods and
+    third-party library internals; use pytest-mock's mocker fixture for object method mocking
+    with automatic cleanup. Never use monkeypatch for object method mocking — it bypasses
+    mock assertion capabilities.
+  why: >
+    monkeypatch replaces attributes directly, has no call tracking, and cannot assert
+    "was called with these arguments." Using it for method mocking produces tests that
+    cannot verify behavior — only that code doesn't raise an exception. unittest.mock.patch
+    provides call_args, assert_called_once_with, side_effect, and return_value. The mocker
+    fixture from pytest-mock wraps mock.patch with pytest fixture lifecycle — automatic
+    cleanup after each test without explicit teardown, preventing mock state bleeding between
+    tests. Teams that used raw mock.patch without pytest-mock had leaked mock state causing
+    50+ intermittent failures per day.
+  how_to_do_right: |
+    1. monkeypatch: os.environ, sys.path, module constants, built-in functions (open, time.sleep)
+    2. mocker.patch: object methods, class constructors, third-party clients
+    3. mocker.patch.object: patch specific attribute on an object instance
+    4. mocker.patch returns a Mock — use .assert_called_once_with(), .return_value, .side_effect
+    5. For async mocks: mocker.AsyncMock or AsyncMock from unittest.mock
+    6. For complex call sequences: mocker.call() and mock.call_args_list
+    7. Patch at the IMPORT LOCATION, not definition location: "mymodule.requests.get" not "requests.get"
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [pytest, pytest-mock, unittest]
+  domains:
+    domain: [testing, code_quality]
+    concern: [mocking, test_isolation, mock_patterns]
+  example_good: |
+    import pytest
+    from unittest.mock import AsyncMock
+
+    # monkeypatch: environment and module-level config
+    def test_uses_correct_env_url(monkeypatch):
+        monkeypatch.setenv("API_URL", "https://test.example.com")
+        client = APIClient()
+        assert client.base_url == "https://test.example.com"
+
+    # mocker: object method with assertions
+    def test_sends_notification(mocker):
+        mock_send = mocker.patch("myapp.notifications.email_client.send")
+        mock_send.return_value = {"status": "sent", "id": "msg_123"}
+        service = NotificationService()
+        service.notify_user(user_id=42, message="Hello")
+        mock_send.assert_called_once_with(
+            to="user@example.com", subject="Notification", body="Hello"
+        )
+
+    # Async mock
+    async def test_async_api_call(mocker):
+        mock_get = mocker.patch("myapp.http_client.get", new_callable=AsyncMock)
+        mock_get.return_value = {"data": [1, 2, 3]}
+        result = await fetch_data(endpoint="/items")
+        assert result == [1, 2, 3]
+        mock_get.assert_awaited_once_with("/items")
+  example_bad: |
+    # WRONG: monkeypatch for method mocking — no assertion capability
+    def test_sends_notification(monkeypatch):
+        calls = []
+        monkeypatch.setattr("myapp.notifications.email_client", "send",
+                            lambda **kw: calls.append(kw))
+        # Cannot use assert_called_once_with — manual call tracking is fragile
+        # Cannot set side_effect for error simulation
+        # Cannot verify call order or arguments structure
+  when_applies: "Every test that needs to isolate external dependencies. Choosing the wrong tool is the most common mocking mistake."
+  sources:
+    - "https://docs.pytest.org/en/stable/how-to/monkeypatch.html"
+    - "https://pytest-mock.readthedocs.io/en/latest/"
+
+- id: PYTEST-007
+  text: >
+    Use factory_boy with SQLAlchemy integration for test data creation. Never write
+    raw object instantiation spread across test files — it creates maintenance nightmares
+    when models change. Bind factories to test sessions, not global sessions, to maintain
+    transaction isolation.
+  why: >
+    When a model adds a required field, raw dict/object instantiation in tests breaks in
+    every test file simultaneously. factory_boy centralizes object creation — updating the
+    factory updates all tests. At a company with 800 tests using raw User(**data) dicts,
+    adding a required timezone field required 3 hours of search-and-replace across 47 test
+    files. With factory_boy, it was a 5-minute factory change. Additionally, Faker integration
+    generates realistic data (real email formats, valid phone numbers) that catches format
+    validation bugs that hardcoded "test@test.com" would miss.
+  how_to_do_right: |
+    1. pip install factory_boy Faker
+    2. Define factory per model in tests/factories.py
+    3. Bind factory to SQLAlchemy session: Meta.sqlalchemy_session = session
+    4. Use factory.Faker("email") for realistic generated data
+    5. Use factory.SubFactory for related objects (ForeignKey)
+    6. Use Traits for variations: UserFactory(is_admin=True) via @factory.trait decorator
+    7. Override specific fields: UserFactory(email="specific@test.com") — rest is auto-generated
+    8. Use create_batch(n) for multiple objects
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [pytest, factory_boy, sqlalchemy]
+  domains:
+    domain: [testing, code_quality]
+    concern: [test_data, factories, maintainability]
+  example_good: |
+    # tests/factories.py
+    import factory
+    from factory import Faker
+    from myapp.models import User, Order, OrderItem
+
+    class UserFactory(factory.alchemy.SQLAlchemyModelFactory):
+        class Meta:
+            model = User
+            sqlalchemy_session_persistence = "flush"  # flush after create, don't commit
+
+        email = Faker("email")
+        name = Faker("name")
+        is_active = True
+        created_at = Faker("date_time_this_year")
+
+        class Params:
+            admin = factory.Trait(
+                role="admin",
+                permissions=["read", "write", "delete", "admin"],
+            )
+
+    class OrderFactory(factory.alchemy.SQLAlchemyModelFactory):
+        class Meta:
+            model = Order
+
+        user = factory.SubFactory(UserFactory)
+        status = "pending"
+        total = Faker("pydecimal", left_digits=4, right_digits=2, positive=True)
+
+    # test usage — concise, readable, maintainable
+    def test_order_cancellation(db_session):
+        UserFactory._meta.sqlalchemy_session = db_session  # bind to test session
+        OrderFactory._meta.sqlalchemy_session = db_session
+        order = OrderFactory(status="pending")
+        cancel_order(db_session, order.id)
+        db_session.refresh(order)
+        assert order.status == "cancelled"
+  example_bad: |
+    # Raw instantiation — breaks when model changes
+    def test_order_cancellation(db_session):
+        user = User(  # Repeated in 47 test files
+            email="test@test.com",
+            name="Test",
+            is_active=True,
+            # Missing: new required field `timezone` — breaks 47 tests simultaneously
+        )
+        db_session.add(user)
+        db_session.flush()
+        order = Order(user_id=user.id, status="pending", total=Decimal("99.99"))
+  when_applies: >
+    Any test that creates ORM objects. Write the factory before writing the first test
+    that needs the model — retrofitting factories into an existing test suite is painful.
+  sources:
+    - "https://factoryboy.readthedocs.io/en/stable/orms.html#sqlalchemy"
+    - "https://factoryboy.readthedocs.io/en/stable/reference.html#factory.Faker"
+
+- id: PYTEST-008
+  text: >
+    Use snapshot testing with syrupy for complex data structures, API response shapes, and
+    serialized outputs that are hard to assert manually. Snapshots catch regressions in
+    output format that manual assertions miss. Update snapshots intentionally with
+    --snapshot-update, never blindly.
+  why: >
+    Manually asserting nested JSON API responses requires writing 30-50 assert statements
+    per test or a custom deep_equal helper. These assertions are fragile (any added field
+    breaks them) or too permissive (missing new required fields). Snapshot testing captures
+    the full shape once and fails immediately when any part changes. A team testing a GraphQL
+    API replaced 800 lines of fragile assertions with 40 snapshot tests. The snapshots caught
+    3 unintended field renames during a refactor that the manual assertions (which checked
+    only specific fields) had missed.
+  how_to_do_right: |
+    1. pip install syrupy
+    2. Use snapshot fixture: def test_api_response(snapshot, client):
+    3. assert response.json() == snapshot — creates snapshot on first run
+    4. Review snapshot file (.ambr) in git before committing — it IS your assertion
+    5. Update intentionally: pytest --snapshot-update -k test_api_response
+    6. Use snapshot.assert_match(value, name="specific-case") for multiple snapshots per test
+    7. Exclude volatile fields: use custom serializer or exclude timestamps from snapshot
+    8. snapshot files go in tests/__snapshots__/ — commit them to git
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [pytest, syrupy]
+  domains:
+    domain: [testing, code_quality]
+    concern: [snapshot_testing, regression_detection, api_testing]
+  example_good: |
+    # tests/api/test_users.py
+    from syrupy.assertion import SnapshotAssertion
+
+    def test_get_user_response_shape(snapshot: SnapshotAssertion, client, created_user):
+        response = client.get(f"/users/{created_user.id}")
+        assert response.status_code == 200
+        # Exclude volatile fields before snapshotting
+        data = response.json()
+        data.pop("created_at", None)  # Remove timestamp
+        data.pop("updated_at", None)
+        assert data == snapshot
+        # Snapshot captures exact JSON shape including all fields, types, nesting
+
+    # On first run: creates tests/__snapshots__/test_users.ambr
+    # On subsequent runs: fails if shape changes unexpectedly
+    # To update: pytest --snapshot-update -k test_get_user_response_shape
+  example_bad: |
+    # Manual assertion — fragile and incomplete
+    def test_get_user_response(client, created_user):
+        response = client.get(f"/users/{created_user.id}")
+        data = response.json()
+        assert data["id"] == created_user.id
+        assert data["email"] == created_user.email
+        # Misses: new fields added, field renamed, wrong nesting, extra unexpected fields
+        # When "display_name" is added to response, test still passes — regression undetected
+  when_applies: >
+    API response shape testing, serializer output validation, complex nested data structure
+    assertions, and any output that is too verbose to manually assert but must not change.
+  sources:
+    - "https://syrupy-project.github.io/syrupy/"
+    - "https://til.simonwillison.net/pytest/syrupy"
+
+- id: PYTEST-009
+  text: >
+    Configure coverage with branch coverage enabled and maintain per-package minimums,
+    not just overall minimums. An overall 85% line coverage target can hide packages with
+    20% coverage masked by packages with 99% coverage. Branch coverage catches untested
+    conditional paths that line coverage reports as covered.
+  why: >
+    Line coverage reports a line as covered even if only one branch of an if/else is tested.
+    A function with if condition: return A; else: return B is reported as 100% line covered
+    if only the if branch is tested — the else is never executed. Branch coverage reports
+    this as 50% covered. A financial calculation module had 91% line coverage but only 43%
+    branch coverage — critical error handling paths (negative amounts, zero division, overflow)
+    were never tested. These exact paths caused production incidents.
+  how_to_do_right: |
+    1. .coveragerc or pyproject.toml [tool.coverage.run]: branch = true
+    2. pytest.ini: addopts = "--cov=src --cov-branch --cov-report=term-missing"
+    3. [tool.coverage.report]: fail_under = 80 (overall minimum)
+    4. Per-module minimums: use pytest-cov --cov-fail-under or coverage.xml in CI quality gates
+    5. [tool.coverage.run] omit = ["*/migrations/*", "*/tests/*", "*/conftest.py"]
+    6. Track branch coverage trends — regression from 85% to 80% is a red flag
+    7. Focus on critical business logic modules: coverage.report --include="src/core/*"
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [pytest, pytest-cov, coverage.py]
+  domains:
+    domain: [testing, code_quality, devops]
+    concern: [coverage, branch_coverage, quality_gates]
+  example_good: |
+    # pyproject.toml
+    # [tool.coverage.run]
+    # branch = true
+    # source = ["src"]
+    # omit = ["*/migrations/*", "*/__init__.py", "*/conftest.py"]
+    #
+    # [tool.coverage.report]
+    # fail_under = 80
+    # show_missing = true
+    # skip_covered = false
+    #
+    # [tool.pytest.ini_options]
+    # addopts = "--cov=src --cov-branch --cov-report=term-missing:skip-covered"
+
+    # Run with branch coverage
+    # pytest --cov=src --cov-branch --cov-report=html
+    # Open htmlcov/index.html — red lines show uncovered branches, not just lines
+
+    def calculate_discount(amount: Decimal, is_premium: bool) -> Decimal:
+        if is_premium:
+            return amount * Decimal("0.9")  # Branch A
+        return amount                        # Branch B — easy to forget testing this
+    # Line coverage: 100% if either branch runs
+    # Branch coverage: 50% if only one branch tested — forces you to test both
+  example_bad: |
+    # Line-only coverage — hides branch gaps
+    # pytest --cov=src (no --cov-branch)
+    # Reports 91% coverage on financial_calc.py
+    # But the error handling branches for negative amounts are never executed
+    # Branch coverage would show 43% — forcing investigation
+  when_applies: "All Python projects with quality gates. Enable branch coverage from project inception."
+  sources:
+    - "https://coverage.readthedocs.io/en/latest/branch.html"
+    - "https://pytest-cov.readthedocs.io/en/latest/config.html"
+
+- id: PYTEST-010
+  text: >
+    Use pytest.approx() for floating-point comparisons and Decimal comparisons in financial
+    code. Never use == for floats in tests. For Decimal assertions requiring exact precision,
+    use Decimal("str") construction — never float() conversion. Define custom assertion
+    helper functions for domain-specific comparisons to avoid duplicating tolerance logic.
+  why: >
+    Python float arithmetic: 0.1 + 0.2 == 0.3 evaluates to False because 0.1 and 0.2 are
+    not exactly representable in binary floating point. Tests that assert result == 0.3
+    fail intermittently depending on CPU and Python version. Teams have wasted hours debugging
+    "flaky" tests that were actually testing floating-point equality incorrectly. For financial
+    code using Decimal, float() conversion introduces the same imprecision: Decimal(0.1) !=
+    Decimal("0.1") — the float literal 0.1 propagates its imprecision into Decimal.
+  how_to_do_right: |
+    1. Use pytest.approx(expected, rel=1e-6) for relative tolerance (6 significant digits)
+    2. Use pytest.approx(expected, abs=1e-10) for absolute tolerance (known precision)
+    3. For Decimal: always construct from string: Decimal("0.1"), never Decimal(0.1)
+    4. For exact Decimal assertions: assert result == Decimal("0.30") (string construction)
+    5. Custom helper: def assert_price(actual, expected): assert actual == pytest.approx(expected, rel=1e-4)
+    6. For test data with Decimal: use Faker pydecimal or Decimal("str") constants
+    7. For numpy arrays: use np.testing.assert_allclose(actual, expected, rtol=1e-6)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pytest]
+  domains:
+    domain: [testing, code_quality]
+    concern: [floating_point, precision, financial_testing]
+  example_good: |
+    from decimal import Decimal
+    import pytest
+
+    # Float comparison — use approx
+    def test_compound_interest():
+        result = calculate_compound_interest(principal=1000.0, rate=0.05, years=3)
+        assert result == pytest.approx(1157.625, rel=1e-6)
+
+    # Decimal in financial code — string construction
+    def test_price_calculation():
+        price = Decimal("19.99")
+        tax_rate = Decimal("0.0875")
+        total = price + (price * tax_rate)
+        assert total == Decimal("21.7391250")  # Exact Decimal comparison, no float involved
+
+    # Custom assertion helper for domain precision
+    def assert_amount(actual: Decimal, expected: Decimal, cents_tolerance: int = 1) -> None:
+        diff = abs(actual - expected)
+        assert diff <= Decimal(cents_tolerance) / 100, f"Amount {actual} differs from {expected} by {diff}"
+  example_bad: |
+    def test_compound_interest():
+        result = calculate_compound_interest(1000.0, 0.05, 3)
+        assert result == 1157.625  # May fail due to float arithmetic
+        # 0.05 ** 3 is not exactly representable
+
+    def test_price_calculation():
+        price = Decimal(19.99)  # WRONG: Decimal(float) inherits float imprecision
+        # Decimal(19.99) == Decimal('19.9900000000000002131628...') — not 19.99
+  when_applies: "Every test involving float or Decimal values. Mandatory for financial calculations, scientific computing, and any precision-sensitive domain."
+  sources:
+    - "https://docs.pytest.org/en/stable/reference/api.html#pytest.approx"
+    - "https://docs.python.org/3/library/decimal.html#decimal-faq"
+
+- id: PYTEST-011
+  text: >
+    Use custom pytest marks to categorize tests by type and speed, then gate slow/integration
+    tests behind explicit opt-in in CI. Fast unit tests must run in under 30 seconds in CI.
+    Integration and end-to-end tests run only on merge requests and nightly builds.
+  why: >
+    A test suite where all tests always run becomes a bottleneck that developers work around
+    by running tests less frequently, or not at all locally. A 10-minute test suite that must
+    complete before merge generates developer frustration and encourages skipping local testing.
+    The solution: unit tests (function-scope, no I/O) run in < 30 seconds, tagged as fast.
+    Integration tests (real DB, real HTTP) run separately. One company reduced "time to first
+    feedback" on pull requests from 14 minutes to 45 seconds by separating test tiers.
+  how_to_do_right: |
+    1. pytest.ini: markers = ["unit: pure unit tests", "integration: needs real infra", "slow: >1s each"]
+    2. Register marks to avoid PytestUnknownMarkWarning
+    3. Default run: pytest -m "not integration and not slow" (fast feedback loop)
+    4. Full run: pytest (all tests — for merge gates)
+    5. Integration run: pytest -m integration (CI integration stage)
+    6. Use @pytest.mark.integration on DB-touching tests, HTTP call tests, file I/O
+    7. CI pipeline: stage 1 = unit, stage 2 = integration (only on success of stage 1)
+    8. For marks on fixtures: use request.param or fixture factories, not fixture marks
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [pytest]
+  domains:
+    domain: [testing, devops, code_quality]
+    concern: [test_categorization, ci_pipeline, developer_experience]
+  example_good: |
+    # pyproject.toml
+    # [tool.pytest.ini_options]
+    # markers = [
+    #   "unit: fast pure unit tests, no I/O",
+    #   "integration: requires database/external services",
+    #   "slow: tests taking >1s",
+    #   "e2e: end-to-end tests",
+    # ]
+    # addopts = "-m 'not integration and not slow'"  # Default: fast tests only
+
+    import pytest
+
+    @pytest.mark.unit
+    def test_price_calculation():  # Pure Python, no I/O — runs in <1ms
+        assert calculate_price(100, 0.1) == Decimal("90.00")
+
+    @pytest.mark.integration
+    def test_user_creation_persists(db_session):  # Needs real DB
+        user = create_user(db_session, email="test@example.com")
+        db_session.expunge(user)
+        found = db_session.get(User, user.id)
+        assert found is not None
+
+    # CI pipeline:
+    # Stage 1: pytest (default: runs unit only, -m 'not integration') — 30 seconds
+    # Stage 2: pytest -m integration -- only if Stage 1 passes — 3 minutes
+  example_bad: |
+    # No marks — all tests run every time
+    def test_price():   # 1ms
+        ...
+    def test_persists():  # 100ms DB roundtrip
+        ...
+    def test_email_sent(): # 2s external API call
+        ...
+    # 1,000 tests × avg 50ms = 50s before first feedback
+    # Developers stop running locally → bugs discovered later → more expensive
+  when_applies: >
+    Any project with more than 50 tests. Define marks before the test suite grows — adding
+    marks to 800 existing tests is a painful afternoon.
+  sources:
+    - "https://docs.pytest.org/en/stable/how-to/mark.html"
+    - "https://docs.pytest.org/en/stable/example/markers.html#registering-markers"
+
+- id: PYTEST-012
+  text: >
+    Use pytest's tmp_path fixture for file I/O tests instead of hardcoded paths or
+    tempfile.mkdtemp(). tmp_path creates a unique per-test directory that is automatically
+    cleaned up after the test, is parallel-safe, and integrates with pytest's failure
+    reporting (preserves directory on failure for debugging).
+  why: >
+    Hardcoded /tmp/test_output.json shared across tests causes race conditions under parallel
+    execution. tempfile.mkdtemp() without cleanup leaks directories and fills disk on long
+    test suites. pytest's tmp_path creates an isolated directory per test under
+    /tmp/pytest-NNN/test_name_0/, preserves it on failure so you can inspect outputs,
+    and cleans up automatically on success. A CI system that ran 10,000 tests with mkdtemp
+    accumulated 40GB of temp files over a week before anyone noticed.
+  how_to_do_right: |
+    1. Use tmp_path: Path fixture (function scope) in test signature
+    2. Create subdirs: tmp_path / "input" / "config.yaml" — auto-creates parent directories
+    3. Write test data: (tmp_path / "data.json").write_text(json.dumps(data))
+    4. Read outputs: assert (tmp_path / "output.csv").exists()
+    5. Pass to SUT: process_file(input=tmp_path / "data.json", output=tmp_path / "output.csv")
+    6. tmp_path_factory for session/module-scoped file fixtures
+    7. pytest --basetemp=/fast/ssd to redirect temp files to faster disk in CI
+  severity: low
+  technologies:
+    lang: [python]
+    framework: [pytest]
+  domains:
+    domain: [testing, code_quality]
+    concern: [file_io_testing, test_isolation, parallel_safety]
+  example_good: |
+    from pathlib import Path
+    import json
+
+    def test_csv_export(tmp_path: Path):
+        input_data = [{"name": "Alice", "score": 95}, {"name": "Bob", "score": 87}]
+        input_file = tmp_path / "input.json"
+        input_file.write_text(json.dumps(input_data))
+        output_file = tmp_path / "output.csv"
+
+        export_to_csv(input_path=input_file, output_path=output_file)
+
+        assert output_file.exists()
+        content = output_file.read_text()
+        assert "Alice,95" in content
+        assert "Bob,87" in content
+        # On failure: directory preserved at /tmp/pytest-NNN/test_csv_export0/
+        # On success: cleaned automatically
+  example_bad: |
+    import tempfile, os
+
+    def test_csv_export():
+        tmpdir = tempfile.mkdtemp()  # Leaks if test fails before cleanup
+        input_file = os.path.join(tmpdir, "input.json")
+        output_file = os.path.join(tmpdir, "output.csv")
+        # ... test logic ...
+        shutil.rmtree(tmpdir)  # Not called if test raises! Memory leak.
+
+    def test_csv_export_v2():
+        export_to_csv(output_path="/tmp/test_output.csv")  # Conflicts with parallel tests
+  when_applies: "Any test that writes to or reads from the filesystem. Use tmp_path by default, never hardcoded paths."
+  sources:
+    - "https://docs.pytest.org/en/stable/how-to/tmp_path.html"
+    - "https://docs.pytest.org/en/stable/reference/fixtures.html#tmp-path"
+
+- id: PYTEST-013
+  text: >
+    Use @pytest.mark.xfail with strict=True for known bugs that have open tickets — this
+    documents the failure, prevents false confidence from skipping tests, and alerts you
+    automatically when the bug is fixed (xfail test unexpectedly passing converts to a
+    strict failure, forcing you to remove the mark and close the ticket).
+  why: >
+    @pytest.mark.skip silently hides a broken test — the CI stays green but the bug persists
+    forever. @pytest.mark.xfail without strict=True is almost as bad: when the bug is fixed,
+    the test passes but pytest just reports it as "xpass" (expected failure that passed) —
+    easy to overlook. With strict=True, an xfail test that passes becomes a FAILURE, forcing
+    you to remove the mark. A team using @pytest.mark.skip accumulated 47 skipped tests over
+    18 months — 23 of them were bugs that had been fixed but never re-enabled. With xfail
+    strict=True, the same team caught 8 bug fixes automatically within a week.
+  how_to_do_right: |
+    1. @pytest.mark.xfail(strict=True, reason="Bug JIRA-123: user cache not invalidated")
+    2. Include ticket/issue reference in reason — creates traceability
+    3. Use raises= to specify expected exception type: xfail(raises=AssertionError)
+    4. Use condition= for environment-specific xfail: xfail(condition=sys.platform=="win32")
+    5. When bug is fixed: remove xfail marker, close ticket
+    6. Never xfail tests you don't intend to fix — fix or delete them
+    7. Review all xfail markers in quarterly code reviews
+  severity: low
+  technologies:
+    lang: [python]
+    framework: [pytest]
+  domains:
+    domain: [testing, code_quality]
+    concern: [known_failures, test_documentation, technical_debt]
+  example_good: |
+    import pytest
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="TICKET-456: Cache not invalidated on profile update. ETA: Sprint 15.",
+        raises=AssertionError,
+    )
+    def test_profile_cache_invalidation(client, user):
+        client.patch(f"/users/{user.id}", json={"name": "New Name"})
+        # Second request should see updated name, but cache returns stale data
+        response = client.get(f"/users/{user.id}")
+        assert response.json()["name"] == "New Name"  # Currently fails due to cache bug
+
+    # When bug is fixed: this test will FAIL (strict=True) until marker is removed
+    # Forces developer to explicitly acknowledge the fix and update documentation
+  example_bad: |
+    @pytest.mark.skip(reason="broken, fix later")  # Silent failure accumulation
+    def test_profile_cache_invalidation(client, user):
+        ...
+    # "fix later" becomes never. CI stays green. Bug ships to production.
+  when_applies: >
+    Any known bug with an open ticket. Replace skip with xfail(strict=True) as a policy.
+    Never use skip for bugs — only for deliberately excluded functionality (OS-specific,
+    not-yet-implemented features).
+  sources:
+    - "https://docs.pytest.org/en/stable/how-to/skipping.html#xfail-mark-test-functions-as-expected-to-fail"
+    - "https://docs.pytest.org/en/stable/reference/api.html#pytest.mark.xfail"

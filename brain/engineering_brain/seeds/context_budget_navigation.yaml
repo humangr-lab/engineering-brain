@@ -1,0 +1,1202 @@
+layer: rules
+domain: architecture
+knowledge:
+- id: CTXB-001
+  text: >
+    Allocate context window budget using the 20-40-30-10 rule: system prompt 20%,
+    knowledge/retrieved context 40%, task description and history 30%, output
+    buffer 10%. Never let retrieved knowledge exceed 40% — exceeding this threshold
+    degrades instruction following as the model loses track of the task in a sea
+    of retrieved text. Never reduce the output buffer below 10% — truncated outputs
+    corrupt structured JSON responses and cut off reasoning chains mid-sentence.
+  why: >
+    Context window research (2024-2025) consistently shows that models process
+    the beginning and end of context more reliably than the middle ("lost in the
+    middle" effect, Liu et al. 2023). The 20-40-30-10 split places the task
+    (critical) near the end, the output buffer at the end (protected), and
+    pushes the bulk of retrieved text to the middle where recall is weakest anyway
+    — so you lose less by retrieval degradation than by instruction confusion.
+    In the Brains pipeline, the spec_writer context with a 70% knowledge allocation
+    caused the agent to start answering questions in retrieved documents instead
+    of completing the spec task — a direct consequence of instruction burial.
+  how_to_do_right: |
+    1. Calculate total context budget: budget = model_max_tokens * 0.9  # 10% safety margin
+    2. Allocate buckets:
+       system_budget = int(budget * 0.20)
+       knowledge_budget = int(budget * 0.40)
+       task_budget = int(budget * 0.30)
+       output_buffer = int(budget * 0.10)
+    3. Measure each component BEFORE constructing the full prompt:
+       system_tokens = count_tokens(system_prompt)
+       knowledge_tokens = count_tokens(retrieved_docs)
+       task_tokens = count_tokens(task_description + history)
+    4. Enforce budget per component — truncate or compress if over
+    5. Never sacrifice output_buffer to fit more knowledge
+    6. Add a hard assertion before calling LLM:
+       assert total_tokens <= budget, f"Context overflow: {total_tokens} > {budget}"
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langchain, crewai, langgraph]
+  domains:
+    domain: [architecture, performance]
+    concern: [context_management, token_budget, prompt_engineering]
+  example_good: |
+    import tiktoken
+
+    enc = tiktoken.encoding_for_model("gpt-4o")
+
+    def count_tokens(text: str) -> int:
+        return len(enc.encode(text))
+
+    def build_context(system_prompt, retrieved_docs, task, model_max=128_000):
+        budget = int(model_max * 0.90)         # 10% safety margin
+        sys_budget   = int(budget * 0.20)      # 25,600 tokens
+        know_budget  = int(budget * 0.40)      # 51,200 tokens
+        task_budget  = int(budget * 0.30)      # 38,400 tokens
+        out_buffer   = int(budget * 0.10)      # 12,800 tokens — PROTECTED
+
+        # Enforce each bucket independently
+        system = truncate_to_budget(system_prompt, sys_budget)
+        knowledge = truncate_to_budget(retrieved_docs, know_budget)
+        task_ctx = truncate_to_budget(task, task_budget)
+
+        total = count_tokens(system + knowledge + task_ctx)
+        assert total <= budget - out_buffer, f"Overflow: {total}"
+        return {"system": system, "knowledge": knowledge, "task": task_ctx}
+  example_bad: |
+    def build_context_bad(system, docs, task):
+        # No budget enforcement — just concatenate everything
+        return system + "\n\n".join(docs) + task
+        # If docs = 200 pages, total = 180K tokens for a 128K model
+        # LLM truncates arbitrarily mid-sentence — silent data loss
+        # No output buffer — structured JSON gets cut off at the closing brace
+  when_applies: >
+    Every LLM call with dynamic content (retrieved documents, user history,
+    generated context). Non-negotiable for RAG pipelines and agent loops.
+  sources:
+    - "Liu et al. (2023). Lost in the Middle: How Language Models Use Long Contexts — https://arxiv.org/abs/2307.03172"
+    - "Anthropic Context Window Guide: https://docs.anthropic.com/en/docs/build-with-claude/context-windows"
+    - "Context Window Management Strategies (2025): https://www.getmaxim.ai/articles/context-window-management-strategies-for-long-context-ai-agents-and-chatbots/"
+
+- id: CTXB-002
+  text: >
+    Navigate the knowledge pyramid top-down: start retrieval at L0 (axioms and
+    hard constraints), then L1 (principles), then L2 (patterns), then L3 (rules).
+    Stop at the first layer where sufficient context is found — do not retrieve
+    from all layers on every call. The pyramid is ordered by information density:
+    L0 axioms compress 10x the information of L3 rules for the same token count.
+    Skipping straight to L3 rules wastes budget on low-density text and misses
+    the high-leverage constraints that L0 provides.
+  why: >
+    Research on hierarchical RAG (PolyRAG, 2024; LLM-guided Hierarchical Retrieval,
+    arxiv 2510.13217) shows that ontology-level (L0/L1) retrieval can answer 40-60%
+    of queries directly, bypassing the need for expensive dense retrieval in lower
+    layers. In the Engineering Brain, the L0→L1→L2→L3 traversal is not just a
+    retrieval strategy — it mirrors how veteran engineers reason: first check
+    whether a hard constraint already answers the question (L0), then check
+    principles (L1), then look for applicable patterns (L2), and only resort to
+    specific rules (L3) when higher layers are insufficient. Retrieving all 4
+    layers simultaneously floods the context with redundant lower-layer text
+    that dilutes the high-signal upper layers.
+  how_to_do_right: |
+    1. Define layer hierarchy in retrieval config:
+       LAYERS = ["L0_axioms", "L1_principles", "L2_patterns", "L3_rules"]
+       TOKEN_BUDGET_PER_LAYER = [500, 1000, 2000, 5000]  # Ascending — lower = denser
+    2. Retrieve top-down, stop early:
+       for layer, budget in zip(LAYERS, TOKEN_BUDGET_PER_LAYER):
+           results = vector_search(query, layer=layer, max_tokens=budget)
+           if is_sufficient(results, query):
+               break  # Don't retrieve lower layers
+           context.extend(results)
+    3. Define "sufficient" as: at least 2 high-relevance hits (score > 0.85) that
+       directly address the query intent
+    4. In the Brains Engineering Brain: L0 = axioms seeds, L1 = principles seeds,
+       L2 = pattern seeds, L3 = rule seeds (sacadas, sre_book, etc.)
+    5. Always include L0 results in full — they are always relevant (hard constraints)
+    6. Log which layers were accessed per query — use this to tune "sufficient" threshold
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [qdrant, llamaindex, langchain]
+  domains:
+    domain: [architecture, knowledge_management]
+    concern: [retrieval_strategy, context_efficiency, rag]
+  example_good: |
+    def retrieve_hierarchical(query: str, knowledge_budget: int) -> list[str]:
+        """Top-down pyramid traversal — stops when context is sufficient."""
+        accumulated = []
+        token_count = 0
+
+        # L0 always included (axioms = hard constraints, maximum information density)
+        l0_results = qdrant.search(query, collection="L0_axioms", limit=3)
+        accumulated.extend(l0_results)
+        token_count += count_tokens("\n".join(l0_results))
+
+        # L1-L3: stop when sufficient
+        for layer in ["L1_principles", "L2_patterns", "L3_rules"]:
+            if token_count >= knowledge_budget * 0.8:
+                break  # Budget nearly exhausted
+            results = qdrant.search(query, collection=layer, limit=5)
+            high_relevance = [r for r in results if r.score > 0.80]
+            if len(high_relevance) >= 2 and layer == "L1_principles":
+                accumulated.extend(high_relevance)
+                break  # L1 sufficient — skip L2/L3
+            accumulated.extend(high_relevance)
+            token_count += count_tokens("\n".join([r.payload["text"] for r in high_relevance]))
+
+        return accumulated
+  example_bad: |
+    def retrieve_all_layers_bad(query: str) -> list[str]:
+        # Retrieves all 4 layers regardless of whether lower layers are needed
+        results = []
+        for layer in ["L0_axioms", "L1_principles", "L2_patterns", "L3_rules"]:
+            results.extend(qdrant.search(query, collection=layer, limit=10))
+        return results
+        # L3 rules dilute L0 axioms — model pays equal attention to both
+        # Budget wasted: 60% on low-density L3 text, 40% on high-density L0-L2
+  when_applies: >
+    Any RAG retrieval step with a structured knowledge base that has multiple
+    abstraction layers. Mandatory for Engineering Brain and CogniFarm knowledge
+    retrieval.
+  sources:
+    - "PolyRAG: Knowledge Pyramid for Multi-Level RAG (2024): https://arxiv.org/abs/2407.21276"
+    - "LLM-guided Hierarchical Retrieval (arxiv 2510.13217): https://arxiv.org/abs/2510.13217"
+    - "Knowledge Retrieval Architecture for LLMs (2023): https://mattboegner.com/knowledge-retrieval-architecture-for-llms/"
+
+- id: CTXB-003
+  text: >
+    Select knowledge entries for context using importance-weighted scoring:
+    score = (severity_weight × relevance_score × freshness_factor). Use
+    severity weights: critical=4.0, high=2.0, medium=1.0, low=0.5.
+    Use freshness_factor = exp(-decay_rate × days_since_update) with decay_rate
+    specific to domain (security: 0.05/day, stable patterns: 0.005/day).
+    Select the top-K entries by score until the knowledge budget is exhausted —
+    never select uniformly at random.
+  why: >
+    Uniform selection from a knowledge base treats a "low" severity style
+    suggestion the same as a "critical" security constraint. In production,
+    including a critical constraint that prevents data loss is worth 10x more
+    than a style suggestion at the same token cost. Freshness matters because
+    a security rule from 3 years ago may reference a patched vulnerability —
+    serving stale critical rules without freshness decay can cause an agent to
+    follow outdated security advice. Real deployments of importance-weighted
+    retrieval show 25-40% improvement in task-relevant context per token
+    compared to relevance-only selection.
+  how_to_do_right: |
+    1. Define severity_weights: SEVERITY_WEIGHTS = {"critical": 4.0, "high": 2.0, "medium": 1.0, "low": 0.5}
+    2. Set decay rates per domain:
+       DECAY_RATES = {"security": 0.05, "architecture": 0.01, "style": 0.002, "stable_theory": 0.0005}
+    3. Compute score for each candidate entry:
+       import math
+       severity_w = SEVERITY_WEIGHTS[entry.severity]
+       freshness = math.exp(-DECAY_RATES[entry.domain] * days_since_update)
+       score = severity_w * relevance_score * freshness
+    4. Sort candidates by score descending, greedily fill knowledge budget
+    5. Log top-5 and bottom-5 selected entries — inspect regularly to verify selection quality
+    6. For critical entries: include regardless of score if domain matches (hard floor)
+    7. Review decay rates quarterly — adjust if fresh content is over/under-represented
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [qdrant, engineering_brain]
+  domains:
+    domain: [architecture, knowledge_management]
+    concern: [retrieval_strategy, context_efficiency, importance_weighting]
+  example_good: |
+    import math
+    from datetime import datetime, timezone
+
+    SEVERITY_WEIGHTS = {"critical": 4.0, "high": 2.0, "medium": 1.0, "low": 0.5}
+    DECAY_RATES = {"security": 0.05, "architecture": 0.01, "style": 0.002}
+
+    def score_entry(entry: KnowledgeEntry, relevance_score: float) -> float:
+        severity_w = SEVERITY_WEIGHTS.get(entry.severity, 1.0)
+        days_old = (datetime.now(timezone.utc) - entry.updated_at).days
+        decay_rate = DECAY_RATES.get(entry.domain, 0.005)
+        freshness = math.exp(-decay_rate * days_old)
+        return severity_w * relevance_score * freshness
+
+    def select_knowledge(candidates: list, budget_tokens: int) -> list:
+        # Sort by importance score
+        scored = [(entry, score_entry(entry, entry.relevance_score)) for entry in candidates]
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        selected, token_count = [], 0
+        for entry, score in scored:
+            entry_tokens = count_tokens(entry.text)
+            if token_count + entry_tokens <= budget_tokens:
+                selected.append(entry)
+                token_count += entry_tokens
+        return selected
+  example_bad: |
+    def select_knowledge_bad(candidates: list, budget_tokens: int) -> list:
+        # Uniform random selection — treats critical == low severity
+        import random
+        random.shuffle(candidates)
+        selected, token_count = [], 0
+        for entry in candidates:
+            if token_count + len(entry.text) // 4 <= budget_tokens:
+                selected.append(entry)
+                token_count += len(entry.text) // 4
+        return selected
+        # May select 10 "low" style rules and miss 2 "critical" security constraints
+        # Stale 3-year-old security entry gets equal weight to current recommendation
+  when_applies: >
+    Any retrieval step that selects from more candidates than fit in the
+    knowledge budget. Universal for RAG pipelines with > 100 knowledge entries.
+  sources:
+    - "Engineering Brain adaptive_weights.py (Thompson Sampling for 6 scoring weights)"
+    - "Context Window Management Best Practices (2025): https://eval.16x.engineer/blog/llm-context-management-guide"
+
+- id: CTXB-004
+  text: >
+    Implement staleness-aware eviction with per-domain TTL and exponential decay.
+    Set TTL floors (minimum retention): security knowledge = 30 days, architecture
+    knowledge = 90 days, stable_theory = 365 days. After TTL, entries are not
+    deleted — they receive a staleness penalty in the importance score (freshness
+    factor drops below 0.5 at TTL). Hard-delete only knowledge with confirmed
+    superseding entries. Never silently evict knowledge without a human-reviewed
+    replacement.
+  why: >
+    Security knowledge has a half-life of roughly 14 days (new CVEs, patched
+    vulnerabilities, new attack vectors emerge daily). Serving a 6-month-old
+    "secure coding" rule that references a now-patched vulnerability as current
+    guidance is worse than serving no rule — it creates false confidence. But
+    deleting the entry without a replacement leaves a knowledge gap. The
+    staleness penalty (not deletion) preserves the knowledge for retrieval in
+    low-competition scenarios while deprioritizing it when fresher alternatives
+    exist. In the Engineering Brain, this maps directly to CTXB-003's freshness
+    factor — the decay ensures stale entries are naturally outcompeted by fresh
+    entries without requiring manual curation at scale.
+  how_to_do_right: |
+    1. Tag every knowledge entry with domain and updated_at timestamp
+    2. Compute staleness at retrieval time (not at ingestion):
+       TTL_BY_DOMAIN = {"security": 30, "architecture": 90, "stable_theory": 365}
+       days_old = (now - entry.updated_at).days
+       ttl = TTL_BY_DOMAIN.get(entry.domain, 90)
+       staleness_flag = days_old > ttl  # Flag, not delete
+    3. For stale entries: reduce selection probability by 0.5 in scoring
+    4. Surface stale entries to knowledge maintainers weekly:
+       SELECT id, domain, updated_at FROM knowledge WHERE staleness_flag = True
+    5. Hard-delete rule: only when a confirmed superseding entry exists and has
+       been validated (not automatically)
+    6. Log every time a stale entry is served — this is a signal for knowledge debt
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [qdrant, engineering_brain]
+  domains:
+    domain: [architecture, knowledge_management]
+    concern: [knowledge_freshness, staleness, cache_eviction]
+  example_good: |
+    from datetime import datetime, timezone
+    import math
+
+    TTL_BY_DOMAIN = {
+        "security": 30,
+        "architecture": 90,
+        "stable_theory": 365,
+        "default": 90
+    }
+
+    def get_freshness_factor(entry, now=None):
+        """Returns 1.0 (fresh) to ~0 (very stale). Soft penalty, never 0."""
+        if now is None:
+            now = datetime.now(timezone.utc)
+        days_old = (now - entry.updated_at).days
+        ttl = TTL_BY_DOMAIN.get(entry.domain, TTL_BY_DOMAIN["default"])
+        # Decay rate tuned so freshness = 0.5 at TTL
+        decay_rate = math.log(2) / ttl
+        return math.exp(-decay_rate * days_old)
+
+    # Entry updated 60 days ago in security domain (TTL=30):
+    # freshness = exp(-0.023 * 60) ≈ 0.25 — heavily penalized but still retrievable
+    # Entry updated 30 days ago in stable_theory (TTL=365):
+    # freshness = exp(-0.0019 * 30) ≈ 0.94 — barely penalized
+  example_bad: |
+    # Hard delete by age — irreversible knowledge loss
+    def evict_stale_entries(knowledge_base, max_age_days=90):
+        cutoff = datetime.now() - timedelta(days=max_age_days)
+        for entry in knowledge_base:
+            if entry.updated_at < cutoff:
+                knowledge_base.delete(entry.id)  # Permanent deletion
+        # Problem: deleted a "critical" security rule because it was 91 days old
+        # The rule was still valid — it hadn't been updated because nothing changed
+        # Now the agent has no constraint for a common SQL injection pattern
+  when_applies: >
+    Any knowledge base with entries older than 30 days, especially security
+    and compliance domains. Implement freshness decay from day 1 — it is
+    essentially free and prevents future expensive manual audits.
+  sources:
+    - "Context Window Management: Write/Select/Compress/Isolate (2025): https://eval.16x.engineer/blog/llm-context-management-guide"
+    - "Engineering Brain adaptive_promotion.py (Bayesian Beta priors per-domain)"
+
+- id: CTXB-005
+  text: >
+    Apply LLMLingua prompt compression when retrieved context exceeds the knowledge
+    budget after importance-weighted selection. Use LLMLingua-2 (ACL 2024) for
+    task-agnostic compression at 3-6x speed advantage over LLMLingua-1. Target
+    compression ratio of 4x-7x for few-shot examples and background context.
+    Never compress: the system prompt, the task instruction, output format
+    specifications, or few-shot examples beyond 2x compression. These components
+    have high information density — compressing them destroys structure.
+  why: >
+    LLMLingua achieves up to 20x compression with only 1.5% performance drop on
+    GSM8K at 20x (EMNLP 2023). At 7x compression on BBH, the performance drop is
+    ~13% (from 70.07 to 56.85 EM) — acceptable for background context but not for
+    core task instructions. The key insight is selectivity: natural language is
+    redundant but not uniformly redundant. Retrieved documents from a knowledge base
+    have high redundancy (the same fact stated multiple ways). Task instructions
+    and few-shot examples have low redundancy — every token carries information.
+    In the Brains pipeline, retrieved engineering rules are prime compression
+    candidates; the spec task definition must never be compressed.
+  how_to_do_right: |
+    1. Install: pip install llmlingua
+    2. Apply only to knowledge/retrieved context, never to instructions:
+       from llmlingua import PromptCompressor
+       compressor = PromptCompressor(model_name="microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank")
+    3. Determine target compression ratio:
+       - Background context (supplementary docs): target_ratio = 0.15 (6-7x compression)
+       - Few-shot examples: target_ratio = 0.5 (2x compression MAX)
+       - Never compress: system prompt, task, format spec
+    4. Compress before budget check:
+       compressed = compressor.compress_prompt(
+           retrieved_docs,
+           rate=0.15,              # Retain 15% of tokens (6.7x compression)
+           force_tokens=["NEVER"],  # Force-keep specific tokens
+           condition_in_question=query  # Task-aware compression
+       )
+    5. Verify compressed output quality: assert len(compressed) > 0
+    6. Log compression ratio for monitoring: ratio = len(original)/len(compressed)
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [llmlingua, llamaindex, langchain]
+  domains:
+    domain: [architecture, performance]
+    concern: [prompt_compression, token_efficiency, context_management]
+  example_good: |
+    from llmlingua import PromptCompressor
+
+    compressor = PromptCompressor(
+        model_name="microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank",
+        use_llmlingua2=True  # Use LLMLingua-2 — 3-6x faster than v1
+    )
+
+    def compress_retrieved_context(docs: list[str], query: str, budget_tokens: int) -> str:
+        full_context = "\n\n".join(docs)
+        current_tokens = count_tokens(full_context)
+
+        if current_tokens <= budget_tokens:
+            return full_context  # No compression needed
+
+        target_ratio = budget_tokens / current_tokens
+        result = compressor.compress_prompt(
+            full_context,
+            rate=target_ratio,
+            condition_in_question=query  # Query-conditioned compression
+        )
+        compressed_text = result["compressed_prompt"]
+        ratio = result["ratio"]  # Actual compression ratio achieved
+        print(f"Compressed: {current_tokens} → {count_tokens(compressed_text)} tokens ({ratio:.1f}x)")
+        return compressed_text
+    # Applied ONLY to retrieved_docs, never to system_prompt or task
+  example_bad: |
+    from llmlingua import PromptCompressor
+    compressor = PromptCompressor()
+
+    def compress_everything(full_prompt: str) -> str:
+        # Compresses the entire prompt including task and format instructions
+        return compressor.compress_prompt(full_prompt, rate=0.1)["compressed_prompt"]
+        # At 10x compression, task instruction "Return JSON with fields: id, title, body"
+        # becomes "Return JSON" — all field names lost → agent returns malformed JSON
+        # System prompt security constraints compressed away → unsafe outputs
+  when_applies: >
+    When retrieved knowledge exceeds the knowledge budget after importance-weighted
+    selection (CTXB-003) and top-down layer traversal (CTXB-002). Compression is
+    the last resort before graceful degradation (CTXB-007). Do not compress
+    proactively — measure budget shortage first.
+  sources:
+    - "LLMLingua: Compressing Prompts (EMNLP 2023): https://arxiv.org/abs/2310.05736"
+    - "LLMLingua-2: Data Distillation for Efficient Compression (ACL 2024): https://arxiv.org/abs/2403.12968"
+    - "LLMLingua GitHub — Microsoft Research: https://github.com/microsoft/LLMLingua"
+
+- id: CTXB-006
+  text: >
+    Chunk long knowledge entries at semantic boundaries (paragraph breaks,
+    heading boundaries, list item separators) — never at fixed token counts.
+    Target chunk size: 200-400 tokens for dense technical rules, 400-800 tokens
+    for narrative explanations. Overlap adjacent chunks by 50 tokens to preserve
+    cross-boundary context. The chunking strategy at ingestion time determines
+    retrieval quality at query time — a rule split in the middle of a
+    how_to_do_right sequence is unusable.
+  why: >
+    Fixed-size tokenization (e.g., split every 512 tokens) cuts knowledge at
+    arbitrary points: a numbered list of 6 steps split at step 4 makes steps
+    5-6 invisible when steps 1-4 are retrieved. A security constraint split
+    mid-sentence loses its negation ("NEVER store...") which becomes "store...".
+    Semantic chunking preserves the logical unit of the rule. In the Engineering
+    Brain, each YAML seed entry is already a semantic unit — chunk at the entry
+    boundary, not within entries. For large entries with multiple sections
+    (text, why, how_to_do_right), each section can be a separate chunk with
+    a shared parent ID for reconstruction.
+  how_to_do_right: |
+    1. For YAML knowledge entries: treat each entry as one chunk (natural semantic boundary)
+    2. For long entries (> 800 tokens): split at heading/section boundaries:
+       sections = split_at_headings(entry.how_to_do_right)  # Split at "1.", "2.", etc.
+    3. Maintain parent_id for all chunks from the same entry:
+       for i, chunk in enumerate(sections):
+           store({"text": chunk, "parent_id": entry.id, "chunk_index": i})
+    4. Add 50-token overlap: include last 50 tokens of previous chunk at start of each chunk
+    5. For code examples: never split inside a code block — treat as atomic unit
+    6. Test chunk quality: manually inspect 20 chunks after chunking a new knowledge file;
+       any chunk that is not independently comprehensible must be rechunked
+    7. Minimum chunk size: 100 tokens — smaller chunks lose context and return too many
+       irrelevant results
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [llamaindex, langchain, qdrant]
+  domains:
+    domain: [architecture, knowledge_management]
+    concern: [chunking_strategy, rag_quality, retrieval]
+  example_good: |
+    import re
+
+    def semantic_chunk(entry_text: str, max_tokens: int = 600, overlap: int = 50) -> list[str]:
+        """Split at paragraph boundaries, preserve semantic units."""
+        # Split at double newlines (paragraphs) or numbered list items
+        paragraphs = re.split(r'\n\n+|\n(?=\d+\.)', entry_text.strip())
+        chunks, current_chunk, current_tokens = [], [], 0
+
+        for para in paragraphs:
+            para_tokens = count_tokens(para)
+            if para_tokens > max_tokens:
+                # Single oversized paragraph: split at sentence boundary only
+                sentences = para.split('. ')
+                for sentence in sentences:
+                    if current_tokens + count_tokens(sentence) > max_tokens:
+                        chunks.append('\n'.join(current_chunk))
+                        # Overlap: keep last 50 tokens from previous chunk
+                        overlap_text = get_last_n_tokens(current_chunk[-1], overlap)
+                        current_chunk = [overlap_text, sentence]
+                        current_tokens = count_tokens(overlap_text) + count_tokens(sentence)
+                    else:
+                        current_chunk.append(sentence)
+                        current_tokens += count_tokens(sentence)
+            elif current_tokens + para_tokens > max_tokens:
+                chunks.append('\n'.join(current_chunk))
+                current_chunk = [para]
+                current_tokens = para_tokens
+            else:
+                current_chunk.append(para)
+                current_tokens += para_tokens
+
+        if current_chunk:
+            chunks.append('\n'.join(current_chunk))
+        return chunks
+  example_bad: |
+    def fixed_token_chunk_bad(text: str, chunk_size: int = 512) -> list[str]:
+        tokens = tokenizer.encode(text)
+        # Split at fixed token boundaries — ignores sentence/paragraph structure
+        return [tokenizer.decode(tokens[i:i+chunk_size])
+                for i in range(0, len(tokens), chunk_size)]
+        # Chunk boundary may land mid-sentence: "...NEVER store plaintext pass"
+        # Next chunk starts: "words even temporarily (logging, debug output)"
+        # The negation "NEVER" is separated from what it negates — rule is useless
+  when_applies: >
+    At knowledge base ingestion time, before storing to Qdrant or any vector store.
+    Re-chunk entire knowledge base if chunking strategy changes — stale chunks
+    degrade all subsequent retrievals.
+  sources:
+    - "LlamaIndex Chunking Strategies: https://docs.llamaindex.ai/en/stable/module_guides/loading/node_parsers/"
+    - "RAG Architecture Engineering Brain seed: rag_architecture.yaml"
+
+- id: CTXB-007
+  text: >
+    Handle context window overflow with graceful degradation in priority order:
+    (1) evict lowest-scoring knowledge entries first, (2) compress remaining
+    knowledge with LLMLingua at 4x ratio, (3) summarize conversation history
+    beyond 10 turns, (4) truncate task history at natural boundaries, (5) as
+    last resort, drop the current task turn's full context and send a minimal
+    fallback prompt. Never silently truncate the middle of a message array —
+    this corrupts conversation structure without the model noticing.
+  why: >
+    Silent truncation at the API level (sending more tokens than the context window
+    allows) causes one of three failure modes: (1) API error and pipeline crash,
+    (2) provider-side truncation that cuts arbitrary messages from the history
+    corrupting the conversation, (3) degraded output quality with no signal.
+    All three are worse than deliberate graceful degradation which preserves
+    the most important content. Models claiming 200K context typically degrade
+    performance around 130K tokens — you need headroom. The priority order
+    above ensures the task instructions and critical constraints survive
+    degradation while background context is sacrificed first.
+  how_to_do_right: |
+    1. Check budget BEFORE constructing message array — not after
+    2. Degradation pipeline (in order):
+       def fit_to_budget(components: ContextComponents, budget: int) -> ContextComponents:
+           # Stage 1: evict low-score knowledge
+           while total_tokens(components) > budget and components.knowledge:
+               components.knowledge.pop()  # Pop lowest-score entry (sorted by score)
+           # Stage 2: compress remaining knowledge if still over
+           if total_tokens(components) > budget:
+               components.knowledge = compress_with_llmlingua(components.knowledge, ratio=0.25)
+           # Stage 3: summarize old conversation history
+           if total_tokens(components) > budget and len(components.history) > 10:
+               components.history = summarize_history(components.history[:-5]) + components.history[-5:]
+           # Stage 4: truncate task history at turn boundary
+           if total_tokens(components) > budget:
+               components.history = components.history[-5:]  # Keep last 5 turns only
+           # Stage 5: minimal fallback — never truncate mid-message
+           if total_tokens(components) > budget:
+               log_warning("Context overflow: sending minimal fallback prompt")
+               components = ContextComponents(system=components.system, task=components.task[-500:])
+           return components
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langchain, crewai, langgraph]
+  domains:
+    domain: [architecture, reliability]
+    concern: [context_overflow, graceful_degradation, error_handling]
+  example_good: |
+    def build_safe_context(system: str, knowledge: list, history: list, task: str,
+                           model_max: int = 128_000) -> list[dict]:
+        budget = int(model_max * 0.88)  # 12% margin for output + variance
+
+        # Check if graceful degradation needed BEFORE building message array
+        total = sum(count_tokens(x) for x in [system] + knowledge + history + [task])
+
+        if total > budget:
+            # Stage 1: evict knowledge entries (sorted by importance score)
+            while total > budget * 0.9 and knowledge:
+                evicted = knowledge.pop()  # Pop lowest scored (pre-sorted)
+                total -= count_tokens(evicted)
+                log.warning(f"Evicted knowledge entry: {evicted[:50]}...")
+
+        # Build message array only when within budget
+        messages = [{"role": "system", "content": system}]
+        if knowledge:
+            messages.append({"role": "user", "content": "\n".join(knowledge)})
+        messages.extend(history)
+        messages.append({"role": "user", "content": task})
+
+        assert sum(count_tokens(m["content"]) for m in messages) <= budget
+        return messages
+  example_bad: |
+    def build_context_bad(system, knowledge, history, task):
+        # Concatenate everything, truncate at API max — corrupts message structure
+        messages = [{"role": "system", "content": system}]
+        messages.extend(history)
+        messages.append({"role": "user", "content": "\n".join(knowledge) + task})
+        # If total > 128K: API truncates mid-message, response is corrupted JSON
+        # No degradation logic: every overflow is a hard failure
+        return messages
+  when_applies: >
+    Any LLM pipeline with dynamic context (retrieval, conversation history, agent
+    state). The graceful degradation pipeline must be implemented before first
+    production deployment — retrofitting it after overflow incidents is reactive.
+  sources:
+    - "Context Window Problem — Factory.ai (2025): https://factory.ai/news/context-window-problem"
+    - "Context Length Guide 2025: https://local-ai-zone.github.io/guides/context-length-optimization-ultimate-guide-2025.html"
+
+- id: CTXB-008
+  text: >
+    Manage multi-turn context with a sliding window strategy: keep the system
+    prompt in full (non-negotiable), keep the last N turns in full (N = 10 for
+    most tasks), and replace older turns with a rolling summary that fits within
+    50% of the history budget. Use a separate fast/cheap LLM (e.g., claude-haiku)
+    to generate the rolling summary every 10 turns. Never use the primary task
+    LLM for summarization — this is the single most common source of context
+    management latency overhead in production agents.
+  why: >
+    Dynamic sliding windows cap context at 32K tokens enable up to 100 interaction
+    turns where vanilla strategies fail at turn 15 (research benchmark, 2024-2025).
+    The problem with naive "keep last N messages" is that important context from
+    turn 5 (a key constraint set by the user) gets evicted at turn 16 without
+    the model having any memory of it. Rolling summarization preserves the semantic
+    content of early turns in compressed form. Using the primary LLM for
+    summarization doubles latency because you must complete a summarization call
+    before the main call — claude-haiku at 200 tokens takes ~0.3s vs claude-opus-4
+    at ~3s, a 10x latency difference for the same summarization quality.
+  how_to_do_right: |
+    1. Define sliding window parameters:
+       FULL_TURNS_WINDOW = 10    # Keep last 10 turns in full
+       SUMMARY_BUDGET = 2000     # Tokens for the rolling summary
+       SUMMARIZE_EVERY = 10      # Trigger summarization every 10 turns
+    2. At every SUMMARIZE_EVERY turns:
+       old_turns = history[:-FULL_TURNS_WINDOW]
+       new_summary = summarize_with_cheap_model(old_turns, max_tokens=SUMMARY_BUDGET)
+       history = [{"role": "system", "content": f"[Conversation summary]\n{new_summary}"}] + history[-FULL_TURNS_WINDOW:]
+    3. Use claude-haiku or gpt-4o-mini for summarization — not the primary model
+    4. Summarization prompt: "Compress the following conversation turns into a
+       200-token summary preserving: key decisions, constraints set, results achieved.
+       Omit: pleasantries, repetition, intermediate reasoning steps."
+    5. Monitor summary quality: check that key constraints from early turns
+       appear in the summary (manual audit first 50 summaries)
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langchain, crewai, anthropic]
+  domains:
+    domain: [architecture, performance]
+    concern: [multi_turn_context, sliding_window, conversation_management]
+  example_good: |
+    import anthropic
+    client = anthropic.Anthropic()
+
+    def manage_context_window(history: list, system: str,
+                              full_window: int = 10, summary_budget: int = 2000) -> list:
+        if len(history) <= full_window:
+            return history  # No management needed
+
+        old_turns = history[:-full_window]
+        recent_turns = history[-full_window:]
+
+        # Use haiku — fast and cheap, same summarization quality for this task
+        summary_response = client.messages.create(
+            model="claude-haiku-4",   # NOT claude-opus-4
+            max_tokens=summary_budget,
+            messages=[{
+                "role": "user",
+                "content": f"Compress into 200 tokens, preserve key constraints/decisions:\n{format_turns(old_turns)}"
+            }]
+        )
+        summary = summary_response.content[0].text
+
+        return [
+            {"role": "user", "content": f"[Prior context summary]\n{summary}"}
+        ] + recent_turns
+  example_bad: |
+    # Use primary LLM for summarization — doubles latency
+    def manage_context_bad(history, primary_model="claude-opus-4"):
+        summary = call_llm(primary_model, "Summarize this conversation: " + str(history))
+        # claude-opus-4 summarization: ~3 seconds, ~$0.015 per call
+        # Happens every 10 turns → 10% latency overhead from summarization alone
+        # For a 100-turn agent: 10 summarization calls × 3s = 30 extra seconds
+  when_applies: >
+    Any agent with > 10 conversation turns or > 15-minute interactive sessions.
+    Implement before building any chatbot or iterative agent loop.
+  sources:
+    - "Ultimate Guide to LLM Memory (2025): https://medium.com/@sonitanishk2003/the-ultimate-guide-to-llm-memory-from-context-windows-to-advanced-agent-memory-systems-3ec106d2a345"
+    - "Context Window Optimization: https://app.ailog.fr/en/blog/guides/context-window-optimization"
+
+- id: CTXB-009
+  text: >
+    Implement a priority queue for knowledge insertion: insert CRITICAL entries
+    first, then HIGH, then MEDIUM, then LOW. Within each severity tier, sort by
+    importance score descending (CTXB-003). Stop insertion when the knowledge
+    budget is exhausted — never insert LOW severity entries if there are MEDIUM
+    entries that didn't fit. The priority queue is evaluated per-query, not
+    pre-computed — a LOW entry with very high relevance (score 0.95) can be
+    promoted above a CRITICAL entry with low relevance (score 0.3) only if the
+    CRITICAL entry's weighted score falls below the LOW entry's weighted score.
+  why: >
+    In a knowledge base with 2000 entries, the knowledge budget of 50K tokens
+    can only hold roughly 200-400 entries (at 200 tokens average). Greedy insertion
+    without priority means a LOW severity style guide entry retrieved first
+    occupies budget that a CRITICAL security constraint retrieved second cannot
+    use. The priority queue ensures that the most important constraints are always
+    included, with progressively less critical entries filling remaining budget.
+    This matches how veteran engineers think: they hold critical constraints as
+    invariants and consider lower-priority guidance only when the high-priority
+    constraints are satisfied.
+  how_to_do_right: |
+    1. Build priority queue after retrieval, before context assembly:
+       from heapq import heappush, heappop
+       import heapq
+
+       priority_map = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+       pq = []
+       for entry in retrieved_entries:
+           # Negated for max-heap behavior (heapq is min-heap)
+           priority = priority_map[entry.severity]
+           score = -entry.importance_score  # Negate for max-heap
+           heappush(pq, (priority, score, entry))
+
+    2. Pop from queue, insert until budget exhausted:
+       selected, token_count = [], 0
+       while pq and token_count < knowledge_budget:
+           _, _, entry = heappop(pq)
+           entry_tokens = count_tokens(entry.text)
+           if token_count + entry_tokens <= knowledge_budget:
+               selected.append(entry)
+               token_count += entry_tokens
+           else:
+               break  # Even the smallest remaining entry won't fit
+    3. Always log: how many entries of each severity were included vs excluded
+    4. Alert if any CRITICAL entry was excluded — this means knowledge budget is too small
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [qdrant, engineering_brain]
+  domains:
+    domain: [architecture, knowledge_management]
+    concern: [priority_queue, context_selection, knowledge_insertion]
+  example_good: |
+    import heapq
+
+    def priority_insert(entries: list, budget: int) -> list:
+        SEVERITY_PRIORITY = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+        pq = []
+        for entry in entries:
+            p = SEVERITY_PRIORITY.get(entry.severity, 2)
+            heapq.heappush(pq, (p, -entry.importance_score, entry))
+
+        selected, token_count = [], 0
+        critical_excluded = []
+
+        while pq:
+            priority, neg_score, entry = heapq.heappop(pq)
+            tokens = count_tokens(entry.text)
+            if token_count + tokens <= budget:
+                selected.append(entry)
+                token_count += tokens
+            elif priority == 0:  # CRITICAL didn't fit
+                critical_excluded.append(entry.id)
+
+        if critical_excluded:
+            log.warning(f"CRITICAL entries excluded due to budget: {critical_excluded}")
+            # Consider increasing knowledge_budget or compressing existing selections
+
+        return selected
+  example_bad: |
+    def insert_random_order(entries: list, budget: int) -> list:
+        # Entries arrive in vector search score order (similarity, not severity)
+        selected, token_count = [], 0
+        for entry in entries:  # No priority ordering
+            tokens = count_tokens(entry.text)
+            if token_count + tokens <= budget:
+                selected.append(entry)
+                token_count += tokens
+        # Result: 3 LOW "style preference" entries included, 2 CRITICAL security
+        # constraints excluded because the style entries arrived first from vector search
+  when_applies: >
+    Any retrieval system that returns more candidates than fit in the knowledge
+    budget. The priority queue is the correct data structure — do not sort by
+    similarity alone when severity data is available.
+  sources:
+    - "Engineering Brain Knowledge Seeds — severity classification system"
+    - "LLM Context Management Guide (2025): https://eval.16x.engineer/blog/llm-context-management-guide"
+
+- id: CTXB-010
+  text: >
+    Implement dynamic budget reallocation: if the task requires more context (e.g.,
+    a multi-file code review), shrink the knowledge budget and expand the task budget
+    by up to 15% of total budget. Define a reallocation cap of 25% maximum transfer
+    between any two budget components. Never reallocate from the output buffer — it
+    is inviolable. Trigger reallocation when task token count exceeds its budget at
+    context construction time, not at LLM call time.
+  why: >
+    The 20-40-30-10 default allocation assumes an average task. A code review task
+    with 5 files to analyze may need 60% task budget, leaving only 20% for knowledge.
+    Forcing it into 30% causes task truncation — the agent reviews only the first 3
+    files and silently omits the last 2. Dynamic reallocation (shrink knowledge by
+    10%, give to task) handles the 80th percentile of tasks without per-task manual
+    tuning. The 25% cap prevents degenerate cases where knowledge budget collapses
+    to near zero, making the agent operate without relevant context constraints.
+  how_to_do_right: |
+    1. Measure actual task tokens after task construction:
+       task_tokens = count_tokens(task_content)
+       task_overage = task_tokens - task_budget
+    2. If overage > 0: reallocate from knowledge_budget (up to 15% of total):
+       max_transfer = int(total_budget * 0.15)
+       actual_transfer = min(task_overage, max_transfer, knowledge_budget * 0.25)
+       knowledge_budget -= actual_transfer
+       task_budget += actual_transfer
+    3. If task still over budget after max transfer: truncate task at natural boundary
+       (end of file, end of function) — not at token count
+    4. Log every reallocation event: {reason, transfer_tokens, new_knowledge_budget,
+       new_task_budget} — this data reveals systematic task size mismatches
+    5. Review reallocation logs weekly: if reallocation fires > 20% of runs,
+       the default allocation is wrong — adjust the base ratios
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langchain, crewai]
+  domains:
+    domain: [architecture, performance]
+    concern: [dynamic_allocation, context_budget, adaptive_context]
+  example_good: |
+    def reallocate_budget(budgets: dict, components: dict) -> dict:
+        """Dynamically reallocate budget based on actual component sizes."""
+        total = sum(budgets.values())
+        task_actual = count_tokens(components["task"])
+        task_overage = task_actual - budgets["task"]
+
+        if task_overage <= 0:
+            return budgets  # No reallocation needed
+
+        max_transfer = int(total * 0.15)
+        max_from_knowledge = int(budgets["knowledge"] * 0.25)
+        transfer = min(task_overage, max_transfer, max_from_knowledge)
+
+        if transfer > 0:
+            budgets["knowledge"] -= transfer
+            budgets["task"] += transfer
+            log.info(f"Budget reallocation: -{transfer} knowledge, +{transfer} task "
+                     f"(task overage: {task_overage} tokens)")
+
+        # output_buffer is NEVER touched
+        assert budgets["output_buffer"] == budgets.get("_original_output_buffer"), \
+            "Output buffer must not be modified"
+        return budgets
+  example_bad: |
+    def reallocate_bad(budgets, components):
+        task_overage = count_tokens(components["task"]) - budgets["task"]
+        if task_overage > 0:
+            # Steal from output buffer — corrupts structured output
+            budgets["output_buffer"] -= task_overage
+            budgets["task"] += task_overage
+        # Result: agent's JSON response gets cut off at closing bracket
+        # Downstream parser crashes with JSONDecodeError every time
+  when_applies: >
+    Tasks with variable-length inputs: code review, document analysis, multi-file
+    inspection. Any task where input size is not bounded by the prompt template.
+  sources:
+    - "Context Window Management Strategies (2025): https://www.getmaxim.ai/articles/context-window-management-strategies-for-long-context-ai-agents-and-chatbots/"
+    - "Anthropic Context Window: https://docs.anthropic.com/en/docs/build-with-claude/context-windows"
+
+- id: CTXB-011
+  text: >
+    Use provider-specific tokenizers for accurate token counting — never use
+    character-count approximations (÷ 4) in budget enforcement code. Use tiktoken
+    for OpenAI/GPT models, Anthropic's token counting API for Claude models, and
+    the exact HuggingFace tokenizer for Mistral/Llama models. A 10-15% counting
+    error from character approximation causes silent budget violations that result
+    in API errors or truncated outputs in production under peak load.
+  why: >
+    Token counts vary significantly by content type: code has ~1 token per 3.5
+    characters (dense), English prose has ~1 token per 4 characters (average),
+    JSON has ~1 token per 3 characters (dense), and non-English text (CJK) can be
+    ~1 token per 1-2 characters (very dense). Character-division (text_length / 4)
+    underestimates CJK content by 2-3x and underestimates code by 15-20%.
+    In the Brains pipeline, the CONTEXT_BUDGET_PROTOCOL runs on content that mixes
+    Python code examples (dense) with English explanations (average) — a uniform
+    approximation gets both wrong. A 15% undercount on a 100K token budget means
+    the actual prompt is 115K tokens — over the 128K limit for Claude.
+  how_to_do_right: |
+    1. For Claude models (production primary): use Anthropic token counting API:
+       import anthropic
+       client = anthropic.Anthropic()
+       response = client.messages.count_tokens(
+           model="claude-opus-4",
+           messages=[{"role": "user", "content": text}]
+       )
+       token_count = response.input_tokens
+    2. For OpenAI models: use tiktoken (exact match):
+       import tiktoken
+       enc = tiktoken.encoding_for_model("gpt-4o")
+       token_count = len(enc.encode(text))
+    3. For Mistral/Llama: use exact HuggingFace tokenizer:
+       from transformers import AutoTokenizer
+       tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
+       token_count = len(tokenizer.encode(text))
+    4. Add 5% safety buffer to all token count results: count_with_buffer = count * 1.05
+    5. Cache tokenizer instances — never reinstantiate per call (startup cost: 200ms-1s)
+    6. For performance-critical paths: tiktoken is 100x faster than Anthropic API counting
+       — use tiktoken as approximation, Anthropic API for final pre-flight check
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [tiktoken, anthropic, transformers]
+  domains:
+    domain: [architecture, reliability]
+    concern: [token_counting, budget_accuracy, api_errors]
+  example_good: |
+    import tiktoken
+    import anthropic
+    from functools import lru_cache
+
+    # Cache tokenizer — one instance per process
+    @lru_cache(maxsize=None)
+    def get_tiktoken_encoder(model: str = "gpt-4o"):
+        return tiktoken.encoding_for_model(model)
+
+    def count_tokens_fast(text: str) -> int:
+        """tiktoken for fast counting — 100x faster than API call."""
+        return len(get_tiktoken_encoder().encode(text))
+
+    # Use for budget decisions — fast enough for hot path
+    def count_tokens_exact_claude(text: str, model: str = "claude-opus-4") -> int:
+        """Anthropic API for final pre-flight check."""
+        client = anthropic.Anthropic()
+        response = client.messages.count_tokens(
+            model=model,
+            messages=[{"role": "user", "content": text}]
+        )
+        return response.input_tokens
+
+    # Budget enforcement uses fast counter + 5% buffer
+    def within_budget(text: str, budget: int) -> bool:
+        estimated = count_tokens_fast(text)
+        return estimated * 1.05 <= budget  # 5% safety buffer covers tiktoken variance
+  example_bad: |
+    def count_tokens_bad(text: str) -> int:
+        return len(text) // 4  # Character division — wrong for code, CJK, JSON
+
+    # This function called with:
+    # text = "if user.is_admin:\n    grant_access(user, resource)"  # Python code
+    # Real tokens: 16 tokens (code is denser than English prose)
+    # Estimated: 50 chars // 4 = 12 tokens  (25% undercount!)
+    # After 50 such calls, budget overflow leads to 413 API error in production
+  when_applies: >
+    Any code that enforces a token budget. Zero tolerance for approximations in
+    production budget enforcement. Use fast approximation only for logging/metrics
+    where accuracy is not critical.
+  sources:
+    - "Token Counting: tiktoken, Anthropic, Gemini (2025): https://www.propelcode.ai/blog/token-counting-tiktoken-anthropic-gemini-guide-2025"
+    - "OpenAI Cookbook — How to Count Tokens with Tiktoken: https://developers.openai.com/cookbook/examples/how_to_count_tokens_with_tiktoken/"
+    - "tiktoken GitHub — OpenAI: https://github.com/openai/tiktoken"
+
+- id: CTXB-012
+  text: >
+    Implement the retrieve-then-compress pipeline: retrieve 3x the knowledge
+    budget in candidates, score by importance (CTXB-003), then compress the
+    top candidates to fit the exact budget. Never retrieve only the final target
+    amount — retrieving 3x gives the importance ranker sufficient signal to
+    identify the best subset. Never compress without first ranking — compressing
+    all retrieved content equally loses the highest-scoring content proportionally.
+  why: >
+    Vector search returns results in similarity order, not importance order.
+    The 4th most similar document may be the most important (CRITICAL severity,
+    fresh) while the most similar document is a LOW severity style note.
+    Retrieving only the target amount locks you into similarity ordering.
+    Retrieving 3x gives the ranker 30 candidates to select the best 10 from.
+    In practice, this retrieval overhead costs ~15ms in Qdrant (query time is
+    O(log n) regardless of result count) — negligible cost for significant
+    quality improvement. Compress after ranking, not before — compressing the
+    full 3x pool and then ranking loses high-quality content inside compressed
+    chunks.
+  how_to_do_right: |
+    1. Set retrieval multiplier: RETRIEVE_MULTIPLIER = 3
+    2. Retrieve: candidates = vector_search(query, top_k=target_k * RETRIEVE_MULTIPLIER)
+    3. Score each candidate with importance score (CTXB-003):
+       scored = [(c, importance_score(c)) for c in candidates]
+       scored.sort(key=lambda x: x[1], reverse=True)
+    4. Greedily select top candidates until knowledge_budget is filled:
+       selected = []
+       for candidate, score in scored:
+           if total_tokens(selected) + tokens(candidate) <= knowledge_budget:
+               selected.append(candidate)
+    5. If total_tokens(selected) > knowledge_budget: compress selected to fit
+       (not the full 3x pool — compress only what's selected)
+    6. Log the multiplier utilization: what fraction of the 3x pool was actually useful?
+       useful_fraction = len(selected) / len(candidates)
+       # If useful_fraction < 0.5: increase retrieval quality, not multiplier
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [qdrant, llmlingua, engineering_brain]
+  domains:
+    domain: [architecture, performance]
+    concern: [retrieval_pipeline, compress_rank_order, rag_quality]
+  example_good: |
+    def retrieve_then_compress(query: str, knowledge_budget: int, qdrant_client) -> list:
+        MULTIPLIER = 3
+        target_k = estimate_entries_for_budget(knowledge_budget)
+        retrieve_k = target_k * MULTIPLIER
+
+        # Stage 1: Retrieve 3x candidates
+        candidates = qdrant_client.search(
+            collection_name="engineering_brain",
+            query_vector=embed(query),
+            limit=retrieve_k,
+            with_payload=True
+        )
+
+        # Stage 2: Score by importance (severity × relevance × freshness)
+        scored = [(c, importance_score(c)) for c in candidates]
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        # Stage 3: Greedy selection up to budget
+        selected, token_count = [], 0
+        for candidate, score in scored:
+            text = candidate.payload["text"]
+            tokens = count_tokens(text)
+            if token_count + tokens <= knowledge_budget:
+                selected.append(text)
+                token_count += tokens
+
+        # Stage 4: Compress only if still over budget (should be rare after ranking)
+        if token_count > knowledge_budget:
+            selected = compress_with_llmlingua(selected, knowledge_budget)
+
+        return selected
+  example_bad: |
+    def retrieve_exact_amount(query: str, knowledge_budget: int, qdrant_client) -> list:
+        target_k = estimate_entries_for_budget(knowledge_budget)
+        # Retrieve only the exact target — locked into similarity order
+        candidates = qdrant_client.search(query_vector=embed(query), limit=target_k)
+        # No importance ranking — returns in similarity order only
+        # CRITICAL severity entry ranked 15th by similarity is excluded
+        # LOW severity style note ranked 3rd by similarity is included
+        return [c.payload["text"] for c in candidates]
+  when_applies: >
+    All production RAG retrieval where knowledge entries have severity or
+    importance metadata. The 3x multiplier is the minimum — use 5x for knowledge
+    bases with highly variable importance distribution.
+  sources:
+    - "PolyRAG: Knowledge Pyramid Multi-Level RAG: https://arxiv.org/abs/2407.21276"
+    - "LLMLingua Microsoft Research: https://www.microsoft.com/en-us/research/blog/llmlingua-innovating-llm-efficiency-with-prompt-compression/"
+
+- id: CTXB-013
+  text: >
+    Apply diminishing returns analysis to few-shot example budget: include 3-5
+    examples maximum for most tasks (accuracy gain from 3→5 examples: +2-4%),
+    never include more than 8 examples (gain from 5→8: < 1%, cost: 2000-3000
+    tokens). Use diverse examples that span edge cases, not similar examples
+    that reinforce the common case. Rotate examples based on which edge case
+    the current query most resembles — do not use a static example set.
+  why: >
+    Research on in-context learning shows accuracy improvements from few-shot
+    examples follow a log curve: the 1st example provides the largest gain (~15%),
+    3 examples cover 80% of achievable gain, 8 examples cover 95%, and diminishing
+    returns flatten completely around 10-12 examples. In the Brains pipeline,
+    each few-shot example for the spec_writer is ~500 tokens. Going from 5 to 10
+    examples costs 2,500 tokens (5% of a 50K knowledge budget) for a <1%
+    accuracy gain. This budget is better spent on additional knowledge entries
+    with high relevance to the current task. Static example sets also cause
+    systematic biases: an agent trained on the same 5 examples for 1000 runs
+    tends to produce outputs that look like those 5 examples, even when the task
+    requires a different format.
+  how_to_do_right: |
+    1. Set maximum few-shot budget: FEW_SHOT_BUDGET = int(total_knowledge_budget * 0.25)
+       (25% of knowledge budget for examples — never more)
+    2. Select examples dynamically per query:
+       most_similar_examples = vector_search(current_query, collection="examples", top_k=10)
+       # Take top 3 by similarity + 1-2 "diversity" examples (different edge case types)
+    3. Enforce diminishing returns ceiling: MAX_EXAMPLES = 5
+    4. If FEW_SHOT_BUDGET exhausted before MAX_EXAMPLES reached: stop — don't exceed budget
+    5. Order examples: hardest (edge case) first, simplest last — models are biased toward
+       the last example when uncertain; end with the most representative case
+    6. Measure: track accuracy with 3 vs 5 examples for your specific task over 100 runs;
+       use 3 if delta < 2%, use 5 only if confirmed improvement > 2%
+  severity: low
+  technologies:
+    lang: [python]
+    framework: [langchain, crewai, engineering_brain]
+  domains:
+    domain: [architecture, performance]
+    concern: [few_shot_examples, context_efficiency, prompt_engineering]
+  example_good: |
+    def select_few_shot_examples(query: str, example_pool: list,
+                                  budget: int, max_examples: int = 5) -> list:
+        # Dynamic selection: retrieve 10 candidates, pick 3-5 diverse ones
+        candidates = vector_search(query, collection="examples", top_k=10)
+
+        # Select top 3 by similarity
+        selected = candidates[:3]
+
+        # Add 1-2 "edge case" examples for diversity
+        edge_cases = [c for c in candidates[3:] if c.payload.get("is_edge_case")]
+        selected.extend(edge_cases[:2])
+
+        # Enforce budget and max count
+        final, token_count = [], 0
+        for ex in selected[:max_examples]:
+            tokens = count_tokens(ex.payload["text"])
+            if token_count + tokens <= budget:
+                final.append(ex.payload["text"])
+                token_count += tokens
+
+        return final  # 3-5 diverse examples, within budget
+  example_bad: |
+    # Static example set, always 8 examples regardless of task
+    FEW_SHOT_EXAMPLES = load_examples("examples.json")[:8]  # Always same 8 examples
+
+    def get_examples():
+        return "\n\n".join(FEW_SHOT_EXAMPLES)  # 4000 tokens, always
+        # For a 50K knowledge budget: 8% wasted on redundant examples
+        # The last 3 examples (>$0.003/call overhead) contribute < 0.5% accuracy gain
+  when_applies: >
+    Any prompt that includes few-shot examples. Baseline: 3 examples. Add to 5
+    only with empirical evidence of > 2% accuracy improvement on your specific task.
+  sources:
+    - "Brown et al. (2020). Language Models are Few-Shot Learners (GPT-3 paper): https://arxiv.org/abs/2005.14165"
+    - "OpenAI Few-Shot Prompting Guide: https://platform.openai.com/docs/guides/prompt-engineering"
+
+- id: CTXB-014
+  text: >
+    Optimize the system prompt for maximum signal-to-token ratio: target 200-500
+    tokens for the system prompt (20% of a 128K budget is 25K tokens — most system
+    prompts should be far shorter). Include: role definition (1 sentence), output
+    format specification (exact schema), critical constraints (max 5 items), and
+    nothing else. Remove: examples (move to few-shot), background theory, preamble,
+    politeness phrases. Every token in the system prompt competes with retrieved
+    knowledge for context budget — bloated system prompts are the most expensive
+    form of context inefficiency.
+  why: >
+    System prompts that grow unbounded are the most common form of context bloat.
+    Teams iteratively add instructions to fix edge cases without removing obsolete
+    instructions. After 6 months, a system prompt that started at 200 tokens is
+    often 2000-3000 tokens — a 10-15x increase that occupies 3% of a 128K context.
+    This seems small until you realize it's 8-12 fewer knowledge entries at 200
+    tokens each, or the cost of 2-3 few-shot examples. More critically, longer
+    system prompts decrease instruction following quality (Anthropic research shows
+    models follow instructions in the first 500 tokens more reliably than later
+    instructions). The most effective system prompts are ruthlessly minimal.
+  how_to_do_right: |
+    1. System prompt template (target: 200-400 tokens):
+       "You are a {role}. Your task: {one_sentence_task_definition}.
+       Output format: {exact_json_schema_or_format}.
+       CRITICAL constraints (follow strictly):
+       1. {constraint_1}
+       2. {constraint_2}
+       3. {constraint_3}"
+    2. Audit system prompt monthly: remove any instruction that was added to fix
+       a one-time edge case and hasn't been triggered in 30 days
+    3. Move examples from system prompt to user turn (few-shot section)
+    4. Move background knowledge from system prompt to retrieved knowledge section
+    5. Test minimal vs verbose system prompt on 50 tasks:
+       - If accuracy difference < 1%: use minimal
+       - If minimal performs worse: identify the specific instruction that matters
+    6. Set a hard token limit: assert count_tokens(system_prompt) <= 600
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langchain, crewai, anthropic]
+  domains:
+    domain: [architecture, performance]
+    concern: [system_prompt_optimization, context_efficiency, instruction_following]
+  example_good: |
+    # Minimal, high-signal system prompt — 180 tokens
+    SYSTEM_PROMPT = """You are a senior software engineer performing code review.
+
+    Output format:
+    {"issues": [{"severity": "critical|high|medium|low", "line": int,
+                 "description": str, "fix": str}], "summary": str}
+
+    Critical constraints:
+    1. Report ONLY verifiable issues present in the provided code
+    2. severity=critical ONLY for: data loss, security vulnerabilities, crashes
+    3. Always provide a concrete fix, never "consider refactoring"
+    4. Maximum 10 issues — prioritize by severity"""
+
+    # 180 tokens for system prompt vs 25,600 token budget → 0.7% usage
+    # Remaining 99.3% available for actual code and knowledge
+  example_bad: |
+    # Bloated system prompt — 2,800 tokens
+    SYSTEM_PROMPT = """You are an expert senior software engineer with 20 years of
+    experience in Python, JavaScript, TypeScript, Go, Java, Rust, and C++.
+    You have deep knowledge of design patterns, SOLID principles, clean code,
+    refactoring techniques, performance optimization, security best practices,
+    database optimization, API design, microservices, and distributed systems.
+
+    When reviewing code, you should:
+    1. Check for syntax errors...
+    [30 more paragraphs of generic instructions]
+    """
+    # 2,800 tokens → 11% of 25,600 token knowledge budget consumed by preamble
+    # Anthropic research: instructions after token 500 followed less reliably
+    # The 30-paragraph instruction set is mostly ignored — the first 5 items matter
+  when_applies: >
+    Every system prompt. Audit existing system prompts immediately — almost
+    all production system prompts have at least 50% removable tokens. Apply
+    the 200-500 token target as a hard constraint, not a guideline.
+  sources:
+    - "Anthropic Prompt Engineering Guide: https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/overview"
+    - "Context Window Management Guide (2025): https://eval.16x.engineer/blog/llm-context-management-guide"

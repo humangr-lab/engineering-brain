@@ -1,0 +1,266 @@
+layer: rules
+technology: SRE
+domain: data_engineering
+knowledge:
+- id: CR-SRE-DPIPE-001
+  text: Data pipeline idempotency means processing the same input twice produces the same output once — not that it produces
+    the same output twice. If your pipeline appends to a table, reprocessing doubles the data. If it uses UPSERT with a unique
+    key, reprocessing is safe.
+  why: 'Google''s data pipeline design (Chapter 25) mandates idempotent processing because pipelines WILL reprocess data —
+    due to job restarts, partition rebalancing, checkpoint recovery, and bug fixes requiring reprocessing. The anti-pattern:
+    pipeline reads events and INSERTs rows. A job restart reprocesses the same events and creates duplicate rows. This is
+    not just a theoretical concern — it happens weekly in most organizations. Google''s approach: every write operation uses
+    a deterministic key derived from the input. INSERT becomes UPSERT (ON CONFLICT DO UPDATE). The key is typically a hash
+    of the input event (event_id, timestamp, source). Reprocessing the same event overwrites the same row with the same data
+    — no duplicates.
+
+    '
+  how_to_do_right: '1. Every pipeline output must have a deterministic unique key derived from the input: hash(event_id +
+    source + timestamp).
+
+    2. Use UPSERT (ON CONFLICT DO UPDATE) instead of INSERT. Reprocessing overwrites with the same data.
+
+    3. For aggregations (SUM, COUNT): use replace semantics, not additive. Store "total for 2024-01-15 = 500" not "add 500
+    to total."
+
+    4. For file outputs: write to deterministic paths (output/date=2024-01-15/hour=14/part-00000). Reprocessing overwrites
+    the same file.
+
+    5. Test idempotency: run the pipeline twice on the same input. Compare outputs. They must be identical.
+
+    6. Use checkpointing: after processing each batch, checkpoint the offset. On restart, resume from the checkpoint, not
+    from the beginning.
+
+    '
+  example_good: "# Idempotent pipeline using UPSERT with deterministic key\nimport hashlib\nimport psycopg2\n\ndef process_event(event: dict, conn) -> None:\n    # Deterministic key from input\n    dedup_key = hashlib.sha256(\n        f\"{event['event_id']}:{event['source']}:{event['timestamp']}\".encode()\n    ).hexdigest()\n\n    with conn.cursor() as cur:\n        cur.execute(\"\"\"\n            INSERT INTO processed_events (dedup_key, payload, processed_at)\n            VALUES (%s, %s, NOW())\n            ON CONFLICT (dedup_key) DO UPDATE SET\n                payload = EXCLUDED.payload,\n                processed_at = EXCLUDED.processed_at\n        \"\"\", (dedup_key, json.dumps(event)))\n    # Reprocessing the same event overwrites with same data — no duplicates\n"
+  example_bad: "# Non-idempotent pipeline — INSERT creates duplicates on reprocessing\ndef process_event(event: dict, conn) -> None:\n    with conn.cursor() as cur:\n        cur.execute(\"\"\"\n            INSERT INTO processed_events (payload, processed_at)\n            VALUES (%s, NOW())\n        \"\"\", (json.dumps(event),))\n    # Job restart reprocesses same events -> duplicate rows\n    # No dedup key -> impossible to detect duplicates later\n"
+  when_applies: "When building any data pipeline that processes events, messages, or records from a source that may deliver duplicates or require reprocessing."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [postgresql, kafka]
+  domains:
+    domain: [architecture, reliability]
+    concern: [api_design, idempotency, data, pipelines]
+  sources:
+  - url: https://sre.google/sre-book/data-processing-pipelines/
+    title: 'Google SRE Book — Chapter 25: Data Processing Pipelines'
+  validation_status: cross_checked
+- id: CR-SRE-DPIPE-002
+  text: Data quality checks must be embedded in the pipeline, not run after the fact. A pipeline that loads garbage data and
+    then detects it has already polluted downstream systems. Validate data at ingestion — reject or quarantine bad records
+    before they enter the system.
+  why: 'Google''s data integrity chapter (Chapter 26) and pipeline chapter (Chapter 25) both advocate for inline validation
+    because downstream systems trust the pipeline''s output. Once bad data enters the warehouse, it poisons: dashboards (wrong
+    numbers → wrong decisions), ML models (trained on corrupted data), reports (incorrect metrics sent to stakeholders), and
+    other pipelines (that read from the warehouse). Fixing after the fact requires: identifying all affected downstream systems,
+    reprocessing data, and rebuilding dependent artifacts. This can take days. Inline validation catches bad data at the source:
+    each record is checked against schema, business rules, and statistical expectations before being written. Bad records
+    are quarantined (sent to a DLQ) for investigation.
+
+    '
+  how_to_do_right: '1. Schema validation at ingestion: every record must match the expected schema (fields present, types
+    correct, required fields non-null).
+
+    2. Business rule validation: "age must be 0-150," "email must contain @," "amount must be positive."
+
+    3. Statistical validation: compare batch statistics against historical norms. If today''s record count is 90% lower than
+    the 30-day average, alert.
+
+    4. Quarantine bad records: don''t drop them (data loss) or halt the pipeline (blocks everything). Send to a DLQ for investigation.
+
+    5. Track data quality metrics: percentage of records passing validation, most common validation failures, quarantine queue
+    depth.
+
+    6. Apply "circuit breaker" logic: if >10% of records in a batch fail validation, halt the batch — the source is likely
+    broken.
+
+    '
+  example_good: "# Inline data quality validation with quarantine\nfrom dataclasses import dataclass\nfrom typing import Optional\nimport statistics\n\n@dataclass\nclass ValidationResult:\n    valid: bool\n    errors: list[str]\n\ndef validate_record(record: dict) -> ValidationResult:\n    errors = []\n    # Schema validation\n    if 'user_id' not in record:\n        errors.append('missing required field: user_id')\n    if not isinstance(record.get('amount'), (int, float)):\n        errors.append('amount must be numeric')\n    # Business rules\n    if record.get('amount', 0) < 0:\n        errors.append('amount must be non-negative')\n    if record.get('age', 0) > 150:\n        errors.append('age out of valid range')\n    return ValidationResult(valid=len(errors) == 0, errors=errors)\n\ndef process_batch(records: list[dict], dlq) -> dict:\n    valid, quarantined = [], []\n    for r in records:\n        result = validate_record(r)\n        if result.valid:\n            valid.append(r)\n        else:\n            dlq.send(r, errors=result.errors)  # quarantine, don't drop\n            quarantined.append(r)\n    if len(quarantined) / len(records) > 0.10:  # circuit breaker\n        raise ValueError(f'>10% records failed validation — source likely broken')\n    return {'valid': len(valid), 'quarantined': len(quarantined)}\n"
+  example_bad: "# Load data without validation — garbage in, garbage out\ndef process_batch(records: list[dict], db) -> None:\n    for record in records:\n        db.insert(record)  # no schema check, no business rules\n    # Corrupt data poisons dashboards, ML models, reports\n    # Discovered days later -> reprocess everything\n"
+  when_applies: "When building data ingestion pipelines that receive data from external sources, user inputs, or upstream systems with uncertain data quality."
+  severity: high
+  technologies:
+    lang: [general]
+    library: [quality, testing]
+    platform: [messaging]
+  domains:
+    domain: [architecture, quality, reliability]
+    concern: [api_design, validation, data, pipelines]
+  sources:
+  - url: https://sre.google/sre-book/data-integrity-what-you-read/
+    title: 'Google SRE Book — Chapter 26: Data Integrity: What You Read Is What You Wrote'
+  validation_status: cross_checked
+- id: CR-SRE-DPIPE-003
+  text: Pipeline checkpointing must be granular enough to avoid reprocessing hours of data on restart. If the pipeline checkpoints
+    once per hour and crashes at minute 59, it reprocesses 59 minutes of work. If it checkpoints every 1000 records, it reprocesses
+    at most 999 records.
+  why: 'Google''s pipeline design (Chapter 25) treats checkpointing as critical infrastructure because pipelines crash frequently:
+    OOM kills, node failures, code bugs, dependency failures. Without granular checkpointing: the pipeline restarts from the
+    beginning of the current batch (which may be hours of data). This causes: wasted compute (reprocessing already-processed
+    data), duplicate outputs (if the pipeline isn''t idempotent), and delayed processing (the pipeline is reprocessing old
+    data instead of processing new data). Google uses "exactly-once" processing frameworks (like Cloud Dataflow) that checkpoint
+    after every transform, but even with simpler frameworks, checkpointing every N records or every M minutes provides adequate
+    recovery points.
+
+    '
+  how_to_do_right: '1. Checkpoint frequency: every N records (1000-10000) OR every M minutes (1-5 minutes). Whichever comes
+    first.
+
+    2. Checkpoint must be atomic: write the checkpoint AFTER the data is committed. If the data write fails, the checkpoint
+    is not updated.
+
+    3. Store checkpoints durably: not in memory (lost on crash), not on local disk (lost on node failure). Use a database,
+    cloud storage, or Kafka offsets.
+
+    4. Include enough state in the checkpoint to resume: offset/position, accumulated state (for aggregations), and timestamp.
+
+    5. Test checkpoint recovery: kill the pipeline mid-batch and verify it resumes correctly from the last checkpoint.
+
+    6. Monitor checkpoint lag: the difference between the latest data and the latest checkpoint. High lag = risk of reprocessing.
+
+    '
+  example_good: "# Granular checkpointing every N records\nimport json\nfrom pathlib import Path\n\nclass CheckpointedPipeline:\n    def __init__(self, checkpoint_path: str, checkpoint_interval: int = 1000):\n        self.checkpoint_path = Path(checkpoint_path)\n        self.interval = checkpoint_interval\n        self.offset = self._load_checkpoint()\n\n    def _load_checkpoint(self) -> int:\n        if self.checkpoint_path.exists():\n            return json.loads(self.checkpoint_path.read_text())['offset']\n        return 0\n\n    def _save_checkpoint(self, offset: int) -> None:\n        self.checkpoint_path.write_text(json.dumps({'offset': offset}))\n\n    def process(self, records: list[dict]) -> None:\n        for i, record in enumerate(records[self.offset:], start=self.offset):\n            self._process_record(record)\n            if (i + 1) % self.interval == 0:\n                self._save_checkpoint(i + 1)  # checkpoint after commit\n        self._save_checkpoint(len(records))  # final checkpoint\n    # Crash at record 5999 -> restart from checkpoint 5000, reprocess 999 records\n"
+  example_bad: "# No checkpointing — restart reprocesses everything\ndef process(records: list[dict]) -> None:\n    for record in records:\n        process_record(record)\n    # Crash at record 59,999 of 60,000 -> restart from record 0\n    # Reprocesses 59,999 records, wastes hours of compute\n    # If not idempotent, also creates duplicates\n"
+  when_applies: "When building any data pipeline that processes large batches where a crash or restart would cause significant reprocessing."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kafka]
+  domains:
+    domain: [architecture, reliability]
+    concern: [data, pipelines]
+  sources:
+  - url: https://sre.google/sre-book/data-processing-pipelines/
+    title: 'Google SRE Book — Chapter 25: Data Processing Pipelines'
+  validation_status: cross_checked
+- id: CR-SRE-DPIPE-004
+  text: Late-arriving data is inevitable in distributed systems — your pipeline must handle records that arrive after the
+    processing window has closed. A pipeline that assumes all data arrives on time will produce incorrect results when data
+    is delayed by network issues, client batching, or timezone mishandling.
+  why: 'Google''s pipeline design (Chapter 25) explicitly accounts for late data because in real systems, data arrival is
+    never perfectly ordered. Sources of late data: mobile clients that batch events and send them when connectivity is restored,
+    time zone mishandling (event timestamp is in local time, server converts incorrectly), network delays (events from a remote
+    region arrive minutes late), and system retries (failed events are replayed hours later). A pipeline that processes "today''s
+    events" and closes the window at midnight will miss events that arrive at 00:05 from a client that was offline. Google''s
+    approach: allow a "late data window" (e.g., events up to 24 hours late are still processed) and use watermarks to track
+    processing completeness.
+
+    '
+  how_to_do_right: '1. Define a late data policy: events up to X hours late are still processed. Events beyond X hours are
+    quarantined.
+
+    2. Use event time (from the event payload), not processing time (when the pipeline sees the event). Event time is when
+    it happened; processing time is when it was processed.
+
+    3. Implement watermarks: track the minimum event time of all in-flight events. When the watermark passes a window boundary,
+    the window is "complete" (with the late tolerance).
+
+    4. Support reprocessing: when late data arrives beyond the window, allow recomputation of the affected window.
+
+    5. For aggregations: use incremental updates, not complete recalculations. Late data updates the existing aggregate, not
+    replaces it.
+
+    6. Monitor late data volume: what percentage of records arrive late? How late? Increasing late data indicates a source
+    problem.
+
+    '
+  example_good: "# Handle late-arriving data with event time and watermarks\nfrom datetime import datetime, timedelta\n\nclass WindowedAggregator:\n    def __init__(self, late_tolerance: timedelta = timedelta(hours=24)):\n        self.late_tolerance = late_tolerance\n        self.windows: dict[str, dict] = {}  # window_key -> aggregate\n\n    def process_event(self, event: dict) -> str:\n        # Use event time, not processing time\n        event_time = datetime.fromisoformat(event['event_timestamp'])\n        window_key = event_time.strftime('%Y-%m-%d-%H')  # hourly window\n\n        watermark = datetime.utcnow() - self.late_tolerance\n        if event_time < watermark:\n            return 'quarantined'  # too late, beyond tolerance\n\n        # Incremental update (not full recalculation)\n        if window_key not in self.windows:\n            self.windows[window_key] = {'count': 0, 'total': 0.0}\n        self.windows[window_key]['count'] += 1\n        self.windows[window_key]['total'] += event.get('amount', 0)\n        return 'processed'\n"
+  example_bad: "# Assumes all data arrives on time — misses late events\nfrom datetime import datetime\n\ndef process_hourly_window(events: list[dict]) -> dict:\n    now = datetime.utcnow()\n    window_start = now.replace(minute=0, second=0, microsecond=0)\n    # Only process events from the current hour\n    current = [e for e in events if e['timestamp'] >= window_start]\n    total = sum(e['amount'] for e in current)\n    return {'window': window_start, 'total': total}\n    # Events arriving 5 minutes late (mobile clients, retries) are silently dropped\n    # Aggregates are permanently incorrect\n"
+  when_applies: "When building streaming or batch pipelines that aggregate data over time windows and data may arrive late due to network delays, client batching, or retries."
+  severity: medium
+  technologies:
+    lang: [general]
+    platform: [kafka]
+  domains:
+    domain: [architecture, reliability]
+    concern: [data, pipelines, streaming]
+  sources:
+  - url: https://sre.google/sre-book/data-processing-pipelines/
+    title: 'Google SRE Book — Chapter 25: Data Processing Pipelines'
+  validation_status: cross_checked
+- id: CR-SRE-DPIPE-005
+  text: Backfill operations must be treated as first-class pipeline operations, not ad-hoc scripts. A data pipeline that cannot
+    be pointed at historical data and run cleanly for a specific date range is incomplete. Bug fixes, schema changes, and
+    source corrections all require backfilling.
+  why: 'Google''s pipeline design treats backfill as a regular operation because it happens frequently: a bug is found in
+    the transformation logic → all data processed since the bug was introduced needs reprocessing. A new column is added →
+    historical data needs the new column populated. A source system corrects historical data → downstream needs reprocessing.
+    Ad-hoc backfill scripts are dangerous: they bypass validation, skip checkpointing, ignore idempotency, and produce output
+    in unexpected locations. A pipeline that supports backfill natively: accepts a date range parameter, processes the specified
+    range using the same logic as real-time processing, writes output to the same locations (using idempotent writes), and
+    tracks the backfill separately from real-time processing.
+
+    '
+  how_to_do_right: '1. Design pipelines to accept date range parameters: --start-date 2024-01-01 --end-date 2024-01-31. Same
+    code path as real-time processing.
+
+    2. Backfill must be idempotent: running backfill for the same date range twice produces the same result.
+
+    3. Separate backfill resources from real-time resources: backfill should not consume capacity needed for real-time processing.
+
+    4. Track backfill progress: which dates have been backfilled, which are pending, which failed.
+
+    5. Validate backfill output: compare backfilled data against expected results (row counts, checksums, statistical distributions).
+
+    6. Test backfill regularly: run backfill for yesterday''s data in staging and compare with production. They should match.
+
+    '
+  example_good: "# Pipeline supports backfill as a first-class operation\nimport argparse\nfrom datetime import date, timedelta\n\ndef run_pipeline(start_date: date, end_date: date, mode: str = 'realtime') -> dict:\n    \"\"\"Same code path for realtime and backfill.\"\"\"\n    results = {'processed': 0, 'failed': 0}\n    current = start_date\n    while current <= end_date:\n        records = fetch_records_for_date(current)\n        process_batch(records)  # idempotent writes\n        results['processed'] += len(records)\n        current += timedelta(days=1)\n    return results\n\nif __name__ == '__main__':\n    parser = argparse.ArgumentParser()\n    parser.add_argument('--start-date', type=date.fromisoformat, required=True)\n    parser.add_argument('--end-date', type=date.fromisoformat, required=True)\n    parser.add_argument('--mode', choices=['realtime', 'backfill'], default='realtime')\n    args = parser.parse_args()\n    # python pipeline.py --start-date 2024-01-01 --end-date 2024-01-31 --mode backfill\n    run_pipeline(args.start_date, args.end_date, args.mode)\n"
+  example_bad: "# Ad-hoc backfill script — bypasses all pipeline safeguards\nimport psycopg2\n\n# Quick-and-dirty backfill script written during incident\nconn = psycopg2.connect('postgres://prod:5432/db')  # direct prod access\ncur = conn.cursor()\ncur.execute(\"SELECT * FROM raw_events WHERE date >= '2024-01-01'\")\nfor row in cur.fetchall():\n    # No validation, no checkpointing, no idempotency\n    cur.execute(\"INSERT INTO processed_events VALUES (%s)\", (row,))\nconn.commit()  # duplicates if run twice, no error handling\n"
+  when_applies: "When designing data pipelines that must support reprocessing historical data due to bug fixes, schema changes, or source corrections."
+  severity: medium
+  technologies:
+    lang: [general]
+    platform: [messaging]
+  domains:
+    domain: [architecture, reliability]
+    concern: [data, backfill, pipelines]
+  sources:
+  - url: https://sre.google/sre-book/data-processing-pipelines/
+    title: 'Google SRE Book — Chapter 25: Data Processing Pipelines'
+  validation_status: cross_checked
+- id: CR-SRE-DPIPE-006
+  text: Schema evolution in data pipelines must be backward AND forward compatible — new code must read old data, AND old
+    code must read new data. This is stricter than API compatibility because data outlives code by years.
+  why: 'Google''s data integrity chapter (Chapter 26) treats schema evolution as critical infrastructure because data is permanent.
+    Code is replaced every deployment. Data persists for years. A schema change that breaks old data renders the entire historical
+    dataset unreadable. The dual-compatibility requirement: backward compatible (new code reads old data without the new field
+    → uses default) AND forward compatible (old code reads new data with an unknown field → ignores it). This ensures: data
+    written by any historical version of the code is readable by the current version, and data written by the current version
+    is readable by any previous version (important during rollback). Binary formats (Protobuf, Avro) enforce this automatically.
+    JSON/CSV do not — you must enforce it manually.
+
+    '
+  how_to_do_right: '1. New fields must have default values: old data without the field uses the default. Old code without
+    knowledge of the field ignores it.
+
+    2. Never remove or rename fields: old data with the field must still be readable. Deprecate (stop writing) but keep in
+    schema.
+
+    3. Never change field types: if "count" was a string, it stays a string forever. Add "count_int" if you need an integer
+    version.
+
+    4. Use a schema registry (Confluent, Glue) to enforce compatibility on every schema change. Reject incompatible changes.
+
+    5. Use binary serialization (Protobuf, Avro) for long-lived data: they enforce compatibility rules automatically. Avoid
+    JSON for data with long retention.
+
+    6. Test schema evolution: deserialize data from 6 months ago with current code. Serialize current data and deserialize
+    with code from 6 months ago. Both must work.
+
+    '
+  example_good: "# Schema evolution: backward AND forward compatible\nfrom dataclasses import dataclass, field\nfrom typing import Optional\nimport json\n\n@dataclass\nclass UserEventV2:\n    user_id: str\n    name: str\n    email: Optional[str] = None       # V1 field (kept for backward compat)\n    email_verified: Optional[bool] = None  # V2 new field (default = None)\n\n    @classmethod\n    def from_json(cls, data: dict) -> 'UserEventV2':\n        # Forward compatible: ignore unknown fields from newer versions\n        known_fields = {f.name for f in cls.__dataclass_fields__.values()}\n        filtered = {k: v for k, v in data.items() if k in known_fields}\n        return cls(**filtered)\n\n# Old data (V1) without email_verified -> uses default None\n# New data (V3) with unknown 'phone' field -> ignored\n# Never remove fields, never change types\n"
+  example_bad: "# Breaking schema change — renames field, breaks old data\n# V1: {'user_id': '123', 'name': 'Alice'}\n# V2: {'user_id': '123', 'full_name': 'Alice'}  # renamed!\n\ndef parse_user(data: dict) -> dict:\n    return {\n        'id': data['user_id'],\n        'name': data['full_name'],  # KeyError on V1 data!\n    }\n# All historical V1 data is now unreadable\n# During rollback, V1 code can't read V2 data either\n"
+  when_applies: "When evolving data schemas in pipelines, event streams, or any system where data written by old code must remain readable by new code and vice versa."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kafka, grpc]
+  domains:
+    domain: [architecture, reliability]
+    concern: [data, pipelines, schema_evolution, data_integrity]
+  sources:
+  - url: https://sre.google/sre-book/data-integrity-what-you-read/
+    title: 'Google SRE Book — Chapter 26: Data Integrity: What You Read Is What You Wrote'
+  validation_status: cross_checked

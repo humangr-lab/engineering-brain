@@ -1,0 +1,1277 @@
+layer: rules
+domain: reasoning
+knowledge:
+- id: ARCH-INT-001
+  text: "Start with a monolith when team size is under 10, deploy frequency is weekly or less, and domain boundaries are unclear. Split into microservices only when you have evidence of independent deploy needs."
+  why: >
+    Premature microservices add network latency, distributed debugging complexity, and operational overhead
+    (service mesh, distributed tracing, contract testing) before the team has enough domain knowledge to
+    draw correct boundaries. Spotify, Shopify, and Basecamp all started monolith-first. Teams that split
+    too early spend 40-60% of engineering time on infrastructure instead of features. Incorrectly drawn
+    service boundaries require expensive cross-service refactors that are harder than refactoring a monolith.
+  how_to_do_right: |
+    1. Start monolith with clear module boundaries (Python packages, not separate repos)
+    2. Enforce module boundaries with import linting (no circular deps between bounded contexts)
+    3. Monitor which modules deploy independently more than 3x/week — those are candidates
+    4. Split when: team >10, deploy frequency >3x/week for a module, OR clear domain boundary emerges
+    5. Extract one service at a time, validate for 2 weeks before extracting another
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [architecture, reasoning]
+    concern: [decision_making]
+  example_good: |
+    # Monolith with clear boundaries
+    # src/billing/       — billing bounded context
+    # src/users/         — user management context
+    # src/notifications/ — notification context
+    # Each has its own models, services, routes
+    # Shared via explicit interfaces, not direct imports
+
+    # pyproject.toml or ruff config enforces boundaries:
+    # billing/ cannot import from users/ internals
+  example_bad: |
+    # Day 1: "Let's do microservices!"
+    # billing-service/  (1 developer, deploys weekly)
+    # user-service/     (1 developer, deploys weekly)
+    # notification-service/ (0.5 developer, deploys monthly)
+    # gateway-service/
+    # Now you need: service mesh, distributed tracing, contract tests,
+    # docker-compose with 8 services, shared auth middleware...
+  when_applies: "Greenfield projects, team formation phase, unclear domain boundaries, fewer than 10 engineers"
+  sources: ["https://martinfowler.com/bliki/MonolithFirst.html"]
+
+- id: ARCH-INT-002
+  text: "Before adding caching, measure first. Caching is warranted when: the query is slow (>200ms), the data is read-heavy (read:write ratio >10:1), and stale data is acceptable for the use case."
+  why: >
+    Cache invalidation is one of the two hard problems in computer science. Adding caching without
+    measurement introduces stale data bugs, memory pressure, thundering herd on expiry, and cache
+    stampede under load. A team at a fintech added Redis caching to a 50ms query, gained nothing
+    measurable, but introduced a bug where users saw other users' account balances due to incorrect
+    cache key construction. Always have the numbers before adding cache.
+  how_to_do_right: |
+    1. Measure baseline latency with APM (p50, p95, p99) — is the query actually slow?
+    2. Check read:write ratio — if writes are frequent, cache will be constantly invalidated
+    3. Determine staleness tolerance — can users see data 30s old? 5min old?
+    4. Choose cache strategy: read-through for simple cases, write-behind for write-heavy
+    5. Set TTL based on staleness tolerance, never cache without TTL
+    6. Add cache hit/miss metrics from day 1
+    7. Implement cache stampede protection (lock or probabilistic early expiry)
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [performance, reasoning]
+    concern: [caching, decision_making]
+  example_good: |
+    # Step 1: Measure
+    # APM shows: GET /products p99 = 800ms, read:write = 50:1
+    # Decision: Cache is justified
+
+    import redis
+    from functools import wraps
+
+    r = redis.Redis()
+
+    def cache_with_metrics(ttl_seconds=300):
+        def decorator(func):
+            @wraps(func)
+            async def wrapper(*args, **kwargs):
+                key = f"{func.__name__}:{hash(args)}"
+                cached = r.get(key)
+                if cached:
+                    metrics.increment("cache.hit")
+                    return json.loads(cached)
+                metrics.increment("cache.miss")
+                result = await func(*args, **kwargs)
+                r.setex(key, ttl_seconds, json.dumps(result))
+                return result
+            return wrapper
+        return decorator
+  example_bad: |
+    # No measurement, just "it feels slow"
+    @cache(ttl=3600)  # 1 hour TTL on user profile
+    def get_user_profile(user_id):
+        return db.query(User).get(user_id)
+
+    # Problem: user updates their name, sees old name for up to 1 hour
+    # No cache metrics — no idea if cache is even helping
+    # No stampede protection — 1000 requests hit DB simultaneously on expiry
+  when_applies: "Any system where someone suggests adding caching, performance optimization discussions"
+  sources: ["https://redis.io/docs/latest/develop/use/patterns/"]
+
+- id: ARCH-INT-003
+  text: "Use async when the caller does not need the result immediately. If the user is waiting for a response, sync is simpler and correct. Async shines for fire-and-forget, fan-out, and I/O-bound parallel work."
+  why: >
+    Async adds complexity: callback chains, error handling across boundaries, harder debugging, and
+    potential for lost messages. A sync HTTP request that takes 200ms is fine — the user waits 200ms.
+    Making it async means you now need: a queue, a consumer, a status endpoint, polling or websockets
+    for the client, and retry logic. That is 5x more code for no user benefit. Reserve async for
+    cases where it genuinely improves UX or throughput: sending emails, processing uploads, fan-out
+    notifications.
+  how_to_do_right: |
+    1. Ask: "Does the caller need this result to continue?" If yes → sync
+    2. Ask: "Is this I/O-bound and can run in parallel?" If yes → async with asyncio.gather
+    3. Ask: "Can this fail silently and be retried later?" If yes → queue + async worker
+    4. For user-facing APIs: sync for reads, async for heavy writes (return 202 Accepted)
+    5. Never make a 50ms operation async just because you can — it adds latency (queue overhead)
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [architecture, reasoning]
+    concern: [decision_making]
+  example_good: |
+    # Sync: user needs the result now
+    @app.get("/users/{user_id}")
+    async def get_user(user_id: int):
+        return await db.get_user(user_id)  # 50ms, user waits — fine
+
+    # Async: user doesn't need to wait for email
+    @app.post("/orders")
+    async def create_order(order: OrderCreate):
+        saved = await db.save_order(order)
+        await queue.publish("send_confirmation_email", {"order_id": saved.id})
+        return saved  # Returns immediately, email sends in background
+  example_bad: |
+    # Making a simple read async for no reason
+    @app.get("/users/{user_id}")
+    async def get_user(user_id: int):
+        job_id = await queue.publish("fetch_user", {"id": user_id})
+        # Now client has to poll /jobs/{job_id} for a 50ms query
+        return {"job_id": job_id, "status": "processing"}
+  when_applies: "Designing new endpoints, choosing between sync and async patterns, architecture reviews"
+  sources: ["https://docs.python.org/3/library/asyncio.html"]
+
+- id: ARCH-INT-004
+  text: "Use a message queue when producer and consumer run at different speeds, when you need to survive consumer downtime, or when multiple consumers need the same message. Use direct calls when latency matters and the callee is reliable."
+  why: >
+    Queues add operational complexity (broker deployment, dead letter queues, monitoring, message
+    serialization) and latency (10-50ms minimum). A direct HTTP call to a healthy service is 5-10ms.
+    But if the consumer goes down during a direct call, the message is lost. A queue survives consumer
+    restarts, handles backpressure naturally, and enables fan-out. The decision is about reliability
+    vs simplicity: if losing a message is acceptable and the callee is fast, call directly.
+  how_to_do_right: |
+    1. Direct call when: callee is in same process or always available, latency < 100ms needed
+    2. Queue when: callee may be down, producer is faster than consumer, need fan-out
+    3. Start with direct calls, add queue when you observe: message loss, backpressure, or fan-out need
+    4. Always implement dead letter queue for failed messages
+    5. Set message TTL — stale messages should expire, not process hours later
+    6. Monitor queue depth — growing depth means consumer is too slow
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [architecture, messaging]
+    concern: [decision_making, message_broker]
+  example_good: |
+    # Direct call: notification service is fast and always up
+    async def create_order(order: OrderCreate):
+        saved = await db.save_order(order)
+        await notification_service.send_confirmation(saved.id)  # 20ms, reliable
+        return saved
+
+    # Queue: email sending is slow and can fail
+    async def create_order(order: OrderCreate):
+        saved = await db.save_order(order)
+        await queue.publish("emails", {
+            "type": "order_confirmation",
+            "order_id": saved.id,
+            "ttl": 3600,  # Expire after 1 hour
+        })
+        return saved
+  example_bad: |
+    # Queue for everything, even fast local operations
+    async def get_user_name(user_id: int):
+        await queue.publish("fetch_user_name", {"id": user_id})
+        # Now you need: consumer, response queue, correlation ID, timeout...
+        # A direct DB query would take 5ms
+  when_applies: "Designing inter-service communication, deciding between sync and async messaging, handling unreliable downstream services"
+  sources: ["https://kafka.apache.org/documentation/#gettingStarted"]
+
+- id: ARCH-INT-005
+  text: "Build vs Buy: buy when the capability is not your core competency, a mature solution exists, and you will not need deep customization. Build when it is your competitive advantage, no solution fits, or vendor lock-in risk is unacceptable."
+  why: >
+    Building everything in-house is the #1 cause of engineering burnout and missed deadlines in startups.
+    A team of 5 spent 6 months building a custom auth system instead of using Auth0/Clerk — they
+    reinvented session management, MFA, password reset, and still had security vulnerabilities. Meanwhile,
+    competitors shipped features. Conversely, buying a core differentiator means you cannot iterate on
+    your competitive advantage. Build your moat, buy everything else.
+  how_to_do_right: |
+    1. Ask: "Is this our competitive advantage?" If no → buy/use OSS
+    2. Ask: "Does a mature, maintained solution exist?" If yes → evaluate (not just npm install)
+    3. Ask: "Will we need to customize it deeply?" If yes → consider building
+    4. Ask: "Can we switch vendors later?" If no → build an abstraction layer
+    5. Evaluate: maintenance cost of building > license cost of buying (include engineer time at $150/hr)
+    6. For OSS: check last commit date, issue response time, bus factor, license compatibility
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [architecture, reasoning]
+    concern: [decision_making]
+  example_good: |
+    # Buy: authentication (not our core competency)
+    # Using Clerk — handles MFA, social login, session management
+    from clerk import verify_session
+
+    # Build: our unique scoring algorithm (competitive advantage)
+    class TruthScoreEngine:
+        """Our proprietary truth verification — this IS our product."""
+        def score(self, claim: Claim) -> TruthScore:
+            ...
+
+    # Abstract vendor dependency
+    class EmailSender(Protocol):
+        async def send(self, to: str, subject: str, body: str) -> None: ...
+
+    class SendGridSender(EmailSender): ...  # Can swap to SES later
+  example_bad: |
+    # Building auth from scratch (6 months, still has vulnerabilities)
+    class CustomAuthSystem:
+        def hash_password(self, password: str) -> str:
+            return hashlib.sha256(password.encode()).hexdigest()  # Wrong!
+        def create_session(self, user_id: int) -> str:
+            return str(uuid4())  # No expiry, no rotation, no MFA
+  when_applies: "Starting new projects, evaluating new capabilities, technology selection discussions"
+  sources: ["https://martinfowler.com/articles/make-vs-buy.html"]
+
+- id: ARCH-INT-006
+  text: "Refactor when more than 60% of the code will remain unchanged. Rewrite when less than 40% of the code is salvageable. In the 40-60% zone, refactor incrementally with the Strangler Fig pattern."
+  why: >
+    Rewrites fail ~70% of the time because they underestimate the hidden business logic embedded in
+    the old code. Netscape's full rewrite took 3 years and nearly killed the company. But refactoring
+    code that is fundamentally broken (wrong data model, wrong language, unmaintainable architecture)
+    is polishing a wreck. The 60/40 heuristic forces you to audit what exists before deciding. If
+    most of the code works, preserve it. If most is broken, start fresh with lessons learned.
+  how_to_do_right: |
+    1. Audit: count functions/modules, classify each as keep/modify/delete
+    2. If >60% keep → refactor in place, one module at a time, with tests as safety net
+    3. If <40% keep → rewrite, but extract business rules from old code first (they are the spec)
+    4. If 40-60% → Strangler Fig: new code handles new requests, old code handles legacy
+    5. Never rewrite without comprehensive tests on the OLD system first — they become your spec
+    6. Set a timebox: if rewrite takes >2x estimated time, abort and refactor instead
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [architecture, reasoning]
+    concern: [decision_making, migration]
+  example_good: |
+    # Audit first
+    # src/billing/  — 12 modules, 8 are fine, 4 need rework → REFACTOR
+    # src/legacy_auth/ — 15 modules, 2 are fine, 13 are broken → REWRITE
+
+    # Strangler Fig for the gray zone:
+    # New requests → new service
+    # Old requests → proxy to legacy
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+    @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+    async def proxy_or_handle(path: str, request: Request):
+        if path in NEW_ROUTES:
+            return await new_handler(path, request)
+        return await proxy_to_legacy(path, request)
+  example_bad: |
+    # "Let's rewrite everything from scratch!"
+    # 6 months later: new system handles 60% of cases
+    # Old system still running for edge cases
+    # Now maintaining TWO systems with no end in sight
+    # Hidden business rules in old code were never extracted
+  when_applies: "Legacy system modernization, tech debt discussions, major version upgrades"
+  sources: ["https://martinfowler.com/bliki/StranglerFigApplication.html"]
+
+- id: ARCH-INT-007
+  text: "Default to PostgreSQL for all new projects. Only use a specialized database when PostgreSQL cannot meet a proven, measured need — and you have benchmarks to prove it."
+  why: >
+    PostgreSQL handles JSON (jsonb), full-text search (tsvector), geospatial (PostGIS), time-series
+    (TimescaleDB extension), and graph queries (recursive CTEs). Adding MongoDB, Elasticsearch, or
+    Neo4j means: another operational burden, another backup strategy, another monitoring setup, another
+    failure mode, and data consistency challenges across stores. A startup added MongoDB for "flexible
+    schemas" alongside PostgreSQL — 2 years later they migrated everything back to PostgreSQL with
+    jsonb columns, after spending months debugging cross-database consistency issues.
+  how_to_do_right: |
+    1. Start with PostgreSQL for everything — it handles 95% of use cases
+    2. Use jsonb for semi-structured data instead of adding MongoDB
+    3. Use tsvector + ts_rank for full-text search before adding Elasticsearch
+    4. Use recursive CTEs for graph queries before adding Neo4j
+    5. Add specialized DB only when: PostgreSQL query >500ms AND you benchmarked the alternative
+    6. If you add a specialized DB, PostgreSQL remains source of truth — sync via CDC or events
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [databases, reasoning]
+    concern: [decision_making]
+  example_good: |
+    # PostgreSQL handles JSON, search, and relational in one DB
+    CREATE TABLE products (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        metadata JSONB DEFAULT '{}',  -- Flexible schema in PostgreSQL
+        search_vector TSVECTOR GENERATED ALWAYS AS (
+            to_tsvector('english', name || ' ' || COALESCE(metadata->>'description', ''))
+        ) STORED
+    );
+
+    CREATE INDEX idx_products_search ON products USING GIN (search_vector);
+    CREATE INDEX idx_products_metadata ON products USING GIN (metadata);
+
+    -- Full-text search without Elasticsearch
+    SELECT * FROM products WHERE search_vector @@ plainto_tsquery('wireless headphones');
+  example_bad: |
+    # 3 databases for a simple CRUD app
+    # PostgreSQL for users (relational)
+    # MongoDB for products (because "flexible schema")
+    # Elasticsearch for search (because "we might need it")
+    # Result: 3x operational overhead, data sync bugs, 3 backup strategies
+  when_applies: "New project database selection, adding new data stores, evaluating NoSQL vs SQL"
+  sources: ["https://www.postgresql.org/docs/current/"]
+
+- id: ARCH-INT-008
+  text: "Use REST for standard CRUD APIs, GraphQL when clients need flexible data fetching with varying shapes, and gRPC for internal high-throughput service-to-service communication."
+  why: >
+    REST is simple, cacheable (HTTP caching), and universally understood. GraphQL solves the over-fetching
+    and under-fetching problem but adds complexity (schema management, N+1 query prevention, caching is
+    harder). gRPC gives binary serialization (10x smaller than JSON), streaming, and code generation but
+    requires HTTP/2 and is not browser-friendly. Using gRPC for a public API means clients need a proxy.
+    Using REST for a mobile app with 50 different screen shapes means 50 endpoint variants or over-fetching.
+  how_to_do_right: |
+    1. Public CRUD API → REST with OpenAPI spec
+    2. Mobile/SPA with varied data needs → GraphQL (solves over/under-fetching)
+    3. Internal service-to-service, high throughput → gRPC with protobuf
+    4. Never mix all three in the same project without clear boundaries
+    5. For REST: follow resource naming conventions, use proper HTTP methods
+    6. For GraphQL: implement DataLoader to prevent N+1 queries
+    7. For gRPC: generate client libraries, version .proto files carefully
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [api, reasoning]
+    concern: [decision_making]
+  example_good: |
+    # REST for public API (simple CRUD)
+    @app.get("/users/{user_id}")
+    async def get_user(user_id: int) -> UserResponse:
+        return await user_service.get(user_id)
+
+    # GraphQL for flexible client queries (mobile app)
+    # Client fetches exactly what it needs per screen
+    # query { user(id: 1) { name, avatar, posts(limit: 5) { title } } }
+
+    # gRPC for internal high-throughput (service-to-service)
+    # scoring.proto — 10x smaller than JSON, streaming support
+    # service ScoringService {
+    #   rpc ScoreBatch(stream Claim) returns (stream Score) {}
+    # }
+  example_bad: |
+    # gRPC for a public web API — browsers can't use it directly
+    # GraphQL for a simple CRUD admin panel — massive overkill
+    # REST with 50 endpoint variants for mobile screens — over-fetching everywhere
+  when_applies: "API design decisions, choosing communication protocols, frontend-backend interface design"
+  sources: ["https://graphql.org/learn/"]
+
+- id: ARCH-INT-009
+  text: "Every piece of mutable state must have exactly one source of truth. Pick one location — client, server session, or database — and derive everything else from it. Dual-write is a bug waiting to happen."
+  why: >
+    When state lives in two places (e.g., Redux store AND server session), they will inevitably diverge.
+    A user updates their profile on mobile, but the web app shows stale data from its local cache.
+    A payment system writes to both a local DB and an external ledger — network failure means they
+    disagree on whether the payment happened. Every state inconsistency bug traces back to having
+    two sources of truth. Pick one, make everything else a cache or derived view.
+  how_to_do_right: |
+    1. Identify every piece of mutable state in the system
+    2. For each, assign ONE canonical source: database (most common), server session, or client state
+    3. Everything else is a cache with explicit TTL and invalidation strategy
+    4. For distributed systems: use events to propagate state changes, not dual-writes
+    5. Client state: only for UI-specific state (open/closed panels, form drafts)
+    6. Database: for all business state (user data, orders, transactions)
+    7. Server session: for authentication state only (token, user context)
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [architecture, reasoning]
+    concern: [consistency, decision_making]
+  example_good: |
+    # Database is source of truth for user profile
+    # React query cache is derived, with explicit invalidation
+
+    # Backend: database is canonical
+    @app.put("/users/{user_id}")
+    async def update_user(user_id: int, data: UserUpdate):
+        user = await db.update_user(user_id, data)
+        await events.publish("user.updated", user)  # Propagate via events
+        return user
+
+    # Frontend: cache with invalidation
+    # const { data } = useQuery(["user", id], fetchUser, { staleTime: 30000 })
+    # On mutation success: queryClient.invalidateQueries(["user", id])
+  example_bad: |
+    # Dual-write: updating both local state and database independently
+    async def update_user(user_id, data):
+        await db.update(user_id, data)      # Write 1
+        await cache.set(f"user:{user_id}", data)  # Write 2 — what if this fails?
+        await search_index.update(user_id, data)   # Write 3 — now 3 sources of truth
+  when_applies: "System design, state management decisions, debugging data inconsistency issues"
+  sources: ["https://martinfowler.com/articles/201701-event-driven.html"]
+
+- id: ARCH-INT-010
+  text: "Scale vertically (bigger machine) until it hurts, then scale horizontally. Vertical scaling is simpler, cheaper, and has no distributed systems problems. A single modern server handles more than most people think."
+  why: >
+    A single PostgreSQL instance on a 64-core server with 256GB RAM handles millions of rows and
+    thousands of concurrent connections. Horizontal scaling introduces: data partitioning, distributed
+    transactions, eventual consistency, network partitions, and operational complexity. StackOverflow
+    served 1.3 billion page views/month on a handful of servers. Premature horizontal scaling is
+    engineering for a problem you do not have. When vertical limit is hit (typically >$10K/month on
+    a single instance), then plan horizontal with proven need.
+  how_to_do_right: |
+    1. Start on a single server (8 cores, 32GB RAM is plenty for most startups)
+    2. Monitor CPU, memory, disk I/O, and connection count
+    3. When hitting limits: upgrade to 16 cores, 64GB — it is a config change, not an architecture change
+    4. Vertical limit reached when: >80% CPU sustained, >90% memory, or cloud max instance size
+    5. Then add horizontal: read replicas first (easiest), then application sharding
+    6. Horizontal only for the bottleneck component, not the entire system
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [architecture, reasoning]
+    concern: [decision_making]
+  example_good: |
+    # Phase 1: Single server (handles 99% of startups)
+    # 8 cores, 32GB RAM, PostgreSQL + Redis + App on same machine
+
+    # Phase 2: Vertical upgrade (config change)
+    # 32 cores, 128GB RAM — handles 10x more load, zero code changes
+
+    # Phase 3: Horizontal only when needed
+    # Read replicas for PostgreSQL (read-heavy workloads)
+    # Separate Redis instance (memory pressure)
+    # Multiple app servers behind load balancer (CPU-bound)
+  example_bad: |
+    # Day 1: "We need Kubernetes for our MVP"
+    # 3 nodes, 12 pods, service mesh, auto-scaling, HPA
+    # Total users: 50
+    # Monthly infrastructure cost: $2,000
+    # Time spent on infra instead of features: 60%
+  when_applies: "Infrastructure planning, scaling discussions, capacity planning, cloud cost optimization"
+  sources: ["https://sre.google/sre-book/handling-overload/"]
+
+- id: ARCH-INT-011
+  text: "For deployments, use rolling deploys as default (simplest, works for most cases). Use blue-green when you need instant rollback. Use canary when you need to validate with real traffic before full rollout."
+  why: >
+    Rolling deploys replace instances one at a time — zero downtime, minimal resource overhead, but
+    rollback takes as long as deploy. Blue-green runs two identical environments and switches traffic
+    instantly — great rollback but 2x infrastructure cost during deploy. Canary routes a small percentage
+    of traffic to new version first — catches issues before they affect all users but requires traffic
+    splitting infrastructure. Start simple, add complexity only when the simpler approach has failed you.
+  how_to_do_right: |
+    1. Default: rolling deploy (replace 1 instance at a time, health check between each)
+    2. Upgrade to blue-green when: rollback speed is critical (payment systems, auth)
+    3. Upgrade to canary when: you need to validate with 1-5% of real traffic first
+    4. Always have health checks — deploy should stop if new instance fails health check
+    5. Rolling: set maxUnavailable=1, maxSurge=1 for safety
+    6. Blue-green: automate the switch, keep old environment for 1 hour after switch
+    7. Canary: start at 1%, promote to 5%, 25%, 50%, 100% with automated metrics checks
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [deployment, reasoning]
+    concern: [decision_making]
+  example_good: |
+    # Rolling deploy with health checks (default choice)
+    # kubernetes deployment
+    # spec:
+    #   strategy:
+    #     type: RollingUpdate
+    #     rollingUpdate:
+    #       maxUnavailable: 1
+    #       maxSurge: 1
+    #   template:
+    #     spec:
+    #       containers:
+    #       - readinessProbe:
+    #           httpGet:
+    #             path: /health/ready
+    #             port: 8000
+    #           initialDelaySeconds: 5
+    #           periodSeconds: 10
+  example_bad: |
+    # No deployment strategy — just restart everything
+    # ssh production "cd /app && git pull && pip install -r requirements.txt && systemctl restart app"
+    # Result: 30-60 seconds of downtime on every deploy
+    # No health checks: broken deploy serves 500s until someone notices
+  when_applies: "Setting up CI/CD pipelines, choosing deployment strategies, production readiness reviews"
+  sources: ["https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#rolling-update-deployment"]
+
+- id: ARCH-INT-012
+  text: "Shard data by tenant for multi-tenant SaaS (natural isolation), by time for time-series data (easy archival), and by hash for uniform distribution. Never shard prematurely — PostgreSQL handles billions of rows with proper indexing."
+  why: >
+    Sharding is the most complex scaling operation and is nearly impossible to undo. It breaks JOINs
+    across shards, complicates transactions, and requires a routing layer. Instagram ran on a single
+    PostgreSQL cluster until 300M users. Most applications never need sharding — they need better
+    indexing, query optimization, and read replicas. When you do shard: tenant-based gives natural
+    isolation (compliance, data locality), time-based enables cheap archival (drop old partitions),
+    hash-based distributes evenly but makes range queries expensive.
+  how_to_do_right: |
+    1. Before sharding: optimize indexes, add read replicas, use connection pooling
+    2. If you must shard, choose key carefully — it cannot be changed later
+    3. Tenant sharding: for SaaS with data isolation requirements (GDPR, SOC2)
+    4. Time sharding: for logs, events, metrics (partition by month, drop after retention)
+    5. Hash sharding: for uniform distribution when no natural partition key exists
+    6. Always keep a routing table: shard_key → shard_location
+    7. Plan for resharding: what happens when one shard gets too big?
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [databases, reasoning]
+    concern: [decision_making]
+  example_good: |
+    # PostgreSQL native partitioning by time (no application sharding needed)
+    CREATE TABLE events (
+        id BIGSERIAL,
+        tenant_id INTEGER NOT NULL,
+        event_type TEXT NOT NULL,
+        payload JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    ) PARTITION BY RANGE (created_at);
+
+    CREATE TABLE events_2026_01 PARTITION OF events
+        FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+    CREATE TABLE events_2026_02 PARTITION OF events
+        FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+
+    -- Drop old data cheaply
+    DROP TABLE events_2024_01;  -- Instant, no vacuum needed
+  example_bad: |
+    # Application-level sharding on day 1
+    def get_shard(user_id: int) -> str:
+        return f"shard_{user_id % 4}"  # 4 shards for 100 users
+
+    # Now every query needs shard routing
+    # JOINs across shards are impossible
+    # Resharding when 1 shard is full requires full data migration
+  when_applies: "Database scaling discussions, multi-tenant architecture, time-series data storage"
+  sources: ["https://docs.microsoft.com/en-us/azure/architecture/patterns/sharding"]
+
+- id: ARCH-INT-013
+  text: "For service communication, use synchronous HTTP for request-response queries, asynchronous events for state change notifications, and a hybrid approach for complex workflows (saga pattern with events + compensating HTTP calls)."
+  why: >
+    Pure sync (all HTTP) creates tight coupling — if service B is slow, service A is slow. Pure async
+    (all events) makes debugging nightmares — you cannot trace a request through 5 event hops easily.
+    A balanced approach: sync HTTP for queries (GET data, need response now), async events for commands
+    (notify other services of state changes). This gives you the simplicity of HTTP for reads and the
+    resilience of async for writes. Complex multi-step workflows use the saga pattern: events for happy
+    path, compensating HTTP calls for rollback.
+  how_to_do_right: |
+    1. Queries (read data from another service) → sync HTTP with timeout and circuit breaker
+    2. Commands (notify of state change) → async event via message broker
+    3. Complex workflows → saga: event-driven with compensating actions
+    4. Set timeouts: HTTP client 5s, gateway 10s, never infinite
+    5. Add correlation IDs to both HTTP headers and event metadata
+    6. Monitor: latency for HTTP calls, queue depth for events, saga completion rate
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [architecture, reasoning]
+    concern: [decision_making, message_broker]
+  example_good: |
+    # Sync HTTP for queries
+    async def get_user_profile(user_id: int) -> UserProfile:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{USER_SERVICE}/users/{user_id}")
+            return UserProfile(**resp.json())
+
+    # Async events for state changes
+    async def complete_order(order_id: int):
+        order = await db.update_order(order_id, status="completed")
+        await events.publish("order.completed", {
+            "order_id": order.id,
+            "user_id": order.user_id,
+            "correlation_id": context.correlation_id,
+        })
+        # Billing, notifications, analytics all react independently
+  example_bad: |
+    # Pure sync chain: A → B → C → D (latency adds up, any failure breaks all)
+    async def process_order(order):
+        user = await http.get(user_service)      # 50ms
+        inventory = await http.get(inv_service)   # 100ms
+        payment = await http.post(pay_service)    # 200ms
+        notification = await http.post(notif_svc) # 50ms
+        # Total: 400ms, and if notification is down, order fails
+  when_applies: "Designing service-to-service communication, microservice architecture, distributed systems"
+  sources: ["https://microservices.io/patterns/communication-style/messaging.html"]
+
+- id: ARCH-INT-014
+  text: "Fail fast at system edges (reject bad input immediately), retry at service boundaries (transient failures are normal), and compensate in sagas (undo partial work on failure). Never retry at all layers — it causes exponential amplification."
+  why: >
+    A system with retry at every layer creates exponential retry storms: if layer A retries 3x, and
+    each retry hits layer B which retries 3x, and each hits layer C which retries 3x, one failure
+    causes 27 requests to layer C. This is called retry amplification and has caused major outages
+    at AWS, Google, and Meta. The correct approach: validate and reject at the edge (no retries needed
+    for bad input), retry only at the service boundary closest to the transient failure, and use
+    compensating transactions for partial failures in multi-step workflows.
+  how_to_do_right: |
+    1. Edge (API gateway/controller): validate input, fail fast with 400/422, no retries
+    2. Service boundary: retry with exponential backoff (base=1s, max=60s, jitter=random)
+    3. Only retry on transient errors: 429, 502, 503, 504, ConnectionError, Timeout
+    4. Never retry on: 400, 401, 403, 404, 409, 422 (these are permanent failures)
+    5. Sagas: if step 3 of 5 fails, compensate steps 1-2 (reverse operations)
+    6. Set retry budget: max 3 retries per request, 10% retry rate across the system
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [reliability, reasoning]
+    concern: [decision_making, failure]
+  example_good: |
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+    # Edge: fail fast on bad input
+    @app.post("/orders")
+    async def create_order(order: OrderCreate):  # Pydantic validates, 422 on bad input
+        return await order_service.create(order)
+
+    # Service boundary: retry transient failures only
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, max=60),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError)),
+    )
+    async def call_payment_service(payment: PaymentRequest):
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(f"{PAYMENT_URL}/charge", json=payment.dict())
+            resp.raise_for_status()
+            return resp.json()
+  example_bad: |
+    # Retry at EVERY layer — exponential amplification
+    @retry(max=3)  # Layer 1: 3 retries
+    async def api_handler():
+        return await service_call()
+
+    @retry(max=3)  # Layer 2: 3 retries each
+    async def service_call():
+        return await db_call()
+
+    @retry(max=3)  # Layer 3: 3 retries each
+    async def db_call():
+        ...
+    # 1 failure = up to 27 DB calls (3 * 3 * 3)
+  when_applies: "Error handling design, resilience patterns, distributed systems, retry strategy discussions"
+  sources: ["https://microservices.io/patterns/reliability/circuit-breaker.html"]
+
+- id: ARCH-INT-015
+  text: "Observability requires three pillars: metrics for dashboards and alerts (what is happening), logs for debugging (why it happened), and traces for latency analysis (where time was spent). Each serves a different purpose — do not conflate them."
+  why: >
+    Teams that only have logs cannot build dashboards or set alerts on trends. Teams that only have
+    metrics cannot debug specific failures. Teams that have neither traces cannot find latency bottlenecks
+    in distributed systems. A production outage without all three pillars means: you see the alert (metrics),
+    but cannot find which service is slow (traces), and cannot read the error message (logs). Each pillar
+    answers a different question. Implementing only one or two leaves blind spots that extend incident
+    resolution time from minutes to hours.
+  how_to_do_right: |
+    1. Metrics: counters (request count), gauges (queue depth), histograms (latency distribution)
+    2. Logs: structured JSON, include correlation_id, severity level, no PII
+    3. Traces: OpenTelemetry spans across service boundaries, include trace_id in logs
+    4. Connect all three: trace_id in logs, trace_id as metric label for drill-down
+    5. Alert on metrics (error_rate > 1% for 5min), investigate with traces, debug with logs
+    6. Use OpenTelemetry as the single instrumentation SDK for all three
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [observability, reasoning]
+    concern: [decision_making, metrics, tracing]
+  example_good: |
+    import structlog
+    from opentelemetry import trace, metrics
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+    # Structured logging with trace context
+    logger = structlog.get_logger()
+
+    # Metrics
+    meter = metrics.get_meter("myapp")
+    request_counter = meter.create_counter("http.requests")
+    latency_histogram = meter.create_histogram("http.latency")
+
+    # All three connected via trace_id
+    @app.middleware("http")
+    async def observability_middleware(request, call_next):
+        span = trace.get_current_span()
+        trace_id = span.get_span_context().trace_id
+        with structlog.contextvars.bound_contextvars(trace_id=trace_id):
+            start = time.time()
+            response = await call_next(request)
+            duration = time.time() - start
+            request_counter.add(1, {"method": request.method, "status": response.status_code})
+            latency_histogram.record(duration, {"endpoint": request.url.path})
+            logger.info("request.completed", duration=duration, status=response.status_code)
+            return response
+  example_bad: |
+    # Only print statements — no metrics, no traces
+    @app.get("/users/{id}")
+    async def get_user(id: int):
+        print(f"Getting user {id}")  # Not structured, not searchable
+        user = await db.get(id)
+        print(f"Got user {user.name}")  # No trace context, no duration
+        return user
+    # Cannot build dashboards, cannot trace latency, cannot correlate across services
+  when_applies: "Production readiness reviews, observability setup, debugging production issues, SRE practices"
+  sources: ["https://opentelemetry.io/docs/concepts/observability-primer/"]
+
+- id: ARCH-INT-016
+  text: "Testing strategy: unit tests for business logic (fast, isolated), integration tests for contracts and boundaries (DB, APIs), and e2e tests only for critical user journeys. The testing pyramid is not optional — inverting it creates slow, flaky CI."
+  why: >
+    A test suite with 500 e2e tests and 20 unit tests takes 45 minutes to run, is flaky due to browser
+    timeouts and network issues, and developers stop running tests locally. A proper pyramid (500 unit,
+    100 integration, 20 e2e) runs in 2 minutes, is deterministic, and catches 95% of bugs at the unit
+    level. Google's internal data shows that flaky tests are the #1 reason developers lose trust in CI.
+    When developers do not trust CI, they stop writing tests and merge without green builds.
+  how_to_do_right: |
+    1. Unit tests: pure functions, business logic, no I/O (target: 80% of test count)
+    2. Integration tests: database queries, API contracts, external service mocks (target: 15%)
+    3. E2E tests: critical user journeys only — login, checkout, core workflow (target: 5%)
+    4. Run unit tests on every save (watch mode), integration on pre-commit, e2e on CI only
+    5. If a test is flaky more than 2x in a month, quarantine it and fix or delete
+    6. Measure test runtime: unit <5s total, integration <30s, e2e <5min
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [testing, reasoning]
+    concern: [decision_making]
+  example_good: |
+    # Unit test: pure logic, no I/O, runs in <1ms
+    def test_calculate_truth_score():
+        claim = Claim(text="Earth is round", sources=3, contradictions=0)
+        score = calculate_truth_score(claim)
+        assert score.value == 0.95
+        assert score.confidence == "high"
+
+    # Integration test: tests DB contract
+    async def test_create_user_persists(db_session):
+        user = await create_user(db_session, name="Alice", email="alice@example.com")
+        fetched = await get_user(db_session, user.id)
+        assert fetched.name == "Alice"
+
+    # E2E test: critical path only
+    async def test_user_can_complete_checkout(browser):
+        await browser.login("testuser@example.com")
+        await browser.add_to_cart("product-123")
+        await browser.checkout()
+        assert await browser.sees("Order confirmed")
+  example_bad: |
+    # Inverted pyramid: 200 e2e tests, 10 unit tests
+    # CI takes 45 minutes, 5% of tests are flaky
+    # Developers: "Tests are broken again, just merge it"
+  when_applies: "Setting up test infrastructure, CI/CD pipeline design, test strategy discussions"
+  sources: ["https://martinfowler.com/bliki/TestPyramid.html"]
+
+- id: ARCH-INT-017
+  text: "Security architecture: apply zero trust (verify every request), defense in depth (multiple layers), and least privilege (minimum permissions). Never rely on a single security boundary — assume every layer will be breached."
+  why: >
+    The 2023 MOVEit breach affected 2,500+ organizations because they trusted their network perimeter.
+    Once an attacker got past the firewall, there was no internal authentication between services.
+    Zero trust means every service verifies every request, even from internal services. Defense in depth
+    means if the WAF fails, the application still validates input. If the application fails, the database
+    still enforces row-level security. Least privilege means the web server cannot access the admin database.
+  how_to_do_right: |
+    1. Zero trust: every service authenticates and authorizes every request (mTLS internally)
+    2. Defense in depth: WAF → API gateway auth → application auth → database RLS
+    3. Least privilege: each service has its own DB credentials with minimal permissions
+    4. Encrypt in transit (TLS 1.3) and at rest (AES-256)
+    5. Rotate secrets every 90 days, use a secret manager (Vault, AWS Secrets Manager)
+    6. Security headers: HSTS, CSP, X-Frame-Options, X-Content-Type-Options
+    7. Dependency scanning: automated, block PRs with critical CVEs
+  severity: critical
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [security, reasoning]
+    concern: [decision_making]
+  example_good: |
+    # Multiple layers of defense
+    # Layer 1: API Gateway validates JWT
+    # Layer 2: Application checks permissions
+    # Layer 3: Database enforces row-level security
+
+    # Application layer
+    @app.get("/users/{user_id}/data")
+    async def get_user_data(
+        user_id: int,
+        current_user: User = Depends(get_authenticated_user),
+    ):
+        if current_user.id != user_id and not current_user.is_admin:
+            raise HTTPException(403, "Access denied")
+        return await db.get_user_data(user_id, requester=current_user.id)
+
+    # Database layer (PostgreSQL RLS)
+    # CREATE POLICY user_data_policy ON user_data
+    #   USING (user_id = current_setting('app.current_user_id')::int);
+  example_bad: |
+    # Single security boundary: just a firewall
+    # Internal services trust each other completely
+    @app.get("/internal/users/{user_id}/data")
+    async def get_user_data(user_id: int):
+        return await db.get_user_data(user_id)  # No auth, no RLS
+    # If attacker gets past the firewall, they have full access to everything
+  when_applies: "Security architecture reviews, compliance requirements (SOC2, GDPR), production hardening"
+  sources: ["https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html"]
+
+- id: ARCH-INT-018
+  text: "Configuration strategy: use environment variables for deploy-time config (secrets, URLs), feature flags for runtime toggles (no deploy needed), and a config service for dynamic values that change frequently across the fleet."
+  why: >
+    Hardcoded config requires a deploy to change anything. Environment variables require a restart.
+    Feature flags can be toggled instantly without deploy or restart. A config service provides fleet-wide
+    dynamic configuration. Using the wrong mechanism for the wrong type of config causes either: unnecessary
+    deploys (hardcoded), unnecessary restarts (should be feature flag), or over-engineering (config service
+    for things that change once a year). Match the mechanism to the change frequency.
+  how_to_do_right: |
+    1. Secrets (API keys, DB passwords) → env vars, never in code, loaded from secret manager
+    2. Deploy-time config (service URLs, pool sizes) → env vars with sensible defaults
+    3. Runtime toggles (feature on/off, A/B tests) → feature flags (LaunchDarkly, Unleash, or DB-backed)
+    4. Dynamic config (rate limits, thresholds) → config service or feature flags with values
+    5. Always have sensible defaults — app should start without any env vars (in dev mode)
+    6. Validate all config at startup — fail fast if required config is missing
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [architecture, reasoning]
+    concern: [decision_making]
+  example_good: |
+    from pydantic_settings import BaseSettings
+
+    class Settings(BaseSettings):
+        # Deploy-time: env vars with defaults
+        database_url: str = "postgresql://localhost/myapp"
+        redis_url: str = "redis://localhost:6379"
+        log_level: str = "INFO"
+
+        # Secrets: env vars, no defaults (fail if missing in prod)
+        secret_key: str  # Required, no default
+        stripe_api_key: str = ""  # Optional in dev
+
+        class Config:
+            env_file = ".env"
+
+    settings = Settings()  # Validates at startup — fails fast if SECRET_KEY missing
+
+    # Runtime toggles: feature flags
+    async def get_recommendations(user_id: int):
+        if await feature_flags.is_enabled("new_recommendation_algo", user_id=user_id):
+            return await new_algo.recommend(user_id)
+        return await legacy_algo.recommend(user_id)
+  example_bad: |
+    # Hardcoded config — requires deploy to change anything
+    DATABASE_URL = "postgresql://prod-server:5432/myapp"
+    RATE_LIMIT = 100  # Need to deploy to change rate limit
+    NEW_FEATURE_ENABLED = True  # Need to deploy to toggle feature
+  when_applies: "Application configuration design, feature flag implementation, deployment strategy"
+  sources: ["https://12factor.net/config"]
+
+- id: ARCH-INT-019
+  text: "Storage strategy: hot data in Redis (sub-millisecond access, ephemeral), warm data in PostgreSQL (millisecond access, durable), cold data in S3 or equivalent object storage (cheap, archival). Never store everything in one tier."
+  why: >
+    Storing everything in PostgreSQL means: your DB grows unbounded, backups take longer, queries slow
+    down as tables grow, and you pay for fast SSD storage for data accessed once a year. Storing
+    everything in Redis means: you pay for expensive RAM for data that could be on disk, and you risk
+    data loss on restart. A 3-tier strategy matches storage cost to access frequency. A SaaS company
+    reduced their PostgreSQL storage costs by 80% by moving audit logs older than 90 days to S3 and
+    serving them via pre-signed URLs on demand.
+  how_to_do_right: |
+    1. Hot (Redis): session data, rate limit counters, real-time leaderboards, cache — TTL always set
+    2. Warm (PostgreSQL): active business data, recent orders, user profiles — indexed and vacuumed
+    3. Cold (S3): audit logs >90 days, old reports, media files, backups — lifecycle policies
+    4. Set lifecycle policies: move from warm to cold after N days automatically
+    5. PostgreSQL partitioning by date makes warm→cold migration easy (detach and export partition)
+    6. Never delete data — archive to cold storage, keep metadata in warm for lookups
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [architecture, reasoning]
+    concern: [decision_making]
+  example_good: |
+    import redis
+    import boto3
+    from sqlalchemy import select
+
+    # Hot: Redis for session and cache (sub-ms, ephemeral)
+    r = redis.Redis()
+    r.setex(f"session:{session_id}", 3600, session_data)  # TTL: 1 hour
+
+    # Warm: PostgreSQL for active business data (ms, durable)
+    async def get_recent_orders(user_id: int):
+        return await db.execute(
+            select(Order).where(Order.user_id == user_id, Order.created_at > days_ago(90))
+        )
+
+    # Cold: S3 for archival (cheap, bulk access)
+    s3 = boto3.client("s3")
+    def archive_old_orders():
+        old_orders = db.execute(select(Order).where(Order.created_at < days_ago(90)))
+        s3.put_object(Bucket="archive", Key=f"orders/{date}.parquet", Body=to_parquet(old_orders))
+        db.execute(delete(Order).where(Order.created_at < days_ago(90)))
+  example_bad: |
+    # Everything in PostgreSQL — 500GB database, backups take 2 hours
+    # Audit logs from 5 years ago in the same table as active data
+    # Queries slow because table has 500M rows, 490M are never accessed
+  when_applies: "Data architecture design, storage cost optimization, database growth management"
+  sources: ["https://redis.io/docs/latest/"]
+
+- id: ARCH-INT-020
+  text: "For search: use PostgreSQL full-text search (tsvector) for simple keyword search. Only add Elasticsearch when you need: fuzzy matching, faceted search, complex aggregations, or search across millions of documents with sub-100ms latency."
+  why: >
+    PostgreSQL tsvector handles keyword search, ranking, and stemming for up to a few million documents
+    with good performance. Adding Elasticsearch means: another cluster to operate, data synchronization
+    between PostgreSQL and Elasticsearch (eventual consistency), another backup strategy, and another
+    monitoring setup. A team added Elasticsearch for a 10K document search — PostgreSQL tsvector would
+    have been faster (no network hop) and simpler (no sync). Elasticsearch earns its complexity at scale
+    or when you need features PostgreSQL cannot provide.
+  how_to_do_right: |
+    1. Start with PostgreSQL: CREATE INDEX ... USING GIN (to_tsvector(...))
+    2. Test with real data: if p99 < 200ms and features are sufficient, stop here
+    3. Add Elasticsearch when: fuzzy matching needed, faceted navigation, >5M documents, or complex aggregations
+    4. If adding Elasticsearch: PostgreSQL remains source of truth, sync via CDC (Debezium) or events
+    5. Never write directly to both — write to PostgreSQL, sync to Elasticsearch
+    6. Monitor index lag: if Elasticsearch is >5s behind PostgreSQL, investigate
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [architecture, reasoning]
+    concern: [decision_making]
+  example_good: |
+    # Start with PostgreSQL full-text search
+    # Works for most use cases up to a few million documents
+
+    # Add search column
+    # ALTER TABLE products ADD COLUMN search_vector TSVECTOR
+    #   GENERATED ALWAYS AS (
+    #     setweight(to_tsvector('english', name), 'A') ||
+    #     setweight(to_tsvector('english', COALESCE(description, '')), 'B')
+    #   ) STORED;
+    # CREATE INDEX idx_search ON products USING GIN (search_vector);
+
+    @app.get("/search")
+    async def search_products(q: str):
+        results = await db.execute(
+            text("""
+                SELECT *, ts_rank(search_vector, query) AS rank
+                FROM products, plainto_tsquery('english', :q) query
+                WHERE search_vector @@ query
+                ORDER BY rank DESC LIMIT 20
+            """),
+            {"q": q},
+        )
+        return results.all()
+  example_bad: |
+    # Elasticsearch for a 5,000 document catalog
+    # Now you maintain: Elasticsearch cluster, Debezium CDC pipeline,
+    # sync monitoring, two backup strategies
+    # PostgreSQL tsvector would handle this in 5ms with zero extra infrastructure
+  when_applies: "Adding search functionality, evaluating Elasticsearch vs PostgreSQL, search architecture design"
+  sources: ["https://www.postgresql.org/docs/current/textsearch.html"]
+
+- id: ARCH-INT-021
+  text: "Notification architecture: queue all notifications (in-app, email, push), batch where possible (digest emails instead of per-event), and let users control their preferences. Never send notifications synchronously in the request path."
+  why: >
+    Sending an email synchronously in an API handler means: if the email provider is slow (500ms) or
+    down, your API is slow or broken. Users who receive 50 individual notification emails per day
+    unsubscribe from everything. A notification queue with batching solves both: API returns immediately,
+    notifications are batched into digests, and if the email provider is down, notifications retry
+    automatically. A SaaS product lost 15% of users because notification fatigue — they switched to
+    daily digests and retention improved by 20%.
+  how_to_do_right: |
+    1. Always queue notifications — never send in the HTTP request path
+    2. Support channels: in-app (always), email (batch into digests), push (real-time critical only)
+    3. Let users set preferences per channel and per event type
+    4. Batch emails: collect events for 15-30 minutes, send one digest email
+    5. Rate limit: max 5 push notifications per hour per user
+    6. Include unsubscribe link in every email (CAN-SPAM compliance)
+    7. Track: delivery rate, open rate, unsubscribe rate — alert if unsubscribe > 2%
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [architecture, reasoning]
+    concern: [decision_making]
+  example_good: |
+    # Queue notification — API returns immediately
+    @app.post("/comments")
+    async def create_comment(comment: CommentCreate):
+        saved = await db.save_comment(comment)
+        await notification_queue.publish("comment.created", {
+            "comment_id": saved.id,
+            "author_id": comment.author_id,
+            "post_owner_id": comment.post_owner_id,
+        })
+        return saved  # Returns in 10ms, notification handled async
+
+    # Notification worker batches emails
+    class NotificationWorker:
+        async def process_batch(self, user_id: int, events: list[Event]):
+            prefs = await db.get_notification_prefs(user_id)
+            if prefs.email_digest:
+                # Batch into digest
+                await send_digest_email(user_id, events)
+            if prefs.push_enabled and any(e.is_critical for e in events):
+                await send_push(user_id, events[0])  # Only critical events as push
+  example_bad: |
+    # Synchronous email in request path
+    @app.post("/comments")
+    async def create_comment(comment: CommentCreate):
+        saved = await db.save_comment(comment)
+        await send_email(comment.post_owner_id, f"New comment!")  # 500ms, blocks response
+        await send_push(comment.post_owner_id, "New comment!")    # 200ms more
+        return saved  # 700ms response time because of notifications
+  when_applies: "Designing notification systems, user engagement features, email architecture"
+  sources: ["https://docs.celeryq.dev/en/stable/getting-started/introduction.html"]
+
+- id: ARCH-INT-022
+  text: "Multi-tenancy: use schema isolation (separate PostgreSQL schemas per tenant) for strong isolation with moderate overhead, or row-level security (RLS) for lightweight isolation with shared tables. Never use separate databases per tenant unless regulatory requirements demand it."
+  why: >
+    Separate databases per tenant means: N database connections, N backup strategies, N migration runs,
+    and cross-tenant analytics is nearly impossible. Schema isolation gives strong isolation (tenant A
+    cannot see tenant B data even with a bug) with shared infrastructure. RLS gives lightweight isolation
+    with the simplest operations but requires careful policy enforcement — one missing WHERE clause leaks
+    data. A startup used separate databases for 500 tenants — migrations took 8 hours and they could not
+    do cross-tenant analytics without an ETL pipeline.
+  how_to_do_right: |
+    1. Default: RLS (row-level security) — simplest, single schema, PostgreSQL policies enforce isolation
+    2. Upgrade to schema isolation when: compliance requires it (healthcare, finance), or tenant data sizes vary wildly
+    3. Separate databases only when: regulatory requires physical separation (government, specific GDPR cases)
+    4. RLS: set app.current_tenant_id at connection level, CREATE POLICY on every table
+    5. Schema isolation: one migration, apply to all schemas (scripted, not manual)
+    6. Always test: query as tenant A, verify tenant B data is not returned
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [architecture, reasoning]
+    concern: [decision_making]
+  example_good: |
+    # Row-Level Security: simplest, most common
+    # PostgreSQL setup:
+    # ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+    # CREATE POLICY tenant_isolation ON orders
+    #   USING (tenant_id = current_setting('app.current_tenant_id')::int);
+
+    # FastAPI middleware sets tenant context on every request
+    @app.middleware("http")
+    async def set_tenant_context(request: Request, call_next):
+        tenant_id = get_tenant_from_token(request)
+        async with db.begin() as conn:
+            await conn.execute(text(f"SET app.current_tenant_id = '{tenant_id}'"))
+            request.state.db = conn
+            return await call_next(request)
+
+    # Queries automatically filtered — no WHERE tenant_id=X needed
+    @app.get("/orders")
+    async def list_orders(request: Request):
+        return await request.state.db.execute(select(Order))  # RLS filters automatically
+  example_bad: |
+    # Separate database per tenant — operational nightmare
+    # 500 tenants = 500 databases, 500 connection pools
+    # Migration takes 8 hours (run on each database sequentially)
+    # Cross-tenant report requires ETL from 500 databases
+    def get_db(tenant_id: str):
+        return create_engine(f"postgresql://host/{tenant_id}_db")
+  when_applies: "SaaS architecture, multi-tenant design, data isolation requirements, compliance"
+  sources: ["https://www.postgresql.org/docs/current/ddl-rowsecurity.html"]
+
+- id: ARCH-INT-023
+  text: "API gateway patterns: consolidate rate limiting, authentication, routing, and request transformation at the gateway layer. This keeps individual services focused on business logic and provides a single point for cross-cutting concerns."
+  why: >
+    Without a gateway, every service implements its own rate limiting, auth verification, CORS headers,
+    and request logging. This leads to: inconsistent behavior (service A rate limits at 100/s, service B
+    at 1000/s), duplicated code, and security gaps (one service forgets to check auth). A gateway
+    centralizes these concerns: one place to configure rate limits, one place to verify JWTs, one place
+    to add request tracing. When a security policy changes, you update one gateway config instead of
+    20 services.
+  how_to_do_right: |
+    1. Gateway handles: auth verification, rate limiting, CORS, request/response logging, routing
+    2. Services handle: business logic only (they trust the gateway already authenticated the request)
+    3. Rate limiting: token bucket per API key (capacity=100, refill=10/s) at gateway
+    4. Auth: verify JWT at gateway, pass user context to services via headers (X-User-ID, X-Tenant-ID)
+    5. Transformation: version translation (v1 → v2 format conversion) at gateway
+    6. Health checks: gateway checks service health, routes only to healthy instances
+    7. Use existing solutions: Kong, Traefik, or cloud-native (AWS API Gateway, GCP Cloud Endpoints)
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [api, reasoning]
+    concern: [decision_making]
+  example_good: |
+    # Gateway handles cross-cutting concerns
+    # traefik.yml or kong config:
+    # - Rate limiting: 100 req/min per API key
+    # - JWT verification: validates token, extracts user_id
+    # - CORS: configured once for all services
+    # - Routing: /api/users → user-service, /api/orders → order-service
+
+    # Service trusts gateway, focuses on business logic
+    @app.get("/users/{user_id}")
+    async def get_user(
+        user_id: int,
+        x_user_id: int = Header(...),  # Injected by gateway after auth
+        x_tenant_id: int = Header(...),
+    ):
+        # No auth check needed — gateway already verified
+        return await user_service.get(user_id, requester=x_user_id)
+  example_bad: |
+    # Every service implements its own auth, rate limiting, CORS
+    # user-service: rate limit 100/s, checks JWT
+    # order-service: rate limit 50/s, checks JWT (different library)
+    # notification-service: no rate limit, no auth (oops)
+    # Result: inconsistent security, duplicated code, one service is a security hole
+  when_applies: "Microservice architecture, API gateway design, cross-cutting concerns management"
+  sources: ["https://microservices.io/patterns/apigateway.html"]
+
+- id: ARCH-INT-024
+  text: "For legacy migration, use the Strangler Fig pattern: route new functionality to the new system while the old system handles existing paths. For validation, run both old and new in parallel and compare outputs before cutting over."
+  why: >
+    Big-bang migrations fail because you discover edge cases only when real traffic hits the new system.
+    The Strangler Fig pattern lets you migrate incrementally: one endpoint, one feature, one module at
+    a time. Each migration is small, testable, and reversible. Parallel running (shadow mode) catches
+    discrepancies before users see them. A bank migrated their payment system using parallel running —
+    they discovered 23 edge cases in the first week that would have caused financial errors in a
+    big-bang cutover.
+  how_to_do_right: |
+    1. Strangler Fig: put a proxy in front of old system, route new paths to new system
+    2. Migrate one endpoint at a time, validate for 1 week before migrating next
+    3. Parallel run (shadow mode): send traffic to both, compare responses, log discrepancies
+    4. Only cut over when parallel run shows <0.1% discrepancy rate for 1 week
+    5. Keep old system running for 2 weeks after cutover (rollback safety net)
+    6. Migrate data last — it is the hardest part and should be done after logic is proven
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [architecture, reasoning]
+    concern: [decision_making, migration]
+  example_good: |
+    # Strangler Fig with parallel validation
+    @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+    async def router(path: str, request: Request):
+        if path in MIGRATED_ROUTES:
+            # New system handles this route
+            return await new_system.handle(request)
+        elif path in SHADOW_ROUTES:
+            # Both systems handle, compare results
+            old_response = await old_system.handle(request)
+            new_response = await new_system.handle(request)
+            if old_response != new_response:
+                logger.warning("shadow_mismatch", path=path,
+                    old=old_response.body, new=new_response.body)
+            return old_response  # Old system is still authoritative
+        else:
+            # Old system handles this route
+            return await old_system.handle(request)
+  example_bad: |
+    # Big-bang migration: switch everything at once
+    # Friday 6pm: "Let's flip the DNS to the new system"
+    # Friday 6:30pm: "Payment processing is broken for 15% of transactions"
+    # Friday 7pm: "Rolling back..." (but some data was written to new system)
+    # Saturday: reconciling data between old and new systems manually
+  when_applies: "Legacy system modernization, platform migration, replatforming projects"
+  sources: ["https://martinfowler.com/bliki/StranglerFigApplication.html"]
+
+- id: ARCH-INT-025
+  text: "Optimize costs by caching expensive operations, deferring non-critical work to off-peak hours, and right-sizing instances based on actual usage metrics. Never optimize prematurely — measure first, then optimize the top 3 cost drivers."
+  why: >
+    Cloud bills grow silently. Teams overprovision instances because they do not know actual usage, run
+    batch jobs during peak hours competing with user traffic, and recompute expensive queries that could
+    be cached. A startup reduced their AWS bill from $15K/month to $4K/month by: right-sizing instances
+    (CPU was at 10% average), moving batch jobs to spot instances during off-peak, and caching their
+    most expensive database query (called 10K times/day, result unchanged for 1 hour). Always measure
+    first — the biggest cost driver is rarely where you think it is.
+  how_to_do_right: |
+    1. Measure first: review cloud bill, identify top 3 cost line items
+    2. Right-size instances: if average CPU <30%, downgrade (check p99 first, not just average)
+    3. Cache expensive operations: if a query runs >100x/day with same result, cache it
+    4. Defer non-critical work: batch processing, report generation, backfills → off-peak or spot instances
+    5. Use auto-scaling: scale up for peak, scale down for off-peak (but set minimum for cold start)
+    6. Reserved instances for baseline, spot/preemptible for burst workloads
+    7. Review monthly: cloud costs should be a dashboard metric like latency or error rate
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [architecture, reasoning]
+    concern: [decision_making]
+  example_good: |
+    # Cache expensive computation
+    from functools import lru_cache
+    from datetime import datetime, timedelta
+
+    @app.get("/dashboard/summary")
+    async def get_dashboard_summary():
+        cache_key = f"dashboard:{datetime.utcnow().strftime('%Y-%m-%d-%H')}"
+        cached = await redis.get(cache_key)
+        if cached:
+            return json.loads(cached)
+
+        # Expensive aggregation — runs once per hour instead of per request
+        summary = await compute_expensive_summary()
+        await redis.setex(cache_key, 3600, json.dumps(summary))
+        return summary
+
+    # Defer non-critical work to background
+    @app.post("/reports")
+    async def generate_report(report: ReportRequest):
+        job_id = await background_queue.submit(
+            "generate_report",
+            report.dict(),
+            priority="low",
+            run_after="02:00",  # Off-peak hours
+        )
+        return {"job_id": job_id, "status": "queued"}
+  example_bad: |
+    # No caching, no deferral, no right-sizing
+    @app.get("/dashboard/summary")
+    async def get_dashboard_summary():
+        # Runs 5-second aggregation query on every request
+        # 10K requests/day = 50K seconds of DB time = $$$
+        return await db.execute(EXPENSIVE_AGGREGATION_QUERY)
+
+    # Batch job runs during peak hours on production instance
+    # Competes with user traffic, causes latency spikes
+  when_applies: "Cloud cost reviews, performance optimization, infrastructure planning, budget discussions"
+  sources: ["https://docs.aws.amazon.com/wellarchitected/latest/cost-optimization-pillar/welcome.html"]

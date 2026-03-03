@@ -1,0 +1,2293 @@
+layer: rules
+domain: reasoning
+knowledge:
+
+# ============================================================
+# Hypothesis-Driven Debugging (DBG-INT-001 to DBG-INT-008)
+# ============================================================
+
+- id: DBG-INT-001
+  text: "Form hypothesis BEFORE touching code — write 3 possible causes ranked by probability"
+  why: >
+    Random code changes waste hours. Without a hypothesis you are doing a random walk
+    through the state space. Writing down 3 ranked causes forces you to think about
+    likelihood, narrows the search space, and creates an audit trail so you don't
+    re-investigate the same dead end twice.
+  how_to_do_right: |
+    1. Read the bug report / error fully. Do NOT skim.
+    2. Write down 3 candidate causes ordered by probability (most likely first).
+    3. For each candidate, write the ONE observation that would confirm or refute it.
+    4. Investigate #1 first. If refuted, move to #2. Update probabilities as you learn.
+    5. If all 3 refuted, generate 3 new hypotheses with the new information you gained.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go, rust]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # Before touching code:
+    # Hypothesis 1 (70%): cache returns stale value — verify by adding cache miss log
+    # Hypothesis 2 (20%): race condition on write — verify by checking write timestamps
+    # Hypothesis 3 (10%): upstream API changed response format — verify by diffing payloads
+    import logging
+    logger = logging.getLogger(__name__)
+
+    def get_user(user_id):
+        cached = cache.get(f"user:{user_id}")
+        logger.debug("cache hit=%s for user_id=%s", cached is not None, user_id)
+        if cached:
+            return cached
+        user = db.fetch_user(user_id)
+        cache.set(f"user:{user_id}", user, ttl=300)
+        return user
+  example_bad: |
+    # "It's broken, let me just try things..."
+    def get_user(user_id):
+        # hmm maybe add a sleep?
+        import time; time.sleep(1)
+        # maybe clear all caches?
+        cache.flush_all()  # nuked production cache
+        return db.fetch_user(user_id)
+  when_applies: During debugging, incident response, code review of bug fixes
+  sources: ["https://sre.google/sre-book/effective-troubleshooting/"]
+
+- id: DBG-INT-002
+  text: "Fastest debugger is git bisect — binary search through commits to find the one that introduced the bug"
+  why: >
+    Manual commit-by-commit checking is O(n). Git bisect is O(log n). For 1000 commits
+    between last known good and current bad, bisect finds the culprit in ~10 steps.
+    It removes all guesswork and works even when you have zero understanding of the
+    codebase. The commit that introduced the bug is the strongest clue you can get.
+  how_to_do_right: |
+    1. Identify a known good commit (e.g., last release tag).
+    2. Run: git bisect start
+    3. Run: git bisect bad HEAD
+    4. Run: git bisect good <known-good-sha>
+    5. Git checks out a middle commit. Test it. Mark good or bad.
+    6. Repeat until git identifies the first bad commit.
+    7. Automate with: git bisect run ./test_script.sh
+    8. Run: git bisect reset when done.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go, rust]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # Automated bisect with a test script
+    # test_bug.sh exits 0 if bug is absent, 1 if present
+    git bisect start
+    git bisect bad HEAD
+    git bisect good v2.3.0
+    git bisect run ./test_bug.sh
+    # Output: abc1234 is the first bad commit
+    # Author: dev@company.com
+    # Date: 2026-02-10
+    # "Refactored user serialization"  <-- there's your culprit
+    git bisect reset
+  example_bad: |
+    # Manually checking out commits one by one
+    git checkout HEAD~1   # test... nope
+    git checkout HEAD~2   # test... nope
+    git checkout HEAD~3   # test... nope
+    # 47 checkouts later...
+    git checkout HEAD~50  # test... still broken
+    # gave up, mass-reverted 50 commits
+  when_applies: During debugging when a regression is suspected, any bug that "used to work"
+  sources: ["https://git-scm.com/docs/git-bisect"]
+
+- id: DBG-INT-003
+  text: "Add ONE change at a time — if you change 3 things simultaneously, you cannot know which one fixed the bug"
+  why: >
+    Multiple simultaneous changes violate the scientific method. If you change the
+    config, fix a typo, and add a retry all at once and the bug goes away, you have
+    no idea which change was the actual fix. Worse, one of your changes might introduce
+    a new bug masked by another change. Single-variable testing is the foundation of
+    all debugging.
+  how_to_do_right: |
+    1. Make exactly ONE change.
+    2. Test. Did the bug reproduce or not?
+    3. If not fixed: revert the change. Make the NEXT single change.
+    4. If fixed: commit that single change with a clear message.
+    5. If you accidentally made multiple changes, use git stash or git diff to isolate them.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # Change 1: increase timeout
+    # config.yaml
+    timeout: 30  # was 5
+
+    # Test -> still fails. Revert.
+
+    # Change 2: fix SQL query
+    # query.py
+    cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))  # was f-string
+
+    # Test -> passes! Commit this single change.
+    # git commit -m "fix: use parameterized query for user lookup (fixes #1234)"
+  example_bad: |
+    # "Let me fix everything at once"
+    # Changed timeout from 5 to 30
+    # Changed SQL from f-string to parameterized
+    # Added retry logic
+    # Upgraded the ORM library
+    # Bug is gone but... which change fixed it?
+    # And the ORM upgrade broke 3 other tests.
+    git commit -m "fix stuff"
+  when_applies: During debugging, hotfix deployment, incident remediation
+  sources: ["https://sre.google/sre-book/effective-troubleshooting/"]
+
+- id: DBG-INT-004
+  text: "After 30 minutes of debugging, stop and re-read the error message — your brain likely skimmed it the first time"
+  why: >
+    Under pressure, developers read error messages superficially. After 30 minutes in
+    the weeds, you have tunnel vision. Stepping back and carefully re-reading the
+    original error often reveals the answer was in the message all along. The error
+    said "column user_name not found" but you spent 30 minutes debugging the ORM
+    because you read it as "user not found".
+  how_to_do_right: |
+    1. Set a 30-minute timer when you start debugging.
+    2. When it fires: STOP. Close all tabs. Take a breath.
+    3. Re-read the ORIGINAL error message word by word.
+    4. Re-read the FULL stack trace, not just the first/last line.
+    5. Google the EXACT error message in quotes.
+    6. If still stuck after another 30 minutes, ask for help. Fresh eyes win.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # Error: FileNotFoundError: [Errno 2] No such file or directory: '/app/config/settings.yml'
+    # After 30 min debugging the config parser...
+    # STOP. Re-read: '/app/config/settings.yml'
+    # Wait — the file is settings.yaml, not settings.yml!
+    # Fix:
+    config_path = "/app/config/settings.yaml"  # not .yml
+  example_bad: |
+    # Error: FileNotFoundError: [Errno 2] No such file or directory: '/app/config/settings.yml'
+    # "Must be a permissions issue"
+    # chmod 777 /app/config/  <-- didn't help
+    # "Maybe the docker volume isn't mounted"
+    # Rewrote the Dockerfile  <-- didn't help
+    # "Maybe the config parser is broken"
+    # Rewrote the config parser  <-- 2 hours wasted
+    # Colleague walks by: "Isn't it .yaml not .yml?"
+  when_applies: During debugging, when stuck for more than 30 minutes
+  sources: ["https://sre.google/sre-book/effective-troubleshooting/"]
+
+- id: DBG-INT-005
+  text: "Rubber duck debugging reveals hidden assumptions — explain the problem out loud to expose what you think you know but don't"
+  why: >
+    When you explain code step by step to someone (or something), you are forced to
+    make every assumption explicit. The bug hides in the gap between what you THINK
+    the code does and what it ACTUALLY does. Verbalizing forces you across that gap.
+    Studies show developers find bugs 50% faster when explaining code aloud.
+  how_to_do_right: |
+    1. Get a rubber duck, a colleague, or open a blank document.
+    2. Explain what the code SHOULD do, line by line.
+    3. For each line, state what the inputs are and what the output should be.
+    4. When you say "and then obviously X happens" — STOP. Verify X actually happens.
+    5. The word "obviously" or "should" is a red flag for an unchecked assumption.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # Explaining to the duck:
+    # "So request comes in, we parse the JSON body..."
+    # "Then we get the user_id from the body... wait."
+    # "We get user_id from request.args, not the body."
+    # "But this is a POST, user_id is in the JSON body!"
+    # BUG FOUND:
+    user_id = request.json["user_id"]  # CORRECT: from JSON body
+    # was:
+    # user_id = request.args.get("user_id")  # WRONG: from query string
+  example_bad: |
+    # Internal monologue: "it should work... it should work..."
+    # *stares at screen for 2 hours*
+    # *adds random print statements everywhere*
+    # *reverts everything and starts over*
+    # *still doesn't find the bug*
+  when_applies: During debugging, code review, design review
+  sources: ["https://blog.pragmaticengineer.com/the-product-minded-engineer/"]
+
+- id: DBG-INT-006
+  text: "Check the OBVIOUS first — typos, wrong variable name, wrong file, wrong branch, wrong environment"
+  why: >
+    80% of bugs are mundane. Developers assume the bug must be complex because they
+    are experienced. But the most common causes are: editing the wrong file, being on
+    the wrong branch, a typo in a variable name, testing against the wrong environment,
+    or forgetting to save. Always rule out the trivial before investigating the exotic.
+  how_to_do_right: |
+    1. Am I on the right git branch? (git branch --show-current)
+    2. Am I editing the right file? (is there a duplicate? a .pyc cached?)
+    3. Did I save the file?
+    4. Am I connected to the right environment/database?
+    5. Did I restart the service after the change?
+    6. Is there a typo? (use your editor's find to compare variable names)
+    7. Only after ruling ALL of these out, investigate deeper.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # Quick sanity checklist before deep debugging:
+    $ git branch --show-current
+    # feature/user-auth  <-- correct branch? yes
+    $ echo $DATABASE_URL
+    # postgres://localhost:5432/myapp_dev  <-- correct DB? yes
+    $ python -c "import mymodule; print(mymodule.__file__)"
+    # /app/mymodule.py  <-- correct file being imported? yes
+    # OK, now investigate the actual logic.
+  example_bad: |
+    # Spent 3 hours debugging "broken" authentication
+    # Wrote a 200-line test harness
+    # Rewrote the JWT validation logic
+    # ...was testing against production database from dev environment
+    # The user didn't exist in production
+    $ echo $DATABASE_URL
+    # postgres://prod-db:5432/myapp  <-- OOPS
+  when_applies: During debugging, always as the first step before deeper investigation
+  sources: ["https://sre.google/sre-book/effective-troubleshooting/"]
+
+- id: DBG-INT-007
+  text: "Read stack traces bottom-to-top for the root cause, top-to-bottom for the execution context"
+  why: >
+    The bottom of a stack trace shows where the error originated — the root cause.
+    The top shows where it propagated to — the symptom. Most developers read top-down
+    and see the symptom, then try to fix the symptom. Reading bottom-up leads you to
+    the actual cause. But the top-down context tells you HOW you got there, which
+    matters for understanding the call chain.
+  how_to_do_right: |
+    1. Scroll to the BOTTOM of the stack trace first.
+    2. Identify the root cause: what file, line, and function threw the error?
+    3. Read the error message associated with the bottom frame.
+    4. Now read UP to understand the call chain that led there.
+    5. The fix is usually at or near the bottom frame, not the top.
+    6. In chained exceptions, read the "Caused by:" sections — the last one is the root.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # Stack trace:
+    # Traceback (most recent call last):
+    #   File "app.py", line 45, in handle_request       <-- context (top)
+    #   File "service.py", line 102, in get_user         <-- context
+    #   File "repo.py", line 67, in find_by_email        <-- context
+    #   File "db.py", line 23, in execute_query          <-- ROOT CAUSE (bottom)
+    # psycopg2.OperationalError: connection refused
+    #
+    # Reading bottom-up: DB connection refused -> fix the DB connection, not the request handler
+    # The fix is in db.py or the connection config, not in app.py
+  example_bad: |
+    # Same stack trace, but developer reads top-down:
+    # "Error in handle_request... let me add a try/except in app.py"
+    @app.route("/user")
+    def handle_request():
+        try:
+            return get_user(request.args["email"])
+        except Exception:
+            return "Something went wrong", 500  # hides the real error
+    # Bug is still there. DB is still unreachable. Now it's just silent.
+  when_applies: During debugging, error triage, log analysis
+  sources: ["https://docs.python.org/3/library/traceback.html"]
+
+- id: DBG-INT-008
+  text: "Bisect the code path: is the bug before or after this midpoint? Binary search your own code, not just commits"
+  why: >
+    Binary search applies to code paths, not just git history. If your request goes
+    through 10 functions, don't add logging to all 10. Add it to function 5. If data
+    is correct at function 5, the bug is in 6-10. Now check function 7 or 8. Three
+    log statements find the bug in a 10-function chain instead of 10.
+  how_to_do_right: |
+    1. Map out the code path from input to output.
+    2. Add a log/breakpoint at the MIDDLE of the path.
+    3. Is the data correct at the midpoint?
+       - Yes: bug is in the second half.
+       - No: bug is in the first half.
+    4. Repeat, halving the search space each time.
+    5. In 3-4 steps you've narrowed a 16-function chain to 1 function.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # Code path: parse_request -> validate -> transform -> enrich -> save -> respond
+    # Add logging at the midpoint (transform):
+    def transform(data):
+        logger.debug("transform input: %s", data)
+        result = apply_rules(data)
+        logger.debug("transform output: %s", result)
+        return result
+    # Output shows transform input is correct, output is wrong
+    # Bug is in apply_rules() — found it in 1 step instead of 6
+  example_bad: |
+    # Add print statements to EVERY function
+    def parse_request(req):
+        print("parse_request", req)  # noisy
+        ...
+    def validate(data):
+        print("validate", data)      # noisy
+        ...
+    def transform(data):
+        print("transform", data)     # noisy
+        ...
+    # Console is flooded with 200 lines of output
+    # Can't find the relevant line
+    # Worse: forgot to remove prints before committing
+  when_applies: During debugging, especially long request/data pipelines
+  sources: ["https://sre.google/sre-book/effective-troubleshooting/"]
+
+# ============================================================
+# Production Debugging (DBG-INT-009 to DBG-INT-018)
+# ============================================================
+
+- id: DBG-INT-009
+  text: "Correlation is not causation in production — check timestamps with microsecond precision before blaming a deploy or event"
+  why: >
+    In production, many things happen concurrently. A deploy went out at 14:00 and
+    errors spiked at 14:02. Easy to blame the deploy. But the actual cause was a DNS
+    TTL expiring at 14:01. Without microsecond-precision timestamps and careful
+    correlation, you blame the wrong thing, roll back a good deploy, and the real bug
+    persists. Always verify temporal ordering with precision.
+  how_to_do_right: |
+    1. Collect timestamps in UTC with microsecond precision for all events.
+    2. Build a timeline: deploy times, config changes, upstream events, error spikes.
+    3. Check if errors started BEFORE or AFTER the suspected cause.
+    4. Check if the error pattern matches the suspected cause (gradual vs sudden).
+    5. Look for MULTIPLE correlations before concluding causation.
+    6. Use distributed tracing (Jaeger, Zipkin) to prove actual causal chains.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # Structured timeline analysis:
+    # 14:00:00.000 — deploy v2.3.1 started
+    # 14:00:45.123 — first 502 error (deploy still rolling, old pods serving)
+    # 14:01:00.000 — DNS TTL expired, resolver switched to new IP
+    # 14:01:00.456 — 502 errors spike 10x
+    # 14:02:00.000 — deploy v2.3.1 completed
+    # 14:02:00.789 — errors continue (deploy is done but errors persist!)
+    # Conclusion: errors started during deploy but continued after.
+    # Root cause: DNS, not the deploy. Rolling back wouldn't help.
+  example_bad: |
+    # "Errors started around 2pm. We deployed at 2pm. Roll it back."
+    # Rolled back deploy. Errors continued.
+    # "Must be a bad rollback. Let's redeploy the old version."
+    # Redeployed. Errors still there.
+    # 2 hours later: "Oh, the upstream DNS changed."
+  when_applies: During incident response, post-deploy monitoring, post-mortem analysis
+  sources: ["https://sre.google/sre-book/managing-incidents/"]
+
+- id: DBG-INT-010
+  text: "The deployment that broke it is not always the deployment that caused it — latent bugs surface when conditions change"
+  why: >
+    A bug can be introduced in deploy A but only manifest in deploy B. Example: deploy
+    A adds a code path that's never hit. Deploy B changes a feature flag that routes
+    traffic to that code path. Deploy B "broke" production, but the bug was in deploy A.
+    If you only look at deploy B's diff, you won't find the bug. Always check what
+    CHANGED in the environment, not just what was deployed.
+  how_to_do_right: |
+    1. Check the diff of the "breaking" deploy — is the bug actually there?
+    2. If the diff looks clean, ask: what else changed? Feature flags? Config? Data?
+    3. Check recent deploys (last 3-5) for latent bugs on the affected code path.
+    4. Check if a cron job, migration, or data change enabled a dormant code path.
+    5. Use feature flags and gradual rollouts to isolate which change triggers the bug.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # Deploy B diff shows only a feature flag change:
+    # features.yaml
+    # new_checkout_flow: true  # was false
+
+    # But new_checkout_flow calls calculate_tax() which was added in Deploy A (2 weeks ago)
+    # calculate_tax() has a division-by-zero when state tax rate is 0
+    # States with 0% tax: Oregon, Montana, Delaware, New Hampshire
+    # Bug was latent for 2 weeks. Feature flag activation exposed it.
+
+    def calculate_tax(price, tax_rate):
+        if tax_rate == 0:
+            return 0  # Fix: handle zero tax rate
+        return price * tax_rate
+  example_bad: |
+    # "Deploy B broke it! Revert Deploy B!"
+    # Reverted. Bug gone (because feature flag is off again).
+    # Next sprint: re-enable feature flag.
+    # Bug comes back. "Deploy B broke it again!"
+    # Cycle repeats 3 times before someone reads the actual error.
+  when_applies: During incident response, post-mortem, when a rollback fixes but re-deploy breaks again
+  sources: ["https://sre.google/sre-book/testing-reliability/"]
+
+- id: DBG-INT-011
+  text: "Check infrastructure before code — DNS, load balancer, certificates, disk space, memory pressure are more likely than a code bug in production"
+  why: >
+    In production, infrastructure failures cause more incidents than code bugs.
+    Developers instinctively blame code because that's what they control. But expired
+    TLS certs, full disks, DNS propagation, load balancer misconfig, and OOM kills
+    are the top causes of production outages. Always rule out infra first — it takes
+    2 minutes and can save 2 hours.
+  how_to_do_right: |
+    1. Check disk space: df -h (is any mount > 90%?)
+    2. Check memory: free -m (is swap being used? OOM kills in dmesg?)
+    3. Check DNS: dig yourdomain.com (does it resolve? correct IP?)
+    4. Check TLS: echo | openssl s_client -connect host:443 2>/dev/null | grep "Not After"
+    5. Check load balancer: are health checks passing? any backends marked down?
+    6. Check recent infra changes: was there a Terraform apply? K8s rollout?
+    7. Only after infra is cleared, look at application code.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # Quick infra triage (< 2 minutes):
+    $ df -h | awk '$5 > "90%"'
+    /dev/sda1  100G  98G  2G  98% /var/log   # <-- FULL DISK!
+    # Root cause: log rotation was disabled. Disk filled up.
+    # App can't write temp files. All requests fail with IOError.
+
+    # Fix:
+    $ sudo logrotate -f /etc/logrotate.conf
+    $ sudo truncate -s 0 /var/log/app/debug.log  # emergency space recovery
+  example_bad: |
+    # "All requests are failing with IOError"
+    # Developer: "Must be a file handling bug in the new code"
+    # Spends 3 hours refactoring file I/O with better error handling
+    # Deploys fix. Still broken.
+    # SRE checks: "Disk is full. Log rotation was off."
+    # 3 hours wasted because nobody ran df -h
+  when_applies: During incident response, production debugging, before deep code investigation
+  sources: ["https://sre.google/sre-book/monitoring-distributed-systems/"]
+
+- id: DBG-INT-012
+  text: "Log analysis: grep by REQUEST_ID or TRACE_ID, not by the error message — error messages are symptoms, trace IDs show the full story"
+  why: >
+    Searching logs by error message shows you thousands of occurrences with no context.
+    Searching by request ID shows you the entire lifecycle of ONE request: what came
+    in, what it called, what succeeded, what failed, and the exact sequence. This is
+    the difference between "there are errors" and "HERE is exactly how THIS request
+    failed."
+  how_to_do_right: |
+    1. Find one instance of the error in your logs.
+    2. Extract the request_id / trace_id / correlation_id from that log line.
+    3. Search ALL logs (all services) for that ID.
+    4. Reconstruct the full request timeline from the filtered logs.
+    5. Identify exactly where in the chain the failure occurred.
+    6. If you don't have request IDs in your logs, adding them is your #1 priority.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # Step 1: Find one error
+    # ERROR 2026-02-26 14:03:22 request_id=abc-123 "Payment failed"
+
+    # Step 2: Grep by request_id across all services
+    $ grep "abc-123" /var/log/api/*.log /var/log/payment/*.log /var/log/notify/*.log
+
+    # Full timeline:
+    # 14:03:22.001 api     request_id=abc-123 POST /checkout user=42
+    # 14:03:22.050 api     request_id=abc-123 calling payment service
+    # 14:03:22.055 payment request_id=abc-123 received charge request amount=99.99
+    # 14:03:22.100 payment request_id=abc-123 stripe timeout after 45ms  <-- ROOT CAUSE
+    # 14:03:22.101 api     request_id=abc-123 payment failed, returning 500
+  example_bad: |
+    # Searching by error message:
+    $ grep "Payment failed" /var/log/api/*.log | wc -l
+    # 14,328 results
+    # "Wow, lots of payment failures"
+    # *scrolls through 14K lines with no context*
+    # *gives up and escalates to payment team with zero useful info*
+  when_applies: During production debugging, incident response, log analysis
+  sources: ["https://opentelemetry.io/docs/concepts/signals/traces/"]
+
+- id: DBG-INT-013
+  text: "Production data differs from test data in ways that break assumptions — 1M rows, emoji usernames, nulls everywhere, Unicode edge cases"
+  why: >
+    Test data is clean, small, and predictable. Production data has: null in every
+    nullable column, emoji in usernames, 50MB JSON blobs, dates from 1970 and 2099,
+    strings with SQL injection attempts, negative quantities, duplicate emails with
+    different casing, and 10M rows that make your O(n^2) algorithm take 3 hours.
+    If it works in test but fails in production, the data is different.
+  how_to_do_right: |
+    1. When a bug appears only in production, first check the data, not the code.
+    2. Get a sanitized sample of the failing records.
+    3. Check for: nulls, empty strings, Unicode/emoji, extreme lengths, special characters.
+    4. Check for: volume (does it work with 10 rows but fail with 10M?).
+    5. Add property-based tests (Hypothesis, fast-check) that generate adversarial data.
+    6. Use production-like datasets in staging (anonymized).
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # Defensive code that handles production data reality:
+    def normalize_username(name: str | None) -> str:
+        if name is None:
+            return "anonymous"
+        # Remove leading/trailing whitespace and zero-width chars
+        name = name.strip().replace("\u200b", "")
+        # Normalize Unicode (NFC form)
+        name = unicodedata.normalize("NFC", name)
+        # Truncate to max length
+        return name[:64]
+
+    # Property-based test:
+    from hypothesis import given, strategies as st
+    @given(st.text(min_size=0, max_size=1000))
+    def test_normalize_never_crashes(name):
+        result = normalize_username(name)
+        assert isinstance(result, str)
+        assert len(result) <= 64
+  example_bad: |
+    def normalize_username(name):
+        return name.strip().lower()
+    # Crashes on: None, emoji-only names, zero-width spaces,
+    # names > column width, names with newlines embedded
+    # All of these exist in production.
+  when_applies: During debugging, data migration, production incidents involving specific records
+  sources: ["https://hypothesis.readthedocs.io/en/latest/"]
+
+- id: DBG-INT-014
+  text: "Time-based bugs hide in timezones, DST transitions, leap years, and month/year boundaries — test at the edges, not the middle"
+  why: >
+    Time is the hardest domain in programming. Bugs that appear only at midnight, only
+    on March 1st, only in November, or only for users in UTC+5:30 are notoriously hard
+    to reproduce. DST creates 25-hour and 23-hour days. Leap seconds exist. Month 2
+    has 28 or 29 days. Year boundaries break fiscal calculations. Always store UTC,
+    convert at display, and test the boundaries.
+  how_to_do_right: |
+    1. Always store datetimes in UTC. Convert to local timezone only at display.
+    2. Use timezone-aware datetime objects, never naive ones.
+    3. Test at boundaries: midnight, month-end, year-end, DST switch, leap day.
+    4. Never calculate duration by subtracting dates — use a library (dateutil, Luxon).
+    5. Never assume a day has 24 hours, a year has 365 days, or month lengths.
+    6. Use freezegun or similar to test with controlled timestamps.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    from freezegun import freeze_time
+
+    def get_billing_period_end(start: datetime) -> datetime:
+        """Always use UTC internally, convert at display."""
+        assert start.tzinfo is not None, "Naive datetimes are bugs"
+        # Use dateutil to handle month boundaries correctly
+        from dateutil.relativedelta import relativedelta
+        return start + relativedelta(months=1)
+
+    @freeze_time("2024-02-29 23:59:59", tz_offset=0)
+    def test_leap_year_boundary():
+        start = datetime(2024, 2, 29, tzinfo=timezone.utc)
+        end = get_billing_period_end(start)
+        assert end == datetime(2024, 3, 29, tzinfo=timezone.utc)
+  example_bad: |
+    from datetime import datetime, timedelta
+
+    def get_billing_period_end(start):
+        return start + timedelta(days=30)  # Not all months are 30 days!
+    # Feb 1 + 30 days = Mar 3 (not Feb 28/29)
+    # Billing periods overlap and customers get double-charged in February
+    # Also: start is a naive datetime — no timezone info
+    # Breaks every DST transition because timedelta doesn't account for DST
+  when_applies: During debugging time-related bugs, billing, scheduling, cron jobs
+  sources: ["https://docs.python.org/3/library/datetime.html"]
+
+- id: DBG-INT-015
+  text: "Network bugs: DNS resolution, SSL/TLS handshake, connection timeout, and read timeout are four different failure modes with different fixes"
+  why: >
+    "Network error" is not one bug — it's at least four. DNS failure means the hostname
+    can't resolve. SSL failure means certificates are wrong. Connection timeout means
+    the server isn't reachable. Read timeout means the server accepted the connection
+    but is too slow responding. Each has a completely different root cause and fix.
+    Conflating them wastes hours.
+  how_to_do_right: |
+    1. DNS failure: check dig/nslookup, /etc/resolv.conf, DNS TTL.
+    2. SSL/TLS failure: check certificate expiry, chain, hostname match, TLS version.
+    3. Connection timeout: check firewall, security groups, port availability, routing.
+    4. Read timeout: check server load, query performance, upstream dependencies.
+    5. Configure SEPARATE timeouts for connect vs read in your HTTP client.
+    6. Log which type of timeout occurred, not just "timeout".
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    import requests
+    from requests.exceptions import (
+        ConnectionError, Timeout, SSLError, DNSLookupError
+    )
+
+    def call_service(url: str) -> dict:
+        try:
+            resp = requests.get(
+                url,
+                timeout=(3.0, 30.0),  # (connect_timeout, read_timeout) — SEPARATE!
+                verify=True,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.ConnectionError as e:
+            if "Name or service not known" in str(e):
+                logger.error("DNS resolution failed for %s", url)
+            else:
+                logger.error("Connection refused/timeout for %s", url)
+            raise
+        except requests.exceptions.ReadTimeout:
+            logger.error("Server responded too slowly for %s", url)
+            raise
+        except requests.exceptions.SSLError as e:
+            logger.error("TLS handshake failed for %s: %s", url, e)
+            raise
+  example_bad: |
+    import requests
+
+    def call_service(url):
+        try:
+            return requests.get(url, timeout=30).json()
+        except Exception:
+            print("Network error")  # Which kind? DNS? SSL? Timeout? No idea.
+            return None
+  when_applies: During debugging network failures, microservice communication issues, API integrations
+  sources: ["https://docs.python-requests.org/en/latest/user/advanced/#timeouts"]
+
+- id: DBG-INT-016
+  text: "Database bugs: suspect the query plan first, then lock contention, then pool exhaustion, then deadlocks — in that order of frequency"
+  why: >
+    When the database is slow, developers blame the database. But 90% of the time it's
+    the query: missing index, bad join order, full table scan on 100M rows, or N+1.
+    After query plan, check lock contention (long transactions holding row locks).
+    Then check if the connection pool is exhausted (all connections busy). Deadlocks
+    are rarest but most dramatic. This order matches frequency in production.
+  how_to_do_right: |
+    1. EXPLAIN ANALYZE the slow query. Check for Seq Scan on large tables.
+    2. Check pg_stat_activity for blocked queries and lock waits.
+    3. Check connection pool metrics: active, idle, waiting counts.
+    4. Check pg_locks for deadlocks, or enable log_lock_waits.
+    5. For N+1: check if you're running 1000 queries when 1 join would suffice.
+    6. For pool exhaustion: check if transactions are being held open too long.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    -- Step 1: Check the query plan
+    EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 42;
+    --  Seq Scan on orders (rows=10000000)  <-- FULL TABLE SCAN!
+    --  Execution Time: 4523.456 ms
+
+    -- Fix: add the missing index
+    CREATE INDEX idx_orders_user_id ON orders(user_id);
+
+    -- After:
+    -- Index Scan using idx_orders_user_id on orders (rows=47)
+    -- Execution Time: 0.234 ms
+
+    -- Step 2: Check for lock waits
+    SELECT pid, wait_event_type, wait_event, query
+    FROM pg_stat_activity
+    WHERE wait_event_type = 'Lock';
+  example_bad: |
+    # "Database is slow, let's increase the connection pool"
+    POOL_SIZE = 100  # was 20
+    # Didn't help because the problem is a missing index.
+    # Now 100 connections are all doing full table scans.
+    # Database CPU at 100%. Made it 5x worse.
+  when_applies: During database performance debugging, slow query investigation, production incidents
+  sources: ["https://www.postgresql.org/docs/current/using-explain.html"]
+
+- id: DBG-INT-017
+  text: "Memory bugs: check OOM-killer, swap usage, thread count, and file descriptor limits — the app looks healthy until it suddenly isn't"
+  why: >
+    Memory bugs are insidious because they're gradual. The app runs fine for hours or
+    days, then suddenly gets OOM-killed. Swap hides the problem by making things slow
+    instead of crashing. Thread leaks exhaust memory with stacks. File descriptor
+    leaks prevent new connections. The app's own health check says "OK" while the
+    kernel is about to kill it.
+  how_to_do_right: |
+    1. Check dmesg for OOM kills: dmesg | grep -i "oom\|killed process"
+    2. Check swap: free -m (any swap usage means memory pressure exists)
+    3. Check process memory: ps aux --sort=-%mem | head
+    4. Check file descriptors: ls /proc/<pid>/fd | wc -l (vs ulimit -n)
+    5. Check thread count: ps -eLf | grep <process> | wc -l
+    6. Use memory profiling (tracemalloc, valgrind) for leaks.
+    7. Set memory limits (cgroups, K8s limits) so OOM kills are controlled, not random.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # Quick memory triage:
+    import tracemalloc
+    tracemalloc.start()
+
+    # ... run the suspected leaky operation ...
+
+    snapshot = tracemalloc.take_snapshot()
+    top_stats = snapshot.statistics("lineno")
+    for stat in top_stats[:5]:
+        print(stat)
+    # /app/cache.py:42: size=512 MiB, count=1048576, average=512 B
+    # ^^ The cache is holding 1M objects and never evicting!
+
+    # Fix: add LRU eviction
+    from functools import lru_cache
+    @lru_cache(maxsize=10000)
+    def get_cached_item(key):
+        return db.fetch(key)
+  example_bad: |
+    # "App keeps restarting randomly"
+    # Developer: "Must be a code bug, let me add more error handling"
+    try:
+        process_data(huge_dataset)
+    except Exception as e:
+        logger.error("Failed: %s", e)  # Never fires — OOM kill has no exception
+        # OOM killer sends SIGKILL, not an exception
+        # No try/except in the world can catch a kernel kill signal
+  when_applies: During memory leak investigation, OOM debugging, capacity planning
+  sources: ["https://docs.python.org/3/library/tracemalloc.html"]
+
+- id: DBG-INT-018
+  text: "Distributed system debugging: assume clocks are wrong, networks are unreliable, and every message can be duplicated, delayed, or lost"
+  why: >
+    In a distributed system, you cannot trust wall clocks (they drift), network
+    delivery (messages arrive out of order, get duplicated, or are lost), or ordering
+    (event A happened before B on node 1, but B's effect is visible before A's on
+    node 2). Bugs that are impossible in a single process are routine in distributed
+    systems. Design for these failures; don't debug them away.
+  how_to_do_right: |
+    1. Use logical clocks (Lamport, vector clocks) or hybrid clocks for ordering, not wall time.
+    2. Make all operations idempotent — receiving the same message twice should be safe.
+    3. Use distributed tracing (Jaeger/Zipkin) to follow requests across services.
+    4. Check NTP sync: ntpstat or timedatectl (clock drift > 100ms causes visible bugs).
+    5. Test with chaos engineering: inject network partitions, delays, duplicates.
+    6. Log the node/pod/container ID with every log line.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    import hashlib
+
+    def process_payment(payment_id: str, amount: float) -> bool:
+        """Idempotent payment processing — safe to call multiple times."""
+        idempotency_key = hashlib.sha256(f"{payment_id}".encode()).hexdigest()
+
+        # Check if already processed
+        existing = db.get(f"payment:{idempotency_key}")
+        if existing:
+            logger.info("Payment %s already processed, returning cached result", payment_id)
+            return existing["success"]
+
+        # Process and store result atomically
+        result = stripe.charge(amount, idempotency_key=idempotency_key)
+        db.set(f"payment:{idempotency_key}", {"success": result.ok, "ts": utc_now()})
+        return result.ok
+  example_bad: |
+    def process_payment(payment_id, amount):
+        # No idempotency check — if message is delivered twice, customer pays twice
+        result = stripe.charge(amount)
+        db.save({"payment_id": payment_id, "success": result.ok})
+        return result.ok
+    # Message queue retries after timeout -> customer charged 3 times
+    # "But the payment service was working fine!" — yes, TOO fine.
+  when_applies: During distributed system debugging, microservice incidents, event-driven architectures
+  sources: ["https://jepsen.io/consistency"]
+
+# ============================================================
+# Concurrency Bugs (DBG-INT-019 to DBG-INT-023)
+# ============================================================
+
+- id: DBG-INT-019
+  text: "3 telltale signs of a race condition: intermittent failure, load-dependent, and disappears when you add logging or a debugger"
+  why: >
+    Race conditions are the hardest bugs because they're non-deterministic. The three
+    classic signs are: (1) it fails intermittently — works 99% of the time, (2) it
+    gets worse under load — more concurrency = more races, (3) it disappears when you
+    add a debugger or logging — because the extra I/O changes timing. If you see all
+    three, it's almost certainly a race condition. Stop looking for logic bugs.
+  how_to_do_right: |
+    1. If a bug is intermittent, assume race condition until proven otherwise.
+    2. Try to reproduce under load (increase concurrency, use stress tools).
+    3. If adding a print statement makes it go away, that CONFIRMS a race.
+    4. Look for shared mutable state accessed without locks/atomics.
+    5. Use thread sanitizer (tsan), race detector (go -race), or concurrency testing tools.
+    6. Fix with proper synchronization: locks, queues, atomics, or make it single-threaded.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    import threading
+
+    class Counter:
+        def __init__(self):
+            self._value = 0
+            self._lock = threading.Lock()
+
+        def increment(self):
+            with self._lock:  # Thread-safe: acquire lock before read-modify-write
+                self._value += 1
+
+        @property
+        def value(self):
+            with self._lock:
+                return self._value
+
+    # Or even better — use an atomic:
+    from atomics import AtomicLong
+    counter = AtomicLong(0)
+    counter.fetch_add(1)  # Atomic increment, no lock needed
+  example_bad: |
+    class Counter:
+        def __init__(self):
+            self.value = 0
+
+        def increment(self):
+            self.value += 1  # NOT ATOMIC: read, add, write — 3 operations
+            # Thread A reads 5, Thread B reads 5
+            # Thread A writes 6, Thread B writes 6
+            # Expected: 7. Got: 6. Lost an increment.
+
+    # "But it works in my tests!" — yes, because tests are single-threaded
+    # Fails in production under load (sign #2)
+    # Adding print("incrementing") makes it pass (sign #3) because print is slow
+  when_applies: During debugging intermittent bugs, load testing failures, concurrency issues
+  sources: ["https://docs.python.org/3/library/threading.html"]
+
+- id: DBG-INT-020
+  text: "Deadlock debugging: get thread dumps from ALL participants simultaneously — one thread dump shows the wait, two show the cycle"
+  why: >
+    A deadlock requires a cycle: Thread A holds lock 1, waits for lock 2. Thread B
+    holds lock 2, waits for lock 1. A single thread dump shows one thread waiting,
+    which looks normal. You need dumps from ALL threads to see the cycle. In
+    production, this means capturing thread dumps from ALL pods/processes at the same
+    time. The deadlock is invisible if you only look at one side.
+  how_to_do_right: |
+    1. Capture thread dumps from ALL threads/processes simultaneously.
+    2. For Java: kill -3 <pid> or jstack <pid>
+    3. For Python: import faulthandler; faulthandler.enable() (then kill -USR1)
+    4. For Go: send SIGQUIT or use pprof
+    5. Look for cycles: Thread A waiting on lock held by Thread B, B waiting on lock held by A.
+    6. Fix: always acquire locks in the SAME order across all code paths.
+    7. Use lock timeouts to detect deadlocks automatically.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    import threading
+
+    # CORRECT: Always acquire locks in consistent order (alphabetical, by ID, etc.)
+    def transfer(from_account, to_account, amount):
+        # Sort by ID to ensure consistent lock ordering
+        first, second = sorted([from_account, to_account], key=lambda a: a.id)
+        with first.lock:
+            with second.lock:
+                from_account.balance -= amount
+                to_account.balance += amount
+
+    # This NEVER deadlocks because all threads acquire locks in the same order
+  example_bad: |
+    def transfer(from_account, to_account, amount):
+        with from_account.lock:          # Thread 1: locks A, waits for B
+            with to_account.lock:        # Thread 2: locks B, waits for A
+                from_account.balance -= amount
+                to_account.balance += amount
+
+    # Thread 1: transfer(A, B, 100) — locks A, waits for B
+    # Thread 2: transfer(B, A, 50)  — locks B, waits for A
+    # DEADLOCK: both threads wait forever
+    # App appears "hung" — no errors, no crashes, just frozen
+  when_applies: During deadlock investigation, hung process debugging, concurrency issues
+  sources: ["https://docs.python.org/3/library/faulthandler.html"]
+
+- id: DBG-INT-021
+  text: "TOCTOU (Time-of-Check-to-Time-of-Use): between reading a value and acting on it, another thread or process may have changed it"
+  why: >
+    TOCTOU is the most common concurrency bug pattern. You check a condition (file
+    exists, balance is sufficient, seat is available), then act on it. Between the check
+    and the act, another thread changes the state. The check passed but the act fails
+    or corrupts data. This is a race condition on the gap between check and use.
+    The fix is to make check-and-act atomic.
+  how_to_do_right: |
+    1. Never separate the check from the action — make them atomic.
+    2. Use database transactions with proper isolation (SERIALIZABLE if needed).
+    3. Use compare-and-swap (CAS) operations for in-memory state.
+    4. Use file locking or O_EXCL for filesystem operations.
+    5. Use SELECT ... FOR UPDATE in SQL to lock the row during check.
+    6. If you can't make it atomic, use optimistic concurrency (version numbers).
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    -- CORRECT: Atomic check-and-update using SQL
+    -- Deduct balance only if sufficient, in one atomic statement
+    UPDATE accounts
+    SET balance = balance - 100
+    WHERE user_id = 42 AND balance >= 100
+    RETURNING balance;
+    -- If no row returned, balance was insufficient. No race condition possible.
+
+    # Or with optimistic concurrency control:
+    def update_document(doc_id, new_content, expected_version):
+        result = db.execute(
+            "UPDATE docs SET content = %s, version = version + 1 "
+            "WHERE id = %s AND version = %s",
+            (new_content, doc_id, expected_version)
+        )
+        if result.rowcount == 0:
+            raise StaleDataError("Document was modified by another user")
+  example_bad: |
+    # TOCTOU: check and act are separate — another thread can act between them
+    def withdraw(user_id, amount):
+        balance = db.execute("SELECT balance FROM accounts WHERE user_id = %s", (user_id,))
+        # ^^^ Thread A reads balance = 100
+        # ^^^ Thread B reads balance = 100 (same value!)
+        if balance >= amount:
+            # Both threads pass this check
+            db.execute("UPDATE accounts SET balance = balance - %s WHERE user_id = %s",
+                       (amount, user_id))
+            # Thread A: balance = 100 - 100 = 0
+            # Thread B: balance = 0 - 100 = -100  <-- NEGATIVE BALANCE!
+  when_applies: During concurrency debugging, financial systems, booking/reservation systems
+  sources: ["https://www.postgresql.org/docs/current/explicit-locking.html"]
+
+- id: DBG-INT-022
+  text: "Connection pool exhaustion: connections are not leaked, they are blocked — find what is holding them, not where they are opened"
+  why: >
+    When the connection pool is exhausted, developers look for connection leaks — code
+    that opens a connection and forgets to close it. But in modern frameworks with
+    context managers and connection pools, leaks are rare. The real cause is almost
+    always blocked connections: a slow query holds a connection for 30 seconds, a
+    transaction left open during an external API call, or a deadlock holding
+    connections indefinitely. Find what's BLOCKING, not what's LEAKING.
+  how_to_do_right: |
+    1. Check pool metrics: active, idle, waiting counts. If active == max and waiting > 0, pool is exhausted.
+    2. Check what the active connections are DOING: pg_stat_activity shows current queries.
+    3. Look for long-running transactions: SELECT * FROM pg_stat_activity WHERE state = 'idle in transaction'.
+    4. Look for queries waiting on locks: state = 'active' AND wait_event_type = 'Lock'.
+    5. Set statement_timeout and idle_in_transaction_session_timeout to prevent indefinite holds.
+    6. Never hold a DB connection while calling an external API or doing file I/O.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # CORRECT: Release the DB connection BEFORE calling external API
+    def process_order(order_id):
+        # Short transaction: read data
+        with db.connection() as conn:
+            order = conn.execute("SELECT * FROM orders WHERE id = %s", (order_id,)).fetchone()
+        # Connection is released back to pool HERE
+
+        # External call (may take 5-30 seconds) — no DB connection held
+        payment_result = payment_api.charge(order.amount)
+
+        # New short transaction: update result
+        with db.connection() as conn:
+            conn.execute("UPDATE orders SET status = %s WHERE id = %s",
+                         (payment_result.status, order_id))
+  example_bad: |
+    def process_order(order_id):
+        with db.connection() as conn:
+            order = conn.execute("SELECT * FROM orders WHERE id = %s", (order_id,)).fetchone()
+            # Connection held during external API call!
+            payment_result = payment_api.charge(order.amount)  # 5-30 seconds
+            # 50 concurrent orders = 50 connections blocked on Stripe API
+            # Pool max is 20 = all other queries queue behind payment API calls
+            conn.execute("UPDATE orders SET status = %s WHERE id = %s",
+                         (payment_result.status, order_id))
+  when_applies: During connection pool exhaustion, database timeout errors, "too many connections" errors
+  sources: ["https://www.postgresql.org/docs/current/monitoring-stats.html"]
+
+- id: DBG-INT-023
+  text: "Lost updates: two processes read the same value, both compute an update, last write wins — the first update is silently lost"
+  why: >
+    Lost updates are silent data corruption. Process A reads balance=100. Process B
+    reads balance=100. A sets balance=150. B sets balance=200. Final balance is 200.
+    A's update (+50) is silently lost. No error, no exception, no log. The data just
+    quietly becomes wrong. This is one of the most dangerous bugs because it can go
+    undetected for months, silently corrupting financial records, inventory counts,
+    or any shared mutable state.
+  how_to_do_right: |
+    1. Use atomic updates: UPDATE x SET value = value + delta (not read-then-write).
+    2. Use optimistic locking: add a version column, reject stale writes.
+    3. Use pessimistic locking: SELECT ... FOR UPDATE to lock the row during read.
+    4. Use SERIALIZABLE isolation for complex multi-statement transactions.
+    5. For in-memory state: use CAS (compare-and-swap) or atomic operations.
+    6. Test with concurrent load — lost updates only appear under concurrency.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # CORRECT Option 1: Atomic update — no read-then-write, single SQL statement
+    def add_to_balance(user_id: int, amount: float) -> float:
+        result = db.execute(
+            "UPDATE accounts SET balance = balance + %s WHERE user_id = %s RETURNING balance",
+            (amount, user_id)
+        )
+        return result.fetchone()[0]
+
+    # CORRECT Option 2: Optimistic locking with version column
+    def update_profile(user_id: int, new_name: str, expected_version: int):
+        result = db.execute(
+            "UPDATE users SET name = %s, version = version + 1 "
+            "WHERE id = %s AND version = %s",
+            (new_name, user_id, expected_version)
+        )
+        if result.rowcount == 0:
+            raise ConflictError("Profile was modified by another request. Please retry.")
+  example_bad: |
+    # LOST UPDATE: read-then-write without any concurrency control
+    def add_to_balance(user_id, amount):
+        row = db.execute("SELECT balance FROM accounts WHERE user_id = %s", (user_id,))
+        current_balance = row.fetchone()[0]     # Process A reads 100, Process B reads 100
+        new_balance = current_balance + amount  # A computes 150, B computes 200
+        db.execute("UPDATE accounts SET balance = %s WHERE user_id = %s",
+                   (new_balance, user_id))      # A writes 150, then B writes 200
+        # A's +50 is SILENTLY LOST. No error. No log. Balance should be 250, is 200.
+        # Customer lost $50 and nobody noticed.
+  when_applies: During concurrency debugging, financial systems, inventory management, any shared mutable state
+  sources: ["https://www.postgresql.org/docs/current/transaction-iso.html"]
+
+# ============================================================
+# Stale Reads & Event Ordering (DBG-INT-024 to DBG-INT-026)
+# ============================================================
+
+- id: DBG-INT-024
+  text: "Stale read after write: you write to the primary, then read from a replica — the replica hasn't caught up yet"
+  why: >
+    In primary-replica database setups, writes go to the primary but reads may be routed
+    to a replica. Replication is asynchronous and has lag — typically milliseconds, but
+    under load it can be seconds or minutes. A user writes a value, immediately reads it
+    back, and gets the OLD value because the read hit a replica that hasn't received the
+    write yet. The code is correct. The data is correct. The timing is wrong.
+  how_to_do_right: |
+    1. After a write, read from the PRIMARY for a short window (read-your-writes consistency).
+    2. Use sticky sessions or connection routing to pin post-write reads to the primary.
+    3. Monitor replication lag: SHOW SLAVE STATUS (MySQL), pg_stat_replication (Postgres).
+    4. Set acceptable lag thresholds and alert when exceeded.
+    5. For critical reads (e.g., after payment), always read from primary explicitly.
+    6. Consider RETURNING clause in your UPDATE/INSERT to get the result without a second read.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # CORRECT: Read from primary after write (read-your-writes)
+    def update_and_read_user(user_id: int, new_name: str) -> dict:
+        with db.primary_connection() as conn:
+            conn.execute(
+                "UPDATE users SET name = %s WHERE id = %s",
+                (new_name, user_id)
+            )
+        # Use RETURNING or read from primary after write
+        with db.primary_connection() as conn:
+            return conn.execute(
+                "SELECT * FROM users WHERE id = %s", (user_id,)
+            ).fetchone()
+
+    # Or better — use RETURNING to avoid the second query entirely:
+    result = conn.execute(
+        "UPDATE users SET name = %s WHERE id = %s RETURNING *",
+        (new_name, user_id)
+    ).fetchone()
+  example_bad: |
+    def update_and_read_user(user_id, new_name):
+        db.execute("UPDATE users SET name = %s WHERE id = %s", (new_name, user_id))
+        # ^^^ Write goes to PRIMARY
+        user = db.execute("SELECT * FROM users WHERE id = %s", (user_id,)).fetchone()
+        # ^^^ Read may go to REPLICA — which still has the OLD name
+        return user  # Returns stale data. User sees old name after saving.
+        # "I just updated my name and it didn't change!" — classic stale read.
+  when_applies: During debugging inconsistencies after writes, primary-replica setups, read-your-writes issues
+  sources: ["https://jepsen.io/consistency"]
+
+- id: DBG-INT-025
+  text: "Event ordering: events arrive out of order in distributed systems — use sequence numbers or logical clocks, not wall-clock timestamps"
+  why: >
+    In distributed systems, events are produced by multiple nodes and consumed by
+    multiple consumers. Network latency varies, queues reorder, retries inject duplicates.
+    Two events sent 1ms apart may arrive in reverse order. Wall clocks across machines
+    drift by milliseconds to seconds. Relying on arrival order or wall-clock timestamps
+    for causality guarantees data corruption. You need explicit sequence numbers, vector
+    clocks, or Lamport timestamps to establish ordering.
+  how_to_do_right: |
+    1. Assign monotonically increasing sequence numbers at the producer.
+    2. Consumers track the last processed sequence and reject/reorder out-of-sequence events.
+    3. For multi-producer: use partition-scoped sequences (e.g., Kafka offsets per partition).
+    4. For causal ordering: use vector clocks or hybrid logical clocks.
+    5. Never use wall-clock time for ordering across machines — clocks drift.
+    6. Make consumers idempotent — processing the same event twice must be safe.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    from dataclasses import dataclass
+
+    @dataclass
+    class Event:
+        sequence: int
+        payload: dict
+
+    class OrderedConsumer:
+        def __init__(self):
+            self.last_sequence = 0
+            self.buffer: dict[int, Event] = {}
+
+        def process(self, event: Event):
+            if event.sequence <= self.last_sequence:
+                return  # Already processed (idempotent)
+            if event.sequence != self.last_sequence + 1:
+                self.buffer[event.sequence] = event  # Out of order — buffer it
+                return
+            self._apply(event)
+            self.last_sequence = event.sequence
+            # Drain buffer for any now-contiguous events
+            while self.last_sequence + 1 in self.buffer:
+                next_event = self.buffer.pop(self.last_sequence + 1)
+                self._apply(next_event)
+                self.last_sequence = next_event.sequence
+  example_bad: |
+    def process_event(event):
+        # Relies on arrival order — WRONG in distributed systems
+        db.execute("INSERT INTO events (payload, ts) VALUES (%s, NOW())",
+                   (event.payload,))
+        # Event A (seq=1) delayed 500ms, Event B (seq=2) arrives first
+        # Database shows B before A. Reads see B's state without A's prerequisite.
+        # Wall-clock NOW() makes it worse: B has earlier timestamp than A
+        # because producer B's clock was 1 second behind producer A's.
+  when_applies: During debugging event-driven systems, message queues, stream processing, distributed logs
+  sources: ["https://kafka.apache.org/documentation/#design_guarantees"]
+
+- id: DBG-INT-026
+  text: "Actor isolation: when actor A sends faster than actor B processes, unbounded mailboxes cause memory leaks and backpressure starvation"
+  why: >
+    Actor-model systems (Akka, Erlang, Python asyncio tasks) communicate via message
+    mailboxes. If producer actors send faster than consumer actors process, the mailbox
+    grows without bound. This is a slow memory leak that eventually OOM-kills the system.
+    Worse, if the consumer is slow because it's under memory pressure from the mailbox,
+    you get a death spiral. Unbounded queues are unbounded bugs.
+  how_to_do_right: |
+    1. Always use bounded mailboxes/queues with explicit capacity.
+    2. Define a backpressure strategy: drop-oldest, drop-newest, block-sender, or error.
+    3. Monitor queue depth as a first-class metric — alert when depth exceeds threshold.
+    4. Set timeouts on sends to bounded queues to detect backpressure early.
+    5. For asyncio: use asyncio.Queue(maxsize=N) not an unbounded list.
+    6. For Kafka: monitor consumer lag per partition.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go, erlang]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    import asyncio
+
+    async def producer(queue: asyncio.Queue):
+        for i in range(1_000_000):
+            await queue.put(i)  # Blocks when queue is full — backpressure!
+            # Producer automatically slows down to match consumer speed
+
+    async def consumer(queue: asyncio.Queue):
+        while True:
+            item = await queue.get()
+            await process(item)
+            queue.task_done()
+
+    async def main():
+        queue = asyncio.Queue(maxsize=1000)  # BOUNDED: max 1000 items
+        await asyncio.gather(producer(queue), consumer(queue))
+  example_bad: |
+    import asyncio
+
+    messages = []  # UNBOUNDED list as mailbox
+
+    async def producer():
+        for i in range(1_000_000):
+            messages.append(i)  # No backpressure — list grows forever
+            # Producer is 100x faster than consumer
+            # After 1 hour: 50M messages in memory, 8GB RAM consumed, OOM
+
+    async def consumer():
+        while True:
+            if messages:
+                item = messages.pop(0)  # O(n) pop from front of list — gets slower as list grows
+                await process(item)
+            await asyncio.sleep(0.01)
+  when_applies: During debugging actor systems, message queue backlogs, asyncio memory leaks, producer-consumer imbalance
+  sources: ["https://docs.python.org/3/library/asyncio-queue.html"]
+
+# ============================================================
+# State Corruption (DBG-INT-027 to DBG-INT-035)
+# ============================================================
+
+- id: DBG-INT-027
+  text: "State corruption: find the FIRST wrong value, then trace backward — corruption propagates, but there is always a patient zero"
+  why: >
+    When state is corrupt, developers look at the current wrong value and try to reason
+    forward from the code. But corruption propagates: wrong value A causes wrong value B
+    causes wrong value C. By the time you notice, you're looking at C, which was caused
+    by B, which was caused by A. The fix is to trace BACKWARD: find the earliest point
+    where the value diverges from expected. That is the actual bug. Everything downstream
+    is a symptom.
+  how_to_do_right: |
+    1. Add assertions at state transition boundaries — fail fast when values go wrong.
+    2. When corruption is detected, binary search through time: find the first wrong value.
+    3. Use audit logs or event sourcing to replay state and find the divergence point.
+    4. Check the write path for the corrupted field — who writes to it, and when.
+    5. Add checksums or invariant checks on critical state.
+    6. Once you find the first wrong write, the bug is in that write path, not downstream.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    class Account:
+        def __init__(self, balance: float):
+            self._balance = balance
+            self._history: list[tuple[str, float, float]] = []
+
+        def debit(self, amount: float, reason: str):
+            old = self._balance
+            self._balance -= amount
+            self._history.append((reason, old, self._balance))
+            # Invariant check — fail fast if state is wrong
+            assert self._balance >= 0, (
+                f"Negative balance! History: {self._history[-5:]}"
+            )
+            # When this fires, history shows EXACTLY which operation caused it
+
+        def audit_trail(self) -> list:
+            return list(self._history)  # Every state change is traceable
+  example_bad: |
+    account.balance = -500
+    # "How did balance become negative?"
+    # Developer reads 2000 lines of code trying to find the bug
+    # No audit trail, no history, no assertions
+    # Could be any of 15 code paths that modify balance
+    # Takes 2 days to find it was a double-debit from a retry
+  when_applies: During debugging data corruption, financial discrepancies, state machine violations
+  sources: ["https://sre.google/sre-book/effective-troubleshooting/"]
+
+- id: DBG-INT-028
+  text: "Database corruption: check constraints, triggers, and app-level invariants — the database trusts your app, but your app has bugs"
+  why: >
+    Databases enforce constraints you define (NOT NULL, UNIQUE, FOREIGN KEY, CHECK). But
+    most business rules are enforced only in application code. When the app has a bug,
+    or a manual SQL query bypasses the app, or a migration script runs incorrectly,
+    the data violates business invariants. The database doesn't know — it only checks
+    what you told it to check. If your constraints aren't in the schema, they don't exist.
+  how_to_do_right: |
+    1. Push business invariants into the database: CHECK constraints, NOT NULL, UNIQUE.
+    2. Use foreign keys — they prevent orphan records and cascading corruption.
+    3. Add database-level triggers for complex invariants the app must maintain.
+    4. Run periodic integrity checks: SELECT rows violating invariants.
+    5. Never bypass the application layer for writes (no manual INSERT/UPDATE in production).
+    6. Write a "data doctor" script that detects and reports violations.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    -- Push invariants into the schema
+    CREATE TABLE orders (
+        id SERIAL PRIMARY KEY,
+        user_id INT NOT NULL REFERENCES users(id),
+        status TEXT NOT NULL CHECK (status IN ('pending', 'paid', 'shipped', 'delivered')),
+        total_cents INT NOT NULL CHECK (total_cents >= 0),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    -- Periodic integrity check:
+    SELECT id, total_cents FROM orders
+    WHERE total_cents < 0
+       OR status NOT IN ('pending', 'paid', 'shipped', 'delivered')
+       OR user_id NOT IN (SELECT id FROM users);
+    -- Should return 0 rows. If not, you have corruption.
+  example_bad: |
+    CREATE TABLE orders (
+        id SERIAL PRIMARY KEY,
+        user_id INT,          -- No NOT NULL, no FK — orphans possible
+        status TEXT,           -- No CHECK — any string accepted
+        total_cents INT        -- No CHECK — negatives allowed
+    );
+    # App enforces rules, but:
+    # 1. DBA runs manual fix: UPDATE orders SET status = 'piad' (typo)
+    # 2. Migration creates orders with user_id = NULL
+    # 3. Bug in refund code sets total_cents = -500
+    # All silently accepted by the database.
+  when_applies: During debugging data integrity issues, post-migration validation, production data audits
+  sources: ["https://www.postgresql.org/docs/current/ddl-constraints.html"]
+
+- id: DBG-INT-029
+  text: "Cache corruption: when cache and source disagree, the cache is wrong — always trust the source of truth"
+  why: >
+    Caches are derived data. They should be rebuildable from the source of truth at any
+    time. When a cached value disagrees with the database, the cache is wrong by
+    definition. Common causes: cache TTL outlived a data change, cache invalidation
+    missed an edge case, cache was populated from a replica with replication lag, or
+    a partial update wrote to the DB but failed to invalidate the cache. The fix is
+    never to "fix the cache" — it's to fix the invalidation.
+  how_to_do_right: |
+    1. When debugging: compare cached value to DB value. If different, cache is wrong.
+    2. Fix the invalidation path, not the cached value.
+    3. Use write-through or write-behind caching to keep cache consistent.
+    4. Cache keys must include ALL dimensions that affect the value (user, locale, version).
+    5. Set reasonable TTLs — shorter is safer. Infinite TTL caches are corruption time bombs.
+    6. Add a "cache bust" mechanism for emergency manual invalidation.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    class UserCache:
+        def __init__(self, redis, db):
+            self.redis = redis
+            self.db = db
+            self.TTL = 300  # 5 minutes — not infinite!
+
+        def get_user(self, user_id: int) -> dict:
+            cached = self.redis.get(f"user:{user_id}")
+            if cached:
+                return json.loads(cached)
+            user = self.db.fetch_user(user_id)
+            self.redis.setex(f"user:{user_id}", self.TTL, json.dumps(user))
+            return user
+
+        def update_user(self, user_id: int, data: dict):
+            self.db.update_user(user_id, data)
+            self.redis.delete(f"user:{user_id}")  # INVALIDATE on write — critical!
+  example_bad: |
+    def get_user(user_id):
+        cached = redis.get(f"user:{user_id}")
+        if cached:
+            return json.loads(cached)
+        user = db.fetch_user(user_id)
+        redis.set(f"user:{user_id}", json.dumps(user))  # No TTL — cached FOREVER
+        return user
+
+    def update_user(user_id, data):
+        db.update_user(user_id, data)
+        # Forgot to invalidate cache!
+        # User updates their email, cache still returns old email for eternity
+  when_applies: During debugging stale data, cache invalidation failures, data inconsistency between services
+  sources: ["https://redis.io/docs/latest/develop/use/patterns/"]
+
+- id: DBG-INT-030
+  text: "Session corruption: multiple browser tabs sharing a session can corrupt state — check session isolation and concurrent mutation"
+  why: >
+    Users open multiple tabs. Each tab shares the same session cookie. If the app stores
+    mutable state in the session (cart contents, form wizard step, selected filters),
+    actions in tab A overwrite state set by tab B. The user fills a form in tab A,
+    switches to tab B (which resets the wizard), goes back to tab A and submits — the
+    submission uses tab B's state. This is a race condition at the session level.
+  how_to_do_right: |
+    1. Minimize mutable state in sessions — prefer URL params or hidden form fields.
+    2. For wizards/flows: use a flow-specific token, not the global session.
+    3. For shopping carts: use server-side cart with optimistic concurrency (version).
+    4. Add a tab-specific token (stored in sessionStorage, not cookies) to scope state.
+    5. Test with multiple tabs as part of your QA checklist.
+    6. Use ETag or version headers to detect stale state on form submission.
+  severity: medium
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    // Each tab gets a unique flow ID — state is scoped to the flow, not the session
+    function startCheckoutFlow() {
+        const flowId = crypto.randomUUID();
+        sessionStorage.setItem("checkoutFlowId", flowId);
+        // Server stores checkout state keyed by flowId, not sessionId
+        return fetch("/api/checkout/start", {
+            method: "POST",
+            body: JSON.stringify({ flowId }),
+        });
+    }
+
+    function submitCheckout(data) {
+        const flowId = sessionStorage.getItem("checkoutFlowId");
+        return fetch("/api/checkout/submit", {
+            method: "POST",
+            body: JSON.stringify({ flowId, ...data }),
+        });
+    }
+    // Tab A and Tab B have different flowIds — no cross-tab corruption
+  example_bad: |
+    // Checkout state stored in server-side session — shared across ALL tabs
+    @app.post("/checkout/set-address")
+    def set_address(request):
+        request.session["checkout_address"] = request.json["address"]
+        # Tab A sets address to "123 Main St"
+        # Tab B sets address to "456 Oak Ave"
+        # Tab A submits checkout — ships to "456 Oak Ave" (tab B's address!)
+        # Customer: "I entered the RIGHT address! Your site is broken!"
+  when_applies: During debugging session-related bugs, multi-tab issues, form submission anomalies
+  sources: ["https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html"]
+
+- id: DBG-INT-031
+  text: "Configuration corruption: environment variable overriding config file silently — always print effective config at startup"
+  why: >
+    Modern apps have configuration from multiple sources: defaults, config files, environment
+    variables, command-line flags, remote config services. Each layer overrides the previous.
+    A stale environment variable on one server can override a config file change, making
+    the app behave differently on different nodes. The config file says "production" but
+    the env var says "staging". The bug is invisible until you print the EFFECTIVE config.
+  how_to_do_right: |
+    1. Log the effective (merged) configuration at startup — every value and its source.
+    2. Include the source of each value: "database_url = X (from: ENV VAR DATABASE_URL)".
+    3. Validate config at startup: fail fast on invalid combinations.
+    4. Use a single config loading library that merges sources with clear precedence.
+    5. Never modify config at runtime — treat it as immutable after startup.
+    6. In K8s: check ConfigMaps, Secrets, and env vars on the pod, not just the YAML.
+  severity: medium
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    import os
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    class Config:
+        def __init__(self):
+            self._sources: dict[str, str] = {}
+            self.db_url = self._load("DATABASE_URL", default="sqlite:///local.db")
+            self.debug = self._load("DEBUG", default="false") == "true"
+            self.env = self._load("ENVIRONMENT", default="development")
+
+        def _load(self, key: str, default: str) -> str:
+            env_val = os.getenv(key)
+            if env_val is not None:
+                self._sources[key] = "ENV"
+                return env_val
+            self._sources[key] = "DEFAULT"
+            return default
+
+        def log_effective_config(self):
+            for key, source in self._sources.items():
+                value = getattr(self, key.lower(), "???")
+                if "secret" in key.lower() or "password" in key.lower():
+                    value = "****"
+                logger.info("Config %s = %s (source: %s)", key, value, source)
+
+    config = Config()
+    config.log_effective_config()  # Log at startup — know exactly what's running
+  example_bad: |
+    import os
+    DB_URL = os.getenv("DATABASE_URL", "sqlite:///local.db")
+    # Server 1: DATABASE_URL set to production DB — works
+    # Server 2: DATABASE_URL set to staging DB from a 6-month-old deploy
+    # Same code, same config file, different behavior
+    # "Works on server 1 but not server 2" — 3 hours debugging before checking env vars
+  when_applies: During debugging environment-specific bugs, deployment issues, config drift between nodes
+  sources: ["https://12factor.net/config"]
+
+- id: DBG-INT-032
+  text: "Migration corruption: migration ran partially — always wrap migrations in transactions and make them idempotent"
+  why: >
+    Database migrations can fail midway: network timeout, disk full, lock timeout. If the
+    migration is not transactional, half the schema changes apply and half don't. The
+    database is now in an undefined state. Running the migration again fails because the
+    first half already applied. Rolling back is impossible because there's no transaction
+    to rollback. You're stuck with a half-migrated database. The only fix is manual SQL.
+  how_to_do_right: |
+    1. Wrap every migration in a transaction (BEGIN/COMMIT).
+    2. Make migrations idempotent: IF NOT EXISTS, DROP IF EXISTS.
+    3. Test migrations against a copy of production data, not empty databases.
+    4. Keep migrations small — one logical change per migration.
+    5. Always write a DOWN migration (rollback) alongside the UP.
+    6. For large tables: use online schema migration tools (gh-ost, pt-osc) instead of ALTER.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    -- Migration: add email_verified column (idempotent + transactional)
+    BEGIN;
+
+    -- Idempotent: only adds column if it doesn't exist
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE;
+
+    -- Idempotent: only creates index if it doesn't exist
+    CREATE INDEX IF NOT EXISTS idx_users_email_verified ON users(email_verified);
+
+    -- Backfill existing verified users
+    UPDATE users SET email_verified = TRUE
+    WHERE id IN (SELECT user_id FROM email_verifications WHERE verified_at IS NOT NULL);
+
+    COMMIT;
+    -- If ANY step fails, the entire migration rolls back. No partial state.
+  example_bad: |
+    -- Migration without transaction or idempotency
+    ALTER TABLE users ADD COLUMN email_verified BOOLEAN DEFAULT FALSE;
+    -- ^^ Succeeds
+    CREATE INDEX idx_users_email_verified ON users(email_verified);
+    -- ^^ Fails: lock timeout on large table
+    -- Database now has the column but no index
+    -- Re-running migration: "column email_verified already exists" — ERROR
+    -- Manual fix required. Production is down.
+  when_applies: During debugging failed migrations, schema drift, deployment failures
+  sources: ["https://www.postgresql.org/docs/current/ddl-alter.html"]
+
+- id: DBG-INT-033
+  text: "Serialization corruption: JSON loses types (dates become strings, ints become floats) — always validate and reconstruct types after deserialization"
+  why: >
+    JSON has no date type, no distinction between int and float, no sets, no tuples, and
+    no binary. When you serialize a Python datetime to JSON, it becomes a string.
+    Deserializing gives you a string, not a datetime. 64-bit integers lose precision in
+    JavaScript (which uses 64-bit floats). Sets become arrays. Enums become strings.
+    If you don't explicitly reconstruct types after deserialization, you silently operate
+    on wrong types. Comparison operators, sorting, and arithmetic all break silently.
+  how_to_do_right: |
+    1. Use Pydantic, dataclasses-json, or Marshmallow for typed deserialization.
+    2. Never trust raw json.loads() output — always validate and convert types.
+    3. Serialize dates as ISO 8601 strings, deserialize back to datetime objects.
+    4. For large integers: serialize as strings to avoid JavaScript float precision loss.
+    5. Write round-trip tests: serialize → deserialize → compare with original.
+    6. Use msgpack or protobuf for binary data instead of base64-in-JSON.
+  severity: medium
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    from pydantic import BaseModel
+    from datetime import datetime
+
+    class Event(BaseModel):
+        id: int
+        name: str
+        created_at: datetime  # Pydantic auto-parses ISO 8601 string to datetime
+        tags: set[str]        # Pydantic converts list back to set
+
+    # Safe deserialization with type validation
+    raw = '{"id": 1, "name": "test", "created_at": "2024-01-15T10:30:00Z", "tags": ["a", "b"]}'
+    event = Event.model_validate_json(raw)
+    assert isinstance(event.created_at, datetime)  # True — properly parsed
+    assert isinstance(event.tags, set)              # True — converted from list
+
+    # Round-trip test
+    assert Event.model_validate_json(event.model_dump_json()) == event
+  example_bad: |
+    import json
+
+    data = json.loads('{"created_at": "2024-01-15T10:30:00Z", "count": 9007199254740993}')
+    # data["created_at"] is a STRING, not datetime
+    # data["count"] in JavaScript would be 9007199254740992 (precision lost!)
+
+    if data["created_at"] > "2024-01-01":  # String comparison — works by accident
+        pass  # But "2024-01-15" > "2024-01-01" is True for wrong reason
+    # Breaks when you compare with an actual datetime object
+    # TypeError: '>' not supported between instances of 'str' and 'datetime'
+  when_applies: During debugging type mismatch errors, API integration issues, data pipeline corruption
+  sources: ["https://docs.pydantic.dev/latest/concepts/validators/"]
+
+- id: DBG-INT-034
+  text: "State machine corruption: an object reached an illegal state — trace the transitions, check the guard conditions"
+  why: >
+    State machines define which transitions are legal (e.g., pending -> paid -> shipped).
+    If an order is in state "shipped" but was never "paid", a transition was skipped or
+    a guard condition was bypassed. This usually means: (1) a code path modifies state
+    directly without going through the FSM, (2) a guard condition has a bug, or (3) a
+    migration or manual SQL set the state directly. Trace the transition log to find
+    which transition was illegal, then find the code that allowed it.
+  how_to_do_right: |
+    1. Define all valid transitions explicitly — whitelist, not blacklist.
+    2. Log every transition: from_state, to_state, trigger, timestamp, actor.
+    3. Reject invalid transitions with a clear error, never silently allow them.
+    4. When corruption is found, query the transition log to find the illegal step.
+    5. Make state changes go through a SINGLE function — never set state directly.
+    6. Write tests for every transition AND every invalid transition (should raise).
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    from enum import Enum
+
+    class OrderState(Enum):
+        PENDING = "pending"
+        PAID = "paid"
+        SHIPPED = "shipped"
+        DELIVERED = "delivered"
+
+    VALID_TRANSITIONS = {
+        OrderState.PENDING: {OrderState.PAID},
+        OrderState.PAID: {OrderState.SHIPPED},
+        OrderState.SHIPPED: {OrderState.DELIVERED},
+        OrderState.DELIVERED: set(),
+    }
+
+    class Order:
+        def __init__(self):
+            self.state = OrderState.PENDING
+            self.transitions: list[tuple] = []
+
+        def transition(self, new_state: OrderState, actor: str):
+            if new_state not in VALID_TRANSITIONS[self.state]:
+                raise InvalidTransition(
+                    f"Cannot go from {self.state} to {new_state}. "
+                    f"Valid: {VALID_TRANSITIONS[self.state]}"
+                )
+            old = self.state
+            self.state = new_state
+            self.transitions.append((old, new_state, actor, utc_now()))
+  example_bad: |
+    class Order:
+        def ship(self):
+            self.status = "shipped"  # No guard! Can ship unpaid orders.
+
+        def pay(self):
+            self.status = "paid"
+
+    order = Order()
+    order.ship()  # Skipped payment — no error, no log, no trace
+    # "How did we ship 47 unpaid orders?" — no transition log to investigate
+  when_applies: During debugging illegal states, workflow violations, order/process lifecycle bugs
+  sources: ["https://refactoring.guru/design-patterns/state"]
+
+- id: DBG-INT-035
+  text: "Distributed state corruption: conflict resolution chose the wrong value — check your merge strategy (LWW, CRDT, or manual resolution)"
+  why: >
+    In distributed systems with multiple writers, conflicts are inevitable. Two nodes
+    update the same record simultaneously. The system must resolve the conflict somehow:
+    last-writer-wins (LWW) picks one value by timestamp, CRDTs merge automatically, or
+    the conflict is flagged for manual resolution. Each strategy can lose data. LWW
+    discards the earlier write. CRDTs can produce unintuitive merged states. Manual
+    resolution can be ignored. If you don't understand your conflict resolution strategy,
+    you can't debug why a value is wrong.
+  how_to_do_right: |
+    1. Know your conflict resolution strategy: LWW, vector clocks, CRDTs, or manual.
+    2. For LWW: ensure clocks are synchronized (NTP) and understand that updates CAN be lost.
+    3. For CRDTs: understand the merge semantics (G-Counter, OR-Set, LWW-Register).
+    4. Log conflicts when they occur — even if auto-resolved.
+    5. For critical data: use manual conflict resolution with user notification.
+    6. Test with network partitions to verify conflict resolution behaves correctly.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    from dataclasses import dataclass, field
+    from datetime import datetime, timezone
+
+    @dataclass
+    class VersionedRecord:
+        value: str
+        version: int
+        updated_at: datetime
+        updated_by: str
+        conflict_history: list[dict] = field(default_factory=list)
+
+    def resolve_conflict(local: VersionedRecord, remote: VersionedRecord) -> VersionedRecord:
+        if local.version == remote.version and local.value != remote.value:
+            # CONFLICT DETECTED — log it, don't silently pick one
+            conflict = {
+                "local": {"value": local.value, "by": local.updated_by},
+                "remote": {"value": remote.value, "by": remote.updated_by},
+                "resolved_at": datetime.now(timezone.utc).isoformat(),
+                "strategy": "higher_version_wins",
+            }
+            winner = max(local, remote, key=lambda r: r.updated_at)
+            winner.conflict_history.append(conflict)
+            return winner
+        return remote if remote.version > local.version else local
+  example_bad: |
+    def sync_record(local_value, remote_value, local_ts, remote_ts):
+        # LWW with no logging — silently discards one value
+        if remote_ts > local_ts:
+            return remote_value  # Local changes SILENTLY LOST
+        return local_value
+    # Node A: user sets name to "Alice" at T=100
+    # Node B: user sets name to "Bob" at T=101 (clock 1ms ahead)
+    # Sync: "Bob" wins. "Alice" is lost. No log, no record, no undo.
+    # User: "I changed my name to Alice, why does it say Bob?"
+  when_applies: During debugging distributed databases, multi-region replication, offline-first apps, CRDT systems
+  sources: ["https://jepsen.io/consistency"]
+
+# ============================================================
+# Pattern Recognition in Errors (DBG-INT-036 to DBG-INT-045)
+# ============================================================
+
+- id: DBG-INT-036
+  text: "StackOverflow = infinite recursion — check your base case, it's either missing, unreachable, or not reducing toward termination"
+  why: >
+    A StackOverflowError (or RecursionError in Python) means the call stack exceeded its
+    limit. This is almost always infinite recursion: a function calls itself without
+    converging toward a base case. Either the base case is missing entirely, the recursive
+    call doesn't reduce the problem size, or an edge case bypasses the base case. In rare
+    cases it's mutual recursion (A calls B calls A) which is harder to spot.
+  how_to_do_right: |
+    1. Check the base case: does it exist? Can it be reached for ALL inputs?
+    2. Check that each recursive call moves CLOSER to the base case (smaller input).
+    3. Add a depth counter or use sys.setrecursionlimit() to get a clear error.
+    4. For tree/graph traversal: check for cycles — visited set prevents infinite loops.
+    5. Consider converting to iteration with an explicit stack for deep recursion.
+    6. Test with edge cases: empty input, single element, maximum depth.
+  severity: medium
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    def factorial(n: int) -> int:
+        if n < 0:
+            raise ValueError("n must be non-negative")
+        if n <= 1:
+            return 1  # Base case: clearly reachable, terminates recursion
+        return n * factorial(n - 1)  # n decreases by 1 each call — converges
+
+    # For deep recursion, convert to iteration:
+    def factorial_iter(n: int) -> int:
+        result = 1
+        for i in range(2, n + 1):
+            result *= i
+        return result
+  example_bad: |
+    def process(node):
+        # Missing base case — what if node.children is empty? Still calls process.
+        for child in node.children:
+            process(child)
+        process(node.parent)  # Goes UP the tree — never terminates!
+        # parent -> child -> parent -> child -> ... -> RecursionError
+  when_applies: During debugging RecursionError, StackOverflowError, infinite loops in recursive functions
+  sources: ["https://docs.python.org/3/library/sys.html#sys.setrecursionlimit"]
+
+- id: DBG-INT-037
+  text: "TypeError in dynamic languages = None/null/undefined where you expected an object — trace backward to find where the None originated"
+  why: >
+    In dynamically typed languages, the most common TypeError is calling a method on None
+    (Python), null (Java), or undefined (JavaScript). The error fires at the point of USE,
+    but the bug is at the point of ORIGIN — some function returned None instead of an
+    object. The fix is not to add a null check at the crash site (that's a band-aid).
+    The fix is to find WHY the value is None and fix that.
+  how_to_do_right: |
+    1. Read the full traceback — it shows WHERE the None was used, not where it was created.
+    2. Trace backward: what function returned this value? Why did it return None?
+    3. Common sources: dict.get() with no default, failed find/query returning None, uninitialized attribute.
+    4. Fix at the source: make the function raise instead of returning None, or use Optional types.
+    5. Never add `if x is not None` at the crash site as the only fix — also fix the source.
+    6. Use type hints and mypy/pyright to catch None-related bugs statically.
+  severity: medium
+  technologies:
+    lang: [python, javascript, java]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    from typing import Optional
+
+    def find_user(user_id: int) -> Optional["User"]:
+        """Returns User or None — caller MUST handle None."""
+        return db.query(User).filter(User.id == user_id).first()
+
+    # Caller handles the None explicitly
+    user = find_user(42)
+    if user is None:
+        raise UserNotFoundError(f"User {42} not found")  # Clear error, not AttributeError
+    # Now user is guaranteed to be a User object
+    print(user.name)  # Safe
+
+    # Even better — make the function raise instead of returning None:
+    def get_user(user_id: int) -> "User":
+        user = db.query(User).filter(User.id == user_id).first()
+        if user is None:
+            raise UserNotFoundError(f"User {user_id} not found")
+        return user  # Always returns a User, never None
+  example_bad: |
+    user = find_user(42)  # Returns None if not found
+    print(user.name)       # AttributeError: 'NoneType' has no attribute 'name'
+    # Developer adds: if user: print(user.name)
+    # This is a band-aid — the real question is WHY was user None?
+    # Was the ID wrong? Was the DB query broken? Was the user deleted?
+  when_applies: During debugging TypeError, AttributeError on NoneType, null pointer exceptions
+  sources: ["https://docs.python.org/3/library/typing.html#typing.Optional"]
+
+- id: DBG-INT-038
+  text: "ConnectionRefused = the service is not running or you're connecting to the wrong port — check the process and the port, not the network"
+  why: >
+    ConnectionRefused means the TCP handshake was rejected by the target machine. This is
+    different from a timeout (which means no response). ConnectionRefused means the OS
+    received the SYN packet and actively sent back RST. This means: the machine is
+    reachable (network is fine), but nothing is listening on that port. Either the service
+    isn't running, it's running on a different port, or a firewall is sending RST.
+  how_to_do_right: |
+    1. Check if the service is running: ps aux | grep <service>, systemctl status, docker ps.
+    2. Check which port it's ACTUALLY listening on: ss -tlnp, netstat -tlnp, lsof -i :<port>.
+    3. Verify the port in your config matches the port the service is bound to.
+    4. Check if the service is bound to 127.0.0.1 (localhost only) vs 0.0.0.0 (all interfaces).
+    5. In Docker: check port mapping (-p host:container), network mode, and container health.
+    6. Don't debug the network — ConnectionRefused means the network WORKS.
+  severity: medium
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # Debugging ConnectionRefused — systematic checklist:
+    # 1. Is the service running?
+    # $ docker ps | grep postgres
+    # (empty) -> postgres container is not running!
+    # $ docker start postgres
+
+    # 2. Is it listening on the expected port?
+    # $ ss -tlnp | grep 5432
+    # LISTEN  0  128  127.0.0.1:5432  -> only on localhost!
+    # Need to bind to 0.0.0.0 for other containers to connect.
+
+    # 3. Config check:
+    import os
+    DB_HOST = os.getenv("DB_HOST", "localhost")
+    DB_PORT = int(os.getenv("DB_PORT", "5432"))
+    print(f"Connecting to {DB_HOST}:{DB_PORT}")  # Verify BEFORE connecting
+  example_bad: |
+    # "ConnectionRefused — must be a network issue"
+    # Developer spends 2 hours checking firewalls, DNS, VPN, security groups
+    # Actual problem: postgres container crashed 3 hours ago
+    # $ docker ps -> no postgres container running
+    # $ docker logs postgres -> "FATAL: could not open file pg_xlog" (disk full)
+  when_applies: During debugging connection failures, service startup issues, Docker networking problems
+  sources: ["https://docs.docker.com/network/"]
+
+- id: DBG-INT-039
+  text: "TimeoutError: connection timeout vs read timeout are completely different failures — connection timeout means unreachable, read timeout means slow"
+  why: >
+    HTTP clients have two separate timeouts: connection timeout (time to establish TCP
+    connection) and read timeout (time to receive response after connection is established).
+    Connection timeout means the server is unreachable — network issue, wrong IP, firewall.
+    Read timeout means the server received the request but is taking too long — slow query,
+    high load, deadlock. The diagnosis and fix are completely different. Most HTTP clients
+    default to a single timeout value, hiding which one fired.
+  how_to_do_right: |
+    1. Always set SEPARATE connect and read timeouts in your HTTP client.
+    2. Connection timeout (2-5s): if this fires, check network/DNS/firewall.
+    3. Read timeout (10-60s): if this fires, check server performance/load.
+    4. Log WHICH timeout fired, not just "timeout error".
+    5. For long-running operations: use async patterns (webhook callback) instead of long timeouts.
+    6. Set client-side timeout < server-side timeout to avoid orphaned requests.
+  severity: medium
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    import requests
+
+    def call_api(url: str) -> dict:
+        try:
+            resp = requests.get(url, timeout=(3.0, 30.0))  # (connect, read) — SEPARATE!
+            return resp.json()
+        except requests.exceptions.ConnectTimeout:
+            # Server is unreachable — check network, DNS, firewall
+            logger.error("Connection timeout to %s — server unreachable", url)
+            raise ServiceUnreachable(url)
+        except requests.exceptions.ReadTimeout:
+            # Server is slow — check server load, query performance
+            logger.error("Read timeout from %s — server too slow", url)
+            raise ServiceOverloaded(url)
+  example_bad: |
+    resp = requests.get(url, timeout=30)  # Single timeout — which one fired?
+    # If timeout fires: is the server unreachable or just slow? No idea.
+    # Developer checks network (wrong diagnosis if it's a slow query)
+    # Or restarts server (wrong fix if it's a firewall rule)
+  when_applies: During debugging timeout errors, API integration issues, microservice communication
+  sources: ["https://docs.python-requests.org/en/latest/user/advanced/#timeouts"]
+
+- id: DBG-INT-040
+  text: "403 vs 401: 401 means 'authenticate first' (who are you?), 403 means 'you don't have permission' (I know who you are, the answer is no)"
+  why: >
+    Developers often confuse 401 Unauthorized and 403 Forbidden. The names are misleading.
+    401 means the request lacks valid authentication credentials — the server doesn't know
+    who you are. Fix: provide or refresh the auth token. 403 means the server knows who
+    you are but you don't have permission for this resource. Fix: check roles/permissions,
+    not the auth token. Debugging a 403 by regenerating tokens wastes time. Debugging a
+    401 by checking permissions wastes time.
+  how_to_do_right: |
+    1. 401: Check if the auth token is present, valid, and not expired.
+    2. 401: Check the Authorization header format (Bearer vs Basic vs API key).
+    3. 403: The token is fine — check the user's roles and permissions for this resource.
+    4. 403: Check if the resource has ACLs, RBAC rules, or IP allowlists.
+    5. Log the distinction clearly: "auth failed" (401) vs "access denied" (403).
+    6. Never return 403 for unauthenticated requests — use 401. 403 reveals that the resource exists.
+  severity: medium
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    from fastapi import HTTPException, Depends
+
+    async def get_current_user(token: str = Depends(oauth2_scheme)):
+        user = decode_token(token)
+        if user is None:
+            raise HTTPException(
+                status_code=401,  # WHO ARE YOU? — authenticate first
+                detail="Invalid or expired token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return user
+
+    async def check_admin(user = Depends(get_current_user)):
+        if not user.is_admin:
+            raise HTTPException(
+                status_code=403,  # I KNOW who you are, but NO — permission denied
+                detail=f"User {user.email} lacks admin role for this resource",
+            )
+        return user
+  example_bad: |
+    # Common mistake: returning 403 for everything
+    if not token:
+        raise HTTPException(status_code=403)  # WRONG: should be 401
+    if not user.is_admin:
+        raise HTTPException(status_code=403)  # Correct
+    # Client gets 403 in both cases — can't tell if token is bad or permission is missing
+    # Developer keeps regenerating tokens for a permissions issue. Wastes an hour.
+  when_applies: During debugging authentication and authorization errors, API access issues
+  sources: ["https://tools.ietf.org/html/rfc7235"]
+
+- id: DBG-INT-041
+  text: "502 Bad Gateway = the proxy reached the backend but got an invalid response — the backend crashed, is misconfigured, or returned garbage"
+  why: >
+    502 Bad Gateway is generated by a reverse proxy (nginx, ALB, Cloudflare) when it
+    contacts the backend server but gets an invalid or empty response. This means: the
+    proxy is working, the network is working, the backend is reachable, but the backend
+    is not responding correctly. Common causes: backend process crashed mid-response,
+    backend returned malformed HTTP, backend closed the connection before responding,
+    or the proxy's upstream config points to the wrong port.
+  how_to_do_right: |
+    1. Check the BACKEND logs, not the proxy logs — the proxy is working fine.
+    2. Check if the backend process is running and healthy.
+    3. Check if the backend is listening on the port the proxy expects.
+    4. Check for OOM kills: dmesg | grep -i oom (backend may have been killed).
+    5. Check proxy upstream config: is the host:port correct?
+    6. Try hitting the backend directly (bypassing the proxy) to confirm.
+  severity: medium
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # 502 debugging checklist (systematic):
+
+    # 1. Check backend process
+    # $ docker ps | grep api-server
+    # -> Status: Restarting (OOM) — backend keeps crashing!
+
+    # 2. Check backend logs
+    # $ docker logs api-server --tail 50
+    # -> "Killed" — OOM killed by kernel
+
+    # 3. Check kernel OOM log
+    # $ dmesg | grep -i oom
+    # -> "Out of memory: Kill process 1234 (python) score 950"
+
+    # 4. Fix: increase memory limit or fix the memory leak
+    # docker-compose.yml: mem_limit: 2g -> 4g (temporary)
+    # Then investigate the memory leak (real fix)
+  example_bad: |
+    # "502 Bad Gateway — must be nginx misconfigured"
+    # Developer spends 3 hours tweaking nginx.conf
+    # proxy_pass, buffer sizes, timeouts, upstream config
+    # Real problem: Python app crashing with OOM after processing large uploads
+    # nginx is perfectly configured — it's faithfully reporting the backend failure
+  when_applies: During debugging 502 errors, reverse proxy issues, backend crashes behind load balancers
+  sources: ["https://nginx.org/en/docs/http/ngx_http_proxy_module.html"]
+
+- id: DBG-INT-042
+  text: "OOMKilled: check dmesg and kernel logs, not application logs — the app never sees its own death"
+  why: >
+    When the Linux OOM killer terminates a process, it sends SIGKILL. The process cannot
+    catch, log, or handle SIGKILL. There is no exception, no error log, no graceful
+    shutdown. The process simply vanishes. Application logs show nothing — the last log
+    line is whatever the app was doing before being killed. The only record is in the
+    kernel log (dmesg) and in the container runtime (docker inspect, kubectl describe).
+    If you only look at app logs, you'll never find the cause.
+  how_to_do_right: |
+    1. Check kernel logs: dmesg | grep -i "oom\|killed process"
+    2. In Docker: docker inspect <container> | grep OOMKilled
+    3. In K8s: kubectl describe pod <pod> — look for OOMKilled in container status.
+    4. Check /proc/meminfo and /proc/<pid>/status for memory usage before the kill.
+    5. Set memory limits explicitly (cgroups, K8s requests/limits) for predictable behavior.
+    6. Add memory monitoring/alerting that triggers BEFORE OOM (at 80% usage).
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # When a process mysteriously disappears, check the kernel:
+    # $ dmesg | grep -i "oom\|killed"
+    # [123456.789] Out of memory: Kill process 4567 (python3) score 850 or sacrifice child
+    # [123456.789] Killed process 4567 (python3) total-vm:8192000kB, anon-rss:4096000kB
+
+    # In Docker:
+    # $ docker inspect my-app | jq '.[0].State'
+    # { "Status": "exited", "OOMKilled": true, "ExitCode": 137 }
+    # ExitCode 137 = 128 + 9 (SIGKILL)
+
+    # In Kubernetes:
+    # $ kubectl describe pod my-app
+    # Last State: Terminated
+    #   Reason: OOMKilled
+    #   Exit Code: 137
+  example_bad: |
+    # "App keeps crashing with no error in logs"
+    # Developer adds more try/except, more error handlers, more logging
+    # None of it helps because SIGKILL cannot be caught
+    # App logs show: "Processing batch 47/100..." then nothing
+    # Developer: "Must be a bug in batch 47" — wrong, it's out of memory
+    # Spends 2 days debugging batch 47 logic when it's a memory issue
+  when_applies: During debugging mysterious process deaths, container restarts, exit code 137
+  sources: ["https://kubernetes.io/docs/tasks/configure-pod-container/assign-memory-resource/"]
+
+- id: DBG-INT-043
+  text: "Slow query = missing index OR full table scan OR lock wait — run EXPLAIN ANALYZE first, guess later"
+  why: >
+    When a query is slow, developers guess: "maybe the database needs more memory",
+    "maybe we need to shard", "maybe we should cache it". All guesses. EXPLAIN ANALYZE
+    shows EXACTLY what the database is doing: sequential scan (missing index), nested
+    loop join (wrong join strategy), sort on disk (insufficient work_mem), or lock wait
+    (contention). It takes 5 seconds to run and eliminates all guesswork. Not running
+    EXPLAIN ANALYZE before optimizing is like prescribing medicine without diagnosis.
+  how_to_do_right: |
+    1. Run EXPLAIN ANALYZE on the slow query — not EXPLAIN alone (ANALYZE gives actual timings).
+    2. Look for Seq Scan on large tables — usually means missing index.
+    3. Look for Nested Loop with high row counts — may need Hash Join or Merge Join.
+    4. Look for Sort with external merge — increase work_mem.
+    5. Look for LockWait events — contention issue, not a query issue.
+    6. Fix based on data: add index, rewrite query, increase memory, or reduce contention.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    -- Step 1: EXPLAIN ANALYZE (not just EXPLAIN)
+    EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+    SELECT o.*, u.name
+    FROM orders o JOIN users u ON o.user_id = u.id
+    WHERE o.created_at > '2024-01-01' AND o.status = 'pending';
+
+    -- Output reveals:
+    -- Seq Scan on orders (actual rows=5000000, time=4200ms)
+    --   Filter: (status = 'pending' AND created_at > '2024-01-01')
+    --   Rows Removed by Filter: 4950000
+
+    -- Diagnosis: full table scan, missing index on (status, created_at)
+    CREATE INDEX idx_orders_status_created ON orders(status, created_at);
+
+    -- After index: Index Scan (actual rows=50000, time=12ms)
+    -- 350x faster. No caching, no sharding, no hardware. Just the right index.
+  example_bad: |
+    # "Query is slow, let's add caching"
+    @cache(ttl=300)
+    def get_pending_orders():
+        return db.execute("SELECT * FROM orders WHERE status = 'pending'").fetchall()
+    # Cache masks the problem for 5 minutes, then it's slow again
+    # Actual fix: a 1-line CREATE INDEX statement
+    # But nobody ran EXPLAIN ANALYZE to find out
+  when_applies: During debugging slow queries, database performance issues, query optimization
+  sources: ["https://www.postgresql.org/docs/current/using-explain.html"]
+
+- id: DBG-INT-044
+  text: "Intermittent 500 = connection pool exhaustion, memory pressure, or transient dependency failure — check resource metrics, not application logic"
+  why: >
+    Intermittent 500 errors that can't be reproduced on demand are almost never logic bugs.
+    Logic bugs are deterministic — same input, same failure. Intermittent failures are
+    resource-related: connection pool briefly exhausted (all connections busy), memory
+    pressure causing GC pauses or swap, a downstream service flapping, or file descriptor
+    limits hit. The app code is correct; it's the environment that's intermittently
+    unhealthy. Check resource metrics at the time of the error, not the code.
+  how_to_do_right: |
+    1. Correlate error timestamps with resource metrics: CPU, memory, connection pool, GC pauses.
+    2. Check connection pool: active vs max count at the time of failure.
+    3. Check memory: was GC running or swap being used at failure time?
+    4. Check downstream dependencies: did a dependency have a blip at that time?
+    5. Add structured error context: log pool stats, memory, open FDs alongside the error.
+    6. Use circuit breakers to fail fast when dependencies are unhealthy.
+  severity: high
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    import psutil
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    def handle_request(request):
+        try:
+            return process(request)
+        except Exception as e:
+            # Log resource context alongside the error
+            pool_stats = db.pool.status()
+            mem = psutil.virtual_memory()
+            logger.error(
+                "Request failed: %s | pool_active=%d pool_max=%d pool_waiting=%d | "
+                "mem_percent=%.1f%% swap_used=%dMB",
+                e,
+                pool_stats.active, pool_stats.max, pool_stats.waiting,
+                mem.percent, psutil.swap_memory().used // 1024 // 1024,
+            )
+            # Now when you see the error log, you immediately know:
+            # pool_active=20 pool_max=20 pool_waiting=15 -> POOL EXHAUSTION
+            # mem_percent=97.2% swap_used=2048MB -> MEMORY PRESSURE
+            raise
+  example_bad: |
+    def handle_request(request):
+        try:
+            return process(request)
+        except Exception as e:
+            logger.error("Request failed: %s", e)  # No context — just the error
+            raise
+    # Log says: "Request failed: OperationalError: connection timeout"
+    # Is it the DB? The pool? A network blip? Memory pressure? No idea.
+    # Developer reads 500 lines of process() code — wrong approach entirely
+  when_applies: During debugging intermittent 500 errors, production incidents, resource contention
+  sources: ["https://sre.google/sre-book/monitoring-distributed-systems/"]
+
+- id: DBG-INT-045
+  text: "Import/module error = wrong path, missing dependency, or circular import — check sys.path, installed packages, and import graph, in that order"
+  why: >
+    ModuleNotFoundError and ImportError have three distinct causes that require different
+    fixes. (1) Wrong sys.path: Python doesn't know where to find the module. (2) Missing
+    dependency: the package isn't installed in the active environment. (3) Circular import:
+    module A imports B, B imports A — one of them is partially initialized when the other
+    tries to use it. The error message looks the same ("cannot import X from Y") but the
+    fix is completely different for each cause.
+  how_to_do_right: |
+    1. Check sys.path: python -c "import sys; print(sys.path)" — is your package's parent dir listed?
+    2. Check installed packages: pip list | grep <package> — is it installed in THIS virtualenv?
+    3. Check which python: which python, which pip — are you in the right virtualenv?
+    4. For circular imports: move the import inside the function, or restructure modules.
+    5. For relative imports: check __init__.py exists in all package directories.
+    6. Use python -v -c "import mymodule" to trace the full import resolution.
+  severity: medium
+  technologies:
+    lang: [python, javascript, java, go]
+  domains:
+    domain: [reasoning, testing]
+    concern: [diagnosis]
+  example_good: |
+    # Systematic import debugging:
+
+    # 1. Check which Python and virtualenv
+    import sys
+    print(f"Python: {sys.executable}")
+    print(f"Path: {sys.path}")
+
+    # 2. Check if package is installed
+    import importlib
+    spec = importlib.util.find_spec("mypackage")
+    if spec is None:
+        print("Package not found in sys.path!")
+        print(f"Searched: {sys.path}")
+    else:
+        print(f"Found at: {spec.origin}")
+
+    # 3. For circular imports: use lazy imports
+    def get_user_service():
+        from myapp.services.user import UserService  # Import inside function
+        return UserService()
+    # Breaks the circular dependency at module level
+
+    # 4. Trace import resolution
+    # $ python -v -c "import mypackage" 2>&1 | grep mypackage
+  example_bad: |
+    # "ModuleNotFoundError: No module named 'mypackage'"
+    # Developer: "I just installed it!"
+    # $ pip install mypackage  # Installs in system Python
+    # $ python3 myapp.py       # Runs in virtualenv — different Python!
+    # Two different Pythons, two different site-packages
+    # Or:
+    # $ PYTHONPATH=src python -m myapp  # Works
+    # $ python -m myapp                 # Fails — src not in path
+  when_applies: During debugging import errors, virtualenv issues, package installation problems, circular dependencies
+  sources: ["https://docs.python.org/3/reference/import.html"]

@@ -1,0 +1,2004 @@
+layer: rules
+domain: agent_orchestration
+knowledge:
+
+# =============================================================================
+# L0 SYSTEM LAYER (ALYR-001 to ALYR-003)
+# Infrastructure heartbeat, resource allocation, circuit breakers
+# =============================================================================
+
+- id: ALYR-001
+  text: "Every agent in a multi-agent pipeline MUST emit periodic heartbeats, and a supervisor MUST detect dead agents within 2x the heartbeat interval and auto-restart them with last-known state."
+  why: >
+    In a 7-layer agent hierarchy, any agent can silently hang — waiting on an LLM call that
+    never returns, stuck in an infinite retry loop, or killed by an OOM. Without heartbeats,
+    the pipeline appears to be running but makes zero progress. Google's Borg (predecessor to
+    Kubernetes) established the heartbeat pattern: every worker reports liveness, the master
+    detects missing heartbeats within 2x the interval, and restarts the worker. In agent
+    pipelines the cost of a hung agent is amplified because downstream agents are blocked,
+    token budgets are wasted on idle polling, and the human operator sees no error — just
+    silence. A 30-second heartbeat interval with a 60-second timeout strikes the balance
+    between responsiveness and overhead for LLM-based agents.
+  how_to_do_right: |
+    1. Each agent writes a heartbeat to a shared store (Redis, SQLite, or in-memory dict) every N seconds.
+    2. The heartbeat payload includes: agent_id, timestamp, current_task_id, status (idle/working/blocked), progress_pct.
+    3. A supervisor thread checks all heartbeats every N seconds. If last_heartbeat > 2*N, declare agent dead.
+    4. On dead agent detection: log the event, capture last-known state (task_id, inputs, partial outputs).
+    5. Restart the agent with the captured state so it resumes, not restarts from scratch.
+    6. Implement exponential backoff for agents that repeatedly die (max 3 restarts, then escalate).
+    7. Expose a /health endpoint or status dict so operators can see agent liveness at a glance.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [langgraph, crewai]
+    infra: [redis]
+  domains:
+    domain: [agent_orchestration, reliability]
+    concern: [liveness, monitoring, auto_recovery]
+  example_good: |
+    import time, threading, redis
+
+    class AgentSupervisor:
+        def __init__(self, redis_client: redis.Redis, heartbeat_interval: int = 30):
+            self.r = redis_client
+            self.interval = heartbeat_interval
+            self.timeout = heartbeat_interval * 2
+
+        def send_heartbeat(self, agent_id: str, task_id: str, progress: float):
+            """Called by each agent every heartbeat_interval seconds."""
+            self.r.hset(f"agent:{agent_id}", mapping={
+                "last_heartbeat": time.time(),
+                "task_id": task_id,
+                "progress": progress,
+                "status": "working",
+            })
+            self.r.expire(f"agent:{agent_id}", self.timeout + 10)
+
+        def check_liveness(self) -> list[str]:
+            """Returns list of dead agent IDs."""
+            dead = []
+            for key in self.r.scan_iter("agent:*"):
+                data = self.r.hgetall(key)
+                last_hb = float(data.get(b"last_heartbeat", 0))
+                if time.time() - last_hb > self.timeout:
+                    agent_id = key.decode().split(":")[1]
+                    dead.append(agent_id)
+            return dead
+
+        def restart_agent(self, agent_id: str):
+            """Restart with last-known state."""
+            state = self.r.hgetall(f"agent:{agent_id}")
+            task_id = state.get(b"task_id", b"").decode()
+            # Re-enqueue task with resume flag
+            self.r.rpush("task_queue", f"{task_id}:resume:{agent_id}")
+  example_bad: |
+    # No heartbeat — agent hangs silently, pipeline stuck forever
+    def run_agent(task):
+        result = call_llm(task.prompt)  # Hangs for 10 minutes, no timeout
+        return result
+
+    # Supervisor has no idea agent is dead
+    # Human notices after 30 minutes of zero output
+    # No state captured — must restart entire pipeline from scratch
+  when_applies: Any multi-agent system with more than 2 agents, especially pipelines where agents run concurrently or have dependencies
+  sources:
+    - "https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/"
+    - "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/"
+    - "https://docs.crewai.com/concepts/agents"
+
+- id: ALYR-002
+  text: "Distribute token budgets top-down across all layers with explicit per-layer caps, and enforce hard limits — no single agent should consume more than its allocated share without explicit override."
+  why: >
+    LLM API calls are the primary cost and latency driver in agent pipelines. Without token
+    budgets, a single verbose agent at L5 can consume 80% of the total budget, starving L1
+    strategic planning and L3 QA review of tokens. This creates a "tragedy of the commons"
+    where worker agents with long prompts crowd out higher-value reasoning at upper layers.
+    OpenAI and Anthropic both enforce rate limits and per-request token caps, but these are
+    per-call limits, not pipeline-level budgets. A global budget allocator ensures that
+    strategic reasoning (L1: 15%), orchestration (L2-L3: 25%), execution (L4-L5: 50%), and
+    specialist consultation (L6: 10%) each get their fair share. When a layer exhausts its
+    budget, it must summarize context or reduce output rather than silently consuming more.
+  how_to_do_right: |
+    1. Define a total pipeline token budget per run (e.g., 2M tokens for a sprint).
+    2. Allocate percentages per layer: L0=5%, L1=10%, L2=10%, L3=15%, L4=15%, L5=35%, L6=10%.
+    3. Track token usage per agent in real-time (input_tokens + output_tokens per LLM call).
+    4. When a layer reaches 80% of its budget, emit a WARNING and switch to shorter prompts.
+    5. When a layer reaches 100%, BLOCK further LLM calls unless an L0/L1 override is issued.
+    6. Allow explicit budget transfers: L1 can donate unused budget to L5 if strategic planning finishes early.
+    7. Log budget usage per layer per run for capacity planning and optimization.
+    8. Never silently exceed — always fail loudly with a BudgetExhausted error.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langgraph, crewai]
+    library: [tiktoken, anthropic]
+  domains:
+    domain: [agent_orchestration, resource_management]
+    concern: [cost_control, fairness, capacity_planning]
+  example_good: |
+    from dataclasses import dataclass, field
+
+    @dataclass
+    class LayerBudget:
+        layer: str
+        max_tokens: int
+        used_tokens: int = 0
+        warning_threshold: float = 0.8
+
+        @property
+        def remaining(self) -> int:
+            return self.max_tokens - self.used_tokens
+
+        def consume(self, tokens: int) -> None:
+            if self.used_tokens + tokens > self.max_tokens:
+                raise BudgetExhaustedError(
+                    f"Layer {self.layer}: {self.used_tokens + tokens} > {self.max_tokens}"
+                )
+            self.used_tokens += tokens
+            if self.used_tokens / self.max_tokens >= self.warning_threshold:
+                logger.warning(f"Layer {self.layer} at {self.used_tokens/self.max_tokens:.0%} budget")
+
+    class PipelineBudgetAllocator:
+        LAYER_ALLOCATIONS = {
+            "L0_system": 0.05, "L1_executive": 0.10, "L2_vp": 0.10,
+            "L3_master": 0.15, "L4_squad_lead": 0.15,
+            "L5_worker": 0.35, "L6_specialist": 0.10,
+        }
+
+        def __init__(self, total_budget: int = 2_000_000):
+            self.budgets = {
+                layer: LayerBudget(layer=layer, max_tokens=int(total_budget * pct))
+                for layer, pct in self.LAYER_ALLOCATIONS.items()
+            }
+
+        def consume(self, layer: str, tokens: int) -> None:
+            self.budgets[layer].consume(tokens)
+
+        def transfer(self, from_layer: str, to_layer: str, tokens: int) -> None:
+            """Explicit budget transfer between layers."""
+            self.budgets[from_layer].max_tokens -= tokens
+            self.budgets[to_layer].max_tokens += tokens
+  example_bad: |
+    # No budget control — one agent consumes everything
+    def run_pipeline(tasks):
+        for task in tasks:
+            # Each agent uses as many tokens as it wants
+            result = call_llm(task.prompt)  # 50K tokens per call, no limit
+            # Worker agent used 1.5M tokens, QA layer gets 0 tokens left
+            # Pipeline "succeeds" but QA never ran — quality is unknown
+
+    # Result: $400 API bill for a single run, QA skipped, bugs shipped
+  when_applies: Any multi-agent pipeline using LLM APIs, especially when running multiple agents concurrently
+  sources:
+    - "https://platform.openai.com/docs/guides/rate-limits"
+    - "https://docs.anthropic.com/en/docs/build-with-claude/rate-limits"
+    - "https://langchain-ai.github.io/langgraph/concepts/low_level/#state"
+
+- id: ALYR-003
+  text: "Implement system-wide circuit breakers that trip when a downstream dependency fails repeatedly, preventing cascading failures from propagating through all 7 layers."
+  why: >
+    In a 7-layer agent hierarchy, a single failing dependency (LLM API down, vector DB
+    unreachable, tool execution timeout) can cascade upward through every layer. L5 workers
+    retry the failing call, L4 squad leads retry the failing workers, L3 masters retry the
+    failing squads — creating an exponential retry storm that consumes all tokens and blocks
+    the entire pipeline. The Circuit Breaker pattern (Michael Nygard, "Release It!") prevents
+    this: after N consecutive failures, the breaker trips OPEN, immediately rejecting calls
+    without attempting them. After a cooldown period, it moves to HALF-OPEN, allowing one
+    probe call. If the probe succeeds, the breaker closes and normal operation resumes. This
+    limits blast radius, preserves token budget, and gives failing dependencies time to recover.
+  how_to_do_right: |
+    1. Wrap every external dependency (LLM API, vector DB, tool execution) in a circuit breaker.
+    2. Configure per-dependency thresholds: failure_count=5, timeout=60s, half_open_after=120s.
+    3. When the breaker trips OPEN, return a cached/default response or raise CircuitOpenError.
+    4. Log every state transition: CLOSED->OPEN (alert), OPEN->HALF_OPEN (recovering), HALF_OPEN->CLOSED (recovered).
+    5. Expose breaker states in the L0 health dashboard so operators see which dependencies are degraded.
+    6. Different breakers for different dependencies: LLM API (trip at 3 failures), Qdrant (trip at 5), tool exec (trip at 10).
+    7. Never let a tripped breaker silently return empty results — always make the failure visible.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [langgraph]
+    library: [tenacity, circuitbreaker]
+  domains:
+    domain: [agent_orchestration, reliability]
+    concern: [fault_tolerance, cascading_failure, resilience]
+  example_good: |
+    import time
+    from enum import Enum
+    from dataclasses import dataclass
+
+    class BreakerState(Enum):
+        CLOSED = "closed"
+        OPEN = "open"
+        HALF_OPEN = "half_open"
+
+    @dataclass
+    class CircuitBreaker:
+        name: str
+        failure_threshold: int = 5
+        recovery_timeout: int = 120
+        state: BreakerState = BreakerState.CLOSED
+        failure_count: int = 0
+        last_failure_time: float = 0.0
+
+        def call(self, func, *args, **kwargs):
+            if self.state == BreakerState.OPEN:
+                if time.time() - self.last_failure_time > self.recovery_timeout:
+                    self.state = BreakerState.HALF_OPEN
+                else:
+                    raise CircuitOpenError(f"Circuit {self.name} is OPEN")
+
+            try:
+                result = func(*args, **kwargs)
+                if self.state == BreakerState.HALF_OPEN:
+                    self.state = BreakerState.CLOSED
+                    self.failure_count = 0
+                return result
+            except Exception as e:
+                self.failure_count += 1
+                self.last_failure_time = time.time()
+                if self.failure_count >= self.failure_threshold:
+                    self.state = BreakerState.OPEN
+                raise
+
+    # Usage: one breaker per dependency
+    llm_breaker = CircuitBreaker("anthropic_api", failure_threshold=3, recovery_timeout=60)
+    qdrant_breaker = CircuitBreaker("qdrant", failure_threshold=5, recovery_timeout=120)
+
+    def safe_llm_call(prompt: str) -> str:
+        return llm_breaker.call(anthropic_client.messages.create, model="claude-sonnet-4-20250514", messages=[...])
+  example_bad: |
+    # No circuit breaker — cascade failure
+    def run_worker(task):
+        for attempt in range(100):  # 100 retries!
+            try:
+                return call_llm(task.prompt)
+            except APIError:
+                time.sleep(1)  # Retry storm: 100 workers x 100 retries = 10,000 API calls
+
+    # All 7 layers retry simultaneously
+    # API rate limit hit — even healthy calls fail
+    # Token budget exhausted in minutes
+    # Pipeline stuck for hours until operator manually kills it
+  when_applies: Any agent pipeline with external dependencies (LLM APIs, databases, tool execution)
+  sources:
+    - "https://martinfowler.com/bliki/CircuitBreaker.html"
+    - "https://learn.microsoft.com/en-us/azure/architecture/patterns/circuit-breaker"
+    - "https://pypi.org/project/circuitbreaker/"
+
+# =============================================================================
+# L1 EXECUTIVE LAYER (ALYR-004 to ALYR-006)
+# Strategic priority, cross-product dependencies, vision alignment
+# =============================================================================
+
+- id: ALYR-004
+  text: "Classify every incoming task as P0 (pipeline-blocking), P1 (sprint-blocking), or P2 (nice-to-have), and enforce strict preemption — a P0 task MUST interrupt any running P1/P2 work immediately."
+  why: >
+    Without explicit priority classification, agent pipelines suffer from "priority inversion"
+    — low-priority tasks consume all available agents while critical blockers sit in a queue.
+    This mirrors the Mars Pathfinder bug (1997) where a low-priority task held a mutex that
+    starved a high-priority watchdog, causing system resets. In agent pipelines, a P0 task
+    like "LLM API key expired" or "test suite completely broken" must preempt any ongoing P1
+    work like "implement feature X." Without preemption, the pipeline continues generating
+    code that will never pass gates because the underlying infrastructure is broken. The
+    P0/P1/P2 classification must be enforced at L1 (Executive) because lower layers lack the
+    global view to judge priority correctly.
+  how_to_do_right: |
+    1. Define priority levels with clear criteria:
+       - P0: Blocks the entire pipeline or multiple products. Examples: API key expired, CI broken, data corruption.
+       - P1: Blocks current sprint or product. Examples: failing gate, missing dependency, spec ambiguity.
+       - P2: Improves quality but not blocking. Examples: refactoring, documentation, tech debt.
+    2. Implement a priority queue with preemption: when a P0 arrives, pause all P1/P2 agents.
+    3. Paused agents must checkpoint their state (partial outputs, current step) before yielding.
+    4. P0 tasks get 100% of resources until resolved. P1 tasks share remaining resources. P2 tasks only run when idle.
+    5. Log every preemption event with reason, paused tasks, and resume time.
+    6. Maximum P0 duration: 4 hours. If unresolved, escalate to human operator.
+    7. Only L1 (Executive) or L0 (System) can classify tasks as P0.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [langgraph, crewai]
+    infra: [redis]
+  domains:
+    domain: [agent_orchestration, project_management]
+    concern: [prioritization, preemption, resource_allocation]
+  example_good: |
+    from enum import IntEnum
+    from dataclasses import dataclass
+    from typing import Optional
+    import heapq, time
+
+    class Priority(IntEnum):
+        P0_PIPELINE_BLOCKING = 0
+        P1_SPRINT_BLOCKING = 1
+        P2_NICE_TO_HAVE = 2
+
+    @dataclass(order=True)
+    class PrioritizedTask:
+        priority: Priority
+        task_id: str
+        description: str
+        created_at: float
+
+    class ExecutivePriorityQueue:
+        def __init__(self):
+            self._queue: list[PrioritizedTask] = []
+            self._running: dict[str, PrioritizedTask] = {}
+
+        def submit(self, task: PrioritizedTask) -> list[str]:
+            """Returns list of agent_ids that should be preempted."""
+            heapq.heappush(self._queue, task)
+            if task.priority == Priority.P0_PIPELINE_BLOCKING:
+                preempt = [
+                    aid for aid, t in self._running.items()
+                    if t.priority > Priority.P0_PIPELINE_BLOCKING
+                ]
+                return preempt
+            return []
+
+        def next_task(self) -> Optional[PrioritizedTask]:
+            return heapq.heappop(self._queue) if self._queue else None
+
+    # Usage
+    queue = ExecutivePriorityQueue()
+    preempted = queue.submit(PrioritizedTask(
+        priority=Priority.P0_PIPELINE_BLOCKING,
+        task_id="FIX-001",
+        description="Anthropic API key expired — all agents blocked",
+        created_at=time.time(),
+    ))
+    for agent_id in preempted:
+        checkpoint_and_pause(agent_id)
+  example_bad: |
+    # FIFO queue — no priorities, P0 waits behind P2 tasks
+    task_queue = []
+    task_queue.append("refactor utils.py")        # P2: nice-to-have
+    task_queue.append("add type hints to models")  # P2: nice-to-have
+    task_queue.append("API KEY EXPIRED - ALL AGENTS BLOCKED")  # P0: critical!
+
+    # P0 task waits 2 hours behind P2 tasks
+    # All agents produce code that fails because API is down
+    # 200K tokens wasted on code that will never compile
+  when_applies: Any multi-agent pipeline with concurrent task execution
+  sources:
+    - "https://www.cs.unc.edu/~anderson/teach/comp790/papers/mars_pathfinder_long_version.html"
+    - "https://docs.crewai.com/concepts/tasks"
+    - "https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/"
+
+- id: ALYR-005
+  text: "Detect and resolve cross-product blocking dependencies at the executive level BEFORE sprint planning — never let two squads discover they block each other mid-sprint."
+  why: >
+    In a multi-product pipeline, Product A's sprint may depend on a library built in Product
+    B's sprint. If this dependency is discovered mid-sprint when a worker agent tries to import
+    a module that does not exist yet, the entire squad stalls, the sprint fails, and both
+    teams waste tokens. This is the "integration hell" problem that DevOps solved for code
+    (CI/CD) but that multi-agent systems recreate at the planning level. The L1 Executive
+    layer has the global view across all products and must build a dependency graph BEFORE
+    sprint planning. Topological sorting of this graph reveals blocking chains, and the
+    Executive must either sequence sprints correctly or parallelize with explicit interface
+    contracts (stubs/mocks) so no squad blocks another.
+  how_to_do_right: |
+    1. Before each planning cycle, build a cross-product dependency graph: nodes=sprints, edges=dependencies.
+    2. Run topological sort to detect cycles (deadlocks) and compute execution order.
+    3. For each blocking dependency: either sequence (A before B) or define an interface contract (stub).
+    4. Interface contracts must specify: function signatures, input/output types, example data, delivery deadline.
+    5. The dependent squad works against the stub; the providing squad delivers the real implementation.
+    6. When the real implementation lands, run integration tests against the contract.
+    7. If a cycle is detected (A depends on B depends on A), escalate to L1 for scope negotiation.
+    8. Track dependency resolution as a first-class metric: "dependency resolution time" per sprint.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langgraph]
+    library: [networkx]
+  domains:
+    domain: [agent_orchestration, project_management]
+    concern: [dependency_management, cross_product, sprint_planning]
+  example_good: |
+    import networkx as nx
+
+    def detect_blocking_dependencies(sprints: list[dict]) -> dict:
+        """Build dependency graph and detect blocking chains."""
+        G = nx.DiGraph()
+        for sprint in sprints:
+            G.add_node(sprint["id"], product=sprint["product"])
+            for dep in sprint.get("depends_on", []):
+                G.add_edge(dep, sprint["id"])
+
+        # Detect cycles (deadlocks)
+        cycles = list(nx.simple_cycles(G))
+        if cycles:
+            raise DependencyCycleError(f"Deadlock detected: {cycles}")
+
+        # Compute execution order
+        execution_order = list(nx.topological_sort(G))
+
+        # Find cross-product edges (the risky ones)
+        cross_product = []
+        for u, v in G.edges():
+            if G.nodes[u]["product"] != G.nodes[v]["product"]:
+                cross_product.append((u, v))
+
+        return {
+            "execution_order": execution_order,
+            "cross_product_deps": cross_product,
+            "critical_path": nx.dag_longest_path(G),
+        }
+
+    # Before sprint planning:
+    result = detect_blocking_dependencies([
+        {"id": "S05", "product": "veritas", "depends_on": []},
+        {"id": "S06", "product": "veritas", "depends_on": ["S05"]},
+        {"id": "CP01", "product": "cockpit", "depends_on": ["S05"]},  # Cross-product!
+    ])
+    # result["cross_product_deps"] = [("S05", "CP01")]
+    # Action: Define interface contract for S05 output before CP01 starts
+  example_bad: |
+    # No dependency detection — squads discover blocking mid-sprint
+    def plan_sprints(products):
+        for product in products:
+            plan_product_sprint(product)
+
+    # Mid-sprint: cockpit agent tries `from veritas.core.models import Claim`
+    # ImportError: module 'veritas.core.models' has no attribute 'Claim'
+    # Claim model is being built in veritas S05, which hasn't finished yet
+    # Cockpit squad blocked for 3 hours, 50K tokens wasted
+  when_applies: Multi-product pipelines or any system where sprints/tasks have cross-team dependencies
+  sources:
+    - "https://networkx.org/documentation/stable/reference/algorithms/dag.html"
+    - "https://martinfowler.com/articles/dependency-injection.html"
+    - "https://docs.github.com/en/issues/planning-and-tracking-with-projects/understanding-fields/about-tracks-and-tracked-by-fields"
+
+- id: ALYR-006
+  text: "Every sprint output MUST trace to the product vision — if an agent cannot articulate which vision goal its work serves, the work should not be done."
+  why: >
+    Agent pipelines are exceptionally prone to "productive drift" — agents generate plausible,
+    well-structured code that passes all automated checks but does not serve the product
+    vision. This happens because LLMs are trained to be helpful and will enthusiastically
+    implement whatever they are asked, even if it contradicts the overall direction. Without
+    explicit vision traceability, an agent hierarchy can spend weeks building features that
+    satisfy local requirements but are globally irrelevant. Amazon's "Working Backwards" process
+    and Google's OKR system both enforce this principle: every unit of work must trace to a
+    strategic objective. In agent pipelines, this traceability must be automated because there
+    is no human in the loop for every task.
+  how_to_do_right: |
+    1. Define the product vision as a structured document: 5-10 goals with measurable outcomes.
+    2. Every sprint spec must include a "vision_alignment" field: which goal(s) does this sprint advance?
+    3. At L1, validate that every sprint has at least one vision goal mapped. Reject unmapped sprints.
+    4. At L3, the Spec Master verifies that every requirement traces to a vision goal.
+    5. At QA (L3), include a "vision alignment check": does the deliverable actually advance the stated goal?
+    6. Track vision coverage: which goals have sprints? Which goals are neglected?
+    7. If >30% of sprint work is P2 with no vision alignment, raise a strategic drift alert at L1.
+    8. Review vision alignment quarterly and update goals as the product evolves.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langgraph, crewai]
+  domains:
+    domain: [agent_orchestration, product_management]
+    concern: [vision_alignment, strategic_planning, traceability]
+  example_good: |
+    from dataclasses import dataclass
+
+    @dataclass
+    class VisionGoal:
+        id: str
+        description: str
+        measurable_outcome: str
+
+    @dataclass
+    class SprintSpec:
+        sprint_id: str
+        title: str
+        vision_goals: list[str]  # Must reference at least one VisionGoal.id
+        deliverables: list[str]
+
+    PRODUCT_VISION = [
+        VisionGoal("VG-01", "Reliable fact-checking", "95% accuracy on TruthfulQA"),
+        VisionGoal("VG-02", "Sub-second verification", "<1s p99 latency"),
+        VisionGoal("VG-03", "Explainable verdicts", "100% verdicts have reasoning chain"),
+    ]
+
+    def validate_vision_alignment(spec: SprintSpec, vision: list[VisionGoal]) -> bool:
+        """Reject sprint specs that don't trace to any vision goal."""
+        valid_ids = {g.id for g in vision}
+        if not spec.vision_goals:
+            raise VisionAlignmentError(f"Sprint {spec.sprint_id} has no vision goals")
+        invalid = set(spec.vision_goals) - valid_ids
+        if invalid:
+            raise VisionAlignmentError(f"Unknown vision goals: {invalid}")
+        return True
+
+    # L1 Executive validates before sprint planning
+    spec = SprintSpec("S05", "Implement Qdrant indexing", ["VG-01", "VG-02"], [...])
+    validate_vision_alignment(spec, PRODUCT_VISION)  # Passes
+  example_bad: |
+    # No vision traceability — agents build whatever sounds reasonable
+    sprint_spec = {
+        "id": "S12",
+        "title": "Add GraphQL subscriptions for real-time updates",
+        "tasks": ["implement pubsub", "add websocket transport", "write tests"],
+    }
+    # Looks productive! But the product vision says nothing about real-time updates.
+    # Agent spent 3 days and 500K tokens building a feature nobody asked for.
+    # Passes all gates (code quality, tests, coverage) but is strategically worthless.
+  when_applies: Any multi-sprint product development pipeline, especially when agents operate autonomously
+  sources:
+    - "https://www.amazon.science/latest-news/the-science-behind-amazons-success"
+    - "https://re-work.co/blog/OKRs-google"
+    - "https://docs.crewai.com/concepts/crews#crew-output"
+
+# =============================================================================
+# L2 VP LAYER (ALYR-007 to ALYR-009)
+# Pipeline orchestration, capacity planning, quality calibration
+# =============================================================================
+
+- id: ALYR-007
+  text: "Enforce explicit phase transition gates between Spec, Exec, and QA — no phase may start until the previous phase's gate passes, and gate criteria must be machine-checkable."
+  why: >
+    Without phase gates, agent pipelines exhibit "phase bleed" — execution starts before the
+    spec is complete, QA reviews code that is still being written, and rework addresses
+    findings against a moving target. This mirrors the "waterfall without gates" antipattern
+    in traditional software, but is worse in agent systems because agents cannot exercise
+    judgment about when to wait. If a spec is 70% complete when execution starts, the executor
+    agent will hallucinate the missing 30%, producing code that must be entirely rewritten.
+    Phase gates force completeness: spec must be 100% before exec starts, exec must pass smoke
+    tests before QA starts. The gates must be machine-checkable (not "looks good to me")
+    because the gatekeepers are also agents.
+  how_to_do_right: |
+    1. Define 3 mandatory gates: SPEC_COMPLETE, EXEC_COMPLETE, QA_COMPLETE.
+    2. SPEC_COMPLETE criteria (all must pass):
+       - All requirements have acceptance criteria (machine-parseable)
+       - All deliverables listed with file paths
+       - All dependencies resolved or stubbed
+       - State machine defined for any entity with lifecycle
+    3. EXEC_COMPLETE criteria:
+       - All deliverable files exist and are non-empty
+       - All files parse without syntax errors
+       - Import graph resolves (no missing modules)
+       - Smoke tests pass (at minimum: files import, classes instantiate)
+    4. QA_COMPLETE criteria:
+       - Test coverage >= threshold (e.g., 90%)
+       - All critical findings addressed
+       - No P0/P1 open findings
+    5. Gate results are persisted — never re-run a passing gate unless inputs change.
+    6. Gate failure produces structured output: which criterion failed, what evidence, suggested fix.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [langgraph]
+    library: [pydantic]
+  domains:
+    domain: [agent_orchestration, quality_assurance]
+    concern: [phase_gates, workflow, quality_control]
+  example_good: |
+    from pydantic import BaseModel
+    from enum import Enum
+
+    class GateResult(BaseModel):
+        gate_name: str
+        passed: bool
+        criteria: list[dict]  # {"name": str, "passed": bool, "evidence": str}
+        blocking_failures: list[str]
+
+    class Phase(Enum):
+        SPEC = "spec"
+        EXEC = "exec"
+        QA = "qa"
+        DONE = "done"
+
+    GATE_TRANSITIONS = {
+        Phase.SPEC: Phase.EXEC,
+        Phase.EXEC: Phase.QA,
+        Phase.QA: Phase.DONE,
+    }
+
+    def check_spec_gate(sprint_state: dict) -> GateResult:
+        criteria = []
+        # Check: all requirements have acceptance criteria
+        for req in sprint_state["requirements"]:
+            has_ac = bool(req.get("acceptance_criteria"))
+            criteria.append({
+                "name": f"req_{req['id']}_has_acceptance_criteria",
+                "passed": has_ac,
+                "evidence": req.get("acceptance_criteria", "MISSING"),
+            })
+        # Check: all deliverables listed
+        has_deliverables = len(sprint_state.get("deliverables", [])) > 0
+        criteria.append({
+            "name": "has_deliverables",
+            "passed": has_deliverables,
+            "evidence": f"{len(sprint_state.get('deliverables', []))} deliverables listed",
+        })
+
+        failures = [c["name"] for c in criteria if not c["passed"]]
+        return GateResult(
+            gate_name="SPEC_COMPLETE",
+            passed=len(failures) == 0,
+            criteria=criteria,
+            blocking_failures=failures,
+        )
+  example_bad: |
+    # No gates — phases overlap, spec is incomplete when exec starts
+    async def run_sprint(spec):
+        code = await exec_agent.generate(spec)  # Spec is 60% complete
+        # Exec agent hallucinated 40% of requirements
+        review = await qa_agent.review(code)     # QA reviews hallucinated code
+        # QA finds 47 issues, 30 of which are "not in spec"
+        # Rework agent fixes against the still-incomplete spec
+        # Infinite loop: fix -> new findings -> fix -> new findings
+  when_applies: Any phased agent pipeline (Spec -> Exec -> QA -> Rework)
+  sources:
+    - "https://langchain-ai.github.io/langgraph/concepts/low_level/#conditional-edges"
+    - "https://docs.pydantic.dev/latest/concepts/validators/"
+    - "https://martinfowler.com/articles/continuousIntegration.html"
+
+- id: ALYR-008
+  text: "Limit concurrent squads based on available agent capacity and context window limits — running N squads when you have resources for N/2 degrades ALL squads rather than completing half well."
+  why: >
+    LLM-based agents are context-window-bound, not CPU-bound. Running 10 concurrent squads
+    with 5 agents each requires 50 active context windows, but if only 20 can fit in memory
+    or the API rate limit supports only 20 concurrent calls, all 50 agents compete for the
+    same bottleneck. This creates thrashing: agents wait for API slots, contexts expire,
+    partial results are evicted, and agents must re-read large contexts. The result is worse
+    than running 5 squads sequentially because of the overhead of context switching and cache
+    misses. Little's Law (L = lambda * W) applies: if arrival rate (squads) exceeds service
+    rate (API throughput), queue length grows unboundedly and latency diverges.
+  how_to_do_right: |
+    1. Measure your actual throughput: max concurrent LLM calls per second at your API tier.
+    2. Each squad needs ~3-5 concurrent agent slots. Divide throughput by agents-per-squad = max squads.
+    3. Implement a semaphore or token bucket at L2 that gates squad creation.
+    4. When a new squad is requested and all slots are full, queue it — do not degrade running squads.
+    5. Monitor queue depth: if queue > 2*capacity, alert L1 to reprioritize or defer P2 work.
+    6. Track per-squad completion time. If it increases >50% when adding squads, you are over capacity.
+    7. Reserve 20% capacity headroom for P0 tasks that may need immediate resources.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langgraph, crewai]
+    library: [asyncio]
+  domains:
+    domain: [agent_orchestration, capacity_planning]
+    concern: [concurrency, throughput, resource_management]
+  example_good: |
+    import asyncio, time
+    from dataclasses import dataclass, field
+
+    @dataclass
+    class CapacityPlanner:
+        max_concurrent_squads: int
+        agents_per_squad: int
+        _semaphore: asyncio.Semaphore = field(init=False)
+        _active_squads: dict = field(default_factory=dict, init=False)
+
+        def __post_init__(self):
+            self._semaphore = asyncio.Semaphore(self.max_concurrent_squads)
+
+        async def run_squad(self, squad_id: str, tasks: list) -> dict:
+            """Only runs when capacity is available, otherwise waits."""
+            async with self._semaphore:
+                self._active_squads[squad_id] = {"started": time.time(), "tasks": len(tasks)}
+                try:
+                    result = await execute_squad(squad_id, tasks)
+                    return result
+                finally:
+                    del self._active_squads[squad_id]
+
+        @property
+        def utilization(self) -> float:
+            return len(self._active_squads) / self.max_concurrent_squads
+
+    # Configure based on actual API capacity
+    # Claude Max: ~60 req/min -> 15 concurrent agents -> 3-5 squads
+    planner = CapacityPlanner(max_concurrent_squads=4, agents_per_squad=4)
+
+    # Queue squads — only 4 run at a time, rest wait
+    results = await asyncio.gather(*[
+        planner.run_squad(f"squad_{i}", tasks[i])
+        for i in range(10)  # 10 squads, but only 4 concurrent
+    ])
+  example_bad: |
+    # No capacity control — all squads launched simultaneously
+    async def run_all_squads(squads):
+        return await asyncio.gather(*[
+            run_squad(s) for s in squads  # 20 squads, 80 agents, API allows 15 concurrent
+        ])
+    # Result: API rate limit hit, retries everywhere, 80% of calls fail
+    # Squads that would finish in 5 minutes now take 45 minutes
+    # Total wall-clock time WORSE than running sequentially
+  when_applies: Any multi-agent system running concurrent work streams against shared API rate limits
+  sources:
+    - "https://docs.anthropic.com/en/docs/build-with-claude/rate-limits"
+    - "https://docs.python.org/3/library/asyncio-sync.html#asyncio.Semaphore"
+    - "https://en.wikipedia.org/wiki/Little%27s_law"
+
+- id: ALYR-009
+  text: "Calibrate quality gate thresholds dynamically based on sprint maturity — early sprints should have lenient gates to encourage exploration, mature sprints should have strict gates to enforce quality."
+  why: >
+    A fixed quality threshold (e.g., "90% test coverage always") is wrong at both ends of the
+    spectrum. In early sprints (S00-S03), the codebase is exploratory — models change shape,
+    APIs evolve, and requiring 90% coverage forces agents to write tests for code that will be
+    rewritten next sprint. This wastes tokens and slows exploration. In mature sprints
+    (S15+), the same 90% threshold is too low — the architecture is stable, and any uncovered
+    code is likely a real gap. Netflix's "paved road" approach and Google's "prober coverage"
+    strategy both use graduated quality bars. The L2 VP layer should calibrate thresholds
+    because it has visibility into sprint position within the product lifecycle.
+  how_to_do_right: |
+    1. Define maturity tiers based on sprint position:
+       - Foundation (S00-S07): 70% coverage, 0 P0 findings, P1 advisory only
+       - Intelligence (S08-S18): 80% coverage, 0 P0, max 3 P1
+       - Hardening (S19+): 90% coverage, 0 P0, 0 P1, mutation kill rate > 70%
+    2. Store thresholds in a config file, not hardcoded — allow L1 to override per sprint.
+    3. Gate logic reads the sprint_id, determines maturity tier, applies appropriate thresholds.
+    4. When a gate fails at a lenient threshold, log it as WARNING (not FAILURE) at higher tiers.
+    5. Track the trend: if coverage decreases sprint-over-sprint, alert regardless of threshold.
+    6. Never make thresholds MORE lenient as sprints progress — monotonically increasing only.
+    7. Document the rationale for each threshold so future operators understand the graduation.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langgraph]
+    library: [pydantic, pytest]
+  domains:
+    domain: [agent_orchestration, quality_assurance]
+    concern: [quality_calibration, gate_thresholds, maturity_model]
+  example_good: |
+    from pydantic import BaseModel
+
+    class QualityThresholds(BaseModel):
+        min_coverage: float
+        max_p0_findings: int
+        max_p1_findings: int
+        mutation_kill_rate: float
+        require_docstrings: bool
+
+    MATURITY_TIERS = {
+        "foundation": QualityThresholds(
+            min_coverage=0.70, max_p0_findings=0, max_p1_findings=99,
+            mutation_kill_rate=0.0, require_docstrings=False,
+        ),
+        "intelligence": QualityThresholds(
+            min_coverage=0.80, max_p0_findings=0, max_p1_findings=3,
+            mutation_kill_rate=0.50, require_docstrings=True,
+        ),
+        "hardening": QualityThresholds(
+            min_coverage=0.90, max_p0_findings=0, max_p1_findings=0,
+            mutation_kill_rate=0.70, require_docstrings=True,
+        ),
+    }
+
+    def get_thresholds(sprint_id: str) -> QualityThresholds:
+        num = int(sprint_id.replace("S", "").replace("CP", ""))
+        if num <= 7:
+            return MATURITY_TIERS["foundation"]
+        elif num <= 18:
+            return MATURITY_TIERS["intelligence"]
+        else:
+            return MATURITY_TIERS["hardening"]
+
+    # Gate applies tier-appropriate threshold
+    thresholds = get_thresholds("S03")
+    assert coverage >= thresholds.min_coverage  # 70% for foundation
+  example_bad: |
+    # Fixed threshold for all sprints — wastes tokens or ships bugs
+    COVERAGE_THRESHOLD = 0.90
+
+    def check_gate(sprint_id, coverage):
+        if coverage < COVERAGE_THRESHOLD:
+            return "FAIL"
+        return "PASS"
+
+    # S00 (exploratory): Agent writes 200 tests for models that change next sprint
+    # S30 (mature): 90% threshold passes but 10% uncovered is the security-critical path
+    # Both cases are wrong — one wastes effort, the other misses risk
+  when_applies: Any pipeline with multiple sprints spanning exploratory to mature phases
+  sources:
+    - "https://netflixtechblog.com/full-cycle-developers-at-netflix-a08c31f83249"
+    - "https://testing.googleblog.com/2014/07/measuring-coverage-at-google.html"
+    - "https://docs.pytest.org/en/stable/how-to/usage.html"
+
+# =============================================================================
+# L3 MASTER LAYER (ALYR-010 to ALYR-013)
+# Spec completeness, code generation guidance, review strategy, surgical rework
+# =============================================================================
+
+- id: ALYR-010
+  text: "Spec Master: validate requirement completeness using the INVEST checklist (Independent, Negotiable, Valuable, Estimable, Small, Testable) — reject any requirement that fails 2+ criteria."
+  why: >
+    LLM-based executor agents are literal interpreters — they implement exactly what the spec
+    says, including its ambiguities and omissions. A vague requirement like "implement user
+    authentication" gives the agent no constraints, so it will make arbitrary choices (JWT vs
+    session cookies? OAuth2 vs API keys? 15-minute vs 24-hour token expiry?) that may conflict
+    with the product vision. The INVEST criteria (Bill Wake, 2003) provide a machine-checkable
+    heuristic for requirement quality. If a requirement is not Testable, the QA agent cannot
+    verify it. If it is not Estimable, the capacity planner cannot allocate resources. If it
+    is not Small, it will exceed the executor agent's context window and produce incomplete
+    results.
+  how_to_do_right: |
+    1. For every requirement, evaluate INVEST criteria:
+       - Independent: Can be implemented without waiting for other requirements
+       - Negotiable: Implementation details are flexible (not over-specified)
+       - Valuable: Directly serves a product vision goal
+       - Estimable: Complexity can be assessed (no "black boxes")
+       - Small: Fits in one agent's context window (~100K tokens of spec + code)
+       - Testable: Has explicit acceptance criteria with concrete examples
+    2. Score each criterion as PASS/FAIL with evidence.
+    3. If 2+ criteria fail, reject the requirement and return specific improvement suggestions.
+    4. The Spec Master should decompose non-Small requirements into sub-requirements.
+    5. For non-Testable requirements, generate example acceptance criteria and ask for validation.
+    6. Track requirement quality metrics: % of requirements passing INVEST per sprint.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai]
+    library: [pydantic]
+  domains:
+    domain: [agent_orchestration, specification]
+    concern: [requirements, quality, completeness]
+  example_good: |
+    from pydantic import BaseModel
+    from typing import Literal
+
+    class INVESTCheck(BaseModel):
+        criterion: Literal["independent", "negotiable", "valuable", "estimable", "small", "testable"]
+        passed: bool
+        evidence: str
+
+    class RequirementValidation(BaseModel):
+        requirement_id: str
+        text: str
+        invest_checks: list[INVESTCheck]
+        overall_pass: bool
+        improvement_suggestions: list[str]
+
+    def validate_requirement(req: dict) -> RequirementValidation:
+        checks = []
+        # Testable: must have acceptance criteria
+        has_ac = bool(req.get("acceptance_criteria"))
+        checks.append(INVESTCheck(
+            criterion="testable",
+            passed=has_ac,
+            evidence=req.get("acceptance_criteria", "MISSING - no acceptance criteria"),
+        ))
+        # Small: estimate tokens (requirement text + expected code < 100K tokens)
+        est_tokens = len(req["text"].split()) * 2  # rough estimate
+        checks.append(INVESTCheck(
+            criterion="small",
+            passed=est_tokens < 50_000,
+            evidence=f"Estimated {est_tokens} tokens",
+        ))
+        # Valuable: must map to a vision goal
+        has_vision = bool(req.get("vision_goal"))
+        checks.append(INVESTCheck(
+            criterion="valuable",
+            passed=has_vision,
+            evidence=req.get("vision_goal", "MISSING - no vision goal mapped"),
+        ))
+
+        failures = [c for c in checks if not c.passed]
+        suggestions = [f"Fix '{c.criterion}': {c.evidence}" for c in failures]
+        return RequirementValidation(
+            requirement_id=req["id"], text=req["text"],
+            invest_checks=checks, overall_pass=len(failures) < 2,
+            improvement_suggestions=suggestions,
+        )
+  example_bad: |
+    # Vague requirement with no validation
+    requirement = {
+        "id": "RF-012",
+        "text": "Implement the authentication system",
+        # No acceptance criteria, no size estimate, no value mapping
+    }
+    # Agent decides on its own: JWT with 7-day expiry, no refresh tokens, bcrypt rounds=4
+    # None of these choices match the security spec that hasn't been written yet
+    # QA agent can't verify because there's nothing to verify against
+  when_applies: Any pipeline where LLM agents implement requirements from specs
+  sources:
+    - "https://xp123.com/articles/invest-in-good-stories-and-smart-tasks/"
+    - "https://www.agilealliance.org/glossary/invest/"
+    - "https://docs.crewai.com/concepts/tasks"
+
+- id: ALYR-011
+  text: "Ace Exec: always generate architecture scaffolding (interfaces, types, module structure) BEFORE implementation — never let a worker agent write business logic without knowing the contracts."
+  why: >
+    LLM agents generating code without architectural scaffolding produce "locally correct,
+    globally incoherent" code. Each function works in isolation, but modules do not compose:
+    one agent returns a dict, another expects a Pydantic model, a third uses a TypedDict —
+    all representing the same entity. This is the "Big Ball of Mud" pattern at generation
+    speed. Architecture-first generation (inspired by TDD's "write the test first" and
+    contract-first API design) establishes shared types, interfaces, and module boundaries
+    before any business logic is written. Worker agents then implement against contracts,
+    and integration becomes mechanical rather than creative.
+  how_to_do_right: |
+    1. Ace Exec generates architecture phase BEFORE implementation phase:
+       a. Type definitions (Pydantic models, TypedDict, dataclasses, enums)
+       b. Interface contracts (abstract base classes or Protocol types)
+       c. Module structure (__init__.py with public API exports)
+       d. Error types (custom exceptions hierarchy)
+    2. Architecture artifacts are validated: types parse, imports resolve, no circular deps.
+    3. Worker agents receive architecture artifacts as context, not just requirement text.
+    4. Workers MUST use the defined types — no inline dicts, no ad-hoc classes.
+    5. Integration test stubs are generated from the architecture (test that modules compose).
+    6. Architecture changes require L3 approval and ripple analysis to affected workers.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai, langgraph]
+    library: [pydantic, abc]
+  domains:
+    domain: [agent_orchestration, software_architecture]
+    concern: [architecture_first, contracts, composability]
+  example_good: |
+    # Phase 1: Ace Exec generates architecture scaffolding
+    # --- src/veritas/core/types.py ---
+    from pydantic import BaseModel
+    from enum import Enum
+    from uuid import UUID
+    from datetime import datetime
+
+    class ClaimStatus(Enum):
+        PENDING = "pending"
+        VERIFIED = "verified"
+        REFUTED = "refuted"
+        INCONCLUSIVE = "inconclusive"
+
+    class Claim(BaseModel):
+        id: UUID
+        text: str
+        status: ClaimStatus = ClaimStatus.PENDING
+        confidence: float  # 0.0 to 1.0
+        created_at: datetime
+
+    class VerificationResult(BaseModel):
+        claim_id: UUID
+        verdict: ClaimStatus
+        confidence: float
+        evidence: list[str]
+        reasoning: str
+
+    # --- src/veritas/core/interfaces.py ---
+    from abc import ABC, abstractmethod
+
+    class Verifier(ABC):
+        @abstractmethod
+        async def verify(self, claim: Claim) -> VerificationResult:
+            """Verify a claim and return structured result."""
+            ...
+
+    # Phase 2: Worker implements against the contract
+    class LLMVerifier(Verifier):
+        async def verify(self, claim: Claim) -> VerificationResult:
+            # Implementation uses the defined types — guaranteed to compose
+            ...
+  example_bad: |
+    # No architecture phase — worker invents types on the fly
+    async def verify_claim(claim_text: str) -> dict:
+        result = await call_llm(f"Verify: {claim_text}")
+        return {
+            "result": result,
+            "status": "done",  # String, not enum
+            "score": 0.8,      # "score" vs "confidence" — inconsistent
+        }
+
+    # Another worker uses different types for the same concept
+    async def check_fact(fact: dict) -> tuple:
+        return ("true", 0.9, ["source1"])  # Tuple, not model
+
+    # Integration: these don't compose. No shared types, no contracts.
+  when_applies: Any multi-agent code generation pipeline where multiple agents produce code that must integrate
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/models/"
+    - "https://docs.python.org/3/library/abc.html"
+    - "https://martinfowler.com/articles/designDead.html"
+
+- id: ALYR-012
+  text: "QA Master: review the critical execution path first, then boundary conditions, then invariants — never spread review effort uniformly across all code."
+  why: >
+    LLM-generated code has predictable failure patterns: the happy path is usually correct
+    (the model has seen millions of examples), but error handling, boundary conditions, and
+    state invariants are systematically weak. A uniform review strategy wastes tokens re-verifying
+    code the model got right while missing the code it got wrong. Research from Microsoft
+    (2024) on AI-generated code shows that 73% of bugs are in error handling and edge cases,
+    not in the main logic. The QA Master should follow a risk-weighted review strategy:
+    critical path first (handles the most traffic), boundary conditions second (off-by-one,
+    empty inputs, max values), invariants third (state machine violations, constraint
+    violations). This maximizes bugs found per token spent.
+  how_to_do_right: |
+    1. Identify the critical path: the main execution flow that handles 80% of use cases.
+    2. Review the critical path for logical correctness, type safety, and performance.
+    3. Then review boundary conditions: empty inputs, max-length inputs, null/None values, zero quantities.
+    4. Then review invariants: state machine transitions, database constraints, business rules.
+    5. Allocate review budget: 40% critical path, 30% boundaries, 20% invariants, 10% style/docs.
+    6. For each finding, classify as P0 (blocks release), P1 (must fix this sprint), P2 (tech debt).
+    7. Stop reviewing when token budget is exhausted — do NOT sacrifice depth for breadth.
+    8. Generate a structured review report: findings per category, with code location and suggested fix.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai]
+    library: [pytest, pydantic]
+  domains:
+    domain: [agent_orchestration, quality_assurance]
+    concern: [code_review, risk_based_testing, critical_path]
+  example_good: |
+    from dataclasses import dataclass
+    from enum import Enum
+
+    class ReviewCategory(Enum):
+        CRITICAL_PATH = "critical_path"
+        BOUNDARY = "boundary"
+        INVARIANT = "invariant"
+        STYLE = "style"
+
+    @dataclass
+    class ReviewBudget:
+        total_tokens: int
+        allocations: dict  # category -> fraction
+
+        RISK_WEIGHTED = {
+            ReviewCategory.CRITICAL_PATH: 0.40,
+            ReviewCategory.BOUNDARY: 0.30,
+            ReviewCategory.INVARIANT: 0.20,
+            ReviewCategory.STYLE: 0.10,
+        }
+
+    @dataclass
+    class ReviewFinding:
+        category: ReviewCategory
+        severity: str  # P0, P1, P2
+        file: str
+        line: int
+        description: str
+        suggested_fix: str
+
+    def build_review_plan(code_files: list[str], budget: ReviewBudget) -> list[dict]:
+        """Order review tasks by risk, not by file order."""
+        plan = []
+        # 1. Critical path: entry points, main handlers, core business logic
+        plan.append({"category": ReviewCategory.CRITICAL_PATH, "focus": [
+            "Check return types match interface contracts",
+            "Verify error handling for all external calls (LLM, DB, API)",
+            "Verify state transitions follow the state machine",
+        ]})
+        # 2. Boundaries: edge cases LLMs consistently get wrong
+        plan.append({"category": ReviewCategory.BOUNDARY, "focus": [
+            "Empty string inputs", "None/null values", "Max-length inputs",
+            "Concurrent access", "Zero quantities", "Unicode edge cases",
+        ]})
+        # 3. Invariants: business rules that must hold across all paths
+        plan.append({"category": ReviewCategory.INVARIANT, "focus": [
+            "State machine: no impossible transitions",
+            "Database: constraints enforced in code AND schema",
+            "Auth: no unprotected endpoints",
+        ]})
+        return plan
+  example_bad: |
+    # Uniform review — wastes tokens on obvious correct code
+    def review_code(files):
+        for f in files:
+            review = call_llm(f"Review this file: {read(f)}")  # Reviews everything equally
+            # Spends 50K tokens reviewing a well-written __init__.py
+            # Runs out of budget before reaching the complex state machine code
+            # Misses the off-by-one in pagination because it never got there
+  when_applies: Any QA phase in an agent pipeline, especially for LLM-generated code
+  sources:
+    - "https://arxiv.org/abs/2401.02990"
+    - "https://testing.googleblog.com/2014/07/measuring-coverage-at-google.html"
+    - "https://martinfowler.com/articles/practical-test-pyramid.html"
+
+- id: ALYR-013
+  text: "Rework Master: apply surgical fixes that change the minimum code necessary to resolve a finding — never regenerate an entire file to fix a single bug."
+  why: >
+    LLM agents have a strong tendency to regenerate entire files when asked to "fix" something.
+    This is because their training data contains more examples of writing complete files than
+    of editing specific lines. The problem: regenerating a 500-line file to fix a 3-line bug
+    introduces regression risk (the model may silently change working code), wastes tokens
+    (500 lines vs 3 lines), and invalidates previous QA review (the entire file must be
+    re-reviewed). Surgical fixes — targeting only the failing code path — are faster, safer,
+    and cheaper. This mirrors the "minimal diff" principle in code review: the best fix is the
+    smallest change that resolves the issue. The Rework Master should produce diffs, not
+    rewrites.
+  how_to_do_right: |
+    1. Parse the QA finding to extract: file path, line range, expected behavior, actual behavior.
+    2. Read only the affected function/class, not the entire file.
+    3. Generate a targeted fix: specific lines to change, with before/after diff.
+    4. Validate the fix resolves the finding WITHOUT changing any other behavior.
+    5. Run only the affected tests, not the entire test suite (for speed).
+    6. If the fix requires changing more than 20 lines, flag for L3 review — it might indicate a design issue.
+    7. Never use "rewrite the file" as a fix strategy. Use edit/patch operations instead.
+    8. Track rework metrics: lines_changed / total_file_lines should be < 10% per fix.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langgraph]
+    library: [difflib]
+  domains:
+    domain: [agent_orchestration, rework]
+    concern: [minimal_change, surgical_fix, regression_prevention]
+  example_good: |
+    from dataclasses import dataclass
+
+    @dataclass
+    class SurgicalFix:
+        file_path: str
+        finding_id: str
+        old_code: str  # Exact lines to replace
+        new_code: str  # Replacement lines
+        affected_tests: list[str]  # Only these tests need re-running
+
+    def create_surgical_fix(finding: dict) -> SurgicalFix:
+        """Generate minimal fix for a QA finding."""
+        # Read only the affected function
+        file_content = read_file(finding["file"])
+        function_code = extract_function(file_content, finding["function_name"])
+
+        # Generate fix for just the affected lines
+        fix_prompt = f"""
+        Fix ONLY the following issue. Do NOT change any other code.
+
+        File: {finding['file']}
+        Function: {finding['function_name']}
+        Issue: {finding['description']}
+        Expected: {finding['expected']}
+        Actual: {finding['actual']}
+
+        Current code:
+        {function_code}
+
+        Return ONLY the changed lines as a diff.
+        """
+        fix = call_llm(fix_prompt)
+
+        return SurgicalFix(
+            file_path=finding["file"],
+            finding_id=finding["id"],
+            old_code=function_code,
+            new_code=apply_diff(function_code, fix),
+            affected_tests=find_tests_for_function(finding["file"], finding["function_name"]),
+        )
+
+    # Apply fix using edit tool, not write tool
+    fix = create_surgical_fix(finding)
+    edit_file(fix.file_path, old_string=fix.old_code, new_string=fix.new_code)
+    run_tests(fix.affected_tests)  # Only affected tests, not full suite
+  example_bad: |
+    # Full file regeneration to fix a single bug
+    def fix_finding(finding):
+        file_content = read_file(finding["file"])
+        fixed = call_llm(f"Fix this bug in the file:\n{file_content}\n\nBug: {finding['description']}")
+        write_file(finding["file"], fixed)  # 500 lines rewritten for a 3-line fix
+
+    # Problems:
+    # 1. Model silently changed a working function on line 47 (regression)
+    # 2. Used 50K tokens instead of 3K (16x waste)
+    # 3. QA must re-review entire file (previous review invalidated)
+    # 4. Three other findings in same file are now invalid (line numbers shifted)
+  when_applies: Any rework/fix phase in an agent pipeline
+  sources:
+    - "https://google.github.io/eng-practices/review/reviewer/looking-for.html"
+    - "https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/reviewing-changes-in-pull-requests"
+    - "https://docs.python.org/3/library/difflib.html"
+
+# =============================================================================
+# L4 SQUAD LEAD LAYER (ALYR-014 to ALYR-016)
+# Task decomposition, agent assignment, progress monitoring
+# =============================================================================
+
+- id: ALYR-014
+  text: "Decompose every task into atomic work packages — each work package must have a single deliverable file, clear acceptance criteria, and be completable by one agent in one context window."
+  why: >
+    LLM agents have a hard context window limit (200K tokens for Claude, 128K for GPT-4). A
+    task that requires reading 5 large files, understanding their relationships, and producing
+    changes across all of them will exceed this limit, causing the agent to lose context and
+    produce incomplete or inconsistent results. Atomic work packages (AWPs) are the solution:
+    each WP targets a single file, has self-contained context (spec excerpt + file content +
+    tests), and fits within one context window. This also enables parallelism — 5 AWPs on
+    5 files can run concurrently. The Squad Lead's job is decomposition: turning a broad task
+    into AWPs that agents can execute independently without coordination overhead.
+  how_to_do_right: |
+    1. Each work package has exactly ONE deliverable file path.
+    2. The WP spec includes: file path, function(s) to implement, input/output types, acceptance criteria.
+    3. Context for each WP: relevant spec section (< 5K tokens) + target file + type definitions.
+    4. Total context per WP: < 50K tokens (leaving room for the agent's reasoning).
+    5. Acceptance criteria are machine-checkable: "function X exists", "test Y passes", "type Z is used."
+    6. If a task requires coordinated changes across files, create one WP per file + an integration WP.
+    7. Track WP granularity: if agents consistently fail WPs, they are too large. If WPs are trivial (< 10 lines), they are too small.
+    8. Each WP includes a "done" definition: what evidence proves completion.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [crewai, langgraph]
+    library: [pydantic]
+  domains:
+    domain: [agent_orchestration, task_management]
+    concern: [decomposition, atomic_work, context_management]
+  example_good: |
+    from pydantic import BaseModel
+
+    class WorkPackage(BaseModel):
+        id: str
+        deliverable_file: str  # Exactly ONE file
+        description: str
+        acceptance_criteria: list[str]
+        context_files: list[str]  # Files the agent needs to read
+        type_definitions: list[str]  # Shared types to use
+        estimated_tokens: int  # Must be < 50K
+        depends_on: list[str]  # Other WP IDs that must complete first
+
+    def decompose_task(task: dict) -> list[WorkPackage]:
+        """Break a broad task into atomic work packages."""
+        wps = []
+        for deliverable in task["deliverables"]:
+            # Compute context budget
+            file_tokens = count_tokens(deliverable["file"]) if file_exists(deliverable["file"]) else 0
+            spec_tokens = count_tokens(deliverable["spec_section"])
+            type_tokens = sum(count_tokens(t) for t in deliverable["types"])
+            total = file_tokens + spec_tokens + type_tokens
+
+            if total > 50_000:
+                sub_wps = split_by_function(deliverable)
+                wps.extend(sub_wps)
+            else:
+                wps.append(WorkPackage(
+                    id=f"WP-{task['id']}-{len(wps):02d}",
+                    deliverable_file=deliverable["file"],
+                    description=deliverable["description"],
+                    acceptance_criteria=deliverable["acceptance_criteria"],
+                    context_files=deliverable.get("context_files", []),
+                    type_definitions=deliverable.get("types", []),
+                    estimated_tokens=total,
+                    depends_on=deliverable.get("depends_on", []),
+                ))
+        return wps
+  example_bad: |
+    # Monolithic task — agent loses context and produces garbage
+    task = {
+        "description": "Implement the entire verification pipeline",
+        "files": [
+            "src/veritas/core/models.py",      # 800 lines
+            "src/veritas/core/verifier.py",     # 600 lines
+            "src/veritas/core/evidence.py",     # 500 lines
+            "src/veritas/api/endpoints.py",     # 400 lines
+            "tests/test_verification.py",       # 300 lines
+        ],
+        # Total: 2,600 lines + spec + types = easily 150K tokens
+        # Agent reads first 3 files, forgets file 1 by the time it writes file 5
+    }
+  when_applies: Any squad-level task decomposition in a multi-agent pipeline
+  sources:
+    - "https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching"
+    - "https://docs.crewai.com/concepts/tasks"
+    - "https://www.agilealliance.org/glossary/decomposition/"
+
+- id: ALYR-015
+  text: "Assign agents to work packages based on complexity x domain_expertise matching — a complex task given to a generalist agent wastes tokens on exploration that an expert would skip."
+  why: >
+    Not all agents are equal. A code generation agent configured with Python-specific system
+    prompt, few-shot examples, and tool access will outperform a general-purpose agent on
+    Python tasks by 30-40% (measured in token efficiency and first-pass correctness). In a
+    multi-agent pipeline, the Squad Lead must match work packages to the best-fit agent,
+    considering: (1) task complexity (simple CRUD vs complex state machine), (2) domain
+    (security, database, API, ML), (3) agent configuration (system prompt, tools, examples).
+    Random or round-robin assignment wastes the specialization investment. This is analogous
+    to the "skills-based routing" used in contact centers, where complex queries go to senior
+    agents and simple queries go to juniors.
+  how_to_do_right: |
+    1. Tag each agent with capabilities: languages, frameworks, domains, complexity_range.
+    2. Tag each work package with requirements: primary_language, framework, domain, complexity_level.
+    3. Compute a match score: count matching tags, weight by importance (domain > language > framework).
+    4. Assign WP to the agent with the highest match score. Break ties by current load (prefer idle agents).
+    5. If no agent scores above threshold (0.5), create a generalist assignment with explicit guidance.
+    6. Track assignment outcomes: did the agent's first-pass succeed? If not, was it a mismatch?
+    7. Use assignment outcomes to update agent capability profiles (learning loop).
+    8. Never assign a security-critical WP to an agent without security in its capability profile.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [crewai]
+  domains:
+    domain: [agent_orchestration, task_management]
+    concern: [assignment, matching, specialization]
+  example_good: |
+    from dataclasses import dataclass
+
+    @dataclass
+    class AgentProfile:
+        agent_id: str
+        capabilities: set[str]  # {"python", "security", "database", "api"}
+        complexity_range: tuple[int, int]  # (min, max) complexity score 1-10
+        current_load: int  # Active work packages
+
+    @dataclass
+    class WorkPackageRequirements:
+        wp_id: str
+        primary_domain: str
+        required_capabilities: set[str]
+        complexity: int  # 1-10
+
+    def assign_agent(wp: WorkPackageRequirements, agents: list[AgentProfile]) -> str:
+        """Find best-fit agent for work package."""
+        scores = []
+        for agent in agents:
+            cap_match = len(wp.required_capabilities & agent.capabilities) / max(len(wp.required_capabilities), 1)
+            lo, hi = agent.complexity_range
+            complexity_fit = 1.0 if lo <= wp.complexity <= hi else 0.5
+            load_penalty = max(0, 1.0 - agent.current_load * 0.2)
+            score = cap_match * 0.5 + complexity_fit * 0.3 + load_penalty * 0.2
+            scores.append((score, agent.agent_id))
+
+        scores.sort(reverse=True)
+        best_score, best_agent = scores[0]
+        if best_score < 0.5:
+            logger.warning(f"Low match ({best_score:.2f}) for {wp.wp_id}")
+        return best_agent
+
+    # Example: security WP goes to security-specialized agent
+    agents = [
+        AgentProfile("agent-1", {"python", "api", "crud"}, (1, 5), 0),
+        AgentProfile("agent-2", {"python", "security", "crypto"}, (5, 10), 0),
+    ]
+    wp = WorkPackageRequirements("WP-05", "security", {"python", "security"}, 8)
+    assigned = assign_agent(wp, agents)  # "agent-2" — security expert
+  example_bad: |
+    # Round-robin assignment — ignores expertise
+    def assign_tasks(tasks, agents):
+        for i, task in enumerate(tasks):
+            agent = agents[i % len(agents)]
+            agent.execute(task)
+
+    # Security-critical task assigned to CRUD agent
+    # Agent wastes 100K tokens exploring security patterns it doesn't know
+    # Produces code with 5 vulnerabilities that QA must catch
+  when_applies: Any squad with multiple agents of different specializations
+  sources:
+    - "https://docs.crewai.com/concepts/agents#agent-attributes"
+    - "https://en.wikipedia.org/wiki/Skills-based_routing"
+    - "https://langchain-ai.github.io/langgraph/concepts/multi_agent/"
+
+- id: ALYR-016
+  text: "Monitor work package progress at 25%, 50%, and 75% completion checkpoints — if an agent is stuck at a checkpoint for more than 2x the expected duration, intervene with additional context or reassign."
+  why: >
+    LLM agents can get stuck in loops — retrying the same failing approach, generating
+    increasingly verbose explanations of why something does not work, or producing code that
+    triggers the same error repeatedly. Without progress checkpoints, the Squad Lead discovers
+    the stall only at the deadline, when the entire sprint schedule is compromised. Progress
+    monitoring at 25/50/75% enables early intervention: at 25%, verify the agent understood
+    the task. At 50%, verify the core logic is on track. At 75%, verify edge cases and tests
+    are being handled. If any checkpoint stalls, the Squad Lead can inject additional context
+    (example code, clarified requirements) or reassign to a more capable agent while there is
+    still time.
+  how_to_do_right: |
+    1. Define progress milestones for each work package:
+       - 25%: File created, imports resolved, function signatures defined
+       - 50%: Core logic implemented, compiles/parses without errors
+       - 75%: Tests written, edge cases handled, docstrings added
+       - 100%: All acceptance criteria pass
+    2. Agent reports progress after each milestone (write to shared state).
+    3. Squad Lead checks progress every N minutes (configurable, default 5 min).
+    4. If elapsed_time > 2 * expected_time at any checkpoint, trigger intervention.
+    5. Intervention options (escalating): inject context -> adjust prompt -> reassign agent.
+    6. Track stall frequency per agent per domain — identifies systematic capability gaps.
+    7. Never let an agent run for > 30 minutes without a progress report.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langgraph, crewai]
+    infra: [redis]
+  domains:
+    domain: [agent_orchestration, task_management]
+    concern: [progress_monitoring, intervention, stall_detection]
+  example_good: |
+    import time
+    from dataclasses import dataclass, field
+    from enum import Enum
+
+    class Checkpoint(Enum):
+        SCAFFOLDED = 25
+        CORE_LOGIC = 50
+        TESTS_WRITTEN = 75
+        COMPLETE = 100
+
+    @dataclass
+    class ProgressTracker:
+        wp_id: str
+        agent_id: str
+        started_at: float = field(default_factory=time.time)
+        expected_duration: float = 600.0  # 10 minutes default
+        checkpoints: dict = field(default_factory=dict)
+
+        def report_checkpoint(self, checkpoint: Checkpoint):
+            self.checkpoints[checkpoint] = time.time()
+
+        def is_stalled(self, current_checkpoint: Checkpoint) -> bool:
+            elapsed = time.time() - self.started_at
+            expected_at_checkpoint = self.expected_duration * (current_checkpoint.value / 100)
+            return elapsed > expected_at_checkpoint * 2
+
+    class SquadLeadMonitor:
+        def __init__(self):
+            self.trackers: dict[str, ProgressTracker] = {}
+
+        def check_all(self) -> list[dict]:
+            """Returns list of stalled work packages with intervention recommendations."""
+            interventions = []
+            for wp_id, tracker in self.trackers.items():
+                latest_cp = max(tracker.checkpoints.keys(), default=Checkpoint.SCAFFOLDED,
+                               key=lambda c: c.value)
+                if tracker.is_stalled(latest_cp):
+                    interventions.append({
+                        "wp_id": wp_id,
+                        "agent_id": tracker.agent_id,
+                        "stalled_at": latest_cp.name,
+                        "elapsed": time.time() - tracker.started_at,
+                        "action": "inject_context" if latest_cp.value < 50 else "reassign",
+                    })
+            return interventions
+  example_bad: |
+    # Fire-and-forget — no progress monitoring
+    def run_squad(tasks, agents):
+        futures = [agent.execute(task) for agent, task in zip(agents, tasks)]
+        results = wait_all(futures, timeout=3600)  # Wait up to 1 hour
+
+    # Agent stuck at 10% for 45 minutes — retrying the same import error
+    # Squad Lead has no idea until the 1-hour timeout
+    # Sprint delayed by 1 hour, budget wasted, no early warning
+  when_applies: Any squad execution where agents work on tasks with expected durations
+  sources:
+    - "https://langchain-ai.github.io/langgraph/concepts/persistence/"
+    - "https://docs.crewai.com/concepts/tasks"
+    - "https://en.wikipedia.org/wiki/Earned_value_management"
+
+# =============================================================================
+# L5 WORKER LAYER (ALYR-017 to ALYR-019)
+# Self-contained execution, output format, error reporting
+# =============================================================================
+
+- id: ALYR-017
+  text: "Every worker agent prompt MUST be fully self-contained — include all necessary context (spec excerpt, type definitions, existing code, examples) directly in the prompt. Never rely on implicit context or shared state the agent cannot see."
+  why: >
+    LLM agents are stateless between calls — they have no memory of previous interactions,
+    no access to shared file systems (unless explicitly given), and no ability to browse
+    codebases. When a worker agent receives a prompt that says "implement the function
+    described in the spec" without including the spec, it will hallucinate what the spec says
+    based on the function name. This is the number one source of agent failures in production
+    pipelines. Google's research on prompt engineering (2024) shows that including relevant
+    context directly in the prompt improves task completion by 60% compared to referencing
+    external documents. The prompt is the agent's entire world — everything it needs must be
+    in the prompt.
+  how_to_do_right: |
+    1. Every worker prompt includes these sections:
+       a. TASK: What to do (1-2 sentences)
+       b. CONTEXT: Relevant spec section, requirement text, acceptance criteria (verbatim, not summarized)
+       c. TYPES: All type definitions the code must use (Pydantic models, enums, protocols)
+       d. EXISTING CODE: Current file contents (if editing) or empty template (if creating)
+       e. EXAMPLES: 1-2 examples of similar correct implementations from the codebase
+       f. CONSTRAINTS: What NOT to do (no star imports, no inline dicts, use Write tool, etc.)
+    2. Total prompt size: 10K-50K tokens. If > 50K, the task is too large — decompose further.
+    3. Never use phrases like "as described in the spec" or "following the pattern we discussed."
+    4. Include literal file paths for deliverables — agents must know WHERE to write.
+    5. Test prompt self-containment: could a new agent with zero prior context complete the task?
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [crewai, langgraph]
+  domains:
+    domain: [agent_orchestration, prompt_engineering]
+    concern: [self_contained, context_injection, agent_execution]
+  example_good: |
+    def build_worker_prompt(wp: dict, context: dict) -> str:
+        """Build a fully self-contained worker prompt."""
+        return f"""
+    ## TASK
+    Implement the function `{wp['function_name']}` in file `{wp['file_path']}`.
+
+    ## REQUIREMENT (verbatim from spec)
+    {context['requirement_text']}
+
+    ## ACCEPTANCE CRITERIA
+    {chr(10).join(f'- {ac}' for ac in wp['acceptance_criteria'])}
+
+    ## TYPE DEFINITIONS (use these exactly)
+    ```python
+    {context['type_definitions']}
+    ```
+
+    ## CURRENT FILE CONTENTS
+    ```python
+    {context['existing_code'] or '# New file - create from scratch'}
+    ```
+
+    ## EXAMPLE (similar function from codebase)
+    ```python
+    {context['example_code']}
+    ```
+
+    ## CONSTRAINTS
+    - Use ONLY the types defined above. No inline dicts or ad-hoc classes.
+    - Include type hints on all function parameters and return values.
+    - Include a docstring with Args, Returns, and Raises sections.
+    - Handle edge cases: empty input, None values, invalid types.
+    - Write the file using the Write tool to `{wp['file_path']}`.
+    """
+  example_bad: |
+    # Implicit context — agent hallucinates everything
+    prompt = f"""
+    Implement the verify_claim function as described in the spec.
+    Follow the patterns we've been using.
+    Make sure it works with the existing models.
+    """
+    # Agent doesn't know: which spec? what patterns? what models?
+    # It hallucinated a spec, invented patterns, and created new models
+    # Output looks plausible but contradicts every design decision
+  when_applies: Every worker-level agent prompt in any multi-agent pipeline
+  sources:
+    - "https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/overview"
+    - "https://platform.openai.com/docs/guides/prompt-engineering"
+    - "https://docs.crewai.com/concepts/tasks"
+
+- id: ALYR-018
+  text: "Worker agents MUST produce structured output matching the spec contract — the output format (file path, code, tests, metadata) must be validated before passing to the next phase."
+  why: >
+    Unstructured agent output is the second most common source of pipeline failures after
+    missing context. An agent told to "write the models file" might output a markdown
+    explanation, a code block inside prose, code with YAML frontmatter, or just the code — all
+    valid from the LLM's perspective but only one is usable by the pipeline. Without output
+    format validation, the next phase (QA) receives unparseable input and fails. Worse, format
+    errors are often silent: the QA agent reviews the markdown explanation thinking it is code,
+    finds no bugs, and the sprint "passes" with zero deliverables. Structured output with
+    schema validation (Pydantic, JSON Schema) eliminates this entire class of errors.
+  how_to_do_right: |
+    1. Define output schema per task type:
+       - Code generation: {file_path: str, code: str, tests: str, imports: list[str]}
+       - Review: {findings: list[Finding], summary: str, passed: bool}
+       - Rework: {file_path: str, diff: str, affected_tests: list[str]}
+    2. Instruct the agent to output in the specified format (include schema in prompt).
+    3. Validate output against schema BEFORE passing to next phase.
+    4. If validation fails, retry with explicit format correction (max 2 retries).
+    5. Use structured output APIs when available (OpenAI response_format, Anthropic tool use).
+    6. Log every format validation failure — high failure rate indicates bad prompt design.
+    7. Never parse unstructured LLM output with regex — use JSON/YAML parsing with error handling.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai, langgraph]
+    library: [pydantic]
+  domains:
+    domain: [agent_orchestration, data_quality]
+    concern: [output_format, validation, structured_output]
+  example_good: |
+    import json
+    from pydantic import BaseModel, field_validator, ValidationError
+
+    class CodeGenerationOutput(BaseModel):
+        file_path: str
+        code: str
+        test_code: str
+        imports_used: list[str]
+        functions_defined: list[str]
+
+        @field_validator("code")
+        @classmethod
+        def code_must_parse(cls, v: str) -> str:
+            try:
+                compile(v, "<string>", "exec")
+            except SyntaxError as e:
+                raise ValueError(f"Generated code has syntax error: {e}")
+            return v
+
+        @field_validator("file_path")
+        @classmethod
+        def path_must_be_valid(cls, v: str) -> str:
+            if not v.endswith(".py"):
+                raise ValueError(f"File path must end with .py, got: {v}")
+            return v
+
+    def validate_worker_output(raw_output: str) -> CodeGenerationOutput:
+        """Parse and validate worker output. Retry on failure."""
+        try:
+            data = json.loads(raw_output)
+            return CodeGenerationOutput(**data)
+        except (json.JSONDecodeError, ValidationError) as e:
+            correction_prompt = (
+                f"Your output had a format error: {e}. "
+                f"Please output valid JSON matching this schema: "
+                f"{CodeGenerationOutput.model_json_schema()}"
+            )
+            corrected = call_llm(correction_prompt)
+            return CodeGenerationOutput(**json.loads(corrected))
+  example_bad: |
+    # No output validation — prose mixed with code
+    output = agent.execute(task)
+    # output = "Here's the implementation:\n\n```python\ndef verify(claim):\n    ...\n```\n\nI also added..."
+
+    # Pipeline tries to write this to a .py file — includes markdown
+    # OR pipeline tries to parse as JSON — fails
+    # OR QA agent reviews the prose and says "looks good!"
+    write_file("src/veritas/core/verifier.py", output)  # Contains markdown fences!
+  when_applies: Any agent that produces code, reviews, or structured deliverables
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/validators/"
+    - "https://platform.openai.com/docs/guides/structured-outputs"
+    - "https://docs.anthropic.com/en/docs/build-with-claude/tool-use"
+
+- id: ALYR-019
+  text: "Worker agents MUST report errors in structured format with full context — the error report must include what failed, why, what was attempted, and what context is needed to fix it."
+  why: >
+    When an agent fails, the error message is the only communication channel to the Rework
+    Master. A bare stack trace ("KeyError: 'claim_id'") tells the rework agent nothing about
+    what the worker was trying to do, what context it had, or why the key was missing. The
+    rework agent then guesses, often making the wrong fix. Structured error reports with full
+    context enable targeted rework: the rework agent knows the failing function, the input
+    that caused the failure, what the expected behavior was, and what context would help. This
+    is the agent equivalent of the bug report golden rule: "Steps to reproduce, expected
+    behavior, actual behavior, environment."
+  how_to_do_right: |
+    1. Define a structured error format:
+       - error_type: Classification (syntax_error, type_error, import_error, logic_error, timeout)
+       - file_path: Where the error occurred
+       - function_name: Which function failed
+       - line_number: Approximate location
+       - error_message: The actual error text
+       - context: What the agent was trying to do when it failed
+       - attempted_fixes: What the agent already tried (to avoid repeating)
+       - missing_context: What information would help resolve this
+    2. The worker agent must catch exceptions and format them, not let them bubble up raw.
+    3. Include the input that caused the failure (sanitized if sensitive).
+    4. Rate-limit error reports: if the same error occurs 3x, escalate instead of reporting again.
+    5. The Rework Master uses structured errors to generate targeted fix prompts.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai, langgraph]
+    library: [pydantic]
+  domains:
+    domain: [agent_orchestration, error_handling]
+    concern: [error_reporting, debugging, structured_errors]
+  example_good: |
+    from pydantic import BaseModel
+    from enum import Enum
+
+    class ErrorType(Enum):
+        SYNTAX_ERROR = "syntax_error"
+        TYPE_ERROR = "type_error"
+        IMPORT_ERROR = "import_error"
+        LOGIC_ERROR = "logic_error"
+        TIMEOUT = "timeout"
+        MISSING_CONTEXT = "missing_context"
+
+    class StructuredAgentError(BaseModel):
+        error_type: ErrorType
+        file_path: str
+        function_name: str
+        line_number: int | None
+        error_message: str
+        context: str  # What the agent was doing
+        attempted_fixes: list[str]  # What was already tried
+        missing_context: list[str]  # What would help
+
+    def worker_execute(wp: dict):
+        try:
+            code = generate_code(wp)
+            validate_syntax(code)
+            return {"status": "success", "code": code}
+        except SyntaxError as e:
+            return StructuredAgentError(
+                error_type=ErrorType.SYNTAX_ERROR,
+                file_path=wp["file_path"],
+                function_name=wp["function_name"],
+                line_number=e.lineno,
+                error_message=str(e),
+                context=f"Generating {wp['function_name']} for requirement {wp['req_id']}",
+                attempted_fixes=["Regenerated with explicit type hints", "Simplified logic"],
+                missing_context=["Example of similar function in codebase", "Exact Pydantic model version"],
+            )
+  example_bad: |
+    # Raw exception — rework agent has no context
+    def worker_execute(task):
+        try:
+            return generate_code(task)
+        except Exception as e:
+            return {"error": str(e)}  # "KeyError: 'claim_id'"
+
+    # Rework agent receives: {"error": "KeyError: 'claim_id'"}
+    # Questions it can't answer:
+    # - Which file? Which function? Which line?
+    # - What was the input? What was expected?
+    # - What already failed? What context is missing?
+    # Result: rework agent guesses wrong, creates a new bug
+  when_applies: Every worker agent that can fail, which is every worker agent
+  sources:
+    - "https://docs.python.org/3/library/exceptions.html"
+    - "https://docs.pydantic.dev/latest/concepts/models/"
+    - "https://google.github.io/eng-practices/review/developer/cl-descriptions.html"
+
+# =============================================================================
+# L6 SPECIALIST LAYER (ALYR-020 to ALYR-022)
+# Domain expertise activation, tool-specific knowledge, cross-specialist collaboration
+# =============================================================================
+
+- id: ALYR-020
+  text: "Invoke specialist agents ONLY when the task requires domain-specific knowledge that a generalist agent would get wrong — measure specialist ROI as (quality_improvement * reuse_count) / invocation_cost."
+  why: >
+    Specialist agents (security expert, database architect, ML engineer) are expensive to
+    invoke — they have large system prompts with domain-specific few-shot examples, tool
+    configurations, and constraints. Invoking a security specialist for a simple CRUD endpoint
+    wastes tokens on unnecessary analysis. Conversely, NOT invoking a security specialist for
+    an authentication flow risks shipping vulnerabilities. The decision to invoke a specialist
+    must be data-driven: track when generalist agents fail at domain tasks and when specialists
+    catch issues that generalists miss. Over time, this builds a decision boundary: tasks with
+    complexity > X and domain = Y always go to the specialist. This mirrors the medical
+    referral pattern: a GP handles common cases and refers complex cases to specialists.
+  how_to_do_right: |
+    1. Define specialist trigger criteria per domain:
+       - Security: any task involving auth, crypto, input validation, or secrets management
+       - Database: schema design, migration, query optimization, constraint design
+       - ML/AI: model selection, prompt engineering, evaluation metrics, fine-tuning
+       - Performance: any task with latency SLO < 100ms or throughput > 1K req/s
+    2. The generalist agent can request specialist consultation mid-task (not just at assignment).
+    3. Track specialist ROI: did the specialist find issues the generalist would miss?
+    4. Measure false positives: did the specialist flag non-issues? High rate means adjust criteria.
+    5. Specialist output is advisory — the generalist integrates it, not the other way around.
+    6. Cache specialist recommendations for similar future tasks (avoid re-invoking for same pattern).
+    7. Review trigger criteria quarterly: as generalist agents improve, raise the threshold.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [crewai, langgraph]
+  domains:
+    domain: [agent_orchestration, specialization]
+    concern: [expertise_activation, cost_efficiency, quality]
+  example_good: |
+    from dataclasses import dataclass
+    from enum import Enum
+
+    class SpecialistDomain(Enum):
+        SECURITY = "security"
+        DATABASE = "database"
+        ML_AI = "ml_ai"
+        PERFORMANCE = "performance"
+
+    SPECIALIST_TRIGGERS = {
+        SpecialistDomain.SECURITY: {
+            "keywords": {"auth", "jwt", "oauth", "encrypt", "password", "secret", "csrf", "xss", "sqli"},
+            "file_patterns": ["**/auth/**", "**/security/**", "**/crypto/**"],
+            "complexity_threshold": 5,
+        },
+        SpecialistDomain.DATABASE: {
+            "keywords": {"migration", "schema", "index", "constraint", "transaction", "deadlock"},
+            "file_patterns": ["**/models/**", "**/migrations/**", "**/*_repository.py"],
+            "complexity_threshold": 6,
+        },
+    }
+
+    @dataclass
+    class SpecialistDecision:
+        should_invoke: bool
+        domain: SpecialistDomain | None
+        reason: str
+        estimated_cost_tokens: int
+
+    def should_invoke_specialist(wp: dict) -> SpecialistDecision:
+        """Decide if a specialist is needed based on task content."""
+        task_text = f"{wp['description']} {wp['file_path']}".lower()
+        for domain, triggers in SPECIALIST_TRIGGERS.items():
+            keyword_match = any(kw in task_text for kw in triggers["keywords"])
+            if keyword_match and wp.get("complexity", 0) >= triggers["complexity_threshold"]:
+                return SpecialistDecision(
+                    should_invoke=True, domain=domain,
+                    reason=f"Task matches {domain.value} triggers",
+                    estimated_cost_tokens=15_000,
+                )
+        return SpecialistDecision(
+            should_invoke=False, domain=None,
+            reason="Generalist sufficient", estimated_cost_tokens=0,
+        )
+  example_bad: |
+    # Always invoke all specialists — wastes tokens
+    def run_task(task):
+        security_review = security_specialist.review(task)   # 15K tokens
+        db_review = database_specialist.review(task)          # 15K tokens
+        perf_review = performance_specialist.review(task)     # 15K tokens
+        ml_review = ml_specialist.review(task)                # 15K tokens
+        # 60K tokens spent on specialist reviews for a README update
+        # All 4 return "no issues found" — 100% waste
+
+    # OR: Never invoke specialists
+    def run_task(task):
+        result = generalist_agent.execute(task)
+        # Auth endpoint with SQL injection vulnerability ships to production
+  when_applies: Any multi-agent system with specialized agents alongside generalist agents
+  sources:
+    - "https://docs.crewai.com/concepts/agents#agent-attributes"
+    - "https://langchain-ai.github.io/langgraph/concepts/multi_agent/"
+    - "https://en.wikipedia.org/wiki/Referral_(medicine)"
+
+- id: ALYR-021
+  text: "Specialist agents MUST encode exact tool versions, configuration flags, and known gotchas in their knowledge base — generic advice like 'use pytest' is worthless compared to 'use pytest 8.x with --strict-markers --tb=short -q'."
+  why: >
+    The value of a specialist agent is precision. A generalist agent can say "use Qdrant for
+    vector search." A specialist agent must say "use Qdrant 1.7+ with HNSW index, ef=128 for
+    indexing, ef=64 for search, cosine distance, payload_index on 'domain' field, batch size
+    1000 for bulk upsert." This precision eliminates the trial-and-error that generalist
+    agents waste tokens on. Tool-specific knowledge decays fast — every major version changes
+    defaults, deprecates flags, and introduces new features. A specialist with stale knowledge
+    (e.g., recommending pytest 6.x patterns in a pytest 8.x codebase) creates more bugs than
+    it prevents. Specialist knowledge bases must be versioned and updated with each tool release.
+  how_to_do_right: |
+    1. Each specialist maintains a knowledge base per tool with:
+       - Exact version supported (e.g., "Qdrant 1.7-1.12")
+       - Recommended configuration with flags and values
+       - Known gotchas: version-specific bugs, deprecated features, breaking changes
+       - Concrete code examples that are copy-paste runnable
+    2. Knowledge base is versioned — when the tool releases a new major version, update or mark as stale.
+    3. Include negative knowledge: "Do NOT use X because Y" (e.g., "Do NOT use Qdrant batch size > 5000 — causes OOM on 16GB RAM").
+    4. Specialist prompts include the tool's changelog diff between the pinned version and latest.
+    5. Validate specialist advice: run the recommended command/config in CI to ensure it works.
+    6. Expire knowledge that is > 6 months old without validation.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai]
+    library: [qdrant-client, pytest, pydantic]
+  domains:
+    domain: [agent_orchestration, specialization]
+    concern: [tool_knowledge, version_awareness, precision]
+  example_good: |
+    # Specialist knowledge base entry for Qdrant
+    QDRANT_SPECIALIST_KNOWLEDGE = {
+        "tool": "qdrant-client",
+        "version_range": "1.7.0 - 1.12.x",
+        "last_validated": "2026-02-15",
+        "recommended_config": {
+            "collection": {
+                "vectors": {"size": 1024, "distance": "Cosine"},
+                "hnsw_config": {"m": 16, "ef_construct": 128},
+                "optimizers_config": {"default_segment_number": 4},
+                "on_disk_payload": True,
+            },
+            "search": {
+                "limit": 10,
+                "hnsw_ef": 64,
+                "exact": False,
+            },
+            "upsert": {
+                "batch_size": 1000,
+                "wait": True,
+            },
+        },
+        "gotchas": [
+            "batch_size > 5000 causes OOM on 16GB RAM — use 1000",
+            "on_disk_payload=True required for collections > 1M points",
+            "hnsw_ef search must be >= limit, recommended 4x-8x limit",
+            "Cosine distance is normalized dot product — vectors MUST be normalized",
+        ],
+        "example": """
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import Distance, VectorParams, PointStruct
+
+    client = QdrantClient(host="localhost", port=6333)
+    client.create_collection(
+        collection_name="brain_nodes",
+        vectors_config=VectorParams(size=1024, distance=Distance.COSINE),
+        hnsw_config={"m": 16, "ef_construct": 128},
+        on_disk_payload=True,
+    )
+
+    # Batch upsert with recommended batch size
+    points = [PointStruct(id=i, vector=vec, payload=meta) for i, (vec, meta) in enumerate(data)]
+    for batch in chunked(points, 1000):
+        client.upsert(collection_name="brain_nodes", points=batch, wait=True)
+    """,
+    }
+  example_bad: |
+    # Generic specialist — no better than a generalist
+    QDRANT_KNOWLEDGE = {
+        "tool": "qdrant",
+        "advice": "Use Qdrant for vector search. It's fast and supports filtering.",
+        "example": "client = QdrantClient(); client.search(...)",
+    }
+    # No version, no config, no gotchas, no batch size
+    # Agent uses default hnsw_ef=256 (way too high for 10-result search)
+    # Agent upserts 100K points in one call — crashes Qdrant
+    # Agent uses Euclidean distance on normalized vectors — wrong results
+  when_applies: Any specialist agent that provides tool-specific recommendations
+  sources:
+    - "https://qdrant.tech/documentation/concepts/search/"
+    - "https://docs.pytest.org/en/stable/reference/reference.html"
+    - "https://docs.pydantic.dev/latest/migration/"
+
+- id: ALYR-022
+  text: "When multiple specialists collaborate on a single deliverable, enforce a shared output schema so their outputs compose without manual integration — the schema IS the integration contract."
+  why: >
+    In complex tasks, multiple specialists contribute: a database specialist designs the
+    schema, a security specialist adds constraints, a performance specialist optimizes queries.
+    If each specialist outputs in their own format (one returns SQL, another returns prose,
+    a third returns a JSON config), the integration step becomes a creative task that requires
+    another LLM call — introducing another failure point. A shared output schema eliminates
+    this: every specialist fills in their section of a common structure, and the final
+    deliverable is assembled mechanically (no LLM needed). This is the "interface segregation"
+    principle applied to agent output: specialists implement different methods of the same
+    interface.
+  how_to_do_right: |
+    1. Define a shared deliverable schema with sections for each specialist:
+       - schema_design: DatabaseSpecialistOutput
+       - security_review: SecuritySpecialistOutput
+       - performance_notes: PerformanceSpecialistOutput
+       - integration_result: FinalDeliverable (assembled from sections)
+    2. Each specialist receives the schema and fills ONLY their section.
+    3. Assembly is mechanical: merge sections, resolve conflicts (security > performance > convenience).
+    4. Conflicts are flagged for L3 resolution: "Security says no caching, performance says cache for 5 min."
+    5. The shared schema includes a version field — if one specialist upgrades the schema, all must adapt.
+    6. Test the assembly with unit tests: given mock specialist outputs, does the assembly produce valid results?
+    7. Track integration failures: high failure rate means the schema needs revision.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [crewai, langgraph]
+    library: [pydantic]
+  domains:
+    domain: [agent_orchestration, specialization]
+    concern: [collaboration, integration, shared_schema]
+  example_good: |
+    from pydantic import BaseModel
+
+    # Shared schema — each specialist fills their section
+    class DatabaseSection(BaseModel):
+        table_name: str
+        columns: list[dict]  # {"name": str, "type": str, "nullable": bool}
+        indexes: list[dict]
+        constraints: list[str]
+
+    class SecuritySection(BaseModel):
+        required_constraints: list[str]
+        encryption_fields: list[str]
+        audit_fields: list[str]
+        row_level_security: bool
+
+    class PerformanceSection(BaseModel):
+        recommended_indexes: list[dict]
+        partition_strategy: str | None
+        caching_policy: dict | None
+        estimated_query_time_ms: dict[str, float]
+
+    class IntegratedDeliverable(BaseModel):
+        """Assembled mechanically from specialist sections."""
+        database: DatabaseSection
+        security: SecuritySection
+        performance: PerformanceSection
+        conflicts: list[str]
+
+    def assemble_deliverable(
+        db: DatabaseSection, sec: SecuritySection, perf: PerformanceSection
+    ) -> IntegratedDeliverable:
+        """Mechanical assembly — no LLM needed."""
+        conflicts = []
+        # Merge indexes (union of DB + Performance recommendations)
+        all_indexes = db.indexes + perf.recommended_indexes
+        # Detect conflicts
+        if perf.caching_policy and sec.row_level_security:
+            conflicts.append("Performance recommends caching but security requires RLS — needs L3 review")
+        # Add security constraints to DB section
+        db.constraints.extend(sec.required_constraints)
+        return IntegratedDeliverable(
+            database=db, security=sec, performance=perf, conflicts=conflicts,
+        )
+  example_bad: |
+    # No shared schema — each specialist returns whatever
+    db_output = "CREATE TABLE users (id SERIAL, email TEXT, password TEXT);"
+    security_output = "The password field should be hashed. Consider adding RLS."
+    perf_output = {"recommendation": "Add index on email", "cache_ttl": 300}
+
+    # Integration requires another LLM call to parse prose + SQL + JSON
+    integrated = call_llm(f"""
+    Combine these specialist outputs into a final schema:
+    DB: {db_output}
+    Security: {security_output}
+    Performance: {perf_output}
+    """)
+    # LLM might ignore the security advice, misparse the JSON, or add its own "improvements"
+    # Result: password stored as plaintext because the integration LLM dropped the "hash" advice
+  when_applies: Any task where multiple specialist agents contribute to a single deliverable
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/models/"
+    - "https://en.wikipedia.org/wiki/Interface_segregation_principle"
+    - "https://langchain-ai.github.io/langgraph/concepts/multi_agent/"

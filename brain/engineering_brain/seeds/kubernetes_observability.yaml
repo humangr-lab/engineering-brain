@@ -1,0 +1,558 @@
+layer: rules
+technology: Kubernetes
+domain: observability
+knowledge:
+- id: CR-K8S-OBS-001
+  text: Use ServiceMonitor and PodMonitor CRDs for Prometheus target discovery — never hardcode scrape configs.
+  why: Hardcoded scrape_configs in Prometheus require manual updates every time a service is added, moved, or renamed — in
+    a dynamic Kubernetes environment, this is unsustainable. Services scale up/down, pods get rescheduled to different IPs,
+    and new services are deployed daily. ServiceMonitor/PodMonitor CRDs enable declarative, auto-discovering monitoring that
+    follows the same lifecycle as the workloads being monitored.
+  how_to_do_right: 'Deploy Prometheus Operator (kube-prometheus-stack). Create a ServiceMonitor for each service that exposes
+    /metrics. Use label selectors to match the Service, not the pod. Set proper scrapeInterval (15-30s for most workloads,
+    5s for latency-critical). Use relabelings to add metadata labels (namespace, service, pod). Set honorLabels: false to
+    prevent metric label hijacking.'
+  severity: high
+  technologies:
+    platform: [kubernetes, prometheus]
+  domains:
+    domain: [observability]
+  example_good: "apiVersion: monitoring.coreos.com/v1\nkind: ServiceMonitor\nmetadata:\n  name: api-metrics\n  labels:\n \
+    \   release: prometheus    # Matches Prometheus serviceMonitorSelector\nspec:\n  selector:\n    matchLabels:\n      app.kubernetes.io/name:\
+    \ api\n  endpoints:\n    - port: metrics\n      interval: 15s\n      path: /metrics\n      scrapeTimeout: 10s\n      honorLabels:\
+    \ false\n      relabelings:\n        - sourceLabels: [__meta_kubernetes_namespace]\n          targetLabel: namespace\n\
+    \        - sourceLabels: [__meta_kubernetes_service_name]\n          targetLabel: service\n  namespaceSelector:\n    matchNames:\
+    \ [production]\n"
+  example_bad: '# Hardcoded Prometheus config — breaks when pods reschedule
+
+    # prometheus.yml
+
+    # scrape_configs:
+
+    #   - job_name: api
+
+    #     static_configs:
+
+    #       - targets: [''10.0.1.15:8080'', ''10.0.1.16:8080'']
+
+    #     # Pod IPs change on restart — stale targets
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments or Prometheus metrics collection
+  when_not_applies: throwaway prototypes, local dev scripts. projects not using Kubernetes or Prometheus
+  sources: ["https://prometheus-operator.dev/docs/api-reference/api/#monitoring.coreos.com/v1.ServiceMonitor"]
+- id: CR-K8S-OBS-002
+  text: Define PrometheusRules for alerting with proper severity levels, runbooks, and inhibition.
+  why: 'Alerting without structure leads to alert fatigue — too many non-actionable alerts that get ignored, causing real
+    incidents to be missed. Every alert must have: a clear severity (critical = page, warning = ticket, info = dashboard),
+    a runbook URL (what to do), and proper labels for routing. Inhibition prevents cascading alerts (node down inhibits all
+    pod alerts on that node).'
+  how_to_do_right: 'Use PrometheusRule CRD with the Prometheus Operator. Structure alerts by: service, severity, and team.
+    Every alert MUST have: runbook_url annotation, summary, description. Use ''for'' duration to avoid flapping (5m for warnings,
+    1m for critical). Group related alerts. Define inhibition rules in Alertmanager to suppress downstream alerts. Test alerts
+    with promtool check rules.'
+  severity: high
+  technologies:
+    platform: [kubernetes, prometheus]
+  domains:
+    domain: [observability]
+  example_good: "apiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nmetadata:\n  name: api-alerts\n  labels:\n  \
+    \  release: prometheus\nspec:\n  groups:\n    - name: api.rules\n      rules:\n        - alert: APIHighErrorRate\n   \
+    \       expr: |\n            sum(rate(http_requests_total{status=~\"5..\"}[5m]))\n            / sum(rate(http_requests_total[5m]))\
+    \ > 0.05\n          for: 5m\n          labels:\n            severity: critical\n            team: platform\n         \
+    \ annotations:\n            summary: \"API error rate above 5% for 5 minutes\"\n            description: \"Error rate\
+    \ is {{ $value | humanizePercentage }}\"\n            runbook_url: \"https://wiki.example.com/runbooks/api-errors\"\n\
+    \        - alert: APIHighLatency\n          expr: |\n            histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m]))\
+    \ by (le))\n            > 1\n          for: 10m\n          labels:\n            severity: warning\n            team: platform\n\
+    \          annotations:\n            summary: \"API P99 latency above 1s for 10 minutes\"\n            runbook_url: \"\
+    https://wiki.example.com/runbooks/api-latency\"\n"
+  example_bad: "# Alert without runbook, severity, or for duration\nrules:\n  - alert: HighCPU\n    expr: container_cpu_usage\
+    \ > 0.8\n    # No 'for' — fires immediately on any spike\n    # No severity — all alerts look the same\n    # No runbook\
+    \ — on-call doesn't know what to do\n    # No description — just a metric name\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments or Prometheus metrics collection
+  when_not_applies: throwaway prototypes, local dev scripts. projects not using Kubernetes or Prometheus
+  sources: ["https://prometheus-operator.dev/docs/api-reference/api/#monitoring.coreos.com/v1.PrometheusRule"]
+- id: CR-K8S-OBS-003
+  text: Use recording rules to pre-compute expensive queries and reduce Prometheus query latency.
+  why: Complex PromQL queries that aggregate across thousands of time series take seconds to execute — too slow for dashboards
+    and alerting. Every time a dashboard with 20 panels loads, Prometheus re-executes 20 expensive queries. Recording rules
+    pre-compute and store the results as new time series, making dashboards instant and reducing Prometheus CPU usage by 50-80%
+    for heavy queries.
+  how_to_do_right: 'Create recording rules for: aggregated request rates, error ratios, histogram quantiles, and any query
+    used in alerts or dashboards. Name them with the convention: namespace:metric_name:aggregation (e.g., api:http_requests_total:rate5m).
+    Evaluate every 15-30s. Keep raw data for ad-hoc investigation. Use recording rules in alert expressions for consistency.'
+  severity: medium
+  technologies:
+    platform: [kubernetes, prometheus]
+  domains:
+    domain: [observability, performance]
+  example_good: "apiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nmetadata:\n  name: api-recording-rules\nspec:\n\
+    \  groups:\n    - name: api.recordings\n      interval: 15s\n      rules:\n        - record: api:http_requests_total:rate5m\n\
+    \          expr: sum(rate(http_requests_total[5m])) by (service, status)\n        - record: api:http_errors:ratio5m\n\
+    \          expr: |\n            sum(rate(http_requests_total{status=~\"5..\"}[5m])) by (service)\n            / sum(rate(http_requests_total[5m]))\
+    \ by (service)\n        - record: api:http_latency_p99:5m\n          expr: |\n            histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m]))\
+    \ by (le, service))\n"
+  example_bad: '# Dashboard with raw PromQL — slow queries on every page load
+
+    # Panel 1: sum(rate(http_requests_total[5m])) by (service, status)
+
+    # Panel 2: histogram_quantile(0.99, sum(rate(...)) by (le))
+
+    # Panel 3: sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(...))
+
+    # Each panel: 2-5 seconds to compute = 30+ seconds per dashboard load
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments or Prometheus metrics collection
+  when_not_applies: throwaway prototypes, local dev scripts. projects not using Kubernetes or Prometheus
+  sources: ["https://prometheus.io/docs/prometheus/latest/configuration/recording_rules/"]
+- id: CR-K8S-OBS-004
+  text: Provision Grafana dashboards as code via ConfigMaps or GrafanaDashboard CRDs — never create manually.
+  why: Manually created dashboards are lost on Grafana restarts (unless persistent storage is configured), cannot be version-controlled,
+    cannot be replicated across environments, and drift between staging and production. Dashboard-as-code ensures reproducibility,
+    review processes, and consistency. It also enables automated deployment of monitoring alongside the applications being
+    monitored.
+  how_to_do_right: 'Use Grafana sidecar that watches ConfigMaps with a specific label (grafana_dashboard: ''1''). Or use the
+    GrafanaDashboard CRD from the Grafana Operator. Store dashboard JSON in git alongside your application code. Use variables
+    for datasource names (so dashboards work in any environment). Use Grafonnet (Jsonnet library) for programmatic dashboard
+    generation. Test dashboards in CI with grafana-dashboard-lint.'
+  severity: medium
+  technologies:
+    platform: [kubernetes, grafana]
+  domains:
+    domain: [observability]
+  example_good: "# Dashboard provisioned via ConfigMap\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: api-dashboard\n\
+    \  labels:\n    grafana_dashboard: \"1\"    # Sidecar picks this up\ndata:\n  api-dashboard.json: |\n    {\n      \"dashboard\"\
+    : {\n        \"title\": \"API Overview\",\n        \"templating\": {\n          \"list\": [{\n            \"name\": \"\
+    datasource\",\n            \"type\": \"datasource\",\n            \"query\": \"prometheus\"\n          }]\n        },\n\
+    \        \"panels\": [\n          {\n            \"title\": \"Request Rate\",\n            \"targets\": [{\n         \
+    \     \"expr\": \"api:http_requests_total:rate5m\",\n              \"datasource\": \"${datasource}\"\n            }]\n\
+    \          }\n        ]\n      }\n    }\n"
+  example_bad: '# Dashboard created manually in Grafana UI
+
+    # - Not in git — no version control
+
+    # - Lost on Grafana restart without persistent storage
+
+    # - Different in staging vs production
+
+    # - No review process for changes
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments or Grafana dashboards and alerting
+  when_not_applies: throwaway prototypes, local dev scripts. projects not using Kubernetes or Grafana
+  sources: ["https://grafana.com/docs/grafana/latest/dashboards/build-dashboards/"]
+- id: CR-K8S-OBS-005
+  text: Use structured JSON logging and ship via Fluent Bit DaemonSet — never write logs to persistent volumes.
+  why: 'Unstructured text logs are impossible to query efficiently at scale. Writing logs to PVCs fills storage and creates
+    a per-pod management burden. Kubernetes stdout/stderr logs are automatically captured by the container runtime and stored
+    on the node — Fluent Bit reads them from /var/log/containers/ and ships them to a centralized backend. This is zero-config
+    for applications: just log to stdout.'
+  how_to_do_right: 'Applications: log to stdout/stderr in JSON format with: timestamp, level, message, service, trace_id,
+    span_id. Deploy Fluent Bit as DaemonSet (not Fluentd — Fluent Bit uses 10x less memory). Configure Fluent Bit parsers
+    for JSON. Ship to Loki (lightweight), Elasticsearch (full-text search), or cloud logging. Set log rotation on nodes (10MB
+    max, 3 files). Add Kubernetes metadata enrichment filter.'
+  severity: high
+  technologies:
+    platform: [kubernetes, fluent_bit, loki]
+  domains:
+    domain: [observability]
+  example_good: "# Application: structured JSON to stdout\n# {\"timestamp\":\"2026-02-17T10:00:00Z\",\"level\":\"info\",\"\
+    service\":\"api\",\n#  \"message\":\"Request handled\",\"method\":\"GET\",\"path\":\"/users\",\n#  \"status\":200,\"duration_ms\"\
+    :45,\"trace_id\":\"abc123\"}\n\n# Fluent Bit DaemonSet config\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: fluent-bit-config\n\
+    data:\n  fluent-bit.conf: |\n    [INPUT]\n        Name              tail\n        Path              /var/log/containers/*.log\n\
+    \        Parser            cri\n        Tag               kube.*\n        Mem_Buf_Limit     5MB\n        Skip_Long_Lines\
+    \   On\n    [FILTER]\n        Name              kubernetes\n        Match             kube.*\n        Merge_Log      \
+    \   On\n        K8S-Logging.Parser On\n    [OUTPUT]\n        Name              loki\n        Match             *\n   \
+    \     Host              loki.monitoring\n        Port              3100\n        Labels            job=fluent-bit\n"
+  example_bad: "# Unstructured text logs to file\n# 2026-02-17 10:00:00 INFO Request handled GET /users 200 45ms\n# Can't\
+    \ query: \"all errors in service X with trace_id Y\"\n#\n# Logs to PVC:\nvolumes:\n  - name: logs\n    persistentVolumeClaim:\n\
+    \      claimName: api-logs     # Fills up, per-pod management, not searchable\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments, Fluent Bit, or Loki
+  when_not_applies: throwaway prototypes, local dev scripts
+  sources: ["https://docs.fluentbit.io/manual/pipeline/inputs/tail"]
+- id: CR-K8S-OBS-006
+  text: Set container log rotation limits and ephemeral-storage limits to prevent node disk exhaustion.
+  why: 'A single container writing logs at high rate without rotation can fill the node''s disk, causing: all pods on the
+    node to be evicted, kubelet to go NotReady, and the node to become unrecoverable without manual cleanup. The container
+    runtime (containerd) rotates logs, but the default settings may be too generous. Combined with ephemeral-storage limits,
+    this prevents any single pod from disrupting the node.'
+  how_to_do_right: 'Configure container runtime log rotation: 10MB max log size, 3 max log files per container. Set ephemeral-storage
+    resource limits on all containers. Monitor node disk usage with node_filesystem_avail_bytes. Alert at 80% disk usage.
+    Use ''kubectl logs --tail'' instead of full log dumps. Never use ''docker logs'' or ''crictl logs'' on production — they
+    don''t limit output.'
+  severity: high
+  technologies:
+    platform: [kubernetes, containerd]
+  domains:
+    domain: [observability, reliability]
+  example_good: "# containerd config for log rotation\n# /etc/containerd/config.toml\n# [plugins.\"io.containerd.grpc.v1.cri\"\
+    ]\n#   max_container_log_line_size = 16384\n# [plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc]\n#   [plugins.\"\
+    io.containerd.grpc.v1.cri\".containerd.runtimes.runc.options]\n#     MaxContainerLogSize = \"10Mi\"\n#     MaxContainerLogFiles\
+    \ = 3\n\n# Pod with ephemeral-storage limits\ncontainers:\n  - name: api\n    resources:\n      requests:\n        ephemeral-storage:\
+    \ \"500Mi\"\n      limits:\n        ephemeral-storage: \"2Gi\"    # Evicted if exceeded\n"
+  example_bad: "# No log rotation, no ephemeral-storage limits\ncontainers:\n  - name: api\n    # Verbose debug logging at\
+    \ 100MB/min\n    # No ephemeral-storage limits\n    # Fills 100GB node disk in 16 hours\n    # All pods on node evicted,\
+    \ node goes NotReady\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments or containerd
+  when_not_applies: throwaway prototypes, local dev scripts. projects not using Kubernetes or containerd
+  sources: ["https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#setting-requests-and-limits-for-local-ephemeral-storage"]
+- id: CR-K8S-OBS-007
+  text: Deploy OpenTelemetry Collector as a DaemonSet for trace collection and use auto-instrumentation for zero-code tracing.
+  why: 'Manual instrumentation requires modifying every service''s code to add trace spans — this takes months for a large
+    codebase and is often incomplete. OpenTelemetry auto-instrumentation injects tracing without code changes via: init containers
+    (Java agent, Python auto-instrumentation), eBPF (language-agnostic), or admission webhooks. The OTel Collector acts as
+    a local agent on each node, reducing application-to-backend latency and providing a single point for sampling, batching,
+    and routing.'
+  how_to_do_right: 'Deploy OTel Collector as DaemonSet (receives traces on localhost, reduces network hops). Use the OpenTelemetry
+    Operator for auto-instrumentation (Instrumentation CRD). Configure sampling: head-based sampling at 10% for high-traffic
+    services, tail-based sampling at the Collector for error traces. Export to Jaeger, Tempo, or cloud provider. Set resource
+    attributes: service.name, service.version, k8s.namespace.name.'
+  severity: medium
+  technologies:
+    platform: [kubernetes, opentelemetry, jaeger, tempo]
+  domains:
+    domain: [observability]
+  example_good: "# OpenTelemetry auto-instrumentation\napiVersion: opentelemetry.io/v1alpha1\nkind: Instrumentation\nmetadata:\n\
+    \  name: auto-instrumentation\nspec:\n  exporter:\n    endpoint: http://otel-collector:4317\n  propagators:\n    - tracecontext\n\
+    \    - baggage\n  sampler:\n    type: parentbased_traceidratio\n    argument: \"0.1\"     # Sample 10% of traces\n  python:\n\
+    \    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-python:latest\n  java:\n    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-java:latest\n\
+    ---\n# Annotate deployment for auto-instrumentation\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\nspec:\n\
+    \  template:\n    metadata:\n      annotations:\n        instrumentation.opentelemetry.io/inject-python: \"true\"\n"
+  example_bad: '# Manual instrumentation in every service
+
+    # 50 services x 2 weeks each = 100 weeks of engineering time
+
+    # Coverage: 30% of services instrumented, 70% are black boxes
+
+    # No traces for legacy services
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments, OpenTelemetry, Jaeger, or Tempo
+  when_not_applies: throwaway prototypes, local dev scripts
+  sources: ["https://opentelemetry.io/docs/kubernetes/operator/automatic/"]
+- id: CR-K8S-OBS-008
+  text: Follow the RED method (Rate, Errors, Duration) for services and USE method (Utilization, Saturation, Errors) for resources.
+  why: 'Without a systematic metrics approach, teams monitor random metrics that don''t answer the key question: ''is the
+    system healthy for users?'' The RED method covers the three things users care about for every service. The USE method
+    covers the three things that cause performance degradation for every resource. Together, they provide complete coverage
+    with minimal metrics — eliminating dashboard clutter and alert fatigue.'
+  how_to_do_right: 'For every service, expose: request rate (rps), error rate (%), and request duration (histogram with P50,
+    P95, P99). For every resource, monitor: utilization (% of capacity), saturation (queue depth, waiters), and error rate.
+    Use Prometheus histogram_quantile for latency percentiles. Create standard dashboards per service type. Alert on: error
+    rate > 1% (P1), P99 latency > SLA (P2), resource saturation > 80% (P3).'
+  severity: high
+  technologies:
+    platform: [kubernetes, prometheus]
+  domains:
+    domain: [observability]
+  example_good: "# RED metrics for a service\n# Rate\n- record: service:http_requests:rate5m\n  expr: sum(rate(http_requests_total[5m]))\
+    \ by (service)\n# Errors\n- record: service:http_errors:ratio5m\n  expr: |\n    sum(rate(http_requests_total{status=~\"\
+    5..\"}[5m])) by (service)\n    / sum(rate(http_requests_total[5m])) by (service)\n# Duration\n- record: service:http_latency_p99:5m\n\
+    \  expr: |\n    histogram_quantile(0.99,\n      sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service))\n\
+    \n# USE metrics for a resource (node CPU example)\n# Utilization: node_cpu_seconds_total\n# Saturation: node_load15 /\
+    \ count(node_cpu_seconds_total{mode=\"idle\"})\n# Errors: node_edac_correctable_errors_total\n"
+  example_bad: '# Random unstructured metrics
+
+    # "cpu_usage" — what does this mean? Container? Node? Request?
+
+    # "memory" — current? peak? requested? limit?
+
+    # "requests" — total? rate? per second? per minute?
+
+    # No error rate, no latency percentiles
+
+    # Dashboard: 50 panels, nobody knows what to look at
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments or Prometheus metrics collection
+  when_not_applies: throwaway prototypes, local dev scripts. projects not using Kubernetes or Prometheus
+  sources:
+    - "https://grafana.com/blog/2018/08/02/the-red-method-how-to-instrument-your-services/"
+    - "https://www.brendangregg.com/usemethod.html"
+- id: CR-K8S-OBS-009
+  text: Configure AlertManager routing with proper grouping, inhibition, and silences for on-call sanity.
+  why: 'Without routing: all alerts go to one channel, burying critical pages in a flood of warnings. Without grouping: 100
+    pods failing generates 100 separate alerts instead of one grouped notification. Without inhibition: node failure triggers
+    50 downstream alerts (pod unhealthy, service degraded, etc.) instead of one root cause alert. This is the primary cause
+    of alert fatigue and ignored pages.'
+  how_to_do_right: 'Route by severity: critical -> PagerDuty (immediate page), warning -> Slack (next business day), info
+    -> dashboard only. Group by: alertname, namespace, service (one notification per issue, not per pod). Inhibit: node alerts
+    suppress pod alerts on that node, cluster alerts suppress namespace alerts. Set group_wait=30s (batch initial alerts),
+    group_interval=5m (re-notify interval), repeat_interval=4h (re-page interval).'
+  severity: high
+  technologies:
+    library: [alertmanager]
+    platform: [kubernetes, prometheus]
+  domains:
+    domain: [observability]
+  example_good: "# AlertManager configuration\napiVersion: monitoring.coreos.com/v1alpha1\nkind: AlertmanagerConfig\nmetadata:\n\
+    \  name: routing\nspec:\n  route:\n    groupBy: ['alertname', 'namespace', 'service']\n    groupWait: 30s\n    groupInterval:\
+    \ 5m\n    repeatInterval: 4h\n    receiver: slack-warnings\n    routes:\n      - matchers:\n          - name: severity\n\
+    \            value: critical\n        receiver: pagerduty-critical\n        repeatInterval: 1h\n      - matchers:\n  \
+    \        - name: severity\n            value: warning\n        receiver: slack-warnings\n  receivers:\n    - name: pagerduty-critical\n\
+    \      pagerdutyConfigs:\n        - routingKey:\n            key: pagerduty-key\n            name: alertmanager-pagerduty\n\
+    \    - name: slack-warnings\n      slackConfigs:\n        - channel: '#alerts-warnings'\n          sendResolved: true\n\
+    \  inhibitRules:\n    - sourceMatch:\n        - name: alertname\n          value: NodeNotReady\n      targetMatch:\n \
+    \       - name: severity\n          value: warning\n      equal: ['node']\n"
+  example_bad: '# All alerts to one Slack channel
+
+    # route:
+
+    #   receiver: slack-all
+
+    #   group_by: []    # No grouping — one message per alert
+
+    # 100 pod failures = 100 Slack messages in 30 seconds
+
+    # On-call mutes the channel and misses the critical page
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments, Prometheus metrics collection, or AlertManager
+  when_not_applies: throwaway prototypes, local dev scripts
+  sources: ["https://prometheus.io/docs/alerting/latest/alertmanager/"]
+- id: CR-K8S-OBS-010
+  text: Export Kubernetes events to your logging system — default event retention is only 1 hour.
+  why: 'Kubernetes events contain critical operational information: why a pod was evicted (OOMKilled, node pressure), why
+    a PVC failed to bind, why a deployment stalled. But events are stored in etcd with a default TTL of 1 hour — by the time
+    you investigate an incident that happened 3 hours ago, the events are gone. Exporting events to your logging system preserves
+    this operational context for incident investigation.'
+  how_to_do_right: 'Deploy kubernetes-event-exporter or kube-events-exporter to stream events to your logging backend. Filter
+    by: involvedObject.kind, reason, type (Normal/Warning). Store events for at least 7 days. Create dashboards for: Warning
+    events per namespace, OOMKilled events, FailedScheduling events, FailedMount events. Alert on: recurring Warning events
+    on the same resource.'
+  severity: medium
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [observability]
+  example_good: "# kubernetes-event-exporter configuration\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: event-exporter-cfg\n\
+    data:\n  config.yaml: |\n    logLevel: error\n    route:\n      routes:\n        - match:\n            - receiver: loki\n\
+    \              # Only Warning events — Normal events are too noisy\n        - drop:\n            - type: Normal\n    receivers:\n\
+    \      - name: loki\n        loki:\n          url: http://loki.monitoring:3100/loki/api/v1/push\n          streamLabels:\n\
+    \            source: kubernetes-events\n"
+  example_bad: '# No event export — events lost after 1 hour
+
+    # 3am: pods evicted, deployment stalled
+
+    # 9am investigation: "kubectl get events" — empty
+
+    # Root cause unknown, incident report incomplete
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: throwaway prototypes, local dev scripts. projects not using Kubernetes
+  sources: ["https://github.com/resmoio/kubernetes-event-exporter"]
+- id: CR-K8S-OBS-011
+  text: Use OpenTelemetry Collector as a unified telemetry pipeline — not separate agents for metrics, logs, and traces.
+  why: Running three separate agents (Prometheus node exporter, Fluent Bit, Jaeger agent) per node wastes resources, creates
+    three configuration surfaces, and three failure domains. The OTel Collector supports all three telemetry signals in one
+    binary, with processors for filtering, transformation, batching, and sampling. It also provides a vendor-neutral format,
+    so you can switch backends without changing applications.
+  how_to_do_right: 'Deploy OTel Collector as DaemonSet (node-level collection) and as Deployment (cluster-level processing).
+    Configure receivers: OTLP (gRPC+HTTP), Prometheus (scraping), Filelog (log tailing). Configure processors: batch (for
+    efficiency), memory_limiter (prevent OOM), resource (add k8s metadata), filter (drop noisy signals). Configure exporters
+    based on your backend. Use the OpAMP protocol for remote configuration management.'
+  severity: medium
+  technologies:
+    platform: [kubernetes, opentelemetry]
+  domains:
+    domain: [observability]
+  example_good: "# OTel Collector ConfigMap\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: otel-collector-config\ndata:\n\
+    \  config.yaml: |\n    receivers:\n      otlp:\n        protocols:\n          grpc:\n            endpoint: 0.0.0.0:4317\n\
+    \          http:\n            endpoint: 0.0.0.0:4318\n      prometheus:\n        config:\n          scrape_configs:\n\
+    \            - job_name: k8s-pods\n              kubernetes_sd_configs:\n                - role: pod\n    processors:\n\
+    \      batch:\n        timeout: 5s\n        send_batch_size: 1024\n      memory_limiter:\n        limit_mib: 400\n   \
+    \     spike_limit_mib: 100\n        check_interval: 5s\n      k8sattributes:\n        extract:\n          metadata:\n\
+    \            - k8s.namespace.name\n            - k8s.pod.name\n            - k8s.deployment.name\n    exporters:\n   \
+    \   otlp:\n        endpoint: tempo:4317\n      prometheusremotewrite:\n        endpoint: http://prometheus:9090/api/v1/write\n\
+    \      loki:\n        endpoint: http://loki:3100/loki/api/v1/push\n    service:\n      pipelines:\n        traces:\n \
+    \         receivers: [otlp]\n          processors: [memory_limiter, batch, k8sattributes]\n          exporters: [otlp]\n\
+    \        metrics:\n          receivers: [otlp, prometheus]\n          processors: [memory_limiter, batch]\n          exporters:\
+    \ [prometheusremotewrite]\n"
+  example_bad: '# Three separate agents per node
+
+    # DaemonSet 1: Prometheus Node Exporter (metrics)
+
+    # DaemonSet 2: Fluent Bit (logs)
+
+    # DaemonSet 3: Jaeger Agent (traces)
+
+    # = 3x resource overhead, 3x config surfaces, 3x failure domains
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments or OpenTelemetry
+  when_not_applies: throwaway prototypes, local dev scripts. projects not using Kubernetes or OpenTelemetry
+  sources: ["https://opentelemetry.io/docs/collector/"]
+- id: CR-K8S-OBS-012
+  text: Configure Kubernetes audit policy to capture security-relevant API operations without overwhelming storage.
+  why: Default audit logging is either disabled or captures everything at Metadata level, generating massive volumes of data
+    (100GB+/day in active clusters) with no useful signal. A well-tuned audit policy captures high-value events (secret access,
+    exec, RBAC changes, privileged pod creation) at full detail while ignoring noisy read operations (watch, list from controllers).
+    This reduces storage by 90% while maintaining forensic capability.
+  how_to_do_right: 'Log at RequestResponse level for: secrets, RBAC, exec/attach/portforward, pod creation in kube-system.
+    Log at Metadata level for: all other writes. Skip at None level for: watch/list from system accounts, health check endpoints,
+    lease renewals. Ship audit logs to a dedicated SIEM (not the same Loki as application logs). Retain for 90 days minimum.
+    Alert on: secret access by non-controller accounts, RBAC changes, exec into production pods.'
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [observability, security]
+  example_good: "apiVersion: audit.k8s.io/v1\nkind: Policy\nomitStages:\n  - RequestReceived\nrules:\n  # Skip noisy system\
+    \ requests\n  - level: None\n    users: [\"system:kube-proxy\", \"system:kube-scheduler\"]\n    verbs: [\"watch\", \"\
+    list\", \"get\"]\n  - level: None\n    resources:\n      - group: \"\"\n        resources: [\"endpoints\", \"events\"\
+    ]\n    verbs: [\"watch\", \"list\"]\n  # Skip lease renewals\n  - level: None\n    resources:\n      - group: \"coordination.k8s.io\"\
+    \n        resources: [\"leases\"]\n  # Full logging for security-sensitive operations\n  - level: RequestResponse\n  \
+    \  resources:\n      - group: \"\"\n        resources: [\"secrets\"]\n  - level: RequestResponse\n    resources:\n   \
+    \   - group: \"\"\n        resources: [\"pods/exec\", \"pods/attach\", \"pods/portforward\"]\n  - level: RequestResponse\n\
+    \    resources:\n      - group: \"rbac.authorization.k8s.io\"\n  # Metadata for everything else\n  - level: Metadata\n"
+  example_bad: "# Audit everything at maximum verbosity\napiVersion: audit.k8s.io/v1\nkind: Policy\nrules:\n  - level: RequestResponse\
+    \    # ALL requests at full detail\n    resources:\n      - group: \"\"\n        resources: [\"*\"]\n# 100GB/day of audit\
+    \ logs\n# 95% is noise (watches, health checks, lease renewals)\n# Cannot find security events in the flood\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: throwaway prototypes, local dev scripts. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/tasks/debug/debug-cluster/audit/"]
+- id: CR-K8S-OBS-013
+  text: Define SLOs with error budgets and burn rate alerts — not threshold-based alerts on raw metrics.
+  why: 'Threshold alerts (e.g., ''alert if latency > 500ms'') fire on every brief spike regardless of user impact. SLOs define
+    what users actually need: ''99.9% of requests complete in < 500ms over 30 days.'' The error budget (0.1% = 43 minutes/month)
+    determines how much failure is acceptable. Burn rate alerts fire only when you''re consuming budget too fast — they''re
+    actionable and directly tied to user impact.'
+  how_to_do_right: 'Define SLOs for each service: availability (% of successful requests), latency (% within threshold), throughput.
+    Calculate error budget: (1 - SLO) * period. Set multi-window burn rate alerts: 1h window at 14.4x burn rate (critical),
+    6h window at 6x burn rate (warning). Use Sloth or pyrra to generate PrometheusRules from SLO definitions. Display SLO
+    dashboards with budget remaining.'
+  severity: medium
+  technologies:
+    library: [sloth]
+    platform: [kubernetes, prometheus]
+  domains:
+    domain: [observability, reliability]
+  example_good: "# SLO definition with Sloth\n# apiVersion: sloth.slok.dev/v1\n# kind: PrometheusServiceLevel\n# metadata:\n\
+    #   name: api-slos\n# spec:\n#   service: api\n#   labels:\n#     team: platform\n#   slos:\n#     - name: requests-availability\n\
+    #       objective: 99.9          # 99.9% availability\n#       sli:\n#         events:\n#           errorQuery: sum(rate(http_requests_total{status=~\"\
+    5..\"}[{{.window}}]))\n#           totalQuery: sum(rate(http_requests_total[{{.window}}]))\n#       alerting:\n#     \
+    \    name: APIAvailability\n#         annotations:\n#           runbook: https://wiki.example.com/runbooks/api-slo\n#\
+    \         pageAlert:\n#           labels:\n#             severity: critical\n#         ticketAlert:\n#           labels:\n\
+    #             severity: warning\n\n# Generated alerts use multi-window burn rate:\n# - 1h window, 14.4x burn rate → page\
+    \ (exhausts budget in 1 day)\n# - 6h window, 6x burn rate → warning (exhausts budget in 3 days)\napiVersion: monitoring.coreos.com/v1\n\
+    kind: PrometheusRule\nmetadata:\n  name: api-slo-alerts\n"
+  example_bad: "# Threshold alert — no SLO context\n- alert: APIHighLatency\n  expr: http_request_duration_seconds > 0.5\n\
+    \  # Fires on every spike — no error budget concept\n  # Brief 2-second spike at 3am = page to on-call\n  # Actual user\
+    \ impact: 0.001% of requests affected\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments, Prometheus metrics collection, or Sloth
+  when_not_applies: throwaway prototypes, local dev scripts
+  sources: ["https://sre.google/workbook/implementing-slos/"]
+- id: CR-K8S-OBS-014
+  text: Structure dashboards in layers — overview, service, and debug — not one mega-dashboard per service.
+  why: 'A single dashboard with 50+ panels for a service is overwhelming — on-call engineers can''t find what matters during
+    an incident when they''re scrolling through 50 panels at 3am. Layered dashboards guide investigation: overview shows which
+    service is affected (10 seconds), service dashboard shows what''s wrong (30 seconds), debug dashboard shows why (2 minutes).
+    This is the difference between 5-minute and 45-minute MTTR.'
+  how_to_do_right: 'Layer 1 (Overview): One dashboard for all services — traffic light per service (RED metrics). Layer 2
+    (Service): Per-service dashboard — request rate, errors, latency, key resources. Layer 3 (Debug): Per-service deep-dive
+    — individual endpoints, database queries, cache hit rates, dependencies. Use variables for namespace, service, and time
+    range. Link between layers with drill-down URLs. Maximum 12 panels per dashboard.'
+  severity: medium
+  technologies:
+    platform: [kubernetes, grafana]
+  domains:
+    domain: [observability]
+  example_good: "# Layer 1: Overview (one dashboard for all services)\n# Panel 1: Service health matrix (green/yellow/red)\n\
+    # Panel 2: Total error rate across all services\n# Panel 3: P99 latency heatmap\n# Panel 4: Resource utilization summary\n\
+    \n# Layer 2: Service dashboard (per service)\n# Panel 1: Request rate (rate)\n# Panel 2: Error rate (errors)\n# Panel\
+    \ 3: P50/P95/P99 latency (duration)\n# Panel 4: CPU utilization\n# Panel 5: Memory utilization\n# Panel 6: Pod status\
+    \ (running/pending/failed)\n# Drill-down link to Layer 3\n\n# Layer 3: Debug dashboard (per service)\n# Panel 1: Latency\
+    \ by endpoint\n# Panel 2: Error rate by status code\n# Panel 3: Database query duration\n# Panel 4: Cache hit/miss ratio\n\
+    # Panel 5: Dependency latency (upstream services)\n# Panel 6: Go/JVM/Python runtime metrics\napiVersion: v1\nkind: ConfigMap\n\
+    metadata:\n  name: overview-dashboard\n  labels:\n    grafana_dashboard: \"1\"\n"
+  example_bad: '# One mega-dashboard with 60 panels
+
+    # Scrolls 5 screens down
+
+    # Half the panels are broken queries
+
+    # On-call: "which panel do I look at?" — no guidance
+
+    # MTTR: 45 minutes just to find the right panel
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments or Grafana dashboards and alerting
+  when_not_applies: throwaway prototypes, local dev scripts. projects not using Kubernetes or Grafana
+  sources: ["https://grafana.com/docs/grafana/latest/dashboards/build-dashboards/best-practices/"]
+- id: CR-K8S-OBS-015
+  text: Monitor kube-state-metrics for resource state and node-exporter for hardware metrics — both are required.
+  why: 'Prometheus scrapes container resource metrics from kubelet (CPU, memory usage), but it doesn''t know about Kubernetes
+    resource state: how many pods are pending, which deployments have available vs desired replicas, which PVCs are unbound,
+    which nodes have conditions. kube-state-metrics exports this Kubernetes metadata as Prometheus metrics. node-exporter
+    exports hardware-level metrics (disk I/O, network, filesystem) that kubelet doesn''t expose.'
+  how_to_do_right: 'Deploy kube-state-metrics as a single Deployment (it reads from API server, doesn''t need per-node). Deploy
+    node-exporter as a DaemonSet on every node. Use kube-state-metrics for alerts like: deployment rollout stuck, pods pending
+    >5m, PVC unbound, node not ready. Use node-exporter for: disk pressure, network errors, CPU throttling. Both are included
+    in kube-prometheus-stack.'
+  severity: high
+  technologies:
+    platform: [kubernetes, prometheus]
+  domains:
+    domain: [observability]
+  example_good: "# Essential kube-state-metrics alerts\napiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nspec:\n\
+    \  groups:\n    - name: kubernetes-state\n      rules:\n        - alert: PodNotReady\n          expr: |\n            kube_pod_status_ready{condition=\"\
+    true\"} == 0\n          for: 15m\n          labels:\n            severity: warning\n        - alert: DeploymentReplicasMismatch\n\
+    \          expr: |\n            kube_deployment_status_replicas_available\n            != kube_deployment_spec_replicas\n\
+    \          for: 10m\n          labels:\n            severity: warning\n        - alert: PersistentVolumeClaimPending\n\
+    \          expr: |\n            kube_persistentvolumeclaim_status_phase{phase=\"Pending\"} == 1\n          for: 15m\n\
+    \          labels:\n            severity: warning\n        - alert: NodeDiskPressure\n          expr: |\n            kube_node_status_condition{condition=\"\
+    DiskPressure\",status=\"true\"} == 1\n          for: 5m\n          labels:\n            severity: critical\n"
+  example_bad: '# Only container resource metrics — no Kubernetes state
+
+    # "Are all deployments healthy?" — unknown
+
+    # "Are there pending pods?" — unknown
+
+    # "Is any PVC unbound?" — unknown
+
+    # "Is any node under disk pressure?" — unknown
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments or Prometheus metrics collection
+  when_not_applies: throwaway prototypes, local dev scripts. projects not using Kubernetes or Prometheus
+  sources:
+    - "https://github.com/kubernetes/kube-state-metrics"
+    - "https://github.com/prometheus/node_exporter"
+- id: CR-K8S-OBS-016
+  text: Deploy cost observability (OpenCost/Kubecost) alongside performance observability for data-driven resource decisions.
+  why: 'Without cost data alongside performance metrics, optimization is guesswork. Teams over-provision because they don''t
+    know the cost impact — a developer sets 4 CPU request ''just to be safe'' without knowing it costs $200/month per replica.
+    Cost observability links resource usage to dollar amounts, enabling: chargeback per team, right-sizing recommendations
+    with cost impact, spot vs on-demand decisions, and cost anomaly detection.'
+  how_to_do_right: 'Deploy OpenCost (CNCF project, free) or Kubecost (more features, free tier available). Configure cloud
+    pricing (AWS CUR, GCP billing export). Tag all workloads with team and project labels. Create dashboards showing: cost
+    per namespace/team, cost efficiency (used/requested ratio), top 10 most expensive workloads, cost trend over time. Alert
+    on: sudden cost spikes (>30% week-over-week), idle resources (requested but unused >50%).'
+  severity: medium
+  technologies:
+    library: [opencost, kubecost]
+    platform: [kubernetes]
+  domains:
+    domain: [observability, performance]
+  example_good: "# OpenCost deployment\n# helm install opencost opencost/opencost --namespace opencost\n# --set opencost.exporter.defaultClusterId=production\n\
+    # --set opencost.exporter.aws.spot_data_region=us-east-1\n\n# Cost alert: sudden spike\napiVersion: monitoring.coreos.com/v1\n\
+    kind: PrometheusRule\nspec:\n  groups:\n    - name: cost.rules\n      rules:\n        - alert: CostSpikeDetected\n   \
+    \       expr: |\n            sum(opencost_monthly_cost) by (namespace)\n            / sum(opencost_monthly_cost offset\
+    \ 7d) by (namespace) > 1.3\n          for: 1h\n          labels:\n            severity: warning\n          annotations:\n\
+    \            summary: \"Namespace {{ $labels.namespace }} cost increased >30% vs last week\"\n"
+  example_bad: '# No cost observability
+
+    # Monthly K8s bill: $50,000 → $75,000
+
+    # "What changed?" → weeks of investigation
+
+    # "Can we optimize?" → afraid to change anything
+
+    # "Who''s responsible?" → nobody knows
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments, OpenCost, or Kubecost
+  when_not_applies: throwaway prototypes, local dev scripts
+  sources: ["https://www.opencost.io/docs/"]

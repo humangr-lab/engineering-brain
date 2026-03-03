@@ -1,0 +1,261 @@
+layer: rules
+technology: Redis
+domain: reliability
+knowledge:
+- id: CR-SRE-REDIS-001
+  text: Redis is single-threaded — one slow command (KEYS *, SMEMBERS on a 1M-element set, LRANGE on a 100K-element list)
+    blocks ALL other clients for the duration. Use SCAN instead of KEYS, paginate large collections, and avoid O(n) operations
+    on large data structures.
+  why: 'Google''s latency management principles apply directly to Redis because Redis processes commands sequentially on a
+    single thread. A KEYS * command on a database with 1M keys takes ~100ms. During those 100ms, every other client (potentially
+    thousands) is blocked — no reads, no writes, no pub/sub messages. At 10,000 operations/second, a 100ms block means 1,000
+    operations are delayed by 100ms. If those operations have a 200ms timeout, half of them may timeout and fail. Google''s
+    SRE approach: eliminate all O(n) operations in the hot path, replace blocking commands with incremental alternatives,
+    and monitor command latency to detect slow commands before they cause incidents.
+
+    '
+  how_to_do_right: '1. Never use KEYS in production: use SCAN with COUNT 100 for incremental iteration. SCAN is O(1) per call,
+    not O(n).
+
+    2. Avoid SMEMBERS on large sets: use SSCAN. Avoid LRANGE 0 -1 on large lists: paginate with LRANGE start stop.
+
+    3. Set maxmemory and maxmemory-policy: prevent Redis from using all available memory and being OOM-killed.
+
+    4. Monitor slowlog: SLOWLOG GET 10 shows the 10 slowest recent commands. Alert if any command exceeds 10ms.
+
+    5. Use Redis Cluster for horizontal scaling: distribute keys across shards. Each shard is single-threaded but handles
+    only a fraction of the total load.
+
+    6. Separate hot and cold data: use different Redis instances for cache (volatile, high throughput) vs persistent data
+    (durable, lower throughput).
+
+    '
+  example_good: "import redis\n\nr = redis.Redis()\n\n# Use SCAN instead of KEYS for iteration\ndef find_user_keys(r: redis.Redis, pattern: str) -> list[str]:\n    keys = []\n    for key in r.scan_iter(match=pattern, count=100):\n        keys.append(key)\n    return keys\n\n# Paginate large lists instead of LRANGE 0 -1\ndef get_page(r: redis.Redis, key: str, page: int, size: int = 50):\n    start = page * size\n    return r.lrange(key, start, start + size - 1)\n"
+  example_bad: "import redis\n\nr = redis.Redis()\n\n# KEYS * blocks ALL clients for ~100ms on 1M keys\nall_keys = r.keys('user:*')  # O(n) — blocks entire server\n\n# SMEMBERS on a 1M-element set — blocks for seconds\nall_members = r.smembers('large_set')  # O(n)\n\n# LRANGE 0 -1 on a 100K-element list\nall_items = r.lrange('huge_list', 0, -1)  # O(n)\n# During these operations, thousands of other clients are blocked\n"
+  when_applies: "When performing key enumeration, large collection reads, or any potentially O(n) operations on a production Redis instance."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [redis]
+  domains:
+    domain: [databases, performance, reliability]
+    concern: [key_value, redis, caching]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-REDIS-002
+  text: Redis persistence must be configured for the use case — RDB snapshots for cache (fast restart, acceptable data loss),
+    AOF for durable data (minimal data loss, slower restart), or both. Using Redis as a durable store without AOF means any
+    restart loses all data since the last RDB snapshot.
+  why: 'Redis stores data in memory and optionally persists to disk. RDB (snapshotting) creates point-in-time dumps at intervals
+    (e.g., every 5 minutes). AOF (Append-Only File) logs every write command. The tradeoff: RDB — fast restart (load snapshot),
+    but loses data between snapshots (up to 5 minutes). AOF — slow restart (replay all commands), but loses at most 1 second
+    of data (with fsync every second). Common mistake: using Redis for critical data (sessions, rate limits, feature flags)
+    with only RDB persistence. Redis restarts → 5 minutes of sessions lost → all users logged out. Google''s approach: match
+    persistence to data criticality. Cache: no persistence needed (data can be recomputed). Sessions: AOF with fsync every
+    second. Financial data: don''t use Redis.
+
+    '
+  how_to_do_right: '1. Cache use case: disable both RDB and AOF. Data is reconstructable from the source of truth. Fast restart
+    with empty cache.
+
+    2. Session store: enable AOF with appendfsync=everysec. Lose at most 1 second of sessions on crash. Acceptable for most
+    web applications.
+
+    3. Rate limiting / counters: enable AOF. Losing rate limit state on restart allows temporary bypass of limits.
+
+    4. Critical data: don''t use Redis as primary store. Use PostgreSQL/MySQL and cache in Redis. Redis loss = performance
+    degradation, not data loss.
+
+    5. Configure save points for RDB: save 900 1, save 300 10, save 60 10000 (snapshot if 1 change in 15min, 10 changes in
+    5min, or 10000 changes in 1min).
+
+    6. Monitor persistence health: check last_rdb_save_time, aof_last_write_status. Alert if persistence falls behind or fails.
+
+    '
+  example_good: "# redis.conf — persistence matched to data criticality\n\n# For session store: AOF with fsync every second\nappendonly yes\nappendfsync everysec\n# Lose at most 1 second of sessions on crash\n\n# For cache-only instance: no persistence needed\n# appendonly no\n# save \"\"  # Disable RDB snapshots\n\n# For mixed workload: both RDB + AOF\n# save 900 1\n# save 300 10\n# appendonly yes\n"
+  example_bad: "# redis.conf — DEFAULT configuration\n# Using Redis for user sessions with only RDB (default)\nsave 900 1\nsave 300 10\nsave 60 10000\n# appendonly no  (default)\n\n# Problem: Redis crashes → loses up to 5 minutes of sessions\n# All users who logged in during that window are logged out\n# Rate limit state is also lost → brief rate limit bypass\n"
+  when_applies: "When configuring Redis persistence for any use case beyond ephemeral caching."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [redis]
+  domains:
+    domain: [databases, reliability]
+    concern: [key_value, persistence, redis]
+  sources:
+  - url: https://sre.google/sre-book/data-integrity/
+    title: 'Google SRE Book — Chapter 26: Data Integrity'
+  validation_status: cross_checked
+- id: CR-SRE-REDIS-003
+  text: Redis key expiration (TTL) must be set on all cache keys — keys without TTL accumulate indefinitely, consuming memory
+    until maxmemory is reached and eviction starts. Eviction under memory pressure is unpredictable and can evict important
+    keys. Explicit TTL prevents this.
+  why: 'Redis without TTL on cache keys behaves like a memory leak. Each key consumes memory. Without expiration, keys only
+    leave Redis when explicitly deleted. If the application creates keys faster than it deletes them (common for cache-aside
+    patterns where deletion depends on update events that may be lost), memory grows continuously. When maxmemory is reached,
+    Redis starts evicting keys based on the eviction policy (LRU, LFU, random). But eviction is a remediation, not a design
+    — it can evict hot keys that are expensive to recompute, causing a cache stampede. Explicit TTL ensures orderly key lifecycle:
+    key is created → serves reads → expires after a predictable duration → recomputed on next miss.
+
+    '
+  how_to_do_right: '1. Set TTL on every cache key: SET key value EX 3600 (1 hour). Never SET without expiration for cache
+    data.
+
+    2. Choose TTL based on data volatility: configuration (1 hour), user profiles (5 minutes), search results (30 seconds).
+
+    3. Add jitter to TTL to prevent thundering herd: TTL = base_ttl + random(0, base_ttl * 0.1). Prevents all keys from expiring
+    simultaneously.
+
+    4. Monitor memory usage: INFO memory shows used_memory, maxmemory, evicted_keys. Alert if evicted_keys > 0 (indicates
+    memory pressure).
+
+    5. Set maxmemory to 80% of available RAM: leave 20% for OS, persistence, and fragmentation overhead.
+
+    6. Use volatile-lru or volatile-lfu eviction policy: evict only keys with TTL set. Keys without TTL (persistent data)
+    are protected from eviction.
+
+    '
+  example_good: "import redis\nimport random\n\nr = redis.Redis()\nBASE_TTL = 3600  # 1 hour\n\ndef cache_set(key: str, value: str, base_ttl: int = BASE_TTL):\n    # Add jitter to prevent thundering herd\n    jitter = random.randint(0, int(base_ttl * 0.1))\n    r.set(key, value, ex=base_ttl + jitter)\n\ndef cache_user_profile(user_id: int, profile: dict):\n    cache_set(f\"user:{user_id}:profile\", json.dumps(profile), base_ttl=300)\n\ndef cache_config(key: str, value: str):\n    cache_set(f\"config:{key}\", value, base_ttl=3600)\n"
+  example_bad: "import redis\n\nr = redis.Redis()\n\n# No TTL — keys accumulate forever\nr.set('user:123:profile', json.dumps(profile))  # Lives forever\nr.set('search:results:abc', json.dumps(results))  # Lives forever\nr.set('temp:calculation:xyz', value)  # Lives forever\n\n# Memory grows continuously until maxmemory is reached\n# Then Redis starts evicting random keys — including hot ones\n# Cache stampede follows: many clients recompute simultaneously\n"
+  when_applies: "When storing any cache data in Redis that is not permanent reference data."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [redis]
+  domains:
+    domain: [databases, performance, reliability]
+    concern: [key_value, caching, redis]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-REDIS-004
+  text: Redis Pub/Sub is fire-and-forget — messages are lost if no subscriber is connected at the time of publish. For reliable
+    messaging, use Redis Streams (XADD/XREAD) which persist messages and support consumer groups with acknowledgment.
+  why: 'Redis Pub/Sub was designed for real-time notifications, not reliable messaging. If a subscriber disconnects (network
+    issue, restart, crash) and reconnects, all messages published during the disconnection are lost — permanently. There is
+    no replay, no acknowledgment, no persistence. Google''s messaging principles require at-least-once delivery for important
+    events. Redis Streams (introduced in Redis 5.0) provide: message persistence (messages stored in a stream), consumer groups
+    (multiple consumers sharing work), acknowledgment (XACK confirms processing), replay (XRANGE reads historical messages),
+    and backpressure (XLEN monitors queue depth).
+
+    '
+  how_to_do_right: '1. Use Pub/Sub only for ephemeral notifications where message loss is acceptable: cache invalidation signals,
+    real-time dashboard updates.
+
+    2. Use Redis Streams for reliable messaging: XADD writes, XREADGROUP reads with consumer groups, XACK acknowledges processing.
+
+    3. Set MAXLEN on streams to prevent unbounded growth: XADD mystream MAXLEN ~1000 * field value.
+
+    4. Monitor pending messages: XPENDING shows messages delivered but not acknowledged. High pending count indicates slow
+    consumers or processing failures.
+
+    5. Implement dead letter handling: claim messages pending > 5 minutes with XCLAIM and route to a dead letter stream for
+    investigation.
+
+    6. Use BLOCK parameter for efficient polling: XREADGROUP GROUP mygroup consumer BLOCK 5000 — blocks for 5 seconds waiting
+    for new messages instead of busy-polling.
+
+    '
+  example_good: "import redis\n\nr = redis.Redis()\nSTREAM = 'orders'\nGROUP = 'order-processors'\n\n# Create consumer group\ntry:\n    r.xgroup_create(STREAM, GROUP, id='0', mkstream=True)\nexcept redis.ResponseError:\n    pass  # Group already exists\n\n# Consume with acknowledgment\nwhile True:\n    messages = r.xreadgroup(GROUP, 'consumer-1', {STREAM: '>'},\n                            count=10, block=5000)\n    for stream, msgs in messages:\n        for msg_id, data in msgs:\n            process_order(data)\n            r.xack(STREAM, GROUP, msg_id)  # Acknowledge\n"
+  example_bad: "import redis\n\nr = redis.Redis()\n\n# Pub/Sub for critical order events — messages lost on disconnect!\nr.publish('orders', json.dumps(order))\n\n# If consumer disconnects for 5 seconds:\n# All orders published during that window are LOST FOREVER\n# No replay, no acknowledgment, no persistence\n# Customer orders vanish silently\n"
+  when_applies: "When choosing between Redis Pub/Sub and Redis Streams for inter-service messaging."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [redis]
+  domains:
+    domain: [databases, architecture, messaging, reliability]
+    concern: [key_value, pub_sub, redis]
+  sources:
+  - url: https://sre.google/sre-book/data-processing-pipelines/
+    title: 'Google SRE Book — Chapter 25: Data Processing Pipelines'
+  validation_status: cross_checked
+- id: CR-SRE-REDIS-005
+  text: Redis Lua scripts execute atomically — use them for multi-step operations that must be atomic (check-and-set, rate
+    limiting with sliding windows, distributed locks). But a long-running Lua script blocks the entire Redis server, so keep
+    scripts under 100ms.
+  why: 'Redis guarantees that a Lua script runs atomically — no other command can execute between the script''s commands.
+    This makes Lua scripts the correct tool for operations like: rate limiting (check counter → increment → set expiry), distributed
+    locks (check if lock exists → acquire if not), and conditional updates (check value → update if condition met). Without
+    atomicity, these operations are subject to race conditions: two clients check the counter simultaneously, both see 99
+    (limit 100), both increment to 100, actual count is 101. However, because Redis is single-threaded, a Lua script blocks
+    all other operations for its duration. A script that takes 500ms means 500ms of complete Redis unavailability.
+
+    '
+  how_to_do_right: '1. Use EVAL for atomic multi-step operations: rate limiting, distributed locks, conditional updates. Replace
+    MULTI/EXEC for complex logic.
+
+    2. Keep scripts under 100ms: avoid loops over large datasets, avoid KEYS or SCAN inside scripts.
+
+    3. Use EVALSHA with script caching: compute SHA1 of the script, use EVALSHA to avoid transmitting the script on every
+    call.
+
+    4. Test scripts with representative data sizes: a script that runs in 1ms on 100 keys may take 1s on 100,000 keys.
+
+    5. Monitor script execution time: SLOWLOG catches slow Lua scripts. Set lua-time-limit to kill long-running scripts (default
+    5000ms).
+
+    6. Pass keys and arguments to scripts using KEYS and ARGV arrays — never hardcode key names in scripts. This enables Redis
+    Cluster compatibility.
+
+    '
+  example_good: "import redis\n\nr = redis.Redis()\n\n# Atomic rate limiter using Lua script\nRATE_LIMIT_SCRIPT = \"\"\"\nlocal key = KEYS[1]\nlocal limit = tonumber(ARGV[1])\nlocal window = tonumber(ARGV[2])\nlocal current = tonumber(redis.call('GET', key) or '0')\nif current >= limit then\n    return 0  -- Rate limited\nend\nredis.call('INCR', key)\nif current == 0 then\n    redis.call('EXPIRE', key, window)\nend\nreturn 1  -- Allowed\n\"\"\"\n\nrate_limit = r.register_script(RATE_LIMIT_SCRIPT)\nallowed = rate_limit(keys=['ratelimit:user:123'], args=[100, 60])\n"
+  example_bad: "import redis\n\nr = redis.Redis()\n\n# Non-atomic rate limit — race condition!\ncurrent = int(r.get('ratelimit:user:123') or 0)\nif current < 100:\n    r.incr('ratelimit:user:123')  # Two clients can both pass the check\n    r.expire('ratelimit:user:123', 60)\n    # Allow request\n# Between GET and INCR, another client may also pass\n# Result: limit of 100 allows 200+ requests\n"
+  when_applies: "When implementing atomic multi-step Redis operations like rate limiting, distributed locks, or conditional updates."
+  severity: medium
+  technologies:
+    lang: [general]
+    platform: [redis]
+  domains:
+    domain: [databases, reliability]
+    concern: [key_value, redis, scripting]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-REDIS-006
+  text: Redis Cluster hash slots must be balanced and multi-key operations must use hash tags — an unbalanced cluster creates
+    hot spots where one shard handles disproportionate traffic. Multi-key commands (MGET, pipeline) fail if keys are on different
+    shards unless hash tags force co-location.
+  why: 'Redis Cluster distributes 16384 hash slots across shards. Each key is assigned to a slot via CRC16(key) % 16384. If
+    data is naturally skewed (e.g., 80% of keys start with "user:"), most keys may land on the same shard — creating a hot
+    spot. Google''s load balancing principles (Chapter 20) apply: even distribution across backends is critical for performance.
+    Multi-key operations (MGET key1 key2, SUNION set1 set2) require all keys to be on the same shard. If they''re on different
+    shards, Redis returns a CROSSSLOT error. Hash tags solve this: keys "order:{user123}:items" and "order:{user123}:total"
+    both hash on "user123" and land on the same shard.
+
+    '
+  how_to_do_right: '1. Use hash tags for related keys: {user:123}:profile, {user:123}:sessions, {user:123}:cart — all co-located
+    on the same shard.
+
+    2. Monitor slot distribution: CLUSTER INFO shows cluster_slots_assigned, cluster_known_nodes. Check per-shard key count
+    with DBSIZE on each node.
+
+    3. Rebalance slots when adding/removing nodes: CLUSTER REBALANCE or use redis-cli --cluster rebalance.
+
+    4. Avoid hot key patterns: if one key receives 10x the traffic of others, it hot-spots its shard. Use client-side caching
+    or key splitting.
+
+    5. Test multi-key operations in cluster mode: MGET, pipelines, and Lua scripts must use hash tags for cross-key operations.
+
+    6. Plan shard count for growth: start with enough shards that adding more doesn''t require a complete re-architecture.
+    6 shards (3 masters + 3 replicas) is a good minimum.
+
+    '
+  example_good: "import redis\n\nr = redis.RedisCluster(host='redis-cluster', port=6379)\n\n# Hash tags co-locate related keys on the same shard\ndef set_user_data(user_id: int, profile: dict, cart: list):\n    # All keys hash on {user:123} -> same shard\n    r.set(f'{{user:{user_id}}}:profile', json.dumps(profile), ex=3600)\n    r.set(f'{{user:{user_id}}}:cart', json.dumps(cart), ex=3600)\n    # MGET works because keys are co-located\n    return r.mget(\n        f'{{user:{user_id}}}:profile',\n        f'{{user:{user_id}}}:cart'\n    )\n"
+  example_bad: "import redis\n\nr = redis.RedisCluster(host='redis-cluster', port=6379)\n\n# Keys without hash tags land on different shards\nr.set(f'user:{user_id}:profile', json.dumps(profile))\nr.set(f'user:{user_id}:cart', json.dumps(cart))\n\n# CROSSSLOT error! Keys are on different shards\nresult = r.mget(\n    f'user:{user_id}:profile',\n    f'user:{user_id}:cart'\n)  # redis.exceptions.ResponseError: CROSSSLOT\n"
+  when_applies: "When using Redis Cluster and performing multi-key operations or when key distribution causes hot spots."
+  severity: medium
+  technologies:
+    lang: [general]
+    platform: [redis]
+  domains:
+    domain: [databases, reliability]
+    concern: [key_value, clustering, redis]
+  sources:
+  - url: https://sre.google/sre-book/load-balancing-datacenter/
+    title: 'Google SRE Book — Chapter 20: Load Balancing in the Datacenter'
+  validation_status: cross_checked

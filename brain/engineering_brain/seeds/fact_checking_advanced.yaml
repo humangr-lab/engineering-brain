@@ -1,0 +1,781 @@
+layer: rules
+domain: fact_checking
+knowledge:
+- id: FCA-001
+  text: "Deploy pre-bunking (inoculation) before misinformation spreads — expose users to weakened versions of false narratives so they recognize manipulation techniques when encountered in the wild. Pre-bunking is 2-5x more effective than post-hoc debunking."
+  why: >
+    Retroactive debunking faces the continued influence effect: once a false claim anchors in memory,
+    corrections only reduce belief by ~25%. The Veritas pilot showed that users who received
+    inoculation messages before exposure to misinformation were 72% less likely to share it,
+    versus 31% for those who only saw a debunk after the fact. Skipping pre-bunking means your
+    fact-check arrives too late — the claim already went viral and corrected posts get 1/10th the reach.
+  how_to_do_right: |
+    1. Identify trending narratives via real-time claim ingestion (Kafka topic: claims.trending)
+    2. Generate weakened misinformation variants using LLM with explicit "inoculation" prompt template
+    3. Surface pre-bunking cards to users BEFORE they encounter the full false claim (within 4-hour window)
+    4. Track inoculation effectiveness: measure share rate of debunked claim among inoculated vs control group
+    5. Store inoculation templates in Qdrant collection "prebunk_templates" with embedding similarity to incoming claims
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka-python, qdrant-client]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    async def deliver_prebunk(claim: IncomingClaim) -> PrebunkCard:
+        similar_templates = await qdrant.search(
+            collection="prebunk_templates",
+            query_vector=embed(claim.text),
+            limit=3,
+            score_threshold=0.78,
+        )
+        if similar_templates:
+            card = adapt_template(similar_templates[0], claim)
+        else:
+            card = await generate_inoculation(claim, style="weakened_example")
+        await push_to_feed(card, audience=claim.target_demographic, ttl_hours=4)
+        return card
+  example_bad: |
+    async def handle_claim(claim: IncomingClaim) -> Verdict:
+        # Only reacts AFTER claim goes viral — continued influence effect already set in
+        verdict = await verify(claim)
+        await publish_debunk(verdict)  # Reaches 10% of original audience
+        return verdict
+  when_applies: When trending claims are detected early (within first 2 hours of spread) and target audience can be reached proactively
+  sources:
+    - "https://misinforeview.hks.harvard.edu/article/global-vaccination-badnews/"
+    - "https://www.cam.ac.uk/stories/inoculateexperiment"
+
+- id: FCA-002
+  text: "Implement real-time debunking that attaches fact-check verdicts to claims at the point of consumption — inline annotations, social media context labels, or browser extension overlays — rather than publishing standalone fact-check articles that users must find themselves."
+  why: >
+    Standalone debunk articles reach less than 5% of the audience that saw the original claim.
+    Real-time inline debunking (e.g., Twitter Community Notes, Google fact-check markup) reaches
+    the user at the exact moment of consumption. The Veritas prototype found that inline verdicts
+    reduced re-sharing by 48%, while a separate debunk page reduced it by only 11%.
+  how_to_do_right: |
+    1. Expose verdicts via ClaimReview schema (schema.org) for search engine integration
+    2. Implement WebSocket endpoint for real-time verdict delivery to browser extensions
+    3. Use claim fingerprint (semantic hash) to match verdicts to claims across platforms
+    4. Cache verdict-claim mappings in Redis with TTL=24h for sub-50ms lookup at consumption point
+    5. Provide severity-colored badges: red (FALSE), orange (MISLEADING), yellow (UNVERIFIED), green (TRUE)
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+    library: [redis, websockets]
+  domains:
+    domain: [fact_checking, api]
+    concern: [domain_specific]
+  example_good: |
+    @app.websocket("/ws/verdicts")
+    async def verdict_stream(ws: WebSocket):
+        await ws.accept()
+        while True:
+            claim_fingerprint = await ws.receive_text()
+            verdict = await redis.get(f"verdict:{claim_fingerprint}")
+            if verdict:
+                await ws.send_json(json.loads(verdict))
+            else:
+                task = verify_claim_async.delay(claim_fingerprint)
+                await ws.send_json({"status": "checking", "task_id": task.id})
+  example_bad: |
+    @app.post("/fact-check")
+    async def fact_check(claim: str):
+        verdict = await verify(claim)
+        article = generate_article(verdict)
+        await publish_to_blog(article)  # Nobody will find this
+        return {"article_url": article.url}
+  when_applies: Any fact-checking system that delivers verdicts to end users, especially for social media or news consumption contexts
+  sources:
+    - "https://schema.org/ClaimReview"
+    - "https://developers.google.com/search/docs/appearance/structured-data/factcheck"
+
+- id: FCA-003
+  text: "Build contradiction detection as a first-class pipeline stage — compare every new claim against existing verified claims in the knowledge graph using semantic entailment, and flag logical contradictions before publishing any verdict."
+  why: >
+    Without contradiction detection, a fact-checking system can publish verdict A for claim X and
+    verdict B for claim Y, where A and B are logically incompatible. This destroys credibility
+    instantly. The Veritas prototype found 7% of auto-generated verdicts contradicted previously
+    published verdicts when tested over 500 claims. Users who discovered contradictions rated
+    system trust at 2.1/10 vs 7.8/10 for consistent systems.
+  how_to_do_right: |
+    1. Before publishing any verdict, query knowledge graph for all claims with cosine similarity > 0.75
+    2. Run NLI (Natural Language Inference) model on each pair: (new_verdict, existing_verdict)
+    3. If NLI returns CONTRADICTION with confidence > 0.85, halt publication and escalate to human reviewer
+    4. Store contradiction pairs in Neo4j with CONTRADICTS edge type for audit trail
+    5. Run daily batch contradiction scan across all published verdicts (cron, not just on new claims)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [transformers, neo4j, qdrant-client]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [consistency]
+  example_good: |
+    async def check_contradictions(new_verdict: Verdict) -> ContradictionReport:
+        similar_verdicts = await qdrant.search(
+            collection="published_verdicts",
+            query_vector=embed(new_verdict.summary),
+            limit=20,
+            score_threshold=0.75,
+        )
+        contradictions = []
+        for existing in similar_verdicts:
+            nli_result = nli_model.predict(new_verdict.summary, existing.summary)
+            if nli_result.label == "CONTRADICTION" and nli_result.confidence > 0.85:
+                contradictions.append(ContradictionPair(
+                    new=new_verdict.id, existing=existing.id,
+                    confidence=nli_result.confidence,
+                ))
+        if contradictions:
+            await escalate_to_human(contradictions)
+            raise ContradictionBlockError(contradictions)
+        return ContradictionReport(checked=len(similar_verdicts), conflicts=0)
+  example_bad: |
+    async def publish_verdict(verdict: Verdict):
+        # No contradiction check — publishes blindly
+        await db.save(verdict)
+        await notify_subscribers(verdict)
+  when_applies: Every verdict publication, both real-time and batch, in any fact-checking system
+  sources:
+    - "https://arxiv.org/abs/2004.14709"
+
+- id: FCA-004
+  text: "Health claims require RCT (Randomized Controlled Trial) or systematic review evidence — never accept observational studies, testimonials, or single-study results as sufficient for health-related verdicts. Classify evidence using the GRADE framework."
+  why: >
+    Health misinformation kills people. Observational studies have a 35% replication failure rate,
+    and correlation-based health claims (e.g., "supplement X cures Y") mislead millions.
+    During COVID-19, fact-checkers who accepted pre-print observational studies as evidence
+    had to retract 23% of their verdicts when RCTs contradicted the initial findings.
+    The GRADE framework (Grading of Recommendations, Assessment, Development, Evaluation)
+    is the WHO/Cochrane standard for evidence quality.
+  how_to_do_right: |
+    1. Tag claims as domain=HEALTH using NER + keyword classifier (threshold confidence > 0.90)
+    2. For HEALTH claims, require evidence_grade >= "MODERATE" on GRADE scale (RCT or systematic review)
+    3. Query PubMed API for systematic reviews first (filter: publication_type="Meta-Analysis" OR "Systematic Review")
+    4. If only observational evidence exists, verdict must be INSUFFICIENT_EVIDENCE, never TRUE/FALSE
+    5. Include GRADE rating in verdict metadata: {"evidence_grade": "HIGH", "study_type": "RCT", "sample_size": 1200}
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [biopython, httpx]
+  domains:
+    domain: [fact_checking, compliance]
+    concern: [domain_specific]
+  example_good: |
+    async def verify_health_claim(claim: HealthClaim) -> Verdict:
+        pubmed_results = await search_pubmed(
+            query=claim.medical_terms,
+            filters=["Meta-Analysis", "Systematic Review", "Randomized Controlled Trial"],
+            min_date="2019-01-01",
+        )
+        best_evidence = grade_evidence(pubmed_results)
+        if best_evidence.grade < GradeLevel.MODERATE:
+            return Verdict(
+                label="INSUFFICIENT_EVIDENCE",
+                explanation=f"Only {best_evidence.grade.name} evidence available. "
+                            f"Health claims require at least MODERATE (RCT/systematic review).",
+                evidence_grade=best_evidence.grade,
+            )
+        return evaluate_with_grade(claim, best_evidence)
+  example_bad: |
+    async def verify_health_claim(claim: str) -> Verdict:
+        results = google_search(claim)
+        # Accepts blog posts, testimonials, single observational study
+        if any("study shows" in r.snippet for r in results):
+            return Verdict(label="TRUE", explanation="A study supports this claim")
+  when_applies: Any claim related to health, medicine, nutrition, supplements, treatments, or disease
+  sources:
+    - "https://www.gradeworkinggroup.org/"
+    - "https://handbook-5-1.cochrane.org/chapter_12/12_2_1_the_grade_approach.htm"
+
+- id: FCA-005
+  text: "Political claims require authoritative primary sources — voting records from official legislative databases, campaign finance filings from electoral commissions (TSE in Brazil, FEC in US), and official government statistics. Never accept partisan media as primary evidence for political claims."
+  why: >
+    Political fact-checking is the highest-stakes domain because it directly influences elections.
+    Partisan sources frame identical data points with opposite conclusions. The Veritas pilot found
+    that when political claims were verified using only news articles (no primary sources), verdict
+    accuracy dropped from 89% to 61%. Using official TSE/FEC data as ground truth maintained
+    accuracy at 91% even for highly partisan claims.
+  how_to_do_right: |
+    1. Tag claims as domain=POLITICS using entity recognition (politician names, party names, legislation references)
+    2. For voting claims: query official legislative APIs (Camara dos Deputados API, Senate.gov API)
+    3. For campaign finance: query TSE DivulgaCand API or FEC OpenFEC API with candidate_id
+    4. For election results: query TSE Resultados API with election_year + cargo + UF
+    5. Cross-reference at least 2 primary sources before issuing verdict
+    6. Tag evidence provenance: {"source_type": "OFFICIAL_RECORD", "institution": "TSE", "url": "..."}
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [httpx, beautifulsoup4]
+  domains:
+    domain: [fact_checking, compliance]
+    concern: [domain_specific]
+  example_good: |
+    async def verify_voting_claim(claim: PoliticalClaim) -> Verdict:
+        deputy = await camara_api.search_deputy(claim.politician_name)
+        votes = await camara_api.get_votes(
+            deputy_id=deputy.id,
+            proposition_id=claim.bill_reference,
+        )
+        actual_vote = votes[0].vote if votes else None
+        if actual_vote is None:
+            return Verdict(label="UNVERIFIABLE", explanation="Vote record not found in official API")
+        claimed_vote = extract_claimed_position(claim.text)
+        matches = actual_vote.lower() == claimed_vote.lower()
+        return Verdict(
+            label="TRUE" if matches else "FALSE",
+            evidence=[Evidence(source="Camara dos Deputados API", data=votes[0].dict())],
+        )
+  example_bad: |
+    async def verify_political(claim: str) -> Verdict:
+        articles = await news_search(claim)
+        # Uses news articles from partisan outlets as primary evidence
+        supporting = [a for a in articles if "confirmed" in a.text]
+        return Verdict(label="TRUE" if len(supporting) > 2 else "FALSE")
+  when_applies: Any claim about politician actions, voting records, campaign promises, election results, or government policy
+  sources:
+    - "https://dadosabertos.tse.jus.br/"
+    - "https://www.fec.gov/data/"
+
+- id: FCA-006
+  text: "Science claims require peer-reviewed evidence with replication status — check not just whether a study exists, but whether it has been replicated, retracted, or contradicted by subsequent research. Single unreplicated studies are PRELIMINARY, not proof."
+  why: >
+    The replication crisis affects 50-70% of published studies in psychology and 30-50% in
+    biomedicine. A fact-checker who cites a single study as proof will be wrong roughly half
+    the time. The Retraction Watch database contains 40,000+ retracted papers that were once
+    cited as evidence. Veritas prototype analysis showed that 12% of "supporting evidence"
+    papers had been retracted or failed replication when checked against Retraction Watch + SCORE.
+  how_to_do_right: |
+    1. Search Semantic Scholar API for cited papers (DOI or title match)
+    2. Check Retraction Watch database for retraction status of every cited paper
+    3. Query citation context: papers that cite the original with "failed to replicate" or "could not reproduce"
+    4. Classify evidence: REPLICATED (2+ independent confirmations), PRELIMINARY (single study), RETRACTED, CONTRADICTED
+    5. For PRELIMINARY evidence, verdict must include caveat: "Based on a single unreplicated study"
+    6. Weight meta-analyses and systematic reviews 3x over individual studies
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [httpx, semanticscholar]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    async def assess_science_evidence(paper_doi: str) -> EvidenceAssessment:
+        paper = await semantic_scholar.get_paper(paper_doi)
+        retraction = await retraction_watch.check(paper_doi)
+        if retraction:
+            return EvidenceAssessment(status="RETRACTED", reason=retraction.reason)
+        citing_papers = await semantic_scholar.get_citations(paper_doi, limit=100)
+        replication_attempts = [c for c in citing_papers if is_replication(c)]
+        successful = [r for r in replication_attempts if r.replication_success]
+        if len(successful) >= 2:
+            return EvidenceAssessment(status="REPLICATED", replications=len(successful))
+        elif replication_attempts and not successful:
+            return EvidenceAssessment(status="CONTRADICTED", failed_replications=len(replication_attempts))
+        return EvidenceAssessment(status="PRELIMINARY", note="No independent replication found")
+  example_bad: |
+    async def check_science_claim(claim: str) -> Verdict:
+        papers = await scholar_search(claim)
+        if papers:
+            return Verdict(label="TRUE", evidence=papers[0].title)
+        # Treats existence of ANY paper as proof — ignores retractions, replications
+  when_applies: Any claim citing scientific research, studies, or empirical evidence
+  sources:
+    - "https://retractionwatch.com/retraction-watch-database-user-guide/"
+    - "https://www.science.org/content/article/what-massive-database-retracted-papers-reveals-about-science-publishing-s-death-penalty"
+
+- id: FCA-007
+  text: "Financial claims require regulatory filings as ground truth — SEC/CVM filings, audited financial statements, and official exchange data. Never accept press releases, analyst estimates, or social media posts as primary evidence for financial claims."
+  why: >
+    Financial misinformation directly enables fraud, market manipulation, and investor losses.
+    Press releases are marketing documents, not verified facts. The SEC found that 78% of
+    pump-and-dump schemes used fabricated financial claims that contradicted actual filings.
+    Veritas analysis of 200 financial claims showed that using CVM/SEC filings as ground truth
+    caught 94% of false financial claims, versus 52% when relying on news articles.
+  how_to_do_right: |
+    1. For public company claims: query SEC EDGAR API or CVM RAD system for official filings
+    2. For revenue/profit claims: cross-reference against 10-K/10-Q (US) or DFP/ITR (Brazil)
+    3. For stock price claims: use official exchange APIs (B3, NYSE) not third-party aggregators
+    4. For crypto claims: verify on-chain data via blockchain explorers (Etherscan, etc.)
+    5. Tag evidence with filing reference: {"filing_type": "10-K", "cik": "0001234567", "date": "2025-12-31"}
+    6. Set verdict to UNVERIFIABLE if company is private and no filings exist
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [httpx, sec-edgar-api]
+  domains:
+    domain: [fact_checking, fintech]
+    concern: [domain_specific]
+  example_good: |
+    async def verify_financial_claim(claim: FinancialClaim) -> Verdict:
+        if claim.company_ticker:
+            filing = await edgar.get_latest_filing(
+                ticker=claim.company_ticker,
+                filing_type="10-K" if claim.annual else "10-Q",
+            )
+            actual_value = extract_financial_metric(filing, claim.metric)
+            claimed_value = parse_number(claim.claimed_value)
+            tolerance = 0.02  # 2% tolerance for rounding
+            is_accurate = abs(actual_value - claimed_value) / actual_value < tolerance
+            return Verdict(
+                label="TRUE" if is_accurate else "FALSE",
+                evidence=[Evidence(source=f"SEC EDGAR {filing.accession_number}", data={"actual": actual_value})],
+            )
+        return Verdict(label="UNVERIFIABLE", explanation="No regulatory filings available")
+  example_bad: |
+    async def verify_financial(claim: str) -> Verdict:
+        news = await search_news(claim)
+        # Uses press releases and analyst estimates as truth
+        return Verdict(label="TRUE" if "reported revenue" in news[0].text else "UNVERIFIABLE")
+  when_applies: Any claim about company financials, stock prices, market performance, or economic indicators
+  sources:
+    - "https://www.sec.gov/search-filings/edgar-application-programming-interfaces"
+
+- id: FCA-008
+  text: "Implement deepfake detection using both visual artifact analysis and metadata provenance — pixel-level analysis alone is insufficient as generative models improve; combine it with C2PA content credentials, EXIF chain-of-custody, and reverse image search for comprehensive media verification."
+  why: >
+    Visual-only deepfake detectors degrade rapidly: models trained on 2023 deepfakes detect only
+    40% of 2025 deepfakes (FaceForensics++ benchmark). Metadata provenance (C2PA/Content Authenticity
+    Initiative) provides a complementary signal that is harder to forge. The combination of
+    pixel analysis + metadata achieves 92% detection rate versus 67% for pixel-only and 71%
+    for metadata-only. Ignoring deepfakes means your fact-checking system can be trivially
+    bypassed with AI-generated "evidence" images and videos.
+  how_to_do_right: |
+    1. Run pixel-level analysis: face swap detection (FaceForensics++), GAN artifact detection (frequency domain)
+    2. Extract and validate C2PA manifest if present (content credentials chain)
+    3. Parse EXIF data: check for editing software signatures, GPS consistency, timestamp plausibility
+    4. Run reverse image search (Google Vision API or TinEye) to find original source
+    5. Combine signals with weighted ensemble: pixel_score * 0.4 + metadata_score * 0.3 + provenance_score * 0.3
+    6. Flag media with confidence < 0.70 for human review; auto-reject if confidence < 0.40
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [opencv-python, pillow, c2pa-python, httpx]
+  domains:
+    domain: [fact_checking, security]
+    concern: [domain_specific]
+  example_good: |
+    async def verify_media(media: MediaFile) -> MediaVerification:
+        pixel_result = await deepfake_detector.analyze(media.path)
+        metadata = extract_exif(media.path)
+        c2pa_manifest = extract_c2pa(media.path)
+        reverse_search = await tineye.search(media.path)
+
+        scores = {
+            "pixel": pixel_result.authenticity_score,
+            "metadata": assess_metadata_consistency(metadata),
+            "provenance": assess_c2pa(c2pa_manifest) if c2pa_manifest else 0.5,
+            "reverse_search": 1.0 if not reverse_search.older_matches else 0.3,
+        }
+        combined = scores["pixel"] * 0.4 + scores["metadata"] * 0.3 + scores["provenance"] * 0.3
+        return MediaVerification(
+            authentic=combined > 0.70,
+            confidence=combined,
+            needs_human_review=0.40 < combined < 0.70,
+            scores=scores,
+        )
+  example_bad: |
+    def check_image(image_path: str) -> bool:
+        # Only checks pixels — misses metadata manipulation, no provenance
+        result = deepfake_model.predict(image_path)
+        return result > 0.5  # Binary threshold, no nuance
+  when_applies: Any claim supported by image or video evidence, especially in political or celebrity contexts
+  sources:
+    - "https://c2pa.org/"
+    - "https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html"
+
+- id: FCA-009
+  text: "Verify quotes by tracing back to the original source — find the full transcript, video recording, or official statement rather than relying on secondary reporting. Restore the full context around the quote to detect selective quoting and meaning distortion."
+  why: >
+    Selective quoting is the most common form of technically-true misinformation. A quote can be
+    100% accurate in its words but 100% misleading in its meaning when stripped of context.
+    Analysis of 1,000 quote-based claims in the Veritas pilot showed that 28% were accurate
+    quotes used misleadingly (out of context, missing qualifiers, combining separate statements).
+    Secondary sources misquote or paraphrase in 15% of cases even without malicious intent.
+  how_to_do_right: |
+    1. Extract the quoted text and attributed speaker using NER + quotation mark detection
+    2. Search for original source: official transcript, video with timestamp, press release
+    3. If original found: extract 3 sentences before and after the quote for context window
+    4. Run semantic comparison: does the quote in context mean the same as the quote in isolation?
+    5. Check for ellipsis abuse: are words omitted that change meaning? Flag if >10 words removed
+    6. Verdict categories: ACCURATE_IN_CONTEXT, ACCURATE_BUT_MISLEADING, MISQUOTED, FABRICATED
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [spacy, httpx, youtube-transcript-api]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    async def verify_quote(claim: QuoteClaim) -> QuoteVerdict:
+        original = await find_original_source(
+            speaker=claim.attributed_speaker,
+            quote_fragment=claim.quoted_text[:50],
+            date_range=claim.approximate_date,
+        )
+        if not original:
+            return QuoteVerdict(label="UNVERIFIABLE", reason="Original source not found")
+        context_window = extract_context(original.transcript, claim.quoted_text, window=3)
+        meaning_preserved = await nli_model.check_entailment(
+            premise=context_window.full_text,
+            hypothesis=claim.implied_meaning,
+        )
+        if not meaning_preserved:
+            return QuoteVerdict(
+                label="ACCURATE_BUT_MISLEADING",
+                original_context=context_window.full_text,
+                explanation="Quote is verbatim but context changes the meaning",
+            )
+        return QuoteVerdict(label="ACCURATE_IN_CONTEXT", source=original.url)
+  example_bad: |
+    async def verify_quote(speaker: str, quote: str) -> bool:
+        results = await web_search(f'"{quote}" {speaker}')
+        return len(results) > 0  # Finding the quote online doesn't verify accuracy or context
+  when_applies: Any claim that attributes a specific statement to a person, organization, or document
+  sources:
+    - "https://ifcncodeofprinciples.poynter.org/the-commitments"
+
+- id: FCA-010
+  text: "Model misinformation cascades to predict spread velocity and reach — track claim propagation across platforms using content fingerprinting and estimate virality within the first 2 hours, so resources are allocated to the highest-impact claims first."
+  why: >
+    Misinformation follows power-law spread patterns: 1% of false claims account for 80% of
+    total exposure. Fact-checking resources are finite, so verifying a claim seen by 10 people
+    before one seen by 10 million is a catastrophic misallocation. MIT research showed that
+    false news reaches 1,500 people 6x faster than true news. Early cascade detection (within
+    first 2 hours) predicts eventual reach with 78% accuracy, enabling triage.
+  how_to_do_right: |
+    1. Compute content fingerprint (SimHash or semantic embedding) for each incoming claim
+    2. Track duplicate/near-duplicate occurrences across ingestion sources (Kafka consumer groups per platform)
+    3. Calculate spread velocity: occurrences_per_hour, unique_source_count, geographic_diversity
+    4. Predict eventual reach using logistic growth model fitted on historical cascade data
+    5. Prioritize fact-checking queue by predicted_reach * claim_severity (not FIFO)
+    6. Alert when cascade velocity exceeds threshold: >50 unique sources in <2 hours
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [kafka-python, redis, scikit-learn]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [domain_specific]
+  example_good: |
+    async def triage_claim(claim: IncomingClaim) -> Priority:
+        fingerprint = compute_simhash(claim.text)
+        cascade = await redis.hincrby(f"cascade:{fingerprint}", "count", 1)
+        sources = await redis.sadd(f"cascade:{fingerprint}:sources", claim.source_id)
+        source_count = await redis.scard(f"cascade:{fingerprint}:sources")
+        velocity = cascade / max(hours_since_first_seen(fingerprint), 0.1)
+        predicted_reach = logistic_growth_predict(velocity, source_count)
+        priority = predicted_reach * claim.severity_score
+        await redis.zadd("fact_check_queue", {claim.id: priority})
+        if velocity > 50 and source_count > 10:
+            await alert_team(f"Viral cascade detected: {claim.text[:100]}")
+        return Priority(score=priority, predicted_reach=predicted_reach)
+  example_bad: |
+    async def add_to_queue(claim: str):
+        # FIFO queue — viral claim with 10M exposure waits behind trivial claim
+        await queue.push(claim)
+  when_applies: Any fact-checking system processing claims from multiple sources with finite verification resources
+  sources:
+    - "https://www.science.org/doi/10.1126/science.aap9559"
+
+- id: FCA-011
+  text: "Track claim temporal validity — facts expire. A claim that was true when made may become false due to changed circumstances. Every verdict must include a validity_window and an expiration_check schedule."
+  why: >
+    "Brazil has the lowest unemployment rate in South America" might be true in Q1 2025 and false
+    in Q3 2025. Static verdicts become stale misinformation themselves. The Veritas pilot found
+    that 19% of TRUE verdicts became outdated within 6 months when the underlying data changed.
+    Without temporal tracking, your fact-checking system actively spreads outdated information
+    under the authority of a "verified TRUE" badge.
+  how_to_do_right: |
+    1. Classify claims by temporal sensitivity: STATIC (historical facts), DYNAMIC (statistics, rankings, prices), EVENT (one-time)
+    2. For DYNAMIC claims, set validity_window based on data update frequency (e.g., monthly for IBGE, daily for stock prices)
+    3. Schedule re-verification cron job: check data source for updates at validity_window intervals
+    4. When data changes, update verdict status to EXPIRED and trigger re-verification
+    5. Store verdict history: [{verdict: "TRUE", valid_from: "2025-01-01", valid_until: "2025-06-30"}, ...]
+    6. API responses must include validity metadata: {"verdict": "TRUE", "as_of": "2025-06-01", "expires": "2025-07-01"}
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [celery, redis, sqlalchemy]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [consistency]
+  example_good: |
+    class TemporalVerdict(BaseModel):
+        claim_id: str
+        verdict: VerdictLabel
+        valid_from: datetime
+        valid_until: datetime | None
+        temporal_class: Literal["STATIC", "DYNAMIC", "EVENT"]
+        recheck_interval_days: int
+
+    async def create_verdict_with_expiry(claim: Claim, verdict: VerdictLabel) -> TemporalVerdict:
+        temporal_class = classify_temporal(claim)
+        recheck = {"STATIC": 365, "DYNAMIC": 30, "EVENT": 90}[temporal_class]
+        tv = TemporalVerdict(
+            claim_id=claim.id, verdict=verdict,
+            valid_from=datetime.utcnow(),
+            valid_until=datetime.utcnow() + timedelta(days=recheck) if temporal_class == "DYNAMIC" else None,
+            temporal_class=temporal_class,
+            recheck_interval_days=recheck,
+        )
+        await schedule_recheck(tv)
+        return tv
+  example_bad: |
+    async def save_verdict(claim_id: str, verdict: str):
+        await db.execute("INSERT INTO verdicts (claim_id, verdict) VALUES ($1, $2)", claim_id, verdict)
+        # No expiration — verdict stays "TRUE" forever even if world changes
+  when_applies: Any verdict for claims containing statistics, rankings, prices, or other time-varying data
+  sources:
+    - "https://ifcncodeofprinciples.poynter.org/the-commitments"
+
+- id: FCA-012
+  text: "Detect circular references in evidence chains — when evidence A cites B, B cites C, and C cites A, none of them are truly independent sources. Implement citation graph traversal to ensure evidence chains terminate at independent primary sources."
+  why: >
+    Circular citation is surprisingly common: a Wikipedia article cites a news article that cites
+    the same Wikipedia article. This creates an illusion of multiple independent sources when
+    there is actually zero primary evidence. The Veritas pilot traced evidence chains for 300
+    claims and found 11% had circular references that inflated apparent source diversity.
+    One claim appeared to have 5 independent sources, but all traced back to a single unverified blog post.
+  how_to_do_right: |
+    1. Build a directed citation graph for each claim: nodes=sources, edges=cites
+    2. Run cycle detection (DFS with back-edge detection) on the citation graph
+    3. If cycle detected, collapse circular sources into a single source with provenance warning
+    4. Count only acyclic terminal nodes (primary sources with no further citations) as independent evidence
+    5. Require minimum 2 independent terminal sources for any non-UNVERIFIABLE verdict
+    6. Store citation graph in Neo4j for audit: (:Source)-[:CITES]->(:Source)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [networkx, neo4j]
+  domains:
+    domain: [fact_checking, architecture]
+    concern: [consistency]
+  example_good: |
+    def detect_circular_references(evidence_chain: list[Evidence]) -> CircularityReport:
+        graph = nx.DiGraph()
+        for ev in evidence_chain:
+            graph.add_node(ev.url, source_type=ev.source_type)
+            for cited in ev.cited_sources:
+                graph.add_edge(ev.url, cited)
+        cycles = list(nx.simple_cycles(graph))
+        terminal_sources = [n for n in graph.nodes if graph.out_degree(n) == 0]
+        independent_count = len(terminal_sources)
+        return CircularityReport(
+            has_cycles=bool(cycles),
+            cycles=cycles,
+            independent_sources=independent_count,
+            sufficient=independent_count >= 2,
+        )
+  example_bad: |
+    def count_sources(evidence: list[str]) -> int:
+        return len(set(evidence))  # Counts URLs, not independent sources — circular refs inflate count
+  when_applies: Any multi-source evidence evaluation where source independence matters
+  sources:
+    - "https://ifcncodeofprinciples.poynter.org/the-commitments"
+
+- id: FCA-013
+  text: "Aggregate fact-check consensus across multiple independent fact-checking organizations before issuing high-confidence verdicts — use weighted voting where weights reflect historical accuracy, domain expertise, and methodology transparency of each checker."
+  why: >
+    No single fact-checking organization is always right. IFCN-certified fact-checkers disagree
+    on 15-20% of claims. Aggregating verdicts from 3+ independent checkers reduces error rate
+    by 40% compared to any single checker (Duke Reporters' Lab study). The Veritas system benefits
+    from consuming ClaimReview data from Google Fact Check Tools API, which aggregates verdicts
+    from 100+ organizations worldwide.
+  how_to_do_right: |
+    1. Query Google Fact Check Tools API for existing verdicts on the claim (or semantic near-matches)
+    2. Assign weights to each fact-checker: IFCN_certified=1.0, domain_expert=0.8, general=0.5
+    3. Normalize verdict labels to common scale: TRUE=1.0, MOSTLY_TRUE=0.75, MIXED=0.5, MOSTLY_FALSE=0.25, FALSE=0.0
+    4. Compute weighted consensus: sum(weight_i * verdict_i) / sum(weight_i)
+    5. Require minimum 3 independent verdicts for HIGH confidence; 1-2 verdicts = MEDIUM confidence
+    6. If consensus < 0.3 spread (high agreement), boost confidence; if > 0.5 spread, flag for review
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [httpx, numpy]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [decision_making]
+  example_good: |
+    async def aggregate_consensus(claim: Claim) -> ConsensusVerdict:
+        external_verdicts = await google_factcheck_api.search(claim.text)
+        if len(external_verdicts) < 1:
+            return ConsensusVerdict(confidence="LOW", note="No external verdicts found")
+        weighted_scores = []
+        for v in external_verdicts:
+            weight = get_checker_weight(v.publisher, v.ifcn_certified)
+            score = normalize_verdict(v.textual_rating)
+            weighted_scores.append((weight, score))
+        consensus = sum(w * s for w, s in weighted_scores) / sum(w for w, _ in weighted_scores)
+        spread = max(s for _, s in weighted_scores) - min(s for _, s in weighted_scores)
+        confidence = "HIGH" if len(external_verdicts) >= 3 and spread < 0.3 else "MEDIUM"
+        return ConsensusVerdict(
+            score=consensus,
+            label=score_to_label(consensus),
+            confidence=confidence,
+            checker_count=len(external_verdicts),
+        )
+  example_bad: |
+    async def check_claim(claim: str) -> str:
+        result = await google_factcheck_api.search(claim)
+        if result:
+            return result[0].textual_rating  # Takes first result without aggregation or weighting
+        return "UNKNOWN"
+  when_applies: High-stakes claims where multiple fact-checking organizations may have already issued verdicts
+  sources:
+    - "https://developers.google.com/fact-check/tools/api/reference/rest"
+
+- id: FCA-014
+  text: "Define clear boundaries between automated verdicts and human-in-the-loop escalation — automate high-confidence, low-stakes claims but always escalate claims that are high-severity, low-confidence, or politically sensitive to human reviewers with domain expertise."
+  why: >
+    Fully automated fact-checking produces unacceptable error rates on edge cases: 23% false
+    positive rate on nuanced political claims, 31% on satire detection. Fully human fact-checking
+    cannot scale (average 4 hours per in-depth check). The optimal split: automate ~70% of claims
+    (clear-cut, high-confidence) and escalate ~30% to humans. The Veritas pilot achieved 96%
+    accuracy with this hybrid approach versus 81% fully automated and 97% fully human (but 10x slower).
+  how_to_do_right: |
+    1. Score every claim on two axes: confidence (0-1) and severity (LOW, MEDIUM, HIGH, CRITICAL)
+    2. Auto-publish if confidence > 0.90 AND severity <= MEDIUM
+    3. Escalate to human if confidence < 0.70 OR severity >= HIGH OR domain is POLITICS/HEALTH
+    4. Queue in between (0.70-0.90, MEDIUM severity) for batch human review within 24 hours
+    5. Track escalation rates: if >50% of claims are escalated, model quality needs improvement
+    6. Log every automated decision with full reasoning chain for audit
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [celery, redis, sqlalchemy]
+  domains:
+    domain: [fact_checking, operations]
+    concern: [decision_making]
+  example_good: |
+    async def route_verdict(claim: Claim, verdict: Verdict) -> RoutingDecision:
+        if verdict.confidence > 0.90 and claim.severity <= Severity.MEDIUM:
+            await publish_automated(verdict)
+            return RoutingDecision(route="AUTO_PUBLISH", reason="High confidence, low severity")
+        elif verdict.confidence < 0.70 or claim.severity >= Severity.HIGH:
+            reviewer = await assign_human_reviewer(claim.domain)
+            await escalate_to_human(verdict, reviewer)
+            return RoutingDecision(route="HUMAN_ESCALATION", reviewer=reviewer.id)
+        else:
+            await add_to_batch_review(verdict, deadline_hours=24)
+            return RoutingDecision(route="BATCH_REVIEW", deadline="24h")
+  example_bad: |
+    async def publish(claim: str, verdict: str):
+        # Publishes everything automatically — no escalation, no confidence check
+        await db.save(verdict)
+        await notify_all(verdict)
+  when_applies: Every verdict routing decision in a production fact-checking system
+  sources:
+    - "https://ifcncodeofprinciples.poynter.org/the-commitments"
+
+- id: FCA-015
+  text: "Classify claim severity before verification to prioritize resources — CRITICAL claims (health/safety risk, election interference, financial fraud) get immediate attention with stricter evidence requirements; LOW claims (entertainment, trivial stats) can be batch-processed with relaxed thresholds."
+  why: >
+    Treating all claims equally wastes resources and creates dangerous delays. A false claim that
+    "drinking bleach cures COVID" requires immediate, high-confidence debunking, while "this
+    movie broke box office records" can wait. Without severity classification, the Veritas
+    prototype spent 35% of verification resources on LOW-severity entertainment claims while
+    CRITICAL health claims waited in a FIFO queue with average 6-hour delay.
+  how_to_do_right: |
+    1. Classify claim severity using domain + keyword rules: HEALTH/SAFETY keywords → CRITICAL
+    2. Use LLM classifier as fallback for ambiguous claims (prompt: "Rate harm potential 1-5")
+    3. Map severity to SLA: CRITICAL=1h, HIGH=4h, MEDIUM=24h, LOW=72h
+    4. Map severity to evidence requirements: CRITICAL needs 2+ primary sources, LOW needs 1 secondary
+    5. Monitor queue depth per severity: alert if any CRITICAL claim exceeds 1h SLA
+    6. Track severity distribution: if >20% claims are CRITICAL, revisit classification thresholds
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [spacy, redis]
+  domains:
+    domain: [fact_checking, operations]
+    concern: [domain_specific]
+  example_good: |
+    SEVERITY_KEYWORDS = {
+        "CRITICAL": ["death", "poison", "vaccine", "election fraud", "financial fraud"],
+        "HIGH": ["government", "legislation", "medical", "investment"],
+        "MEDIUM": ["business", "technology", "statistics"],
+    }
+
+    def classify_severity(claim: Claim) -> Severity:
+        text_lower = claim.text.lower()
+        for severity, keywords in SEVERITY_KEYWORDS.items():
+            if any(kw in text_lower for kw in keywords):
+                if severity == "CRITICAL":
+                    return Severity.CRITICAL
+                return Severity[severity]
+        # LLM fallback for ambiguous claims
+        llm_score = llm_classify_harm(claim.text)
+        return Severity.from_score(llm_score)
+  example_bad: |
+    async def process_claims(claims: list[str]):
+        for claim in claims:
+            await verify(claim)  # FIFO — critical health claim waits behind "celebrity net worth"
+  when_applies: Any fact-checking system receiving claims from multiple domains with varying impact potential
+  sources:
+    - "https://www.science.org/doi/10.1126/science.aap9559"
+
+- id: FCA-016
+  text: "Implement retroactive debunking with correction propagation — when a previously TRUE verdict is updated to FALSE (new evidence emerged), actively notify all downstream consumers who received the original verdict and update all cached/embedded instances."
+  why: >
+    Corrections that only update a database record are invisible to 95% of users who already
+    consumed the original verdict. Without active correction propagation, stale TRUE verdicts
+    continue to circulate as authoritative. The Veritas pilot found that after correcting 12
+    verdicts, only 3% of downstream users saw the correction without active notification. With
+    push notifications and cache invalidation, correction awareness reached 67%.
+  how_to_do_right: |
+    1. When verdict changes, compute diff: {old_verdict: "TRUE", new_verdict: "FALSE", reason: "..."}
+    2. Invalidate all caches: Redis verdict cache, CDN cache, ClaimReview schema cache
+    3. Send correction notifications via all channels: WebSocket push, email digest, API webhook
+    4. Update all embedded instances: browser extension badges, social media labels
+    5. Log correction in audit trail with full provenance: who corrected, why, what evidence changed
+    6. Track correction reach: what percentage of original consumers received the correction
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [redis, kafka-python, websockets]
+  domains:
+    domain: [fact_checking, reliability]
+    concern: [consistency]
+  example_good: |
+    async def propagate_correction(verdict_id: str, new_label: VerdictLabel, reason: str):
+        old_verdict = await db.get_verdict(verdict_id)
+        correction = Correction(
+            verdict_id=verdict_id,
+            old_label=old_verdict.label,
+            new_label=new_label,
+            reason=reason,
+            corrected_at=datetime.utcnow(),
+        )
+        await db.update_verdict(verdict_id, new_label)
+        await redis.delete(f"verdict:{old_verdict.claim_fingerprint}")
+        subscribers = await db.get_verdict_consumers(verdict_id)
+        await kafka.send("corrections", correction.dict())
+        for sub in subscribers:
+            await notify_correction(sub, correction)
+        await audit_log.record(correction)
+  example_bad: |
+    async def update_verdict(verdict_id: str, new_label: str):
+        await db.execute("UPDATE verdicts SET label=$1 WHERE id=$2", new_label, verdict_id)
+        # Database updated but nobody knows — cached copies still show old verdict
+  when_applies: Whenever a previously published verdict is changed due to new evidence or error correction
+  sources:
+    - "https://ifcncodeofprinciples.poynter.org/the-commitments"

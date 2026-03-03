@@ -1,0 +1,996 @@
+layer: rules
+domain: api
+knowledge:
+- id: API-DES-001
+  text: "RESTful resource naming: use plural nouns for collections (/users, /orders), not verbs (/getUsers, /createOrder). The HTTP method already conveys the action — the URL identifies the resource, not the operation."
+  why: >
+    Verb-based URLs (/getUser, /createUser, /deleteUser, /updateUser) duplicate information already
+    conveyed by HTTP methods (GET, POST, DELETE, PUT). This leads to inconsistency: is it /getUsers
+    or /fetchUsers or /listUsers? With noun-based URLs, there is exactly one URL per resource (/users),
+    and the method determines the action. Every major API (Stripe, GitHub, Twilio) uses this convention.
+    Deviating from it confuses developers who expect RESTful conventions and makes auto-generated
+    documentation harder to navigate.
+  how_to_do_right: |
+    1. Collections: plural nouns — /users, /orders, /products
+    2. Single resource: /users/{id}, /orders/{id}
+    3. Nested resources: /users/{id}/orders (orders belonging to user)
+    4. Actions (non-CRUD): POST /orders/{id}/cancel — use verb only for actions that don't map to CRUD
+    5. Use kebab-case for multi-word: /order-items, not /orderItems or /order_items
+    6. Max nesting depth: 2 levels (/users/{id}/orders is fine, /users/{id}/orders/{id}/items/{id}/reviews is too deep)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, architecture]
+    concern: [web]
+  example_good: |
+    from fastapi import APIRouter
+
+    router = APIRouter(prefix="/users", tags=["users"])
+
+    @router.get("/")                    # GET /users — list users
+    async def list_users(): ...
+
+    @router.post("/")                   # POST /users — create user
+    async def create_user(): ...
+
+    @router.get("/{user_id}")           # GET /users/123 — get one user
+    async def get_user(user_id: int): ...
+
+    @router.put("/{user_id}")           # PUT /users/123 — replace user
+    async def replace_user(user_id: int): ...
+
+    @router.patch("/{user_id}")         # PATCH /users/123 — partial update
+    async def update_user(user_id: int): ...
+
+    @router.delete("/{user_id}")        # DELETE /users/123 — delete user
+    async def delete_user(user_id: int): ...
+
+    # Nested resource
+    @router.get("/{user_id}/orders")    # GET /users/123/orders
+    async def list_user_orders(user_id: int): ...
+  example_bad: |
+    @app.get("/getUser")          # Verb in URL — redundant with GET method
+    @app.post("/createUser")      # Verb in URL — redundant with POST method
+    @app.post("/deleteUser")      # POST for delete? Use DELETE /users/{id}
+    @app.get("/fetchAllUsers")    # "fetchAll" is not a resource name
+    @app.post("/user/update")     # Singular, verb, inconsistent
+  when_applies: "Designing new REST APIs, API review, naming conventions discussion"
+  sources: ["https://restfulapi.net/resource-naming/"]
+
+- id: API-DES-002
+  text: "HTTP method semantics: GET is read-only and safe (never mutates), POST creates new resources, PUT replaces the entire resource, PATCH partially updates, DELETE removes. GET and DELETE must be idempotent. Misusing methods breaks caching, retries, and client expectations."
+  why: >
+    HTTP caches (CDN, browser, proxy) cache GET responses by default. If GET /users/123 creates a
+    side effect (like logging a view count), cache hits silently skip the side effect. POST is not
+    idempotent by specification — clients and middleware know not to retry a POST automatically. If you
+    use POST for reads, clients cannot safely retry on timeout. PUT is idempotent — sending the same
+    PUT twice produces the same result, which is essential for retry safety. Violating these semantics
+    breaks the entire HTTP ecosystem built on these assumptions.
+  how_to_do_right: |
+    1. GET: read-only, safe, cacheable, idempotent — never use GET with side effects
+    2. POST: create new resource, not idempotent (use Idempotency-Key header for safety)
+    3. PUT: replace entire resource, idempotent (same PUT twice = same result)
+    4. PATCH: partial update, not necessarily idempotent (depends on operation)
+    5. DELETE: remove resource, idempotent (deleting already-deleted resource returns 204 or 404)
+    6. Return correct status codes: 200 (OK), 201 (Created), 204 (No Content), 404 (Not Found)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, architecture]
+    concern: [web]
+  example_good: |
+    @app.get("/users/{user_id}")
+    async def get_user(user_id: int) -> UserResponse:
+        """GET: read-only, safe, cacheable."""
+        user = await db.get_user(user_id)
+        if not user:
+            raise HTTPException(404, "User not found")
+        return user
+
+    @app.post("/users", status_code=201)
+    async def create_user(user: UserCreate) -> UserResponse:
+        """POST: creates new resource, returns 201."""
+        return await db.create_user(user)
+
+    @app.put("/users/{user_id}")
+    async def replace_user(user_id: int, user: UserReplace) -> UserResponse:
+        """PUT: replaces entire resource, idempotent."""
+        return await db.replace_user(user_id, user)
+
+    @app.patch("/users/{user_id}")
+    async def update_user(user_id: int, user: UserUpdate) -> UserResponse:
+        """PATCH: partial update."""
+        return await db.update_user(user_id, user)
+
+    @app.delete("/users/{user_id}", status_code=204)
+    async def delete_user(user_id: int):
+        """DELETE: removes resource, idempotent, returns 204."""
+        await db.delete_user(user_id)
+  example_bad: |
+    @app.get("/users/create")       # GET creating a resource — breaks caching
+    @app.post("/users/123")          # POST to update — not idempotent, retry creates duplicates
+    @app.get("/users/123/delete")    # GET with side effects — CDN caches this, oops
+    @app.post("/users/search")       # POST for read — can't cache, can't bookmark
+  when_applies: "API design, HTTP method selection, REST API review"
+  sources: ["https://tools.ietf.org/html/rfc7231#section-4"]
+
+- id: API-DES-003
+  text: "Error responses must use a consistent JSON format across all endpoints: {error: {code: string, message: string, details: array}}. Never return plain text errors, HTML error pages, or inconsistent structures across different endpoints."
+  why: >
+    When different endpoints return errors in different formats — one returns {error: "Not found"},
+    another returns {message: "Not found"}, and a third returns a plain string "Not found" — every
+    client must write custom error handling for each endpoint. A consistent format means one error
+    parser for all endpoints. The 'code' field is machine-readable (for client logic), 'message' is
+    human-readable (for logging/display), and 'details' provides field-level validation errors. FastAPI
+    already returns 422 validation errors in a consistent format — extend this pattern to all errors.
+  how_to_do_right: |
+    1. Standard format: {"error": {"code": "user_not_found", "message": "User 123 not found", "details": []}}
+    2. 'code': machine-readable string, stable across versions (clients switch on this)
+    3. 'message': human-readable, can change between versions (never parse programmatically)
+    4. 'details': array of field-level errors for validation failures
+    5. Use HTTP status codes correctly: 400 (bad input), 401 (not authenticated), 403 (not authorized), 404 (not found), 409 (conflict), 422 (validation), 500 (server error)
+    6. Global exception handler: catch all exceptions, format consistently
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, architecture]
+    concern: [web]
+  example_good: |
+    from pydantic import BaseModel
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
+
+    class ErrorDetail(BaseModel):
+        field: str | None = None
+        message: str
+
+    class ErrorResponse(BaseModel):
+        code: str
+        message: str
+        details: list[ErrorDetail] = []
+
+    class APIError(Exception):
+        def __init__(self, status_code: int, code: str, message: str, details: list | None = None):
+            self.status_code = status_code
+            self.code = code
+            self.message = message
+            self.details = details or []
+
+    app = FastAPI()
+
+    @app.exception_handler(APIError)
+    async def api_error_handler(request: Request, exc: APIError):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": {"code": exc.code, "message": exc.message, "details": exc.details}},
+        )
+
+    @app.exception_handler(Exception)
+    async def generic_error_handler(request: Request, exc: Exception):
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"code": "internal_error", "message": "An unexpected error occurred", "details": []}},
+        )
+
+    # Usage
+    @app.get("/users/{user_id}")
+    async def get_user(user_id: int):
+        user = await db.get_user(user_id)
+        if not user:
+            raise APIError(404, "user_not_found", f"User {user_id} not found")
+        return user
+  example_bad: |
+    @app.get("/users/{id}")
+    async def get_user(id: int):
+        if not user:
+            return {"error": "not found"}         # No status code, no code field
+
+    @app.get("/orders/{id}")
+    async def get_order(id: int):
+        if not order:
+            return Response("Order not found", 404)  # Plain text, not JSON
+
+    @app.get("/products/{id}")
+    async def get_product(id: int):
+        if not product:
+            raise HTTPException(404)               # Generic, no useful info
+  when_applies: "API design, error handling setup, client SDK development, API standardization"
+  sources: ["https://tools.ietf.org/html/rfc7807"]
+
+- id: API-DES-004
+  text: "API versioning: use URL path versioning (/v1/users) for simplicity and discoverability. Use header versioning (Accept: application/vnd.myapi.v2+json) only when you need to version without changing URLs. Never have unversioned APIs in production — you will need to break compatibility eventually."
+  why: >
+    Every API will eventually need a breaking change. If you start unversioned (/users), you have no
+    migration path — you must change the URL or break existing clients. URL path versioning (/v1/users)
+    is the most common approach because it is simple, visible, and cacheable. Header versioning is more
+    RESTful but less discoverable (you cannot see the version in a browser URL). GitHub uses URL path,
+    Stripe uses URL path, Twilio uses URL path — the industry has converged on this for good reason.
+  how_to_do_right: |
+    1. Start with /v1/ prefix on all endpoints from day 1
+    2. Non-breaking changes (new fields, new endpoints): no version bump needed
+    3. Breaking changes (removed fields, changed types): create /v2/ routes
+    4. Support N and N-1 versions simultaneously (current + previous)
+    5. Deprecation: 6 months notice, monitor usage, sunset when usage < 1%
+    6. Internal APIs: version with date-based (2026-02-01) or semver in header
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, architecture]
+    concern: [web, migration]
+  example_good: |
+    from fastapi import APIRouter, FastAPI
+
+    app = FastAPI()
+
+    # Version 1
+    v1 = APIRouter(prefix="/v1")
+
+    @v1.get("/users/{user_id}")
+    async def get_user_v1(user_id: int) -> UserResponseV1:
+        user = await user_service.get(user_id)
+        return UserResponseV1(id=user.id, name=user.name, email=user.email)
+
+    # Version 2: breaking change (split name into first_name + last_name)
+    v2 = APIRouter(prefix="/v2")
+
+    @v2.get("/users/{user_id}")
+    async def get_user_v2(user_id: int) -> UserResponseV2:
+        user = await user_service.get(user_id)
+        return UserResponseV2(
+            id=user.id,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            email=user.email,
+        )
+
+    app.include_router(v1)
+    app.include_router(v2)
+  example_bad: |
+    # Unversioned API — no migration path when you need breaking changes
+    @app.get("/users/{id}")
+    async def get_user(id: int):
+        ...
+    # 1 year later: need to change response format
+    # Option A: break all clients (bad)
+    # Option B: add /v2/ now and redirect /users to /v1/users (messy)
+  when_applies: "API design, versioning strategy, public API planning"
+  sources: ["https://docs.microsoft.com/en-us/azure/architecture/best-practices/api-design#uri-versioning"]
+
+- id: API-DES-005
+  text: "Pagination: use cursor-based pagination for feeds and real-time data (consistent results, O(1) performance), page-based for admin panels and reports (users need to jump to specific pages). Always include pagination metadata in the response."
+  why: >
+    Offset pagination (page=50, per_page=20) causes the database to scan and discard 980 rows before
+    returning 20. At page 5000, this takes seconds. Cursor pagination (after=cursor_xyz) uses an index
+    seek and is constant time. But cursor pagination cannot jump to page 50 — it must iterate from the
+    start. For admin panels where users click "page 50", offset is acceptable because deep pagination
+    is rare and data changes infrequently. For feeds and timelines, cursor is required because data
+    changes constantly and deep pagination is the normal use case (infinite scroll).
+  how_to_do_right: |
+    1. Cursor-based for: feeds, timelines, messages, event logs, infinite scroll
+    2. Page-based for: admin panels, reports, search results, data tables
+    3. Always return metadata: {items: [...], pagination: {next_cursor, has_more}} or {items: [...], pagination: {page, per_page, total}}
+    4. Default page size: 20, max page size: 100
+    5. Cursor: opaque string (base64-encoded), client should not parse or construct it
+    6. Include has_more or has_next_page flag — do not make clients guess
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, architecture]
+    concern: [web]
+  example_good: |
+    # Cursor-based for feeds
+    @app.get("/feed")
+    async def get_feed(
+        cursor: str | None = None,
+        limit: int = Query(default=20, le=100),
+    ):
+        items, next_cursor = await feed_service.get_page(cursor=cursor, limit=limit)
+        return {
+            "items": items,
+            "pagination": {
+                "next_cursor": next_cursor,
+                "has_more": next_cursor is not None,
+            },
+        }
+
+    # Page-based for admin
+    @app.get("/admin/users")
+    async def list_users_admin(
+        page: int = Query(default=1, ge=1),
+        per_page: int = Query(default=20, le=100),
+    ):
+        items, total = await user_service.list_paginated(page=page, per_page=per_page)
+        return {
+            "items": items,
+            "pagination": {
+                "page": page,
+                "per_page": per_page,
+                "total": total,
+                "total_pages": (total + per_page - 1) // per_page,
+            },
+        }
+  example_bad: |
+    @app.get("/feed")
+    async def get_feed(page: int = 1):
+        # Offset pagination on a real-time feed
+        # Page 5000 takes 3 seconds, and items shift between pages
+        items = await db.execute(
+            text("SELECT * FROM posts ORDER BY created_at DESC OFFSET :o LIMIT 20"),
+            {"o": (page - 1) * 20}
+        )
+        return items  # No pagination metadata — client doesn't know if there's more
+  when_applies: "API pagination design, list endpoints, feed/timeline implementation"
+  sources: ["https://slack.engineering/evolving-api-pagination-at-slack/"]
+
+- id: API-DES-006
+  text: "Filtering and sorting: use query parameters for filtering (?status=active&role=admin) and sorting (?sort=-created_at for descending). Prefix with minus for descending order. Whitelist allowed filter and sort fields — never pass user input directly to SQL."
+  why: >
+    Allowing arbitrary filter and sort fields opens SQL injection vectors and performance problems.
+    If a user passes ?sort=password, you might expose that the password column exists. If they pass
+    ?filter=1=1, you might have an injection. Whitelisting ensures only indexed, safe columns are used
+    for filtering and sorting. The minus-prefix convention (?sort=-created_at) is used by JSON:API
+    and many major APIs — it is concise and unambiguous.
+  how_to_do_right: |
+    1. Filter with query params: ?status=active&role=admin
+    2. Sort with minus-prefix: ?sort=-created_at (descending), ?sort=name (ascending)
+    3. Multi-sort: ?sort=-created_at,name (primary: created_at desc, secondary: name asc)
+    4. Whitelist allowed fields: ALLOWED_FILTERS = {"status", "role", "created_after"}
+    5. Validate filter values: use Pydantic enum or regex validation
+    6. Ensure filtered/sorted columns have database indexes
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, architecture]
+    concern: [web, sql]
+  example_good: |
+    from enum import Enum
+    from fastapi import Query
+
+    class UserStatus(str, Enum):
+        active = "active"
+        inactive = "inactive"
+        suspended = "suspended"
+
+    ALLOWED_SORT_FIELDS = {"name", "created_at", "email"}
+
+    @app.get("/users")
+    async def list_users(
+        status: UserStatus | None = None,
+        role: str | None = None,
+        sort: str = Query(default="-created_at"),
+    ):
+        # Validate sort field
+        sort_field = sort.lstrip("-")
+        if sort_field not in ALLOWED_SORT_FIELDS:
+            raise HTTPException(400, f"Sort by '{sort_field}' not allowed. Use: {ALLOWED_SORT_FIELDS}")
+        sort_dir = "DESC" if sort.startswith("-") else "ASC"
+
+        # Build query safely with ORM (not string interpolation)
+        query = select(User)
+        if status:
+            query = query.where(User.status == status.value)
+        if role:
+            query = query.where(User.role == role)
+        query = query.order_by(getattr(User, sort_field).desc() if sort_dir == "DESC" else getattr(User, sort_field).asc())
+
+        return await db.execute(query)
+  example_bad: |
+    @app.get("/users")
+    async def list_users(filter: str = None, sort: str = None):
+        # Passing user input directly to SQL — injection risk
+        query = f"SELECT * FROM users WHERE {filter} ORDER BY {sort}"
+        return await db.execute(text(query))
+    # ?filter=1=1 OR password LIKE '%' → SQL injection
+    # ?sort=password → reveals column existence
+  when_applies: "List endpoints, search functionality, data table APIs, admin interfaces"
+  sources: ["https://jsonapi.org/format/#fetching-sorting"]
+
+- id: API-DES-007
+  text: "Rate limiting headers: always include X-RateLimit-Limit (max requests), X-RateLimit-Remaining (requests left), and X-RateLimit-Reset (epoch seconds when limit resets) in every API response. On limit exceeded, return 429 with Retry-After header."
+  why: >
+    Without rate limit headers, clients cannot implement proper backoff — they discover the limit only
+    when they hit it. With headers, smart clients can slow down before hitting the limit, spread requests
+    over time, and display remaining quota to users. The Retry-After header tells the client exactly how
+    long to wait, preventing blind retry loops. Stripe, GitHub, and Twitter all include these headers.
+    Clients without rate limit visibility generate 10x more support tickets about "API not responding."
+  how_to_do_right: |
+    1. X-RateLimit-Limit: max requests per window (e.g., 100)
+    2. X-RateLimit-Remaining: requests left in current window (e.g., 73)
+    3. X-RateLimit-Reset: Unix timestamp when the window resets (e.g., 1709078400)
+    4. On 429: include Retry-After header (seconds to wait, e.g., 30)
+    5. Include headers on ALL responses, not just 429 — clients need proactive visibility
+    6. Different limits per endpoint if needed (expensive endpoints get lower limits)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, architecture]
+    concern: [web]
+  example_good: |
+    @app.middleware("http")
+    async def rate_limit_headers(request: Request, call_next):
+        api_key = get_api_key(request)
+        limit_info = await rate_limiter.check(api_key)
+
+        if not limit_info.allowed:
+            return JSONResponse(
+                status_code=429,
+                content={"error": {"code": "rate_limited", "message": "Too many requests"}},
+                headers={
+                    "X-RateLimit-Limit": str(limit_info.limit),
+                    "X-RateLimit-Remaining": "0",
+                    "X-RateLimit-Reset": str(limit_info.reset_at),
+                    "Retry-After": str(limit_info.retry_after_seconds),
+                },
+            )
+
+        response = await call_next(request)
+        # Include on ALL responses, not just 429
+        response.headers["X-RateLimit-Limit"] = str(limit_info.limit)
+        response.headers["X-RateLimit-Remaining"] = str(limit_info.remaining)
+        response.headers["X-RateLimit-Reset"] = str(limit_info.reset_at)
+        return response
+  example_bad: |
+    # Rate limiting without headers — client has no visibility
+    @app.middleware("http")
+    async def rate_limit(request, call_next):
+        if is_rate_limited(request):
+            return Response("Too many requests", status_code=429)  # No headers
+            # Client has no idea: when to retry? what's the limit? how many left?
+        return await call_next(request)
+  when_applies: "Rate limiting implementation, API response headers, client developer experience"
+  sources: ["https://tools.ietf.org/html/rfc6585#section-4"]
+
+- id: API-DES-008
+  text: "HATEOAS (Hypermedia as the Engine of Application State) is theoretically pure REST but rarely practical. Use pragmatic REST: include relevant links (self, next, related) in responses when they help client navigation, but do not force every response to include full hypermedia controls."
+  why: >
+    Full HATEOAS requires every response to include links for all possible next actions — this bloats
+    responses and forces clients to parse link structures instead of using documented URL templates.
+    In practice, almost no major API (Stripe, GitHub, Twilio) implements full HATEOAS. However,
+    including key links (self URL, pagination next/prev, related resources) is genuinely useful —
+    clients can follow links instead of constructing URLs. The pragmatic middle ground: include links
+    where they reduce client-side URL construction, skip them where they add noise.
+  how_to_do_right: |
+    1. Include 'self' link: helps clients confirm which resource they are looking at
+    2. Include pagination links: next, previous (clients follow links instead of building URLs)
+    3. Include related resource links: user has link to their orders collection
+    4. Skip action links: do not include "delete", "update" links — clients know the methods from docs
+    5. Use standard format: {"links": {"self": "/users/123", "orders": "/users/123/orders"}}
+    6. Links are optional — never break client code if links are missing
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, architecture]
+    concern: [web]
+  example_good: |
+    @app.get("/users/{user_id}")
+    async def get_user(user_id: int):
+        user = await db.get_user(user_id)
+        return {
+            "id": user.id,
+            "name": user.name,
+            "email": user.email,
+            "links": {
+                "self": f"/v1/users/{user.id}",
+                "orders": f"/v1/users/{user.id}/orders",
+                "avatar": user.avatar_url,
+            },
+        }
+
+    @app.get("/users")
+    async def list_users(cursor: str | None = None, limit: int = 20):
+        items, next_cursor = await user_service.list(cursor=cursor, limit=limit)
+        response = {"items": items}
+        response["links"] = {"self": "/v1/users"}
+        if next_cursor:
+            response["links"]["next"] = f"/v1/users?cursor={next_cursor}&limit={limit}"
+        return response
+  example_bad: |
+    # Full HATEOAS — bloated, nobody uses it
+    @app.get("/users/{user_id}")
+    async def get_user(user_id: int):
+        return {
+            "id": 123, "name": "Alice",
+            "_links": {
+                "self": {"href": "/users/123", "method": "GET"},
+                "update": {"href": "/users/123", "method": "PUT"},
+                "delete": {"href": "/users/123", "method": "DELETE"},
+                "orders": {"href": "/users/123/orders", "method": "GET"},
+                "create_order": {"href": "/users/123/orders", "method": "POST"},
+                "friends": {"href": "/users/123/friends", "method": "GET"},
+                # 20 more links nobody uses...
+            }
+        }
+  when_applies: "API design, REST architecture decisions, response format design"
+  sources: ["https://roy.gbiv.com/untangled/2008/rest-apis-must-be-hypertext-driven"]
+
+- id: API-DES-009
+  text: "API authentication: use Bearer tokens (JWT or opaque) for user-facing APIs, API keys for server-to-server integration, and OAuth2 authorization code flow for third-party access. Never send credentials in URL query parameters — they are logged in server access logs."
+  why: >
+    API keys in query parameters (?api_key=secret) are logged in server access logs, browser history,
+    and proxy logs — making them trivially extractable. JWTs are self-contained (no database lookup for
+    validation) but cannot be revoked until they expire. Opaque tokens require a lookup but can be
+    instantly revoked. API keys are simpler for server-to-server but should not be used for user-facing
+    APIs because they do not carry user identity. OAuth2 authorization code flow is the standard for
+    third-party access because the user grants permission without sharing credentials.
+  how_to_do_right: |
+    1. User-facing: Bearer token in Authorization header (Bearer eyJhbG...)
+    2. Server-to-server: API key in X-API-Key header (not query parameter)
+    3. Third-party: OAuth2 authorization code flow with PKCE
+    4. JWT: short-lived (15min access token + long-lived refresh token)
+    5. Always use HTTPS — tokens in HTTP are visible to any network observer
+    6. Rotate API keys regularly (90 days), support multiple active keys for rotation
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, security]
+    concern: [web]
+  example_good: |
+    from fastapi import Depends, HTTPException, Security
+    from fastapi.security import HTTPBearer, APIKeyHeader
+
+    # Bearer token for user-facing API
+    bearer_scheme = HTTPBearer()
+
+    async def get_current_user(token = Security(bearer_scheme)):
+        try:
+            payload = jwt.decode(token.credentials, SECRET_KEY, algorithms=["HS256"])
+            return await db.get_user(payload["sub"])
+        except jwt.ExpiredSignatureError:
+            raise HTTPException(401, "Token expired")
+        except jwt.InvalidTokenError:
+            raise HTTPException(401, "Invalid token")
+
+    @app.get("/me")
+    async def get_profile(user: User = Depends(get_current_user)):
+        return user
+
+    # API key for server-to-server
+    api_key_header = APIKeyHeader(name="X-API-Key")
+
+    async def verify_api_key(api_key: str = Security(api_key_header)):
+        client = await db.get_api_client(api_key)
+        if not client:
+            raise HTTPException(401, "Invalid API key")
+        return client
+
+    @app.get("/api/data")
+    async def get_data(client = Depends(verify_api_key)):
+        return await data_service.get(client.id)
+  example_bad: |
+    # API key in query parameter — logged in access logs, browser history
+    @app.get("/data")
+    async def get_data(api_key: str = Query(...)):
+        # URL: /data?api_key=sk_live_secret123
+        # Logged in: access logs, CDN logs, browser history, proxy logs
+        ...
+
+    # No authentication at all
+    @app.get("/users")
+    async def list_users():
+        return await db.get_all_users()  # Anyone can access
+  when_applies: "API security setup, authentication design, third-party API access"
+  sources: ["https://tools.ietf.org/html/rfc6750"]
+
+- id: API-DES-010
+  text: "Request validation: use Pydantic models for all request bodies and query parameters. Fail fast with 422 Unprocessable Entity and detailed field-level errors. Never silently ignore invalid fields — this hides client bugs."
+  why: >
+    Without validation, invalid data enters your system and causes errors deeper in the stack — where
+    the error message is cryptic and disconnected from the original bad input. A null email causes a
+    database constraint violation 3 layers deep, returning "IntegrityError" instead of "email is required."
+    Pydantic validates at the API boundary, returns clear field-level errors immediately, and generates
+    OpenAPI documentation automatically. FastAPI integrates Pydantic natively — not using it means
+    writing manual validation code that Pydantic provides for free.
+  how_to_do_right: |
+    1. Every request body: Pydantic BaseModel with type annotations and constraints
+    2. Field constraints: min_length, max_length, ge, le, regex, Field(...)
+    3. Custom validators: @field_validator for business rules (email format, date ranges)
+    4. Strict mode: reject extra fields (model_config = ConfigDict(extra="forbid"))
+    5. Return 422 with field-level errors: [{"field": "email", "message": "invalid format"}]
+    6. Query parameters: use Query() with validation for list endpoints
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, architecture]
+    concern: [web]
+  example_good: |
+    from pydantic import BaseModel, Field, field_validator, ConfigDict
+    from datetime import date
+
+    class UserCreate(BaseModel):
+        model_config = ConfigDict(extra="forbid")  # Reject unknown fields
+
+        name: str = Field(..., min_length=1, max_length=100)
+        email: str = Field(..., pattern=r"^[\w\.-]+@[\w\.-]+\.\w+$")
+        age: int = Field(..., ge=13, le=150)
+        birth_date: date | None = None
+
+        @field_validator("birth_date")
+        @classmethod
+        def birth_date_not_future(cls, v):
+            if v and v > date.today():
+                raise ValueError("Birth date cannot be in the future")
+            return v
+
+    @app.post("/users", status_code=201)
+    async def create_user(user: UserCreate):
+        """Pydantic validates automatically. 422 on invalid input with field details."""
+        return await user_service.create(user)
+
+    # Response on invalid input:
+    # 422: {"detail": [
+    #   {"loc": ["body", "email"], "msg": "string does not match regex", "type": "value_error"},
+    #   {"loc": ["body", "age"], "msg": "ensure this value is greater than or equal to 13", "type": "value_error"}
+    # ]}
+  example_bad: |
+    @app.post("/users")
+    async def create_user(data: dict):  # No validation — anything goes
+        name = data.get("name", "")     # Empty string silently accepted
+        email = data.get("email")        # None silently accepted
+        user = User(name=name, email=email)
+        await db.save(user)  # Crashes here with IntegrityError — unhelpful
+  when_applies: "API endpoint design, input validation, request handling"
+  sources: ["https://fastapi.tiangolo.com/tutorial/request-files/"]
+
+- id: API-DES-011
+  text: "Response shaping: support sparse fieldsets (?fields=id,name,email) to let clients request only the fields they need. Include related resources via ?include=orders to prevent N+1 client-side requests. This reduces payload size and round trips."
+  why: >
+    A mobile client that only needs user name and avatar downloads 5KB instead of 50KB when the full
+    user object includes profile, settings, preferences, and history. Over millions of requests, this
+    saves bandwidth and improves performance. The ?include parameter prevents the "N+1 client problem"
+    where the client fetches a list of users, then makes 20 separate requests to fetch each user's
+    orders. One request with ?include=orders returns everything in a single round trip. JSON:API and
+    GraphQL both solve this — sparse fieldsets bring the same benefit to REST APIs.
+  how_to_do_right: |
+    1. Sparse fieldsets: ?fields=id,name,email → return only those fields
+    2. Whitelist allowed fields: ALLOWED_FIELDS = {"id", "name", "email", "created_at", ...}
+    3. Include related resources: ?include=orders,profile → embed related data
+    4. Whitelist allowed includes: ALLOWED_INCLUDES = {"orders", "profile", "settings"}
+    5. Default: return a reasonable set of fields (not everything, not nothing)
+    6. Document which fields are available and which includes are supported
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, performance]
+    concern: [web]
+  example_good: |
+    ALLOWED_FIELDS = {"id", "name", "email", "avatar_url", "created_at", "role"}
+    DEFAULT_FIELDS = {"id", "name", "email"}
+    ALLOWED_INCLUDES = {"orders", "profile"}
+
+    @app.get("/users/{user_id}")
+    async def get_user(
+        user_id: int,
+        fields: str | None = Query(None, description="Comma-separated fields"),
+        include: str | None = Query(None, description="Comma-separated relations"),
+    ):
+        # Parse and validate fields
+        if fields:
+            requested = set(fields.split(","))
+            invalid = requested - ALLOWED_FIELDS
+            if invalid:
+                raise HTTPException(400, f"Invalid fields: {invalid}")
+            selected_fields = requested
+        else:
+            selected_fields = DEFAULT_FIELDS
+
+        user = await db.get_user(user_id)
+        result = {f: getattr(user, f) for f in selected_fields}
+
+        # Include related resources
+        if include:
+            for rel in include.split(","):
+                if rel not in ALLOWED_INCLUDES:
+                    raise HTTPException(400, f"Invalid include: {rel}")
+                if rel == "orders":
+                    result["orders"] = await db.get_user_orders(user_id)
+                elif rel == "profile":
+                    result["profile"] = await db.get_user_profile(user_id)
+
+        return result
+  example_bad: |
+    @app.get("/users/{user_id}")
+    async def get_user(user_id: int):
+        # Always returns EVERYTHING — 50 fields, 5KB payload
+        return await db.get_user_with_all_relations(user_id)
+    # Mobile client that only needs name and avatar downloads 50 fields
+    # Client that needs orders makes a second request: GET /users/123/orders
+  when_applies: "API response optimization, mobile API design, bandwidth reduction"
+  sources: ["https://jsonapi.org/format/#fetching-sparse-fieldsets"]
+
+- id: API-DES-012
+  text: "Bulk operations: accept POST /resources/bulk with an array body, process each item independently, return per-item results with 207 Multi-Status. Limit batch size to 100 items. Each item must be processable independently — one failure should not fail the batch."
+  why: >
+    Without bulk operations, creating 100 users requires 100 HTTP requests — 100 round trips, 100 TCP
+    handshakes (if not using connection pooling), and 100x overhead of HTTP headers and TLS negotiation.
+    A single bulk request reduces this to 1 round trip. Per-item results with 207 Multi-Status let the
+    client know exactly which items succeeded and which failed, without needing to retry the entire batch.
+    The 100-item limit prevents server memory issues and request timeouts on large batches.
+  how_to_do_right: |
+    1. Endpoint: POST /users/bulk (separate from single-resource POST /users)
+    2. Request body: {"items": [{...}, {...}, ...]}
+    3. Limit: max 100 items per request (reject with 400 if exceeded)
+    4. Process independently: each item in its own try/except
+    5. Response: 207 Multi-Status with per-item results
+    6. Each item result: {"index": 0, "status": 201, "data": {...}} or {"index": 1, "status": 422, "error": {...}}
+    7. Support Idempotency-Key header for the entire batch operation
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, architecture]
+    concern: [web]
+  example_good: |
+    class BulkUserCreate(BaseModel):
+        items: list[UserCreate] = Field(..., max_length=100)
+
+    @app.post("/users/bulk", status_code=207)
+    async def bulk_create_users(bulk: BulkUserCreate):
+        results = []
+        for i, item in enumerate(bulk.items):
+            try:
+                user = await user_service.create(item)
+                results.append({"index": i, "status": 201, "data": UserResponse.model_validate(user).model_dump()})
+            except ValidationError as e:
+                results.append({"index": i, "status": 422, "error": {"code": "validation_error", "details": e.errors()}})
+            except DuplicateError:
+                results.append({"index": i, "status": 409, "error": {"code": "duplicate", "message": f"Email already exists"}})
+            except Exception:
+                results.append({"index": i, "status": 500, "error": {"code": "internal_error", "message": "Failed to create"}})
+
+        return {"results": results, "summary": {
+            "total": len(bulk.items),
+            "succeeded": sum(1 for r in results if r["status"] < 400),
+            "failed": sum(1 for r in results if r["status"] >= 400),
+        }}
+  example_bad: |
+    @app.post("/users/bulk")
+    async def bulk_create(users: list[dict]):
+        # No size limit — client sends 10K items, server OOMs
+        created = []
+        for user in users:
+            created.append(await db.create_user(user))  # If one fails, all lost
+        return created  # No per-item status, no error details
+  when_applies: "Batch operations, data import, bulk data management endpoints"
+  sources: ["https://google.aip.dev/233"]
+
+- id: API-DES-013
+  text: "Webhook design: POST to a registered callback URL, sign the payload with HMAC-SHA256, include an event type and unique event ID, retry with exponential backoff on failure, and document the retry policy. Receivers must respond within 5 seconds and process asynchronously."
+  why: >
+    Webhooks are the standard way to push real-time events to external systems without polling. Without
+    signing, any attacker can forge webhook requests and trigger actions in the receiver. Without retries,
+    transient failures mean lost events. The 5-second response requirement prevents slow receivers from
+    holding your connection pool. Processing asynchronously (acknowledge immediately, process in background)
+    ensures the receiver does not block the sender. Stripe, GitHub, and Shopify all follow this pattern.
+  how_to_do_right: |
+    1. Register: POST /webhooks with {url, events, secret} — validate URL is reachable
+    2. Deliver: POST to registered URL with {id, type, timestamp, data} body
+    3. Sign: HMAC-SHA256(webhook_secret, raw_body) in X-Webhook-Signature header
+    4. Retry: 5 attempts with exponential backoff (1s, 30s, 5min, 30min, 2h)
+    5. Timeout: 5 seconds — if receiver does not respond, count as failure
+    6. Disable: after 100 consecutive failures, disable webhook and notify owner
+    7. Event types: use dot-notation (user.created, order.completed, payment.failed)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, architecture]
+    concern: [web]
+  example_good: |
+    import hmac
+    import hashlib
+    import time
+    import uuid
+
+    class WebhookPayload(BaseModel):
+        id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+        type: str              # e.g., "order.completed"
+        timestamp: int = Field(default_factory=lambda: int(time.time()))
+        data: dict
+
+    async def deliver_webhook(endpoint: WebhookEndpoint, event_type: str, data: dict):
+        payload = WebhookPayload(type=event_type, data=data)
+        body = payload.model_dump_json()
+
+        signature = hmac.new(
+            endpoint.secret.encode(), body.encode(), hashlib.sha256
+        ).hexdigest()
+
+        delays = [1, 30, 300, 1800, 7200]
+        for attempt, delay in enumerate(delays):
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.post(
+                        endpoint.url,
+                        content=body,
+                        headers={
+                            "Content-Type": "application/json",
+                            "X-Webhook-ID": payload.id,
+                            "X-Webhook-Signature": f"sha256={signature}",
+                            "X-Webhook-Timestamp": str(payload.timestamp),
+                        },
+                    )
+                    if 200 <= resp.status_code < 300:
+                        await db.log_delivery(payload.id, "delivered", attempt + 1)
+                        return
+            except Exception:
+                pass
+            if attempt < len(delays) - 1:
+                await asyncio.sleep(delay)
+
+        await db.log_delivery(payload.id, "failed", len(delays))
+        await db.increment_consecutive_failures(endpoint.id)
+  example_bad: |
+    # No signature, no retry, no timeout, synchronous processing
+    async def send_webhook(url: str, data: dict):
+        await httpx.post(url, json=data)  # No signature — forgeable
+        # No retry — if it fails, event is lost
+        # No timeout — slow receiver blocks your server
+  when_applies: "Event notification systems, third-party integrations, real-time data delivery"
+  sources: ["https://stripe.com/docs/webhooks/signatures"]
+
+- id: API-DES-014
+  text: "OpenAPI/Swagger documentation: let FastAPI auto-generate from your Pydantic models. Add descriptions to every endpoint, field, and parameter. Include example values in Field() definitions. Your API docs are your developer experience — treat them as a product."
+  why: >
+    Developers spend 10x more time reading API documentation than writing integration code. If the
+    docs are wrong, incomplete, or hard to navigate, developers waste hours guessing and experimenting.
+    FastAPI generates OpenAPI docs automatically from your code — but only if you provide descriptions,
+    examples, and proper type annotations. An API with auto-generated docs that include examples,
+    descriptions, and proper status codes reduces integration time from days to hours. Stripe's docs
+    are considered industry-leading specifically because of examples and descriptions.
+  how_to_do_right: |
+    1. Every endpoint: summary (short title), description (detailed), tags (grouping)
+    2. Every Pydantic field: description, example value, constraints (min, max, pattern)
+    3. Every response: document all status codes (200, 201, 400, 401, 404, 422, 500)
+    4. Authentication: document security scheme in OpenAPI metadata
+    5. Examples: include realistic request/response examples (not {"string": "string"})
+    6. Host docs at /docs (Swagger UI) and /redoc (ReDoc) — FastAPI does this by default
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, architecture]
+    concern: [web]
+  example_good: |
+    from pydantic import BaseModel, Field
+
+    class OrderCreate(BaseModel):
+        """Create a new order for the authenticated user."""
+
+        product_id: int = Field(..., description="ID of the product to order", examples=[42])
+        quantity: int = Field(..., ge=1, le=100, description="Number of items", examples=[2])
+        shipping_address: str = Field(
+            ..., min_length=10, max_length=500,
+            description="Full shipping address including postal code",
+            examples=["123 Main St, San Francisco, CA 94105"],
+        )
+
+    class OrderResponse(BaseModel):
+        """Order resource with server-generated fields."""
+
+        id: int = Field(..., description="Unique order identifier", examples=[1001])
+        status: str = Field(..., description="Current order status", examples=["pending"])
+        total_cents: int = Field(..., description="Total price in cents", examples=[4999])
+        created_at: str = Field(..., description="ISO 8601 creation timestamp", examples=["2026-02-26T10:30:00Z"])
+
+    @app.post(
+        "/orders",
+        response_model=OrderResponse,
+        status_code=201,
+        summary="Create an order",
+        description="Creates a new order for the authenticated user. The order starts in 'pending' status.",
+        tags=["orders"],
+        responses={
+            201: {"description": "Order created successfully"},
+            400: {"description": "Invalid product_id or insufficient stock"},
+            401: {"description": "Authentication required"},
+            422: {"description": "Validation error in request body"},
+        },
+    )
+    async def create_order(
+        order: OrderCreate,
+        user: User = Depends(get_current_user),
+    ):
+        ...
+  example_bad: |
+    @app.post("/orders")
+    async def create(data: dict):  # No model, no validation, no docs
+        ...
+    # Auto-generated docs show: Request Body: {} — useless
+    # No descriptions, no examples, no status codes documented
+  when_applies: "API documentation, developer experience, public API launch, client onboarding"
+  sources: ["https://fastapi.tiangolo.com/tutorial/schema-extra-example/"]
+
+- id: API-DES-015
+  text: "API testing strategy: contract tests verify that the API matches the OpenAPI spec (use schemathesis), integration tests verify business logic with real database, and load tests verify performance under expected traffic (use locust or k6). Run contract tests on every PR, integration on merge, load tests weekly."
+  why: >
+    Unit tests verify internal logic but miss API contract issues (wrong status code, missing field,
+    incorrect type). Integration tests catch business logic bugs but miss performance regressions.
+    Load tests catch performance issues but are too slow for every PR. The three-tier approach gives
+    fast feedback on PRs (contract tests in 30s), thorough validation on merge (integration in 2min),
+    and performance assurance weekly (load tests in 10min). A team shipped a breaking API change because
+    their unit tests passed but they had no contract tests — the response schema changed and clients broke.
+  how_to_do_right: |
+    1. Contract tests: schemathesis against OpenAPI spec, runs on every PR (30s)
+    2. Integration tests: real database, real HTTP requests via TestClient, runs on merge (2min)
+    3. Load tests: locust or k6 against staging, runs weekly or before release (10min)
+    4. Contract tests catch: missing fields, wrong types, wrong status codes, undocumented endpoints
+    5. Integration tests catch: business logic, auth, database constraints, error handling
+    6. Load tests catch: memory leaks, connection pool exhaustion, slow queries under concurrency
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, testing]
+    concern: [web]
+  example_good: |
+    # Contract test: verifies API matches OpenAPI spec
+    # Run: schemathesis run http://localhost:8000/openapi.json
+    # Automatically generates requests from spec and validates responses
+
+    # Integration test: real business logic
+    from fastapi.testclient import TestClient
+
+    def test_create_user_returns_201(client: TestClient, db_session):
+        response = client.post("/v1/users", json={
+            "name": "Alice",
+            "email": "alice@example.com",
+        })
+        assert response.status_code == 201
+        data = response.json()
+        assert data["name"] == "Alice"
+        assert "id" in data
+        assert "created_at" in data
+
+    def test_create_user_duplicate_email_returns_409(client: TestClient, db_session):
+        client.post("/v1/users", json={"name": "Alice", "email": "alice@example.com"})
+        response = client.post("/v1/users", json={"name": "Bob", "email": "alice@example.com"})
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "duplicate_email"
+
+    def test_get_user_not_found_returns_404(client: TestClient):
+        response = client.get("/v1/users/99999")
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "user_not_found"
+
+    # Load test (locust): run weekly against staging
+    # from locust import HttpUser, task
+    # class APIUser(HttpUser):
+    #     @task
+    #     def get_users(self):
+    #         self.client.get("/v1/users?limit=20")
+  example_bad: |
+    # Only unit tests — no API contract or load testing
+    def test_user_model():
+        user = User(name="Alice", email="alice@example.com")
+        assert user.name == "Alice"
+    # Model works, but: does the endpoint return the right status code?
+    # Does the response match the OpenAPI spec?
+    # Does the API handle 1000 concurrent requests without OOM?
+  when_applies: "API testing setup, CI/CD pipeline for APIs, quality assurance, pre-release validation"
+  sources: ["https://schemathesis.readthedocs.io/en/stable/"]

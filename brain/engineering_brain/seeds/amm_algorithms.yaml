@@ -1,0 +1,1063 @@
+layer: rules
+domain: prediction_markets
+knowledge:
+- id: PM-AMM-001
+  text: "LMSR (Logarithmic Market Scoring Rule) cost function: C(q) = b * ln(sum(exp(q_i / b))). This is the canonical AMM for prediction markets. It guarantees bounded loss, infinite liquidity, and prices that always sum to 1.00."
+  why: >
+    LMSR is mathematically proven to be incentive-compatible (truth-telling is optimal), to have
+    bounded market maker loss (max = b * ln(N)), and to maintain coherent probabilities. Robin Hanson
+    designed it specifically for prediction markets, unlike CPMM (Uniswap-style) which was designed
+    for token swaps and requires adaptation for probability markets. Polymarket, Kalshi, and most
+    serious prediction market platforms use LMSR or a variant. Using a naive AMM without these
+    guarantees leads to arbitrage exploits and incoherent probabilities.
+  how_to_do_right: |
+    1. Implement cost function: C(q) = b * ln(sum(exp(q_i / b)))
+    2. Use log-sum-exp trick to avoid overflow: C(q) = b * (max_q/b + ln(sum(exp((q_i - max_q) / b))))
+    3. Price of outcome i: p_i = exp(q_i / b) / sum(exp(q_j / b))
+    4. Cost of trade: buyer pays C(q_after) - C(q_before)
+    5. Store quantities q_i as the canonical state, derive prices from quantities
+    6. After every trade, verify: sum(prices) == 1.0 (should be automatic but verify)
+    7. Use Decimal for all financial math, float only for intermediate exp/log calculations
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    import math
+    from decimal import Decimal
+
+    class LMSR:
+        def __init__(self, b: float, num_outcomes: int):
+            self.b = b
+            self.quantities = [0.0] * num_outcomes
+
+        def _cost(self, quantities: list[float]) -> float:
+            """Log-sum-exp trick for numerical stability."""
+            scaled = [q / self.b for q in quantities]
+            max_s = max(scaled)
+            return self.b * (max_s + math.log(
+                sum(math.exp(s - max_s) for s in scaled)
+            ))
+
+        def prices(self) -> list[Decimal]:
+            scaled = [q / self.b for q in self.quantities]
+            max_s = max(scaled)
+            exp_vals = [math.exp(s - max_s) for s in scaled]
+            total = sum(exp_vals)
+            return [Decimal(str(round(e / total, 10))) for e in exp_vals]
+
+        def cost_of_trade(self, outcome: int, shares: float) -> Decimal:
+            q_before = list(self.quantities)
+            q_after = list(self.quantities)
+            q_after[outcome] += shares
+            cost = self._cost(q_after) - self._cost(q_before)
+            return Decimal(str(round(cost, 10)))
+
+        def execute_trade(self, outcome: int, shares: float) -> Decimal:
+            cost = self.cost_of_trade(outcome, shares)
+            self.quantities[outcome] += shares
+            return cost
+  example_bad: |
+    # WRONG: Naive implementation without log-sum-exp — overflows for large quantities
+    import math
+    def cost(quantities, b):
+        return b * math.log(sum(math.exp(q / b) for q in quantities))
+        # math.exp(800) = OverflowError!
+  when_applies: Implementing the core AMM for any prediction market platform
+  sources:
+    - "Hanson, R. (2003). Combinatorial Information Market Design"
+    - "Hanson, R. (2007). Logarithmic Market Scoring Rules for Modular Combinatorial Information Aggregation"
+
+- id: PM-AMM-002
+  text: "CPMM (Constant Product Market Maker) uses the invariant x * y = k for binary markets. Simpler than LMSR but does not natively handle multi-outcome markets and prices do not naturally sum to 1.00 without normalization."
+  why: >
+    CPMM (Uniswap's model) is popular in DeFi but was designed for token swaps, not probability
+    markets. For binary markets, CPMM can work if you normalize prices (p_yes = y/(x+y)), but it
+    breaks down for 3+ outcomes because x*y*z=k gives different slippage characteristics per outcome
+    depending on pool composition. Augur v2 used CPMM and had to add complex normalization layers
+    that introduced rounding errors. LMSR is strictly superior for prediction markets unless you
+    need DeFi composability.
+  how_to_do_right: |
+    1. Only use CPMM if you need DeFi composability (LP tokens, yield farming)
+    2. For binary markets: x * y = k where x = Yes tokens, y = No tokens
+    3. Price of Yes = y / (x + y), Price of No = x / (x + y) — normalize explicitly
+    4. After every swap, verify: x * y >= k (rounding can cause slight decrease)
+    5. For multi-outcome: use separate CPMM pairs (Yes/No for each outcome) with arbitrage bot to maintain coherence
+    6. Document the tradeoff: CPMM has higher slippage at extremes (near 0% or 100%) than LMSR
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+
+    class CPMM:
+        def __init__(self, x: Decimal, y: Decimal):
+            """x = Yes reserve, y = No reserve."""
+            self.x = x
+            self.y = y
+            self.k = x * y
+
+        def price_yes(self) -> Decimal:
+            return self.y / (self.x + self.y)
+
+        def price_no(self) -> Decimal:
+            return self.x / (self.x + self.y)
+
+        def buy_yes(self, amount_in: Decimal) -> Decimal:
+            """Buy Yes tokens by depositing No tokens. Returns Yes tokens received."""
+            new_y = self.y + amount_in
+            new_x = self.k / new_y
+            tokens_out = self.x - new_x
+            self.x = new_x
+            self.y = new_y
+            assert self.x * self.y >= self.k - Decimal("0.0001"), "Invariant violated"
+            return tokens_out
+  example_bad: |
+    # WRONG: No normalization — prices don't represent probabilities
+    class BadCPMM:
+        def price_yes(self):
+            return self.x  # Raw reserve, not a probability!
+  when_applies: DeFi-integrated prediction markets, when LP tokens are needed, Uniswap-compatible platforms
+  sources: ["https://docs.uniswap.org/contracts/v2/concepts/protocol-overview/how-uniswap-works"]
+
+- id: PM-AMM-003
+  text: "The LMSR liquidity parameter b controls the tradeoff between liquidity depth and market maker risk. Higher b means more liquidity (lower slippage) but higher maximum loss (b * ln(N)). Select b based on expected market volume and acceptable loss budget."
+  why: >
+    Setting b too low makes the market unusable: a $10 trade moves the price from 50% to 90%.
+    Setting b too high wastes capital: max loss of $50K on a market that only attracts $500 in
+    volume. Polymarket reportedly calibrates b per market based on expected interest level.
+    A common mistake is using the same b for all markets — a presidential election market needs
+    1000x the liquidity of a niche tech prediction. The b parameter is the most important
+    operational decision in running an LMSR-based prediction market.
+  how_to_do_right: |
+    1. Start with b = expected_market_volume / 10 as a heuristic
+    2. For binary markets, max loss = b * ln(2) ≈ 0.693 * b
+    3. For N-outcome markets, max loss = b * ln(N)
+    4. Set minimum b so a $100 trade moves price by at most 5 percentage points
+    5. Test: if b=100 and there are 2 outcomes, a 10-share purchase costs ~$5 and moves price ~5%
+    6. Monitor: if >50% of trades move price >10%, b is too low — increase by 2x
+    7. Allow dynamic b: increase b as volume grows (but never decrease, to avoid price jumps)
+    8. Budget: allocate max_loss per market as a platform expense
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    import math
+    from decimal import Decimal
+
+    class LiquidityParameterCalculator:
+        def calculate_b(self, expected_volume: Decimal, num_outcomes: int,
+                        max_acceptable_loss: Decimal) -> float:
+            """Select b balancing liquidity and loss budget."""
+            # Constraint 1: Max loss within budget
+            b_from_loss = float(max_acceptable_loss) / math.log(num_outcomes)
+
+            # Constraint 2: $100 trade moves price at most 5%
+            b_from_slippage = 100 / 0.05  # 2000
+
+            # Constraint 3: Proportional to expected volume
+            b_from_volume = float(expected_volume) / 10
+
+            b = min(b_from_loss, max(b_from_slippage, b_from_volume))
+            return round(b, 2)
+
+        def max_loss(self, b: float, num_outcomes: int) -> Decimal:
+            return Decimal(str(round(b * math.log(num_outcomes), 2)))
+  example_bad: |
+    # WRONG: Hardcoded b with no rationale
+    amm = LMSR(b=100, num_outcomes=2)  # Why 100? What's the max loss? Unknown.
+  when_applies: Market creation, liquidity parameter tuning, platform budgeting
+  sources: ["https://mason.gmu.edu/~rhanson/mktscore.pdf"]
+
+- id: PM-AMM-004
+  text: "Slippage in prediction market AMMs is the difference between the expected price and the actual average price paid for a trade. For LMSR, slippage increases with trade size relative to b. Calculate and display slippage BEFORE the user confirms a trade."
+  why: >
+    Users who don't see slippage before confirming lose trust when a large trade moves the price
+    significantly. A user expecting to buy at 60% who actually pays an average of 75% because of
+    slippage will feel cheated. Polymarket shows estimated slippage prominently in the trade
+    confirmation dialog. For AMMs, slippage is a mathematical certainty for every trade — it's
+    the price of providing infinite liquidity. Hiding it from users is deceptive.
+  how_to_do_right: |
+    1. Calculate slippage before trade: slippage = avg_price_paid - current_price
+    2. For LMSR: avg_price = cost_of_trade / num_shares
+    3. Display to user: "Current price: 60.0%. Your avg price: 63.2%. Slippage: 3.2%"
+    4. Implement slippage tolerance: reject trade if slippage > user-specified max (default 5%)
+    5. For large trades, suggest splitting into smaller chunks with time delay
+    6. Track slippage per market to calibrate b parameter
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, react]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+
+    class SlippageCalculator:
+        def calculate_slippage(self, amm: "LMSR", outcome: int,
+                               shares: float) -> dict:
+            current_price = amm.prices()[outcome]
+            cost = amm.cost_of_trade(outcome, shares)
+            avg_price = Decimal(str(cost)) / Decimal(str(shares))
+            slippage = avg_price - current_price
+
+            return {
+                "current_price": current_price,
+                "avg_price": avg_price,
+                "slippage": slippage,
+                "slippage_pct": slippage * 100,
+                "total_cost": cost,
+            }
+
+        def validate_slippage(self, slippage: Decimal,
+                              max_tolerance: Decimal = Decimal("0.05")) -> bool:
+            return slippage <= max_tolerance
+  example_bad: |
+    # WRONG: No slippage calculation or display
+    def buy(market_id, outcome, shares):
+        cost = amm.execute_trade(outcome, shares)
+        user.debit(cost)  # User has no idea what price they got
+  when_applies: Trade confirmation UI, order execution, user-facing trade APIs
+  sources: ["https://mason.gmu.edu/~rhanson/mktscore.pdf"]
+
+- id: PM-AMM-005
+  text: "All financial calculations in prediction markets MUST use Decimal, never float. IEEE 754 floating point cannot represent 0.1 exactly. In a system processing thousands of trades, rounding errors accumulate and create exploitable arbitrage."
+  why: >
+    Float arithmetic: 0.1 + 0.2 = 0.30000000000000004 in Python. Over 10,000 trades with $100
+    average, cumulative rounding error can reach $50-100. More critically, if yes_price + no_price
+    = 0.9999999999999998 instead of 1.0, arbitrage bots will exploit the $0.0000000000000002
+    per contract at infinite volume. A crypto exchange lost $8M in 2021 due to floating point
+    rounding in their fee calculation engine. Use Python's decimal.Decimal for ALL money operations.
+  how_to_do_right: |
+    1. from decimal import Decimal, ROUND_HALF_EVEN — import at top of every financial module
+    2. Create Decimal from strings: Decimal("0.1") not Decimal(0.1) — the latter preserves float error
+    3. Set context: decimal.getcontext().prec = 28 (default) — sufficient for financial math
+    4. Use Decimal for: prices, quantities, balances, fees, payouts — ALL financial values
+    5. Float is acceptable ONLY for intermediate math (exp, log in LMSR) — convert back to Decimal immediately
+    6. Store as NUMERIC(precision, scale) in PostgreSQL, never FLOAT or DOUBLE
+    7. Add linting rule: ban float() in files matching **/financial/**, **/amm/**, **/trading/**
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [decimal, sqlalchemy]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [consistency]
+  example_good: |
+    from decimal import Decimal, ROUND_HALF_EVEN
+
+    class UserBalance:
+        def __init__(self):
+            self.balance = Decimal("0.00")
+
+        def deposit(self, amount: Decimal):
+            assert isinstance(amount, Decimal), "Amount must be Decimal"
+            assert amount > Decimal("0"), "Amount must be positive"
+            self.balance += amount
+
+        def debit(self, amount: Decimal) -> bool:
+            assert isinstance(amount, Decimal), "Amount must be Decimal"
+            if self.balance >= amount:
+                self.balance -= amount
+                return True
+            return False
+
+    # PostgreSQL column definition
+    # balance = Column(Numeric(precision=20, scale=10), nullable=False)
+  example_bad: |
+    # CATASTROPHICALLY WRONG: float for financial math
+    class UserBalance:
+        def __init__(self):
+            self.balance = 0.0  # float!
+
+        def deposit(self, amount: float):
+            self.balance += amount  # 0.1 + 0.2 = 0.30000000000000004
+  when_applies: Every financial calculation, every price display, every balance operation, every database column
+  sources: ["https://docs.python.org/3/library/decimal.html"]
+
+- id: PM-AMM-006
+  text: "AMM state updates must be atomic: all quantity changes, price recalculations, and balance debits/credits must occur within a single database transaction. A partial update (quantity changed but balance not debited) creates free money."
+  why: >
+    If the AMM updates the outcome quantity but crashes before debiting the user's balance, the user
+    got free shares. If the user is debited but the quantity isn't updated, the user lost money.
+    Both scenarios are catastrophic. A DeFi protocol lost $130M in 2021 because a two-step swap
+    (deposit then withdraw) could be interrupted between steps. Prediction markets have the same
+    risk: every trade involves at least 3 state changes (quantity, user balance, trade log) that
+    MUST all succeed or all fail.
+  how_to_do_right: |
+    1. Wrap every trade in a database transaction: BEGIN; ...all changes...; COMMIT;
+    2. Use SELECT FOR UPDATE on the AMM state row to prevent concurrent modification
+    3. Order of operations within transaction: validate → debit balance → update quantities → log trade
+    4. If any step fails, ROLLBACK entire transaction — user balance and AMM state unchanged
+    5. Use optimistic locking (version column) if you can't hold row locks
+    6. Test with concurrent trades: 100 simultaneous buys should produce consistent state
+    7. Never update AMM state in application memory and flush later — always go through the database
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [sqlalchemy, asyncpg]
+  domains:
+    domain: [prediction_markets, fintech, databases]
+    concern: [consistency]
+  example_good: |
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    class TradeService:
+        def execute_trade(self, session: Session, user_id: str,
+                         market_id: str, outcome: int, shares: float) -> Trade:
+            # Single transaction — all or nothing
+            with session.begin():
+                # 1. Lock AMM state
+                amm_state = session.execute(
+                    select(AMMState).where(AMMState.market_id == market_id).with_for_update()
+                ).scalar_one()
+
+                # 2. Calculate cost
+                amm = LMSR.from_state(amm_state)
+                cost = amm.cost_of_trade(outcome, shares)
+
+                # 3. Debit user (raises if insufficient)
+                user = session.execute(
+                    select(User).where(User.id == user_id).with_for_update()
+                ).scalar_one()
+                user.debit_balance(cost)  # Raises InsufficientBalance
+
+                # 4. Update AMM quantities
+                amm_state.quantities[outcome] += shares
+                amm_state.version += 1
+
+                # 5. Log trade
+                trade = Trade(user_id=user_id, market_id=market_id,
+                             outcome=outcome, shares=shares, cost=cost)
+                session.add(trade)
+
+                return trade
+            # If anything fails, transaction rolls back automatically
+  example_bad: |
+    # CATASTROPHICALLY WRONG: Non-atomic updates
+    def execute_trade(user_id, market_id, outcome, shares):
+        cost = amm.cost_of_trade(outcome, shares)
+        amm.execute(outcome, shares)       # Step 1: AMM updated
+        # CRASH HERE = free shares!
+        user.debit(cost)                   # Step 2: Never reached
+  when_applies: Every trade execution, settlement, deposit, withdrawal — any state mutation
+  sources: ["https://www.postgresql.org/docs/current/tutorial-transactions.html"]
+
+- id: PM-AMM-007
+  text: "Property-based testing for AMMs must verify three invariants: (1) sum of all outcome prices equals 1.00 after every trade, (2) no outcome has negative shares, (3) cost of buying X shares then selling X shares returns to within epsilon of original cost (path independence for LMSR)."
+  why: >
+    Unit tests with specific inputs miss edge cases. Property-based tests (Hypothesis library) generate
+    thousands of random trade sequences and verify invariants hold. A property-based test suite found a
+    rounding error in a production LMSR implementation that only manifested after 500+ trades on a
+    4-outcome market — no hand-written test would have caught this. The three invariants are mathematical
+    properties of LMSR; any violation indicates a bug. Run these tests in CI on every commit.
+  how_to_do_right: |
+    1. Use hypothesis library for property-based testing
+    2. Invariant 1: After any sequence of trades, sum(prices) == 1.0 (tolerance 1e-10)
+    3. Invariant 2: After any trade, all quantities >= 0 (no negative shares)
+    4. Invariant 3: buy(X) then sell(X) returns net cost within epsilon of 0 (LMSR path independence)
+    5. Generate: random sequences of 1-1000 trades with random outcomes and random share amounts
+    6. Run in CI: at least 1000 examples per invariant per commit
+    7. Shrink on failure: hypothesis automatically finds minimal failing example
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [hypothesis, pytest]
+  domains:
+    domain: [prediction_markets, testing, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from hypothesis import given, strategies as st, settings
+    from decimal import Decimal
+
+    @given(
+        trades=st.lists(
+            st.tuples(
+                st.integers(min_value=0, max_value=1),  # outcome
+                st.floats(min_value=0.01, max_value=100.0),  # shares
+            ),
+            min_size=1, max_size=500,
+        ),
+        b=st.floats(min_value=10.0, max_value=10000.0),
+    )
+    @settings(max_examples=1000)
+    def test_prices_sum_to_one(trades, b):
+        amm = LMSR(b=b, num_outcomes=2)
+        for outcome, shares in trades:
+            amm.execute_trade(outcome, shares)
+        prices = amm.prices()
+        total = sum(prices)
+        assert abs(total - Decimal("1")) < Decimal("1e-8"), f"Prices sum to {total}"
+
+    @given(
+        shares=st.floats(min_value=0.01, max_value=100.0),
+        b=st.floats(min_value=10.0, max_value=10000.0),
+    )
+    def test_buy_sell_roundtrip(shares, b):
+        amm = LMSR(b=b, num_outcomes=2)
+        cost_buy = amm.execute_trade(0, shares)
+        cost_sell = amm.execute_trade(0, -shares)
+        net_cost = cost_buy + cost_sell
+        assert abs(net_cost) < Decimal("1e-6"), f"Roundtrip cost: {net_cost}"
+  example_bad: |
+    # WEAK: Only testing specific hardcoded values
+    def test_prices():
+        amm = LMSR(b=100, num_outcomes=2)
+        amm.execute_trade(0, 10)
+        assert sum(amm.prices()) == Decimal("1")  # Only one case!
+  when_applies: AMM implementation, CI/CD pipeline, regression testing, pre-release validation
+  sources: ["https://hypothesis.readthedocs.io/en/latest/"]
+
+- id: PM-AMM-008
+  text: "AMM vs order book: AMMs provide guaranteed liquidity and simplicity but have higher slippage. Order books provide better prices for large trades but require active market makers. Best practice for prediction markets is a hybrid: AMM as backstop + order book for limit orders."
+  why: >
+    Pure AMM markets (LMSR only) have poor execution for large trades because all slippage is paid
+    to the mathematical function, not to real counterparties. Pure order book markets have periods
+    of zero liquidity. The hybrid model used by Polymarket routes orders to whichever venue (AMM or
+    book) gives the better price. This attracts both sophisticated traders (who use limit orders) and
+    casual users (who want instant execution via AMM). Implementing both increases complexity but
+    significantly improves execution quality.
+  how_to_do_right: |
+    1. Implement LMSR AMM as the always-available liquidity source
+    2. Implement a CLOB (Central Limit Order Book) for limit orders
+    3. Smart order router: check both venues, execute on the one with better price
+    4. AMM acts as "liquidity of last resort" — order book matches first, AMM fills remainder
+    5. For market orders: fill from order book at best prices, then AMM for remaining quantity
+    6. For limit orders: place in order book only, not against AMM
+    7. Track volume split: if >80% goes through AMM, order book is underutilized (increase AMM spread)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+
+    class HybridRouter:
+        def __init__(self, amm: LMSR, order_book: OrderBook):
+            self.amm = amm
+            self.order_book = order_book
+
+        def execute_market_order(self, outcome: int, shares: float) -> list[Fill]:
+            fills = []
+            remaining = shares
+
+            # 1. Fill from order book first (better prices)
+            book_fills = self.order_book.match(outcome, remaining)
+            for fill in book_fills:
+                fills.append(fill)
+                remaining -= fill.shares
+
+            # 2. Fill remainder from AMM
+            if remaining > 0:
+                cost = self.amm.execute_trade(outcome, remaining)
+                fills.append(Fill(source="amm", shares=remaining, cost=cost))
+
+            return fills
+  example_bad: |
+    # SUBOPTIMAL: AMM only — poor execution for large trades
+    def buy(outcome, shares):
+        return amm.execute_trade(outcome, shares)  # All slippage, no price improvement
+  when_applies: Platform architecture decisions, trade execution design, hybrid venue implementation
+  sources: ["https://mason.gmu.edu/~rhanson/mktscore.pdf"]
+
+- id: PM-AMM-009
+  text: "Dynamic liquidity adjustment: increase AMM parameter b when trading volume is high (more liquidity needed) and decrease when low (reduce risk). Never decrease b below the initial value to avoid sudden price jumps."
+  why: >
+    Static liquidity is wasteful: a market with $1M daily volume needs deep liquidity, but the same
+    market at 3am on a Sunday needs much less. Dynamic adjustment reduces the platform's risk exposure
+    during quiet periods while ensuring good execution during peak times. However, decreasing b causes
+    a discrete price jump (same quantities, different prices), which can trigger stop-loss orders and
+    confuse users. Only increase b, or decrease very gradually (max 5% per hour).
+  how_to_do_right: |
+    1. Track rolling 1-hour volume per market
+    2. If hourly volume > 2x the 24h average, increase b by 50%
+    3. Never decrease b by more than 5% per hour to avoid price jumps
+    4. Never decrease b below the initial value set at market creation
+    5. Log all b changes with reason, old value, new value, and resulting price change
+    6. Alert if b increase would push max_loss above the platform's budget for that market
+    7. Implement a "b change cooldown": minimum 15 minutes between adjustments
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+    from datetime import datetime, timedelta
+
+    class DynamicLiquidityManager:
+        MAX_DECREASE_RATE = Decimal("0.05")  # 5% max decrease per hour
+        COOLDOWN_MINUTES = 15
+
+        def adjust_liquidity(self, market_id: str) -> Decimal | None:
+            market = self.get_market(market_id)
+            last_adjustment = market.last_b_adjustment_at
+            if last_adjustment and (datetime.utcnow() - last_adjustment) < timedelta(minutes=self.COOLDOWN_MINUTES):
+                return None  # Cooldown period
+
+            hourly_vol = self.get_hourly_volume(market_id)
+            avg_vol = self.get_24h_avg_volume(market_id)
+
+            if hourly_vol > avg_vol * 2:
+                new_b = market.b * Decimal("1.5")
+            elif hourly_vol < avg_vol * Decimal("0.3"):
+                decrease = min(Decimal("0.05"), Decimal("1") - market.initial_b / market.b)
+                new_b = max(market.b * (1 - decrease), market.initial_b)
+            else:
+                return None
+
+            market.b = new_b
+            market.last_b_adjustment_at = datetime.utcnow()
+            return new_b
+  example_bad: |
+    # WRONG: Halving b instantly — causes massive price jump
+    def reduce_liquidity(market):
+        market.b = market.b / 2  # Prices jump discontinuously!
+  when_applies: Market operations, liquidity management, volume-responsive parameter tuning
+  sources: ["https://mason.gmu.edu/~rhanson/mktscore.pdf"]
+
+- id: PM-AMM-010
+  text: "AMM fee structures in prediction markets must balance revenue generation with market efficiency. Fees too high discourage informed trading (reducing prediction accuracy); fees too low make the platform unsustainable. Standard: 1-2% per trade or 0.5-1% per side."
+  why: >
+    Prediction markets live or die by participation volume. PredictIt charges 10% of profits plus
+    5% of withdrawals, which many users consider excessive and drives them to competitors. Polymarket
+    charges ~1% per trade. Academic research (Manski 2006) shows that fees >5% distort market prices
+    significantly, making predictions less accurate. The fee must be low enough that the cost of
+    being informed (fees + time) is less than the expected profit from correcting mispriced markets.
+  how_to_do_right: |
+    1. Charge 1-2% per trade as a spread on the AMM price (built into the AMM, not a separate fee)
+    2. Alternatively, charge 0.5-1% per side (buy and sell each incur fee)
+    3. Implement fee tiers: lower fees for high-volume traders to retain them
+    4. Fee formula: effective_price = amm_price * (1 + fee_rate) for buys, amm_price * (1 - fee_rate) for sells
+    5. Track fee revenue per market, per day — target: fees cover AMM losses + 20% margin
+    6. A/B test fee levels: 0.5% vs 1% vs 2% on different markets to find optimal
+    7. Never charge fees on market creation or resolution — only on trades
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+
+    class FeeSchedule:
+        BASE_FEE = Decimal("0.01")  # 1%
+        TIER_THRESHOLDS = {
+            Decimal("10000"): Decimal("0.008"),   # 0.8% for >$10K volume
+            Decimal("100000"): Decimal("0.005"),   # 0.5% for >$100K volume
+        }
+
+        def get_fee_rate(self, user_id: str) -> Decimal:
+            volume_30d = self.get_user_volume(user_id, days=30)
+            for threshold, rate in sorted(self.TIER_THRESHOLDS.items(), reverse=True):
+                if volume_30d >= threshold:
+                    return rate
+            return self.BASE_FEE
+
+        def apply_fee(self, cost: Decimal, user_id: str, side: str) -> Decimal:
+            fee_rate = self.get_fee_rate(user_id)
+            fee = cost * fee_rate
+            return cost + fee if side == "buy" else cost - fee
+  example_bad: |
+    # WRONG: 10% fee — destroys market accuracy
+    def calculate_cost(base_cost):
+        return base_cost * 1.10  # 10% fee discourages informed trading
+  when_applies: Revenue model design, fee structure implementation, trader retention strategy
+  sources: ["https://users.nber.org/~jwolfers/Papers/PredictionMarkets(Palgrave).pdf"]
+
+- id: PM-AMM-011
+  text: "Impermanent loss in prediction market AMMs differs from DeFi: it's permanent because markets resolve to 0 or 1. The AMM (market maker) always loses to a perfectly informed trader. This loss is the cost of providing the information aggregation service."
+  why: >
+    In DeFi, impermanent loss reverses if token prices return to their initial ratio. In prediction
+    markets, the final price is always 0 or 1, so the loss is permanent and guaranteed. If a market
+    starts at 50/50 and resolves Yes, the AMM sold Yes shares cheaply (below $1) and bought No shares
+    that are worthless. The total loss depends on b and the path of trading. Platform operators must
+    budget for this loss as a cost of doing business — it is NOT a bug, it is the mathematical cost
+    of running a prediction market.
+  how_to_do_right: |
+    1. Calculate expected AMM loss per market: E[loss] = b * ln(N) * (1 - 1/N) approximately
+    2. Budget AMM losses as a line item: total_budget = sum(max_loss per market)
+    3. Offset losses with trading fees: target fee_revenue > AMM_loss * 1.2 (20% margin)
+    4. Track realized loss per market at settlement for P&L reporting
+    5. Display AMM P&L on operator dashboard (not to users — it's confusing)
+    6. For subsidized markets (platform-seeded), record the subsidy as a marketing expense
+    7. Never try to "hedge" the AMM — it's economically equivalent to reducing b
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+    import math
+
+    class AMMProfitLoss:
+        def calculate_settlement_pnl(self, market: Market) -> Decimal:
+            """Calculate AMM P&L at market settlement."""
+            # Total collected from selling shares
+            total_revenue = market.total_fees_collected + market.total_trade_revenue
+
+            # Total payout to winners
+            winning_outcome = market.resolved_outcome
+            total_payout = sum(
+                position.shares for position in market.positions
+                if position.outcome == winning_outcome
+            )
+
+            pnl = total_revenue - total_payout
+            return Decimal(str(round(pnl, 10)))
+
+        def estimated_max_loss(self, b: float, num_outcomes: int) -> Decimal:
+            return Decimal(str(round(b * math.log(num_outcomes), 2)))
+  example_bad: |
+    # WRONG: Not tracking AMM P&L — no idea if platform is profitable
+    def settle_market(market_id):
+        for position in positions:
+            if position.outcome == winner:
+                pay_user(position.user_id, position.shares)
+        # How much did the AMM lose? Nobody knows.
+  when_applies: Platform economics, financial planning, operator dashboards, budgeting
+  sources: ["https://mason.gmu.edu/~rhanson/mktscore.pdf"]
+
+- id: PM-AMM-012
+  text: "Multi-outcome AMMs (N-way) require LMSR or a cost-function-based approach. Pairwise CPMM pools (one per outcome pair) create N*(N-1)/2 pools that must be kept in sync by arbitrageurs, adding latency and complexity."
+  why: >
+    For an election with 10 candidates, pairwise CPMM requires 45 separate pools. Prices across
+    pools can desynchronize for seconds or minutes, creating arbitrage opportunities that extract
+    value from the system. LMSR handles N outcomes natively with a single cost function, maintaining
+    perfect coherence (sum=1.00) at all times. The cost is O(N) per trade for LMSR vs O(1) for CPMM,
+    but N is typically <100 in prediction markets so this is negligible. For multi-outcome markets,
+    LMSR is strictly superior.
+  how_to_do_right: |
+    1. Use LMSR for all multi-outcome markets (N > 2)
+    2. CPMM is acceptable only for binary markets or if DeFi composability is required
+    3. LMSR price calculation: p_i = exp(q_i / b) / sum(exp(q_j / b)) — all N prices in one pass
+    4. Trade on any single outcome: cost = C(q_after) - C(q_before), only one quantity changes
+    5. Verify sum(prices) == 1.0 after every trade (mathematically guaranteed but verify anyway)
+    6. For display, sort outcomes by price descending (most likely first)
+    7. Allow "combination trades": buy outcome A and sell outcome B atomically (reduces user costs)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    class MultiOutcomeLMSR(LMSR):
+        """LMSR that natively handles N outcomes."""
+
+        def __init__(self, b: float, outcomes: list[str]):
+            super().__init__(b=b, num_outcomes=len(outcomes))
+            self.outcome_names = outcomes
+
+        def buy_outcome(self, outcome_name: str, shares: float) -> Decimal:
+            idx = self.outcome_names.index(outcome_name)
+            return self.execute_trade(idx, shares)
+
+        def get_all_prices(self) -> dict[str, Decimal]:
+            prices = self.prices()
+            return dict(zip(self.outcome_names, prices))
+
+        def combination_trade(self, buy_outcome: str, sell_outcome: str,
+                              shares: float) -> Decimal:
+            """Buy one outcome and sell another atomically."""
+            buy_idx = self.outcome_names.index(buy_outcome)
+            sell_idx = self.outcome_names.index(sell_outcome)
+            q_before = list(self.quantities)
+            self.quantities[buy_idx] += shares
+            self.quantities[sell_idx] -= shares
+            cost = self._cost(self.quantities) - self._cost(q_before)
+            return Decimal(str(round(cost, 10)))
+  example_bad: |
+    # WRONG: Pairwise CPMM for multi-outcome — creates N*(N-1)/2 pools
+    def create_election_market(candidates):
+        pools = {}
+        for i, c1 in enumerate(candidates):
+            for c2 in candidates[i+1:]:
+                pools[(c1, c2)] = CPMM(x=1000, y=1000)  # 45 pools for 10 candidates!
+  when_applies: Election markets, sports tournaments, any market with 3+ mutually exclusive outcomes
+  sources: ["https://mason.gmu.edu/~rhanson/mktscore.pdf"]
+
+- id: PM-AMM-013
+  text: "AMM initialization requires setting initial quantities so that all outcome prices are equal (uniform prior). For LMSR with N outcomes, set all q_i = 0 (which gives p_i = 1/N by the softmax formula). Initial liquidity is deposited to fund the market maker."
+  why: >
+    If initial quantities are not uniform, the market starts with a built-in bias — e.g., one
+    outcome at 70% before any trade occurs. This is unfair and violates the principle that markets
+    should discover prices through trading, not through initialization. The initial liquidity
+    deposited determines b, which controls how much trading is needed to move prices. Setting
+    initial liquidity too low means the first trade dominates the market; too high means many
+    trades are needed before prices are informative.
+  how_to_do_right: |
+    1. Set all initial quantities q_i = 0 (uniform prior: all outcomes equally likely)
+    2. Calculate b from initial liquidity: b = initial_liquidity / ln(num_outcomes)
+    3. Verify initial prices: all should be exactly 1/N
+    4. Record initial liquidity as a platform expense (it funds the market maker)
+    5. Do not allow trading until initial liquidity is confirmed deposited
+    6. Log: "Market {id} initialized with b={b}, {N} outcomes at {1/N} each, funded with {liquidity}"
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+    import math
+
+    class MarketInitializer:
+        def initialize_amm(self, num_outcomes: int,
+                          initial_liquidity: Decimal) -> LMSR:
+            b = float(initial_liquidity) / math.log(num_outcomes)
+            amm = LMSR(b=b, num_outcomes=num_outcomes)
+
+            # Verify uniform prior
+            prices = amm.prices()
+            expected = Decimal("1") / Decimal(str(num_outcomes))
+            for i, p in enumerate(prices):
+                assert abs(p - expected) < Decimal("1e-8"), (
+                    f"Outcome {i} price {p} != {expected}"
+                )
+
+            return amm
+  example_bad: |
+    # WRONG: Non-uniform initialization biases the market
+    amm = LMSR(b=100, num_outcomes=3)
+    amm.quantities = [50, 20, 10]  # Market starts biased toward outcome 0!
+  when_applies: Market creation, AMM setup, platform initialization
+  sources: ["https://mason.gmu.edu/~rhanson/mktscore.pdf"]
+
+- id: PM-AMM-014
+  text: "AMM shutdown/settlement: when a market resolves, freeze all trading, calculate each user's payout based on their position in the winning outcome, and execute payouts atomically. Unsettled markets are a liability on the platform's balance sheet."
+  why: >
+    Settlement is the most critical financial operation in a prediction market. If settlement fails
+    partially (some users paid, others not), it creates legal liability and destroys trust. If trading
+    continues after resolution is known, insiders can drain the AMM. A prediction market platform
+    must treat settlement as a financial close: freeze, calculate, verify, execute, confirm.
+    Unsettled markets accumulate as liabilities that affect platform solvency calculations.
+  how_to_do_right: |
+    1. Freeze market: reject all new orders, cancel all pending orders
+    2. Record resolution: which outcome won, timestamp, source, operator sign-off
+    3. Calculate payouts: for each user, payout = shares_in_winning_outcome * Decimal("1.00")
+    4. Verify: sum(all_payouts) <= total_market_collateral (platform is solvent)
+    5. Execute payouts atomically in a single database transaction
+    6. Mark market as SETTLED with immutable audit record
+    7. Retain all trade history for 7 years (regulatory requirement in most jurisdictions)
+    8. Report: total volume, total fees, AMM P&L, number of unique traders
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+
+    class SettlementService:
+        def settle_market(self, session: Session, market_id: str,
+                         winning_outcome: str, resolution_source: str) -> SettlementReport:
+            with session.begin():
+                market = session.query(Market).with_for_update().get(market_id)
+                assert market.status == MarketStatus.CLOSED, "Market must be closed first"
+
+                # 1. Freeze
+                market.status = MarketStatus.SETTLING
+
+                # 2. Cancel pending orders
+                self.cancel_all_orders(session, market_id)
+
+                # 3. Calculate payouts
+                positions = session.query(Position).filter_by(
+                    market_id=market_id, outcome=winning_outcome
+                ).all()
+                total_payout = sum(p.shares for p in positions)
+
+                # 4. Verify solvency
+                assert total_payout <= market.total_collateral, "Insolvency detected!"
+
+                # 5. Execute payouts
+                for pos in positions:
+                    pos.user.balance += pos.shares
+                    pos.settled = True
+
+                # 6. Mark settled
+                market.status = MarketStatus.SETTLED
+                market.resolved_outcome = winning_outcome
+                market.resolution_source = resolution_source
+
+                return SettlementReport(market_id=market_id, payouts=len(positions),
+                                       total_paid=total_payout)
+  example_bad: |
+    # WRONG: Non-atomic settlement, no freeze, no verification
+    def settle(market_id, winner):
+        for position in get_positions(market_id, winner):
+            pay_user(position.user_id, position.shares)  # What if this fails halfway?
+  when_applies: Market resolution, end-of-life market operations, platform financial operations
+  sources: ["https://mason.gmu.edu/~rhanson/mktscore.pdf"]
+
+- id: PM-AMM-015
+  text: "Price bounds enforcement: AMM prices must always be in [0, 1] for each outcome. LMSR guarantees this mathematically (softmax output is always in (0,1)), but numerical edge cases near 0 and 1 require clamping and precision management."
+  why: >
+    While LMSR's softmax formula mathematically produces values in (0,1), floating point arithmetic
+    can produce values like -0.0000000001 or 1.0000000001 at the extremes when quantities differ by
+    orders of magnitude. Displaying a price of 100.0001% or -0.001% to users is confusing and suggests
+    the system is broken. More critically, if a price is stored as slightly negative, downstream
+    calculations (square root for volatility, log for scoring) will crash.
+  how_to_do_right: |
+    1. After every price calculation, clamp: price = max(Decimal("0"), min(Decimal("1"), price))
+    2. Use epsilon bounds: if price < 0.001, display as "<0.1%"; if price > 0.999, display as ">99.9%"
+    3. Log a warning if pre-clamp price is outside [0, 1] — indicates precision issue
+    4. For LMSR: if any quantity exceeds 1000 * b, normalize all quantities by subtracting min(q_i)
+    5. Database constraint: CHECK(price >= 0 AND price <= 1) on all price columns
+    6. API validation: reject any external input claiming a price outside [0, 1]
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [consistency]
+  example_good: |
+    from decimal import Decimal
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    class PriceBoundsEnforcer:
+        MIN_PRICE = Decimal("0")
+        MAX_PRICE = Decimal("1")
+        DISPLAY_MIN = Decimal("0.001")
+        DISPLAY_MAX = Decimal("0.999")
+
+        def enforce(self, price: Decimal, context: str = "") -> Decimal:
+            if price < self.MIN_PRICE or price > self.MAX_PRICE:
+                logger.warning(
+                    f"Price {price} out of bounds [{self.MIN_PRICE}, {self.MAX_PRICE}] "
+                    f"in {context}. Clamping."
+                )
+            return max(self.MIN_PRICE, min(self.MAX_PRICE, price))
+
+        def format_display(self, price: Decimal) -> str:
+            if price < self.DISPLAY_MIN:
+                return "<0.1%"
+            if price > self.DISPLAY_MAX:
+                return ">99.9%"
+            return f"{price * 100:.1f}%"
+  example_bad: |
+    # WRONG: No clamping — negative prices displayed to users
+    def display_price(price):
+        return f"{price * 100:.2f}%"  # Could show "-0.00%" or "100.01%"
+  when_applies: Price display, price storage, API responses, database constraints
+  sources: ["https://mason.gmu.edu/~rhanson/mktscore.pdf"]
+
+- id: PM-AMM-016
+  text: "Price impact calculation shows how much a trade will move the market price. For LMSR: price_after = exp((q_i + shares) / b) / sum(exp((q_j + delta_j) / b)). Display price impact alongside slippage in the trade confirmation."
+  why: >
+    Price impact is different from slippage: slippage is the cost to the trader, price impact is the
+    change visible to all market participants. A large trade might have 3% slippage but 10% price
+    impact. Traders need to see both to make informed decisions. Market observers use price impact to
+    assess whether a trade is informational (large impact from a known expert) or noise (small impact
+    from many small trades). Without price impact display, large traders cannot manage their
+    market-moving effect.
+  how_to_do_right: |
+    1. Calculate price before trade: p_before = current price of target outcome
+    2. Calculate price after trade: simulate trade and get new price
+    3. Price impact = p_after - p_before (positive for buys, negative for sells)
+    4. Display: "Price impact: 60.0% -> 63.2% (+3.2%)"
+    5. Warn if price impact > 10%: "Large trade warning: this will significantly move the market"
+    6. For API: return both slippage and price_impact in trade preview response
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, react]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+
+    class PriceImpactCalculator:
+        def calculate(self, amm: "LMSR", outcome: int,
+                     shares: float) -> dict:
+            price_before = amm.prices()[outcome]
+
+            # Simulate trade without executing
+            simulated = LMSR(b=amm.b, num_outcomes=len(amm.quantities))
+            simulated.quantities = list(amm.quantities)
+            simulated.execute_trade(outcome, shares)
+            price_after = simulated.prices()[outcome]
+
+            impact = price_after - price_before
+            return {
+                "price_before": price_before,
+                "price_after": price_after,
+                "impact": impact,
+                "impact_pct": impact * Decimal("100"),
+                "large_trade_warning": abs(impact) > Decimal("0.10"),
+            }
+  example_bad: |
+    # WRONG: No price impact calculation — trader is blind
+    def buy(market_id, outcome, shares):
+        cost = amm.execute_trade(outcome, shares)
+        return {"cost": cost}  # How much did the price move? Unknown.
+  when_applies: Trade preview API, trade confirmation UI, market analytics
+  sources: ["https://mason.gmu.edu/~rhanson/mktscore.pdf"]
+
+- id: PM-AMM-017
+  text: "AMM state persistence should be event-sourced: store every trade as an immutable event and derive current state by replaying events. This provides a complete audit trail, enables point-in-time reconstruction, and simplifies debugging."
+  why: >
+    Financial regulators (CFTC, CVM, FCA) require complete audit trails for all transactions.
+    Event sourcing provides this by default: every state change is an immutable event. If a bug is
+    found in the AMM logic, you can replay events with the fixed code to determine the correct state.
+    If a user disputes a trade, you can reconstruct the exact AMM state at the time of their trade.
+    State-based persistence (just storing current quantities) loses this history. The cost is
+    higher storage (~10x more rows) but prediction markets are low-frequency (hundreds of trades/day,
+    not millions) so this is negligible.
+  how_to_do_right: |
+    1. Store every trade as an immutable event: (market_id, outcome, shares, cost, timestamp, user_id)
+    2. Store AMM snapshots periodically (every 100 trades or every hour) for fast reconstruction
+    3. Current state = last snapshot + replay of events since snapshot
+    4. Never update or delete trade events — append only
+    5. Implement replay function: given events 1..N, produce AMM state at event N
+    6. Verify: replay all events from genesis should produce current state (run daily in CI)
+    7. Retention: keep all events for 7+ years (regulatory requirement)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [sqlalchemy, asyncpg]
+  domains:
+    domain: [prediction_markets, fintech, databases]
+    concern: [domain_specific]
+  example_good: |
+    from dataclasses import dataclass
+    from datetime import datetime
+    from decimal import Decimal
+
+    @dataclass(frozen=True)
+    class TradeEvent:
+        event_id: str
+        market_id: str
+        user_id: str
+        outcome: int
+        shares: float
+        cost: Decimal
+        timestamp: datetime
+        amm_state_before: dict  # snapshot for debugging
+        amm_state_after: dict
+
+    class EventSourcedAMM:
+        def __init__(self, market_id: str, event_store: "EventStore"):
+            self.market_id = market_id
+            self.event_store = event_store
+
+        def replay_to(self, timestamp: datetime) -> LMSR:
+            """Reconstruct AMM state at any point in time."""
+            events = self.event_store.get_events(
+                self.market_id, up_to=timestamp
+            )
+            amm = LMSR(b=self._get_initial_b(), num_outcomes=self._get_num_outcomes())
+            for event in events:
+                amm.quantities[event.outcome] += event.shares
+            return amm
+  example_bad: |
+    # WRONG: Mutable state with no history — can't audit, can't debug
+    def execute_trade(market_id, outcome, shares):
+        amm = load_amm(market_id)
+        amm.quantities[outcome] += shares
+        save_amm(market_id, amm)  # Previous state lost forever
+  when_applies: AMM persistence design, audit trail requirements, regulatory compliance, debugging
+  sources: ["https://martinfowler.com/eaaDev/EventSourcing.html"]
+
+- id: PM-AMM-018
+  text: "AMM audit trail must record every state change with before/after snapshots, user identity, timestamp, and trade parameters. This is both a regulatory requirement and a debugging necessity. Use structured logging with correlation IDs for traceability."
+  why: >
+    When a user says "I was charged $50 but only received 10 shares, that's wrong", you need to
+    reconstruct exactly what happened: the AMM state before the trade, the calculation performed,
+    and the state after. Without an audit trail, you have no evidence to resolve disputes. A
+    prediction market without audit capability will fail regulatory review (CFTC requires 5+ years
+    of transaction records). Structured logging with correlation IDs enables tracing a single trade
+    across AMM, order book, balance, and notification systems.
+  how_to_do_right: |
+    1. Every trade log entry must include: trade_id, user_id, market_id, outcome, shares, cost,
+       price_before, price_after, quantities_before, quantities_after, timestamp, ip_address
+    2. Use a correlation_id (UUID) that follows the trade through all subsystems
+    3. Store audit records in an append-only table with no UPDATE or DELETE permissions
+    4. Include the AMM version/code hash in each record (for debugging after code changes)
+    5. Implement audit query API: "show me everything that happened for trade {trade_id}"
+    6. Retention: minimum 7 years, encrypted at rest
+    7. Test: every trade should produce exactly 1 audit record — verify in integration tests
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [sqlalchemy, structlog]
+  domains:
+    domain: [prediction_markets, fintech, compliance]
+    concern: [domain_specific]
+  example_good: |
+    import structlog
+    import uuid
+    from decimal import Decimal
+
+    logger = structlog.get_logger()
+
+    class AuditedTradeService:
+        def execute_trade(self, user_id: str, market_id: str,
+                         outcome: int, shares: float) -> Trade:
+            correlation_id = str(uuid.uuid4())
+            log = logger.bind(correlation_id=correlation_id, user_id=user_id,
+                             market_id=market_id)
+
+            amm = self.get_amm(market_id)
+            state_before = {"quantities": list(amm.quantities), "prices": amm.prices()}
+
+            cost = amm.execute_trade(outcome, shares)
+            state_after = {"quantities": list(amm.quantities), "prices": amm.prices()}
+
+            # Immutable audit record
+            audit = AuditRecord(
+                correlation_id=correlation_id, trade_type="AMM_TRADE",
+                user_id=user_id, market_id=market_id, outcome=outcome,
+                shares=shares, cost=cost,
+                state_before=state_before, state_after=state_after,
+            )
+            self.audit_store.append(audit)
+
+            log.info("trade_executed", cost=str(cost), outcome=outcome, shares=shares)
+            return Trade(id=correlation_id, cost=cost)
+  example_bad: |
+    # WRONG: No audit trail — disputes are unresolvable
+    def trade(user_id, market_id, outcome, shares):
+        cost = amm.execute(outcome, shares)
+        user.debit(cost)
+        return cost  # No record of what happened or why
+  when_applies: Every trade execution, regulatory compliance, dispute resolution, debugging
+  sources: ["https://martinfowler.com/eaaDev/EventSourcing.html"]

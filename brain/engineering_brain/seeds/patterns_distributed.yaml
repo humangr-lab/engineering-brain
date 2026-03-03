@@ -1,0 +1,848 @@
+layer: patterns
+domain: distributed
+
+knowledge:
+  # === Reliability Patterns ===
+  - id: PAT-DIST-CIRCUIT-BREAKER
+    name: "Circuit Breaker Pattern"
+    category: distributed
+    intent: "Prevent cascading failures by wrapping calls to remote services with a circuit that opens on repeated failures."
+    when_to_use: |
+      Any call to a remote service, database, or external API that can become slow or unresponsive. The circuit
+      breaker is essential when a downstream dependency's failure would otherwise cause the calling service to
+      exhaust its thread pool, connection pool, or memory waiting for responses that will never come. Use it when
+      you have multiple consumers of the same dependency and a single degraded service would cascade into system-wide
+      failure. Especially critical in microservice architectures where a single service might call 5-10 downstream
+      services per request — without circuit breakers, the slowest dependency dictates the latency and availability
+      of the entire call chain. The pattern shines when you have a meaningful fallback (cached data, default
+      response, degraded feature) that can serve users while the downstream recovers. Also use it to protect
+      against thundering herd problems: when a recovered service comes back online, the half-open state allows
+      gradual traffic ramp-up rather than an immediate flood.
+    when_not_to_use: |
+      In-process function calls where failure is near-instantaneous and cannot block resources. Local
+      computations that fail fast on their own. Calls where there is no meaningful fallback and the caller
+      must propagate the error regardless — the circuit breaker adds complexity without benefit.
+    languages: [Python, Java, Go]
+    example_good: |
+      import time
+      from enum import Enum
+
+      class State(Enum):
+          CLOSED = "closed"
+          OPEN = "open"
+          HALF_OPEN = "half_open"
+
+      class CircuitBreaker:
+          def __init__(self, failure_threshold=5, recovery_timeout=30):
+              self.state = State.CLOSED
+              self.failure_count = 0
+              self.threshold = failure_threshold
+              self.recovery_timeout = recovery_timeout
+              self.last_failure_time = 0
+
+          def call(self, func, *args, **kwargs):
+              if self.state == State.OPEN:
+                  if time.time() - self.last_failure_time > self.recovery_timeout:
+                      self.state = State.HALF_OPEN
+                  else:
+                      raise CircuitOpenError("Circuit is open — fast-failing")
+              try:
+                  result = func(*args, **kwargs)
+                  self._on_success()
+                  return result
+              except Exception as e:
+                  self._on_failure()
+                  raise
+
+          def _on_success(self):
+              self.failure_count = 0
+              self.state = State.CLOSED
+
+          def _on_failure(self):
+              self.failure_count += 1
+              self.last_failure_time = time.time()
+              if self.failure_count >= self.threshold:
+                  self.state = State.OPEN
+    example_bad: |
+      import requests
+
+      def get_user_profile(user_id):
+          # No circuit breaker — if profile-service is down, every request
+          # blocks for the full timeout, exhausting the thread pool
+          try:
+              resp = requests.get(
+                  f"http://profile-service/users/{user_id}",
+                  timeout=30,  # 30s timeout * 200 concurrent requests = disaster
+              )
+              return resp.json()
+          except requests.Timeout:
+              # Log and retry immediately — hammering a sick service
+              logger.warning("Timeout, retrying...")
+              return get_user_profile(user_id)  # Infinite retry loop
+          except Exception:
+              return None  # Silently swallow — no metrics, no fallback strategy
+    text: "Circuit Breaker Pattern -- Prevent cascading failures by wrapping calls to remote services with a circuit that opens on repeated failures."
+    why: "Prevent cascading failures by wrapping calls to remote services with a circuit that opens on repeated failures."
+    how_to_do_right: |
+      1. Identify where circuit breaker pattern applies in your codebase
+      2. Review existing implementations for consistency with the pattern
+      3. Apply the pattern following the example_good template above
+      4. Validate correctness with automated tests covering edge cases
+      5. Document the pattern usage in architecture decision records
+    severity: high
+    technologies:
+      lang: [python, java, go]
+    domains:
+      domain: [distributed, distributed]
+      concern: [pattern, best_practice]
+    when_applies: "Any call to a remote service, database, or external API that can become slow or unresponsive."
+
+    related_principles: [P-DIST-CIRCUIT-BREAKER, P-REL-GRACEFUL-DEGRADE, P-ERR-FAIL-FAST]
+    sources: ["https://martinfowler.com/bliki/CircuitBreaker.html", "https://microservices.io/patterns/reliability/circuit-breaker.html"]
+
+  - id: PAT-DIST-SAGA
+    name: "Saga Pattern"
+    category: distributed
+    intent: "Coordinate distributed transactions across multiple services using a sequence of local transactions with compensating actions for rollback."
+    when_to_use: |
+      Any business process that spans multiple services and requires atomicity guarantees beyond a single
+      database. Classic examples include order processing (create order, charge payment, reserve inventory,
+      schedule shipment), user onboarding (create account, provision resources, send welcome email, set up
+      billing), and financial transfers (debit source, credit destination, update ledger). Use sagas when
+      two-phase commit is impractical due to heterogeneous data stores, long-running operations, or the need
+      to maintain availability during partial failures. The saga pattern is especially valuable when each step
+      has a natural business-level reversal (refund, release, cancel) that users already understand. Prefer
+      orchestration (a central coordinator) when the workflow has complex branching logic or you need
+      centralized visibility; prefer choreography (event-driven) when services must remain fully decoupled
+      and the workflow is linear.
+    when_not_to_use: |
+      Operations that can fit in a single database transaction — use ACID directly. Workflows where
+      compensating actions are impossible or meaningless (e.g., sending a physical letter cannot be
+      un-sent). Very low-latency paths where saga coordination overhead is unacceptable.
+    languages: [Python, Java, Go]
+    example_good: |
+      from dataclasses import dataclass, field
+      from enum import Enum
+
+      class StepStatus(Enum):
+          PENDING = "pending"
+          COMPLETED = "completed"
+          COMPENSATED = "compensated"
+
+      @dataclass
+      class SagaStep:
+          name: str
+          action: callable
+          compensate: callable
+          status: StepStatus = StepStatus.PENDING
+
+      class SagaOrchestrator:
+          def __init__(self, steps: list[SagaStep]):
+              self.steps = steps
+
+          def execute(self, context: dict) -> dict:
+              completed = []
+              for step in self.steps:
+                  try:
+                      step.action(context)
+                      step.status = StepStatus.COMPLETED
+                      completed.append(step)
+                  except Exception as e:
+                      logger.error("Step %s failed: %s", step.name, e)
+                      self._compensate(completed, context)
+                      raise SagaAborted(step.name, e)
+              return context
+
+          def _compensate(self, completed: list[SagaStep], context: dict):
+              for step in reversed(completed):
+                  try:
+                      step.compensate(context)
+                      step.status = StepStatus.COMPENSATED
+                  except Exception as e:
+                      logger.critical("Compensation failed for %s: %s", step.name, e)
+                      # Alert ops — manual intervention required
+    example_bad: |
+      def create_order(order_data):
+          # Distributed transaction without saga — partial failure leaves inconsistent state
+          payment_service.charge(order_data["payment"])  # Succeeds
+          inventory_service.reserve(order_data["items"])  # Succeeds
+          shipping_service.schedule(order_data["address"])  # FAILS!
+          # Payment is charged, inventory is reserved, but no shipment.
+          # No compensating logic — customer is charged for nothing.
+          # Manual intervention required to fix every failure.
+
+      def create_order_2pc(order_data):
+          # Two-phase commit attempt — holds locks across all services
+          with distributed_lock("order", timeout=60):
+              payment_service.prepare(order_data["payment"])
+              inventory_service.prepare(order_data["items"])
+              # If shipping_service is slow, ALL locks held for 60s
+              shipping_service.prepare(order_data["address"])
+              # Coordinator crash here = all services stuck in limbo
+              commit_all()
+    text: "Saga Pattern -- Coordinate distributed transactions across multiple services using a sequence of local transactions with compensating actions for rollback."
+    why: "Coordinate distributed transactions across multiple services using a sequence of local transactions with compensating actions for rollback."
+    how_to_do_right: |
+      1. Identify where saga pattern applies in your codebase
+      2. Review existing implementations for consistency with the pattern
+      3. Apply the pattern following the example_good template above
+      4. Validate correctness with automated tests covering edge cases
+      5. Document the pattern usage in architecture decision records
+    severity: high
+    technologies:
+      lang: [python, java, go]
+    domains:
+      domain: [distributed, distributed]
+      concern: [pattern, best_practice]
+    when_applies: "Any business process that spans multiple services and requires atomicity guarantees beyond a single
+database."
+
+    related_principles: [P-DIST-SAGA, P-API-IDEMPOTENT, P-DIST-EVENTUAL-CONSIST]
+    sources: ["https://microservices.io/patterns/data/saga.html"]
+
+  - id: PAT-DIST-BULKHEAD
+    name: "Bulkhead Pattern"
+    category: distributed
+    intent: "Isolate failures to specific resource pools so that one degraded dependency cannot exhaust shared resources and bring down the entire system."
+    when_to_use: |
+      Any service that calls multiple downstream dependencies and shares a common resource pool (thread pool,
+      connection pool, memory) across those calls. Without bulkheads, a single slow dependency can consume all
+      available threads or connections, starving healthy dependencies. The pattern is essential in API gateways,
+      BFF (backend-for-frontend) services, and orchestration services that aggregate data from multiple sources.
+      Name comes from ship compartments — flooding one compartment does not sink the ship. Use it when different
+      call paths have different latency profiles (a payment call taking 2s should not block a cache lookup that
+      takes 5ms). Also critical when you have mixed-criticality workloads: isolate critical-path requests from
+      background/batch processing to guarantee latency SLAs for the critical path.
+    when_not_to_use: |
+      Services with a single downstream dependency — there is nothing to isolate from. Systems where the
+      total resource budget is already minimal and splitting it would leave each pool too small to function.
+      Stateless compute functions that create no shared resource contention.
+    languages: [Python, Java, Go]
+    example_good: |
+      from concurrent.futures import ThreadPoolExecutor
+      from functools import wraps
+
+      # Separate thread pools per dependency — failure in one cannot starve others
+      POOLS = {
+          "payment": ThreadPoolExecutor(max_workers=10, thread_name_prefix="payment"),
+          "inventory": ThreadPoolExecutor(max_workers=8, thread_name_prefix="inventory"),
+          "recommendations": ThreadPoolExecutor(max_workers=4, thread_name_prefix="recs"),
+      }
+
+      def bulkhead(pool_name: str, timeout: float = 5.0):
+          def decorator(func):
+              @wraps(func)
+              def wrapper(*args, **kwargs):
+                  pool = POOLS[pool_name]
+                  future = pool.submit(func, *args, **kwargs)
+                  try:
+                      return future.result(timeout=timeout)
+                  except TimeoutError:
+                      future.cancel()
+                      raise BulkheadTimeout(f"{pool_name} pool timeout after {timeout}s")
+              return wrapper
+          return decorator
+
+      @bulkhead("payment", timeout=10.0)
+      def charge_payment(order_id, amount):
+          return payment_client.charge(order_id, amount)
+
+      @bulkhead("recommendations", timeout=2.0)
+      def get_recommendations(user_id):
+          return recs_client.get(user_id)
+    example_bad: |
+      # Shared thread pool for ALL downstream calls
+      executor = ThreadPoolExecutor(max_workers=20)
+
+      def handle_request(user_id, order_id):
+          # All calls share the same 20 threads
+          payment_future = executor.submit(charge_payment, order_id)
+          recs_future = executor.submit(get_recommendations, user_id)
+          inv_future = executor.submit(check_inventory, order_id)
+
+          # If recommendation-service hangs, it consumes all 20 threads.
+          # Payment and inventory calls queue indefinitely.
+          # Entire service becomes unresponsive — cascading failure.
+          payment = payment_future.result(timeout=30)
+          recs = recs_future.result(timeout=30)
+          inventory = inv_future.result(timeout=30)
+    text: "Bulkhead Pattern -- Isolate failures to specific resource pools so that one degraded dependency cannot exhaust shared resources and bring down the entire system."
+    why: "Isolate failures to specific resource pools so that one degraded dependency cannot exhaust shared resources and bring down the entire system."
+    how_to_do_right: |
+      1. Identify where bulkhead pattern applies in your codebase
+      2. Review existing implementations for consistency with the pattern
+      3. Apply the pattern following the example_good template above
+      4. Validate correctness with automated tests covering edge cases
+      5. Document the pattern usage in architecture decision records
+    severity: high
+    technologies:
+      lang: [python, java, go]
+    domains:
+      domain: [distributed, distributed]
+      concern: [pattern, best_practice]
+    when_applies: "Any service that calls multiple downstream dependencies and shares a common resource pool (thread pool,
+connection pool, memory) across those calls."
+
+    related_principles: [P-REL-BLAST-RADIUS, P-REL-GRACEFUL-DEGRADE, P-ARCH-SEPARATION]
+    sources: ["https://docs.microsoft.com/en-us/azure/architecture/patterns/bulkhead"]
+
+  - id: PAT-DIST-RETRY-BACKOFF
+    name: "Retry with Exponential Backoff Pattern"
+    category: distributed
+    intent: "Make remote calls resilient to transient failures by retrying with increasing delays and jitter, avoiding thundering herd problems."
+    when_to_use: |
+      Any call to a remote service, cloud API, or external dependency that can experience transient failures
+      such as network blips, temporary overload (HTTP 429, 503), DNS resolution hiccups, or TLS handshake
+      timeouts. The pattern is standard practice for cloud SDK calls (AWS, GCP, Azure all recommend it in
+      their official documentation), database connections during failover, message queue publish operations,
+      and any I/O operation across a network boundary. Critical that the backoff includes jitter (randomized
+      component) — without jitter, all clients that failed at the same time retry at the same time, creating
+      periodic load spikes that re-trigger the very failure they are recovering from. Use it when the
+      operation is idempotent or can be made idempotent. Cap the maximum delay and maximum retries to bound
+      total latency.
+    when_not_to_use: |
+      Non-idempotent operations without deduplication (retrying a non-idempotent payment charge creates
+      double charges). Deterministic errors (HTTP 400, 404) that will never succeed on retry. Operations
+      where the total retry time exceeds the user's patience or SLA.
+    languages: [Python, Java, Go]
+    example_good: |
+      import random
+      import time
+      from functools import wraps
+
+      def retry_with_backoff(
+          max_retries: int = 3,
+          base_delay: float = 1.0,
+          max_delay: float = 60.0,
+          retryable_exceptions: tuple = (ConnectionError, TimeoutError),
+      ):
+          def decorator(func):
+              @wraps(func)
+              def wrapper(*args, **kwargs):
+                  for attempt in range(max_retries + 1):
+                      try:
+                          return func(*args, **kwargs)
+                      except retryable_exceptions as e:
+                          if attempt == max_retries:
+                              raise
+                          delay = min(base_delay * (2 ** attempt), max_delay)
+                          jitter = delay * random.uniform(0.5, 1.0)
+                          logger.warning(
+                              "Attempt %d/%d failed: %s. Retrying in %.1fs",
+                              attempt + 1, max_retries, e, jitter,
+                          )
+                          time.sleep(jitter)
+              return wrapper
+          return decorator
+
+      @retry_with_backoff(max_retries=3, base_delay=0.5, max_delay=30.0)
+      def fetch_user_data(user_id: str) -> dict:
+          resp = httpx.get(f"https://api.users.com/v1/{user_id}", timeout=5.0)
+          resp.raise_for_status()
+          return resp.json()
+    example_bad: |
+      def fetch_user_data(user_id):
+          # Immediate retry with no backoff — hammers the failing service
+          for attempt in range(10):
+              try:
+                  resp = requests.get(f"http://api/users/{user_id}")
+                  return resp.json()
+              except Exception:
+                  pass  # Swallow all exceptions — retries non-retryable errors too
+          # 10 retries * 0 delay = 10 rapid-fire requests to a sick service
+          # No jitter — every client retries at the same instant
+          # No distinction between 404 (never succeeds) and 503 (transient)
+          # Silently returns None — caller has no idea it failed
+          return None
+    text: "Retry with Exponential Backoff Pattern -- Make remote calls resilient to transient failures by retrying with increasing delays and jitter, avoiding thundering herd problems."
+    why: "Make remote calls resilient to transient failures by retrying with increasing delays and jitter, avoiding thundering herd problems."
+    how_to_do_right: |
+      1. Identify where retry with exponential backoff pattern applies in your codebase
+      2. Review existing implementations for consistency with the pattern
+      3. Apply the pattern following the example_good template above
+      4. Validate correctness with automated tests covering edge cases
+      5. Document the pattern usage in architecture decision records
+    severity: high
+    technologies:
+      lang: [python, java, go]
+    domains:
+      domain: [distributed, distributed]
+      concern: [pattern, best_practice]
+    when_applies: "Any call to a remote service, cloud API, or external dependency that can experience transient failures
+such as network blips, temporary overload (HTTP 429, 503), DNS resolution hiccups, or TLS handsha."
+
+    related_principles: [P-MSG-BACKOFF, P-ERR-FAIL-FAST, P-API-IDEMPOTENT]
+    sources: ["https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/"]
+
+  # === Infrastructure Patterns ===
+  - id: PAT-DIST-SIDECAR
+    name: "Sidecar Pattern"
+    category: distributed
+    intent: "Extract cross-cutting concerns (logging, networking, security, configuration) into a companion process that runs alongside the main application container."
+    when_to_use: |
+      Polyglot microservice environments where services are written in different languages but need uniform
+      observability, mTLS, rate limiting, or configuration management. The sidecar runs as a separate process
+      (typically a container in the same Kubernetes pod) that intercepts or augments the main application's
+      network traffic or file I/O. Classic use cases include Envoy as a network proxy sidecar (service mesh),
+      Fluentd or Filebeat for log collection, HashiCorp Vault agent for secret injection, and OpenTelemetry
+      Collector for telemetry. The pattern lets you upgrade the cross-cutting capability independently of the
+      application — deploy a new Envoy version without rebuilding any application container. It enforces
+      organizational standards without requiring every team to implement them: the platform team owns the
+      sidecar, application teams own the business logic.
+    when_not_to_use: |
+      Monolithic applications where all concerns can be addressed in-process with libraries. Extremely
+      latency-sensitive paths where the extra network hop through the sidecar proxy adds unacceptable
+      overhead. Resource-constrained environments where running a second container per pod doubles
+      memory/CPU consumption beyond budget.
+    languages: [Python, Java, Go]
+    example_good: |
+      # Kubernetes pod spec with Envoy sidecar for mTLS and observability
+      # Application code is completely unaware of mTLS — sidecar handles it
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: order-service
+        annotations:
+          sidecar.istio.io/inject: "true"
+      spec:
+        containers:
+          - name: order-service
+            image: order-service:1.4.2
+            ports:
+              - containerPort: 8080
+            # App talks plain HTTP to localhost — sidecar upgrades to mTLS
+            env:
+              - name: PAYMENT_URL
+                value: "http://payment-service:8080"
+          # Sidecar injected automatically by Istio — intercepts all traffic
+          # Provides: mTLS, retries, circuit breaking, distributed tracing
+          # Zero application code changes required
+    example_bad: |
+      # Every service implements its own mTLS, retries, and tracing
+      import ssl
+      import certifi
+      from opentelemetry import trace
+
+      class OrderClient:
+          def __init__(self):
+              # Each service team maintains TLS config — inconsistent across org
+              self.ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+              self.ssl_ctx.load_cert_chain("certs/client.pem", "certs/client-key.pem")
+              # Each team implements retries differently (or not at all)
+              self.retry_policy = RetryPolicy(max=3, backoff=1.0)
+              # Tracing setup duplicated in every service
+              self.tracer = trace.get_tracer("order-client")
+
+          def call_payment(self, order_id):
+              with self.tracer.start_as_current_span("call-payment"):
+                  # 50 lines of boilerplate per service, per dependency
+                  # Certificate rotation requires redeploying every service
+                  pass
+    text: "Sidecar Pattern -- Extract cross-cutting concerns (logging, networking, security, configuration) into a companion process that runs alongside the main application container."
+    why: "Extract cross-cutting concerns (logging, networking, security, configuration) into a companion process that runs alongside the main application container."
+    how_to_do_right: |
+      1. Identify where sidecar pattern applies in your codebase
+      2. Review existing implementations for consistency with the pattern
+      3. Apply the pattern following the example_good template above
+      4. Validate correctness with automated tests covering edge cases
+      5. Document the pattern usage in architecture decision records
+    severity: high
+    technologies:
+      lang: [python, java, go]
+    domains:
+      domain: [distributed, distributed]
+      concern: [pattern, best_practice]
+    when_applies: "Polyglot microservice environments where services are written in different languages but need uniform
+observability, mTLS, rate limiting, or configuration management."
+
+    related_principles: [P-ARCH-SEPARATION, P-ARCH-SINGLE-RESP, P-OBS-STRUCTURED]
+    sources: ["https://docs.microsoft.com/en-us/azure/architecture/patterns/sidecar"]
+
+  - id: PAT-DIST-SERVICE-MESH
+    name: "Service Mesh Pattern"
+    category: distributed
+    intent: "Move networking concerns (service discovery, load balancing, mTLS, observability, traffic management) into an infrastructure layer that applications do not need to implement."
+    when_to_use: |
+      Microservice architectures with 10+ services where consistent networking policy enforcement is critical.
+      The service mesh (Istio, Linkerd, Consul Connect) deploys a data plane of sidecar proxies alongside every
+      service instance, controlled by a central control plane. Use it when you need uniform mTLS across all
+      service-to-service communication, canary deployments and traffic splitting (route 5% of traffic to v2),
+      circuit breaking and retry policies enforced at the infrastructure level, and distributed tracing without
+      application instrumentation. The mesh provides a single point of control for network policy: one YAML
+      change can add retries to every call to the payment service, without touching any application code. It
+      also provides fleet-wide observability: golden metrics (latency, traffic, errors, saturation) for every
+      service-to-service edge, automatically.
+    when_not_to_use: |
+      Fewer than 5-10 services — the operational overhead of running a mesh control plane exceeds the benefit.
+      Monolithic applications. Teams without Kubernetes expertise, since service meshes deeply integrate with
+      the container orchestrator. Environments where sidecar resource overhead (50-100MB per proxy) is
+      prohibitive.
+    languages: [Python, Java, Go]
+    example_good: |
+      # Istio VirtualService — canary deployment, no application code changes
+      apiVersion: networking.istio.io/v1beta1
+      kind: VirtualService
+      metadata:
+        name: payment-service
+      spec:
+        hosts: [payment-service]
+        http:
+          - route:
+              - destination:
+                  host: payment-service
+                  subset: stable
+                weight: 95
+              - destination:
+                  host: payment-service
+                  subset: canary
+                weight: 5
+            retries:
+              attempts: 3
+              perTryTimeout: 2s
+              retryOn: "5xx,reset,connect-failure"
+      ---
+      # DestinationRule — circuit breaker at infrastructure level
+      apiVersion: networking.istio.io/v1beta1
+      kind: DestinationRule
+      metadata:
+        name: payment-service
+      spec:
+        host: payment-service
+        trafficPolicy:
+          outlierDetection:
+            consecutive5xxErrors: 3
+            interval: 30s
+            baseEjectionTime: 60s
+    example_bad: |
+      # Without service mesh — every service implements its own networking
+      class PaymentClient:
+          ENDPOINTS = ["payment-1:8080", "payment-2:8080", "payment-3:8080"]
+
+          def call(self, request):
+              # Hand-rolled service discovery — stale, no health checks
+              endpoint = random.choice(self.ENDPOINTS)
+              # Hand-rolled retry — inconsistent with other services
+              for attempt in range(3):
+                  try:
+                      return requests.post(f"http://{endpoint}/charge", json=request)
+                  except Exception:
+                      endpoint = random.choice(self.ENDPOINTS)
+              # No mTLS — traffic is plaintext on the network
+              # No circuit breaking — retries hammer a failing instance
+              # No canary capability — all-or-nothing deployments
+              # No distributed tracing — blind spot in the call graph
+              raise PaymentError("All payment endpoints failed")
+    text: "Service Mesh Pattern -- Move networking concerns (service discovery, load balancing, mTLS, observability, traffic management) into an infrastructure layer that applications do not need to implement."
+    why: "Move networking concerns (service discovery, load balancing, mTLS, observability, traffic management) into an infrastructure layer that applications do not need to implement."
+    how_to_do_right: |
+      1. Identify where service mesh pattern applies in your codebase
+      2. Review existing implementations for consistency with the pattern
+      3. Apply the pattern following the example_good template above
+      4. Validate correctness with automated tests covering edge cases
+      5. Document the pattern usage in architecture decision records
+    severity: high
+    technologies:
+      lang: [python, java, go]
+    domains:
+      domain: [distributed, distributed]
+      concern: [pattern, best_practice]
+    when_applies: "Microservice architectures with 10+ services where consistent networking policy enforcement is critical."
+
+    related_principles: [P-DIST-CIRCUIT-BREAKER, P-REL-REDUNDANCY, P-OBS-STRUCTURED]
+    sources: ["https://istio.io/latest/docs/concepts/what-is-istio/", "https://linkerd.io/2/overview/"]
+
+  # === Messaging Patterns ===
+  - id: PAT-DIST-EVENT-DRIVEN
+    name: "Event-Driven Architecture Pattern"
+    category: distributed
+    intent: "Decouple services by communicating through asynchronous events rather than synchronous request-response calls."
+    when_to_use: |
+      Systems where producers and consumers have different availability and throughput requirements. The
+      event-driven pattern replaces direct service-to-service HTTP calls with events published to a broker
+      (Kafka, RabbitMQ, AWS SNS/SQS, NATS). Producers fire-and-forget; consumers process at their own pace.
+      Use it when a single action triggers multiple downstream reactions (order placed triggers: payment,
+      inventory, notification, analytics), when services should remain deployable and scalable independently,
+      when you need temporal decoupling (producer and consumer do not need to be online at the same time), and
+      when you want to add new consumers without modifying the producer (open/closed principle at the system
+      level). The pattern is the foundation of CQRS and Event Sourcing architectures. It enables natural
+      replay and audit trails since events are an immutable log of what happened.
+    when_not_to_use: |
+      Request-response workflows where the caller needs an immediate, synchronous answer (user login, real-time
+      price check). Simple CRUD applications with no fan-out. When debugging asynchronous flows would impose
+      excessive cognitive overhead on a small team.
+    languages: [Python, Java, Go]
+    example_good: |
+      import json
+      from dataclasses import dataclass, asdict
+      from datetime import datetime, timezone
+
+      @dataclass
+      class OrderPlacedEvent:
+          event_type: str = "order.placed"
+          order_id: str = ""
+          customer_id: str = ""
+          items: list = None
+          total_amount: float = 0.0
+          occurred_at: str = ""
+
+          def __post_init__(self):
+              if not self.occurred_at:
+                  self.occurred_at = datetime.now(timezone.utc).isoformat()
+
+      class EventPublisher:
+          def __init__(self, broker_client):
+              self.broker = broker_client
+
+          def publish(self, event, topic: str):
+              message = json.dumps(asdict(event))
+              self.broker.publish(topic=topic, message=message)
+              logger.info("Published %s to %s", event.event_type, topic)
+
+      # Producer: publishes event, does not know or care about consumers
+      def place_order(order_data: dict, publisher: EventPublisher):
+          order = OrderRepository.create(order_data)
+          event = OrderPlacedEvent(
+              order_id=order.id,
+              customer_id=order.customer_id,
+              items=order.items,
+              total_amount=order.total,
+          )
+          publisher.publish(event, topic="orders")
+          return order
+    example_bad: |
+      def place_order(order_data):
+          order = OrderRepository.create(order_data)
+          # Synchronous calls to every downstream — tight coupling
+          payment_service.charge(order.id, order.total)   # If down, order fails
+          inventory_service.reserve(order.id, order.items) # If slow, user waits
+          email_service.send_confirmation(order.customer)  # If down, order fails
+          analytics_service.track_order(order.id)          # Adding a new consumer
+          fraud_service.check(order.id)                    #   requires modifying
+          loyalty_service.award_points(order.customer)     #   this function every time
+          # 6 synchronous calls: latency = sum of all; availability = product of all
+          # P(all 6 up) = 0.99^6 = 0.94 — 6% failure rate even with 99% uptime each
+          return order
+    text: "Event-Driven Architecture Pattern -- Decouple services by communicating through asynchronous events rather than synchronous request-response calls."
+    why: "Decouple services by communicating through asynchronous events rather than synchronous request-response calls."
+    how_to_do_right: |
+      1. Identify where event-driven architecture pattern applies in your codebase
+      2. Review existing implementations for consistency with the pattern
+      3. Apply the pattern following the example_good template above
+      4. Validate correctness with automated tests covering edge cases
+      5. Document the pattern usage in architecture decision records
+    severity: high
+    technologies:
+      lang: [python, java, go]
+    domains:
+      domain: [distributed, distributed]
+      concern: [pattern, best_practice]
+    when_applies: "Systems where producers and consumers have different availability and throughput requirements."
+
+    related_principles: [P-ARCH-SEPARATION, P-DIST-EVENTUAL-CONSIST, P-MSG-ORDERING]
+    sources: ["https://martinfowler.com/articles/201701-event-driven.html"]
+
+  - id: PAT-DIST-DLQ
+    name: "Dead Letter Queue Pattern"
+    category: distributed
+    intent: "Capture messages that cannot be processed after exhausting retries, preventing poison messages from blocking the queue while preserving them for investigation."
+    when_to_use: |
+      Any message-driven system where consumers can encounter messages that are permanently unprocessable:
+      malformed payloads, schema mismatches, referencing entities that no longer exist, or triggering
+      application bugs. Without a DLQ, a poison message blocks the entire queue (head-of-line blocking) — the
+      consumer retries forever, no subsequent messages are processed, and the backlog grows until the system
+      collapses. The DLQ pattern configures the broker to move a message to a separate dead letter queue after
+      N failed processing attempts. Use it in every production message consumer. The DLQ serves as both a
+      safety valve (keeps the main queue flowing) and an investigation tool (operators can inspect, fix, and
+      replay failed messages). Pair it with alerting on DLQ depth to catch systemic issues early.
+    when_not_to_use: |
+      Synchronous request-response APIs where errors are returned immediately to the caller. In-memory
+      queues in single-process applications where a simpler error handler suffices. Fire-and-forget
+      telemetry where losing a small percentage of messages is acceptable.
+    languages: [Python, Java, Go]
+    example_good: |
+      import json
+      from dataclasses import dataclass
+
+      @dataclass
+      class DLQMessage:
+          original_message: dict
+          error: str
+          attempts: int
+          original_queue: str
+          failed_at: str
+
+      class ResilientConsumer:
+          MAX_RETRIES = 3
+
+          def __init__(self, main_queue, dlq, handler):
+              self.main_queue = main_queue
+              self.dlq = dlq
+              self.handler = handler
+
+          def consume(self):
+              for message in self.main_queue.receive():
+                  attempts = message.metadata.get("retry_count", 0)
+                  try:
+                      self.handler(message.body)
+                      self.main_queue.ack(message)
+                  except Exception as e:
+                      if attempts >= self.MAX_RETRIES:
+                          self._send_to_dlq(message, str(e), attempts)
+                          self.main_queue.ack(message)  # Remove from main queue
+                          logger.error("Message %s -> DLQ after %d attempts: %s",
+                                       message.id, attempts, e)
+                      else:
+                          self.main_queue.nack(message, retry_count=attempts + 1)
+
+          def _send_to_dlq(self, message, error, attempts):
+              dlq_msg = DLQMessage(
+                  original_message=message.body,
+                  error=error,
+                  attempts=attempts,
+                  original_queue=self.main_queue.name,
+                  failed_at=datetime.now(timezone.utc).isoformat(),
+              )
+              self.dlq.publish(json.dumps(asdict(dlq_msg)))
+    example_bad: |
+      def consume_messages(queue, handler):
+          for message in queue.receive():
+              try:
+                  handler(message.body)
+                  queue.ack(message)
+              except Exception:
+                  # Requeue with no retry limit — poison message retried forever
+                  queue.nack(message)
+                  # This message fails, gets requeued, fails again, requeued...
+                  # Head-of-line blocking: no other message is processed
+                  # Queue depth grows unbounded
+                  # No record of WHY it failed — impossible to investigate
+                  # No alerting — team discovers the problem hours later via customer complaints
+    text: "Dead Letter Queue Pattern -- Capture messages that cannot be processed after exhausting retries, preventing poison messages from blocking the queue while preserving them for investigation."
+    why: "Capture messages that cannot be processed after exhausting retries, preventing poison messages from blocking the queue while preserving them for investigation."
+    how_to_do_right: |
+      1. Identify where dead letter queue pattern applies in your codebase
+      2. Review existing implementations for consistency with the pattern
+      3. Apply the pattern following the example_good template above
+      4. Validate correctness with automated tests covering edge cases
+      5. Document the pattern usage in architecture decision records
+    severity: high
+    technologies:
+      lang: [python, java, go]
+    domains:
+      domain: [distributed, distributed]
+      concern: [pattern, best_practice]
+    when_applies: "Any message-driven system where consumers can encounter messages that are permanently unprocessable:
+malformed payloads, schema mismatches, referencing entities that no longer exist, or triggering
+app."
+
+    related_principles: [P-MSG-DLQ, P-ERR-ACTIONABLE, P-MSG-BACKOFF]
+    sources: ["https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html"]
+
+  # === Coordination Patterns ===
+  - id: PAT-DIST-LEADER-ELECTION
+    name: "Leader Election Pattern"
+    category: distributed
+    intent: "Ensure exactly one instance in a distributed cluster acts as the active coordinator for a given task, preventing duplicate work and split-brain scenarios."
+    when_to_use: |
+      Any distributed system where exactly one node must perform a coordination task at any given time:
+      scheduled job execution (cron in a cluster — only one node should fire the job), shard rebalancing,
+      cache warming, database migration, or acting as a write leader in a leader-follower replication setup.
+      Without leader election, running 3 replicas of a service that each independently fire a daily billing
+      job results in triple-charging customers. The pattern uses a consensus mechanism (ZooKeeper, etcd, Consul,
+      or a database advisory lock) to elect a single leader. All other nodes become followers that monitor the
+      leader's health and participate in a new election if the leader fails. Use it when the coordinated task
+      must not run concurrently on multiple nodes, and when automatic failover (new election on leader crash) is
+      required for availability.
+    when_not_to_use: |
+      Stateless services where all instances can independently handle any request — no coordination needed.
+      Tasks that are idempotent and safe to run on multiple nodes simultaneously (each node running its own
+      health check). Environments without a reliable consensus store.
+    languages: [Python, Java, Go]
+    example_good: |
+      import time
+      import threading
+
+      class LeaderElection:
+          """Leader election using etcd lease-based mechanism."""
+          def __init__(self, etcd_client, election_key: str, node_id: str, ttl: int = 10):
+              self.etcd = etcd_client
+              self.key = election_key
+              self.node_id = node_id
+              self.ttl = ttl
+              self.is_leader = False
+              self.lease = None
+
+          def campaign(self):
+              """Attempt to become leader by acquiring a lease-backed key."""
+              self.lease = self.etcd.lease(self.ttl)
+              try:
+                  # put_if_absent — only succeeds if no current leader
+                  success = self.etcd.put_if_absent(
+                      self.key, self.node_id, lease=self.lease
+                  )
+                  if success:
+                      self.is_leader = True
+                      self._start_keepalive()
+                      logger.info("Node %s elected as leader", self.node_id)
+                  else:
+                      self._watch_leader()
+              except Exception as e:
+                  logger.error("Election failed: %s", e)
+                  self.is_leader = False
+
+          def _start_keepalive(self):
+              """Refresh lease periodically to maintain leadership."""
+              def keepalive():
+                  while self.is_leader:
+                      self.lease.refresh()
+                      time.sleep(self.ttl // 3)
+              threading.Thread(target=keepalive, daemon=True).start()
+
+          def _watch_leader(self):
+              """Watch for leader key deletion to trigger new election."""
+              self.etcd.watch(self.key, callback=lambda e: self.campaign())
+    example_bad: |
+      import time
+      import random
+
+      class NaiveScheduler:
+          """Every instance independently runs scheduled jobs — no coordination."""
+          def run_billing_job(self):
+              # All 3 replicas wake up at midnight and run billing
+              # Result: customers charged 3x
+              while True:
+                  if self.is_midnight():
+                      self.charge_all_customers()  # Runs on EVERY instance
+                  time.sleep(60)
+
+      class FileBasedLock:
+          """Attempting leader election via shared filesystem — broken."""
+          def try_lock(self):
+              # Race condition: two nodes check, both see no lock, both write
+              if not os.path.exists("/shared/leader.lock"):
+                  with open("/shared/leader.lock", "w") as f:
+                      f.write(self.node_id)
+                  # Node crashes here — lock file persists forever (no TTL)
+                  # No other node can ever become leader — permanent deadlock
+                  return True
+              return False
+    text: "Leader Election Pattern -- Ensure exactly one instance in a distributed cluster acts as the active coordinator for a given task, preventing duplicate work and split-brain scenarios."
+    why: "Ensure exactly one instance in a distributed cluster acts as the active coordinator for a given task, preventing duplicate work and split-brain scenarios."
+    how_to_do_right: |
+      1. Identify where leader election pattern applies in your codebase
+      2. Review existing implementations for consistency with the pattern
+      3. Apply the pattern following the example_good template above
+      4. Validate correctness with automated tests covering edge cases
+      5. Document the pattern usage in architecture decision records
+    severity: high
+    technologies:
+      lang: [python, java, go]
+    domains:
+      domain: [distributed, distributed]
+      concern: [pattern, best_practice]
+    when_applies: "Any distributed system where exactly one node must perform a coordination task at any given time:
+scheduled job execution (cron in a cluster — only one node should fire the job), shard rebalancing,
+ca."
+
+    related_principles: [P-CONC-ATOMIC, P-REL-REDUNDANCY, P-SCALE-HORIZONTAL]
+    sources: ["https://etcd.io/docs/v3.5/dev-guide/api_concurrency_reference_v3/", "https://docs.microsoft.com/en-us/azure/architecture/patterns/leader-election"]

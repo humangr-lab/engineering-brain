@@ -1,0 +1,268 @@
+layer: rules
+technology: SRE
+domain: testing
+knowledge:
+- id: CR-SRE-TDEEP-001
+  text: Integration tests must test the contract between services, not the internal implementation of either service. A test
+    that verifies "service A sends field X to service B" is fragile. A test that verifies "when service A creates an order,
+    service B processes the payment" is valuable.
+  why: 'Google''s testing chapter (Chapter 17) distinguishes between contract testing (valuable at scale) and implementation
+    testing (fragile at scale). Implementation tests couple to internal details: they break when you refactor, they''re hard
+    to maintain across teams, and they test what the code does rather than what it should do. Contract tests verify the interface
+    between services: "given this input, I expect this output." They survive refactoring, can be maintained independently
+    by each team, and catch the actual failure mode (service A changes its output in a way service B doesn''t expect). Google
+    uses a combination of: producer-driven contract tests (service A tests that its output matches the contract), consumer-driven
+    contract tests (service B tests that it can handle service A''s output), and schema validation (protobuf/OpenAPI schemas
+    enforce the contract at the protocol level).
+
+    '
+  how_to_do_right: '1. Define contracts explicitly: use OpenAPI specs, protobuf definitions, or JSON Schema for every service-to-service
+    interface.
+
+    2. Producer tests: service A verifies its output matches the contract. "My /users endpoint returns {id: int, name: string,
+    email: string}."
+
+    3. Consumer tests: service B verifies it can handle service A''s output. "I can parse {id: int, name: string, email: string}
+    and extract what I need."
+
+    4. Use contract testing tools: Pact (consumer-driven contracts), Schemathesis (OpenAPI-based), protobuf compatibility
+    checks.
+
+    5. Run contract tests in CI for both producer and consumer: a change in service A triggers contract tests for all consumers.
+
+    6. Contract changes require coordination: if service A wants to remove a field, it must verify no consumer uses it before
+    removal.
+
+    '
+  example_good: "import pytest\nfrom pydantic import BaseModel\n\n# Contract test: verify the interface, not the implementation\nclass UserResponse(BaseModel):\n    id: int\n    name: str\n    email: str\n\ndef test_user_api_contract(api_client):\n    \"\"\"Consumer contract: I can parse the user response.\"\"\"\n    response = api_client.get('/api/users/1')\n    assert response.status_code == 200\n    user = UserResponse(**response.json())  # Validates schema\n    assert user.id > 0\n    assert '@' in user.email\n    # Tests the contract (schema + types), not implementation\n    # Survives refactoring of user service internals\n\ndef test_user_api_produces_valid_contract(app):\n    \"\"\"Producer contract: my output matches the schema.\"\"\"\n    response = app.test_client().get('/api/users/1')\n    UserResponse(**response.json())  # Must not raise\n"
+  example_bad: "def test_user_api_implementation(api_client, mock_db):\n    \"\"\"Implementation test: coupled to internal details.\"\"\"\n    mock_db.execute.return_value = [{'id': 1, 'name': 'Alice'}]\n    response = api_client.get('/api/users/1')\n    # Testing internal SQL query — breaks on any refactor\n    mock_db.execute.assert_called_with(\n        'SELECT id, name, email FROM users WHERE id = %s', (1,)\n    )\n    # Testing internal field names — breaks if column renamed\n    assert response.json()['name'] == 'Alice'\n    # This test breaks when you refactor, even if the API contract is unchanged\n"
+  when_applies: "When writing integration tests between services or verifying API contracts across team boundaries."
+  severity: high
+  technologies:
+    lang: [general]
+    library: [quality, testing]
+    platform: [grpc, http]
+  domains:
+    domain: [architecture, reliability, testing]
+    concern: [api_design]
+  sources:
+  - url: https://sre.google/sre-book/testing-reliability/
+    title: 'Google SRE Book — Chapter 17: Testing for Reliability'
+  validation_status: cross_checked
+- id: CR-SRE-TDEEP-002
+  text: Test flakiness is a reliability problem — a test that fails 5% of the time trains engineers to ignore failures. When
+    a real bug causes the test to fail, the engineer says "it's probably flaky" and merges anyway. Flaky tests are worse than
+    no tests because they erode trust in the test suite.
+  why: 'Google has invested heavily in detecting and eliminating test flakiness because flaky tests compound damage over time.
+    A flaky test in CI: fails → engineer reruns → passes → engineer merges. The next engineer: same test fails → "it was flaky
+    for the last person too" → reruns → passes → merges. Eventually: the test fails because of a real bug → "it''s always
+    flaky" → engineer merges → bug reaches production. Google tracks test flakiness rates per test: any test that fails >
+    1% of runs without code changes is flagged as flaky and either fixed or quarantined. Common causes: time-dependent tests
+    (date/time comparisons), order-dependent tests (shared state between tests), resource-dependent tests (network calls,
+    file system), concurrency-dependent tests (race conditions in test setup).
+
+    '
+  how_to_do_right: '1. Track test flakiness: run each test N times without code changes. Any test that fails once is potentially
+    flaky.
+
+    2. Quarantine flaky tests: move them to a separate suite that runs but doesn''t block CI. Fix them within 1 week or delete
+    them.
+
+    3. Common fix: replace time-dependent assertions with time freezing (freezegun, clock mocking).
+
+    4. Common fix: isolate test state — each test creates its own data, doesn''t depend on other tests'' data, and cleans
+    up after itself.
+
+    5. Common fix: replace real network calls with stubs/mocks. If the test needs real network, it''s an integration test,
+    not a unit test.
+
+    6. Measure flakiness rate as a team metric: "98% of our tests are non-flaky" → good. "85%" → the test suite is unreliable.
+
+    '
+  example_good: "import pytest\nfrom unittest.mock import patch\nfrom freezegun import freeze_time\n\n# Hermetic: frozen time, no external dependencies\n@freeze_time('2026-01-15 10:00:00')\ndef test_subscription_expiry():\n    sub = create_subscription(days=30)\n    assert not sub.is_expired()\n\n@freeze_time('2026-02-15 10:00:00')\ndef test_subscription_expired():\n    sub = Subscription(created_at=datetime(2026, 1, 15), days=30)\n    assert sub.is_expired()\n\n# Isolated: each test creates its own data\ndef test_order_total(db_session):\n    user = create_user(db_session, name='Test')  # Own data\n    order = create_order(db_session, user_id=user.id, items=[\n        {'price': 10.0, 'qty': 2}, {'price': 5.0, 'qty': 1}\n    ])\n    assert order.total == 25.0  # Deterministic\n"
+  example_bad: "import requests\n\ndef test_api_response():\n    # Flaky: depends on external service availability\n    response = requests.get('https://api.example.com/users/1')\n    assert response.status_code == 200  # Fails during API maintenance\n\ndef test_recent_orders():\n    # Flaky: depends on system clock\n    orders = get_orders_created_today()\n    assert len(orders) > 0  # Fails at midnight, passes at noon\n\ndef test_user_count():\n    # Flaky: depends on shared state from other tests\n    users = db.query('SELECT COUNT(*) FROM users')\n    assert users == 5  # Fails if another test added a user\n"
+  when_applies: "When tests intermittently fail without code changes, eroding team trust in the test suite."
+  severity: high
+  technologies:
+    lang: [general]
+    framework: [testing, pytest]
+  domains:
+    domain: [deployment, reliability, testing]
+    concern: [ci_cd]
+  sources:
+  - url: https://sre.google/sre-book/testing-reliability/
+    title: 'Google SRE Book — Chapter 17: Testing for Reliability'
+  validation_status: cross_checked
+- id: CR-SRE-TDEEP-003
+  text: Mutation testing reveals the true quality of your test suite — a test suite with 95% code coverage but 40% mutation
+    kill rate is only catching superficial bugs. Mutation testing inserts bugs (mutations) into your code and checks whether
+    your tests catch them.
+  why: 'Google uses mutation testing to measure test quality because code coverage is a necessary but insufficient metric.
+    A test that executes a line of code (coverage) may not actually verify its behavior (quality). Example: the function returns
+    `a + b`. A test calls the function and checks `result is not None` → 100% coverage, 0% quality. Mutation testing: change
+    `+` to `-` → if no test fails, the test suite doesn''t verify the arithmetic. Change `>` to `>=` → if no test fails, the
+    boundary condition is untested. Each mutation that survives (no test catches it) represents a potential bug your tests
+    can''t detect. Google reports 70-80% mutation kill rates for well-tested code; below 60% indicates significant test quality
+    gaps.
+
+    '
+  how_to_do_right: '1. Run mutation testing after achieving high code coverage (>80%). Mutation testing on low-coverage code
+    just confirms "you don''t have enough tests."
+
+    2. Focus on critical modules first: authentication, payment processing, data validation. These need the highest mutation
+    kill rates.
+
+    3. Target mutation kill rate: >70% for most code, >85% for critical modules.
+
+    4. Use tools: mutmut (Python), Stryker (JavaScript/TypeScript), PIT (Java), go-mutesting (Go).
+
+    5. Surviving mutations show exactly which behaviors are untested: "changing `balance >= 0` to `balance > 0` was not caught"
+    → add a test for balance = 0.
+
+    6. Run mutation testing in CI (nightly, not on every commit — it''s slow) and track the trend. Kill rate should improve
+    over time.
+
+    '
+  example_good: "# Test that actually verifies behavior (high mutation kill rate)\ndef test_calculate_discount():\n    # Tests exact values, boundary conditions, and edge cases\n    assert calculate_discount(100, 0.10) == 90.0   # 10% off\n    assert calculate_discount(100, 0.00) == 100.0   # No discount\n    assert calculate_discount(100, 1.00) == 0.0     # 100% off\n    assert calculate_discount(0, 0.50) == 0.0       # Zero amount\n    assert calculate_discount(100, 0.50) == 50.0    # 50% off\n    # Mutation: changing * to + -> test fails\n    # Mutation: changing - to + -> test fails\n    # Mutation: changing 0.10 boundary -> test fails\n    # Kill rate: ~100% for this function\n\n# Run: mutmut run --paths-to-mutate=src/pricing.py\n# mutmut results: 12 mutants killed, 0 survived\n"
+  example_bad: "# Test with high coverage but low mutation kill rate\ndef test_calculate_discount():\n    result = calculate_discount(100, 0.10)\n    assert result is not None     # Useless: doesn't verify value\n    assert isinstance(result, float)  # Useless: doesn't verify correctness\n    # Coverage: 100% (code was executed)\n    # Mutation kill rate: 0% (no mutation is caught)\n    # Changing + to -, * to /, > to >= — none detected\n    # This test gives false confidence\n"
+  when_applies: "When evaluating test suite quality beyond code coverage, especially for critical business logic."
+  severity: medium
+  technologies:
+    lang: [general]
+    framework: [testing, pytest]
+    library: [quality, testing]
+  domains:
+    domain: [reliability, testing]
+    concern: [unit, mutation]
+  sources:
+  - url: https://sre.google/sre-book/testing-reliability/
+    title: 'Google SRE Book — Chapter 17: Testing for Reliability'
+  validation_status: cross_checked
+- id: CR-SRE-TDEEP-004
+  text: 'Property-based testing discovers edge cases that example-based tests miss — instead of testing with specific inputs
+    (add(2, 3) == 5), test with properties that must hold for ALL inputs (for any a, b: add(a, b) == add(b, a) AND add(a,
+    0) == a).'
+  why: 'Google''s testing practices include property-based testing for algorithms, parsers, serializers, and data transformations
+    because example-based tests only cover the examples the developer thinks of — and developers tend to test happy paths.
+    Property-based testing generates thousands of random inputs and verifies that properties hold for all of them. It finds:
+    integer overflow (input = 2^31), empty string handling (input = ""), unicode edge cases (input = ""), null byte injection,
+    boundary conditions, and race conditions. The framework automatically shrinks failing inputs to the minimal reproducing
+    case. Google found that property-based tests consistently find bugs that hundreds of example-based tests miss.
+
+    '
+  how_to_do_right: '1. Identify properties: "sort(list) has the same elements as the input," "serialize(deserialize(x)) ==
+    x," "encrypt(decrypt(x)) == x."
+
+    2. Use hypothesis (Python), fast-check (JavaScript), QuickCheck (Haskell/various), or proptest (Rust).
+
+    3. Best for: serialization/deserialization roundtrips, sorting algorithms, math functions, parsers, encoders/decoders.
+
+    4. Combine with example-based tests: examples document expected behavior (human-readable), properties verify invariants
+    (machine-verified).
+
+    5. Use custom strategies for domain-specific inputs: generate valid email addresses, valid JSON, valid SQL queries — not
+    just random strings.
+
+    6. Save and replay failing inputs: when a property-based test finds a bug, save the minimal failing input as a regression
+    test.
+
+    '
+  example_good: "from hypothesis import given, strategies as st\nimport json\n\n# Property: serialize(deserialize(x)) == x (roundtrip)\n@given(st.dictionaries(\n    keys=st.text(min_size=1, max_size=50),\n    values=st.one_of(st.integers(), st.floats(allow_nan=False), st.text())\n))\ndef test_json_roundtrip(data):\n    serialized = json.dumps(data)\n    deserialized = json.loads(serialized)\n    assert deserialized == data\n\n# Property: sort preserves elements\n@given(st.lists(st.integers()))\ndef test_sort_preserves_elements(lst):\n    sorted_lst = sorted(lst)\n    assert len(sorted_lst) == len(lst)\n    assert set(sorted_lst) == set(lst)\n    assert all(sorted_lst[i] <= sorted_lst[i+1] for i in range(len(sorted_lst)-1))\n    # Hypothesis generates thousands of inputs including edge cases:\n    # empty list, single element, duplicates, negatives, MAX_INT, etc.\n"
+  example_bad: "import json\n\n# Example-based: only tests the cases the developer thought of\ndef test_json_roundtrip():\n    assert json.loads(json.dumps({'a': 1})) == {'a': 1}\n    assert json.loads(json.dumps({'b': 'hello'})) == {'b': 'hello'}\n    # Never tests: empty dict, nested dicts, special chars,\n    # unicode, very long strings, numeric edge cases,\n    # keys with spaces, None values, etc.\n    # Developer tests the happy path, misses edge cases\n\ndef test_sort():\n    assert sorted([3, 1, 2]) == [1, 2, 3]\n    # Never tests: empty list, single element, all same,\n    # negative numbers, MAX_INT, very large lists\n"
+  when_applies: "When testing algorithms, parsers, serializers, or data transformations where edge cases are hard to enumerate manually."
+  severity: medium
+  technologies:
+    lang: [general, javascript, python]
+    framework: [testing, pytest]
+  domains:
+    domain: [reliability, testing]
+    concern: [unit, property_based]
+  sources:
+  - url: https://sre.google/sre-book/testing-reliability/
+    title: 'Google SRE Book — Chapter 17: Testing for Reliability'
+  validation_status: cross_checked
+- id: CR-SRE-TDEEP-005
+  text: Test environments must be hermetic — tests must not depend on external services, network connectivity, specific file
+    system state, or the system clock. A test that passes on Tuesday but fails on Monday (because the external API has Monday
+    maintenance) is not a test — it's a random number generator.
+  why: 'Google mandates hermetic tests because non-hermetic tests are the primary source of flakiness and CI failures. Non-hermetic
+    dependencies that cause test failures: external APIs (down for maintenance, rate limited, changed response format), databases
+    (connection pool exhausted, data left by previous test run), file system (temp directory full, permission changes), system
+    clock (test with "created today" fails tomorrow), network (DNS resolution, proxy settings, VPN state), and other tests
+    (shared state, execution order dependence). A non-hermetic test may pass 99% of the time and fail 1% of the time for reasons
+    unrelated to the code being tested. This 1% failure rate, multiplied by thousands of tests, means the CI pipeline fails
+    regularly for no code-related reason.
+
+    '
+  how_to_do_right: '1. Mock all external services: HTTP calls use recorded responses (VCR, responses library), database uses
+    in-memory SQLite or Docker containers.
+
+    2. Freeze time: use freezegun (Python), Timecop (Ruby), or mockk (Kotlin) to control the system clock in tests.
+
+    3. Isolate test data: each test creates its own data, operates on it, and cleans up. No shared test databases or fixtures.
+
+    4. Use Docker containers for dependencies: PostgreSQL, Redis, Kafka in Docker compose. Recreated fresh for each test run.
+
+    5. No network calls in unit tests: if a test needs real HTTP calls, it''s an integration test and should be in a separate
+    suite.
+
+    6. Mark non-hermetic tests explicitly: if a test requires network or external services, tag it (e.g., @pytest.mark.integration)
+    and exclude from the default test suite.
+
+    '
+  example_good: "import pytest\nfrom unittest.mock import patch\nfrom freezegun import freeze_time\nfrom responses import activate, add, GET\n\n# Hermetic test: no external dependencies\n@freeze_time('2026-01-15 12:00:00')\n@activate\ndef test_fetch_weather_data():\n    # Mock external API response\n    add(GET, 'https://api.weather.com/v1/forecast',\n        json={'temp': 22, 'condition': 'sunny'}, status=200)\n    result = fetch_weather('NYC')\n    assert result.temperature == 22\n    assert result.condition == 'sunny'\n    # No real network call\n    # Frozen time: deterministic\n    # Runs the same on any machine, any day\n\n@pytest.fixture\ndef isolated_db(tmp_path):\n    \"\"\"Each test gets its own database.\"\"\"\n    db = sqlite3.connect(tmp_path / 'test.db')\n    create_schema(db)\n    yield db\n    db.close()\n"
+  example_bad: "import requests\n\ndef test_weather_api():\n    # Non-hermetic: depends on external API\n    response = requests.get('https://api.weather.com/v1/forecast?city=NYC')\n    assert response.status_code == 200  # Fails during API maintenance\n    data = response.json()\n    assert 'temp' in data  # Fails if API changes schema\n\ndef test_user_created_today():\n    # Non-hermetic: depends on system clock\n    user = create_user(name='test')\n    assert user.created_at.date() == datetime.now().date()  # Fails at midnight\n\ndef test_shared_database():\n    # Non-hermetic: depends on state from other tests\n    count = db.query('SELECT COUNT(*) FROM users')\n    assert count == 3  # Fails if test execution order changes\n"
+  when_applies: "When tests must be reliable and reproducible regardless of external factors like network, time, or shared state."
+  severity: high
+  technologies:
+    lang: [general]
+    framework: [testing, pytest]
+    platform: [docker]
+  domains:
+    domain: [deployment, reliability, testing]
+    concern: [ci_cd, integration, hermetic]
+  sources:
+  - url: https://sre.google/sre-book/testing-reliability/
+    title: 'Google SRE Book — Chapter 17: Testing for Reliability'
+  validation_status: cross_checked
+- id: CR-SRE-TDEEP-006
+  text: Chaos engineering in production requires safety guardrails — halt experiments automatically when impact exceeds thresholds.
+    Running chaos experiments without guardrails is not engineering — it's gambling with production availability.
+  why: 'Google''s DiRT exercises (Chapter 13) include safety mechanisms because the goal of chaos engineering is to discover
+    weaknesses, not to cause outages. Without guardrails: inject 50% packet loss → service becomes completely unavailable
+    → users are affected → the "experiment" is now an incident. With guardrails: inject 50% packet loss → automated monitor
+    detects error rate exceeding 5% → experiment automatically halted → service recovers in seconds → weakness documented,
+    no user impact. The guardrail system monitors SLIs during the experiment and compares them against abort thresholds. If
+    any SLI degrades beyond the threshold, the experiment is rolled back automatically — no human decision needed.
+
+    '
+  how_to_do_right: '1. Define abort conditions BEFORE starting: "Abort if error rate > 5% OR P99 latency > 2s OR any alert
+    fires."
+
+    2. Automate abort: the chaos tool must monitor SLIs and halt the experiment automatically when thresholds are exceeded.
+
+    3. Start small: begin with 1% of traffic or 1 instance. Increase scope only after the system proves resilient.
+
+    4. Time-bound experiments: maximum 30 minutes. If the experiment is still running after 30 minutes, halt it regardless
+    of metrics.
+
+    5. Run during business hours when the full team is available, not at 3 AM with minimal staff.
+
+    6. Document every experiment: hypothesis, method, results, action items. The documentation is as valuable as the experiment
+    itself.
+
+    '
+  example_good: "import time\nimport logging\n\nlogger = logging.getLogger(__name__)\n\nclass ChaosExperiment:\n    def __init__(self, name: str, abort_conditions: dict):\n        self.name = name\n        self.abort_conditions = abort_conditions\n        self.start_time = None\n        self.max_duration_sec = 1800  # 30 minutes max\n\n    def run(self, inject_fn, monitor_fn, rollback_fn):\n        self.start_time = time.time()\n        logger.info(\"Chaos experiment '%s' started\", self.name)\n        inject_fn()  # Inject the failure\n        try:\n            while time.time() - self.start_time < self.max_duration_sec:\n                metrics = monitor_fn()\n                if self._should_abort(metrics):\n                    logger.warning(\"Abort conditions met, rolling back\")\n                    rollback_fn()\n                    return {'status': 'aborted', 'metrics': metrics}\n                time.sleep(5)\n        finally:\n            rollback_fn()  # Always clean up\n        return {'status': 'completed', 'duration': time.time() - self.start_time}\n\n    def _should_abort(self, metrics: dict) -> bool:\n        if metrics.get('error_rate', 0) > self.abort_conditions.get('max_error_rate', 0.05):\n            return True\n        if metrics.get('p99_latency_ms', 0) > self.abort_conditions.get('max_p99_ms', 2000):\n            return True\n        return False\n"
+  example_bad: "# Chaos without guardrails\ndef chaos_test():\n    # Inject 50% packet loss with no monitoring\n    os.system('tc qdisc add dev eth0 root netem loss 50%')\n    time.sleep(3600)  # Wait 1 hour with no checks\n    os.system('tc qdisc del dev eth0 root')\n    # Problems:\n    # 1. No abort conditions — if service goes down, experiment continues\n    # 2. No monitoring — nobody knows the impact until users complain\n    # 3. Fixed duration — 1 hour of potential outage\n    # 4. No rollback on exception — failure persists if script crashes\n    # 5. Run at 3 AM with no staff — nobody to respond if it breaks\n"
+  when_applies: "When running chaos engineering experiments in any environment to validate system resilience."
+  severity: high
+  technologies:
+    lang: [general]
+    library: [quality, testing]
+  domains:
+    domain: [reliability, testing]
+    concern: [resilience, chaos_engineering]
+  sources:
+  - url: https://sre.google/sre-book/emergency-response/
+    title: 'Google SRE Book — Chapter 13: Emergency Response'
+  validation_status: cross_checked

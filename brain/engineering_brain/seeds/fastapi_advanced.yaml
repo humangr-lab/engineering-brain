@@ -1,0 +1,595 @@
+layer: rules
+technology: FastAPI
+domain: backend
+knowledge:
+- id: CR-FAPI-001
+  text: Use Depends() for dependency injection of database sessions, authentication, pagination, and shared logic. Never create
+    dependencies inline in endpoint functions.
+  why: Inline dependency creation (db = get_db()) bypasses FastAPI's dependency injection system, preventing proper lifecycle
+    management (session cleanup), request scoping, and override in tests. Depends() ensures resources are created once per
+    request, properly cleaned up, and easily mockable. Without it, database sessions leak and tests require real database
+    connections.
+  how_to_do_right: '1. Define dependencies as generator functions (yield for cleanup) or classes.
+
+    2. Use Depends() in endpoint function signatures.
+
+    3. Chain dependencies: current_user depends on get_db depends on get_session.
+
+    4. Use app.dependency_overrides for testing.
+
+    5. Create reusable dependency classes for pagination, filtering, sorting.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, sqlalchemy]
+  domains:
+    domain: [architecture]
+    concern: [backend]
+  example_good: "# dependencies.py\nasync def get_db() -> AsyncGenerator[AsyncSession, None]:\n    async with async_session()\
+    \ as session:\n        try:\n            yield session\n            await session.commit()\n        except Exception:\n\
+    \            await session.rollback()\n            raise\n\nasync def get_current_user(\n    token: str = Depends(oauth2_scheme),\n\
+    \    db: AsyncSession = Depends(get_db),\n) -> User:\n    payload = jwt.decode(token, SECRET_KEY, algorithms=[\"HS256\"\
+    ])\n    user = await db.get(User, payload[\"sub\"])\n    if user is None:\n        raise HTTPException(status_code=401,\
+    \ detail=\"User not found\")\n    return user\n\nclass Pagination:\n    def __init__(self, page: int = Query(1, ge=1),\
+    \ size: int = Query(20, ge=1, le=100)):\n        self.offset = (page - 1) * size\n        self.limit = size\n\n# endpoints.py\n\
+    @router.get(\"/orders\")\nasync def list_orders(\n    db: AsyncSession = Depends(get_db),\n    user: User = Depends(get_current_user),\n\
+    \    pagination: Pagination = Depends(),\n) -> list[OrderResponse]:\n    stmt = select(Order).where(Order.user_id == user.id).offset(pagination.offset).limit(pagination.limit)\n\
+    \    result = await db.execute(stmt)\n    return [OrderResponse.model_validate(o) for o in result.scalars()]\n"
+  example_bad: "# Wrong: Inline dependencies — no cleanup, no testing, no lifecycle\n@router.get(\"/orders\")\nasync def list_orders(request:\
+    \ Request):\n    db = SessionLocal()  # No cleanup — session leaks on exception\n    try:\n        token = request.headers.get(\"\
+    Authorization\", \"\").replace(\"Bearer \", \"\")\n        payload = jwt.decode(token, SECRET_KEY)  # Inline auth — duplicated\
+    \ everywhere\n        user = db.query(User).get(payload[\"sub\"])\n        page = int(request.query_params.get(\"page\"\
+    , 1))  # No validation\n        orders = db.query(Order).filter_by(user_id=user.id).all()\n        return orders\n   \
+    \ finally:\n        db.close()  # Runs but commit/rollback not handled\n"
+  when_applies: Any project using FastAPI async web services, Python codebases, or SQLAlchemy ORM interactions
+  when_not_applies: small scripts under 100 lines, single-purpose utilities
+  sources: ["https://fastapi.tiangolo.com/tutorial/dependencies/"]
+- id: CR-FAPI-002
+  text: Use BackgroundTasks for fire-and-forget operations within a request. Use Celery/ARQ for reliable, retryable jobs.
+  why: Processing emails, webhooks, or analytics synchronously in an endpoint blocks the response for seconds. BackgroundTasks
+    run after the response is sent but are tied to the worker process — if it crashes, the task is lost. Celery/ARQ provides
+    persistence, retries, and dead-letter queues for operations that must eventually succeed.
+  how_to_do_right: '1. Use BackgroundTasks for: logging, metrics, cache warming — tasks where loss is acceptable.
+
+    2. Use Celery/ARQ for: email delivery, payment processing, webhook delivery — tasks that must succeed.
+
+    3. Inject BackgroundTasks via function parameter (FastAPI auto-provides).
+
+    4. Keep background task functions lightweight — they share the worker process.
+
+    5. Never access the response object in background tasks — it is already sent.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [architecture, performance]
+    concern: [backend]
+  example_good: "# Fire-and-forget: BackgroundTasks (loss is OK)\n@router.post(\"/orders\", status_code=201)\nasync def create_order(\n\
+    \    dto: CreateOrderRequest,\n    background_tasks: BackgroundTasks,\n    db: AsyncSession = Depends(get_db),\n    user:\
+    \ User = Depends(get_current_user),\n) -> OrderResponse:\n    order = await OrderService(db).create(dto, user)\n    #\
+    \ Fire-and-forget: analytics, cache warming\n    background_tasks.add_task(track_order_created, order.id)\n    background_tasks.add_task(warm_recommendation_cache,\
+    \ user.id)\n    return OrderResponse.model_validate(order)\n\n# Must-succeed: Celery task (persisted, retried)\n@celery_app.task(bind=True,\
+    \ max_retries=5, default_retry_delay=60)\ndef send_order_confirmation(self, order_id: int):\n    try:\n        order =\
+    \ Order.get(order_id)\n        EmailService.send_confirmation(order)\n    except SMTPError as exc:\n        self.retry(exc=exc)\n\
+    \n# Enqueue Celery task from endpoint\n@router.post(\"/orders\", status_code=201)\nasync def create_order(dto: CreateOrderRequest,\
+    \ ...):\n    order = await OrderService(db).create(dto, user)\n    send_order_confirmation.delay(order.id)  # Persisted\
+    \ in Redis/RabbitMQ\n    return OrderResponse.model_validate(order)\n"
+  example_bad: "# Wrong: Synchronous email in endpoint — blocks response for 3+ seconds\n@router.post(\"/orders\")\nasync\
+    \ def create_order(dto: CreateOrderRequest, ...):\n    order = await OrderService(db).create(dto, user)\n    await send_email(order.user.email,\
+    \ \"Order confirmed\")  # 3 second block\n    await notify_warehouse(order)  # 2 second block\n    return order  # User\
+    \ waited 5+ seconds for response\n"
+  when_applies: Projects using FastAPI async web services or Python codebases
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using FastAPI or Python
+  sources: ["https://fastapi.tiangolo.com/tutorial/background-tasks/"]
+- id: CR-FAPI-003
+  text: Use async def for I/O-bound endpoints and def for CPU-bound endpoints. Never mix blocking I/O calls inside async def.
+  why: FastAPI runs async def endpoints on the asyncio event loop (single thread). A blocking call (time.sleep, synchronous
+    DB query, requests.get) inside async def blocks the ENTIRE event loop — no other requests are processed until it returns.
+    def endpoints are automatically run in a thread pool, so blocking calls are safe there.
+  how_to_do_right: '1. Use async def + await for async I/O (httpx, asyncpg, aioredis).
+
+    2. Use def (not async def) for sync libraries (requests, psycopg2, file I/O).
+
+    3. Never call requests.get() or time.sleep() inside async def.
+
+    4. If you must use blocking code in async: run_in_executor(None, blocking_func).
+
+    5. Use httpx.AsyncClient instead of requests for async HTTP calls.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python, asyncio]
+    framework: [fastapi]
+  domains:
+    domain: [architecture, performance]
+    concern: [backend]
+  example_good: "# Correct: async endpoint with async I/O\n@router.get(\"/weather/{city}\")\nasync def get_weather(city: str):\n\
+    \    async with httpx.AsyncClient() as client:\n        response = await client.get(f\"https://api.weather.com/{city}\"\
+    )\n        return response.json()\n\n# Correct: sync endpoint for CPU-bound work (runs in thread pool)\n@router.post(\"\
+    /reports\")\ndef generate_report(data: ReportRequest):\n    # CPU-intensive — runs in thread pool, doesn't block event\
+    \ loop\n    result = heavy_computation(data.values)\n    pdf = generate_pdf(result)\n    return FileResponse(pdf)\n\n\
+    # Correct: Blocking I/O in async via executor\n@router.get(\"/legacy-data\")\nasync def get_legacy_data():\n    loop =\
+    \ asyncio.get_event_loop()\n    data = await loop.run_in_executor(\n        None, legacy_sync_db_query  # Runs in thread\
+    \ pool\n    )\n    return data\n"
+  example_bad: "# WRONG: Blocking call in async def — freezes entire event loop\n@router.get(\"/weather/{city}\")\nasync def\
+    \ get_weather(city: str):\n    # requests.get is BLOCKING — all other async endpoints freeze\n    response = requests.get(f\"\
+    https://api.weather.com/{city}\")  # 2s block\n    return response.json()\n    # During those 2 seconds, ZERO other requests\
+    \ are processed\n\n# Also wrong: time.sleep in async\n@router.post(\"/orders\")\nasync def create_order(dto: CreateOrderRequest):\n\
+    \    order = await create(dto)\n    time.sleep(1)  # Blocks the entire event loop for 1 second\n    return order\n"
+  when_applies: Any project using FastAPI async web services, Python codebases, or asyncio
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant
+  sources: ["https://fastapi.tiangolo.com/async/"]
+- id: CR-FAPI-004
+  text: Use Pydantic v2 model_validator and field_validator for input validation. Define separate request and response models
+    — never use the same model for both.
+  why: Using the same model for request and response exposes internal fields (id, hashed_password, created_at) in the request
+    schema and requires nullable fields that should be required on one side. Separate models provide precise OpenAPI schemas,
+    clear documentation, and prevent mass assignment by ensuring only intended fields are accepted.
+  how_to_do_right: '1. Create separate models: CreateUserRequest, UpdateUserRequest, UserResponse.
+
+    2. Use field_validator for single-field validation (email format, password strength).
+
+    3. Use model_validator for cross-field validation (password confirmation, date ranges).
+
+    4. Use Annotated types for reusable constraints.
+
+    5. Use model_config = ConfigDict(from_attributes=True) for ORM compatibility.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, pydantic]
+  domains:
+    domain: [architecture, security]
+    concern: [backend]
+  example_good: "from pydantic import BaseModel, ConfigDict, EmailStr, field_validator, model_validator\n\nclass CreateUserRequest(BaseModel):\n\
+    \    name: str\n    email: EmailStr\n    password: str\n    password_confirmation: str\n\n    @field_validator(\"password\"\
+    )\n    @classmethod\n    def validate_password(cls, v: str) -> str:\n        if len(v) < 12:\n            raise ValueError(\"\
+    Password must be at least 12 characters\")\n        if not any(c.isupper() for c in v):\n            raise ValueError(\"\
+    Password must contain uppercase letter\")\n        return v\n\n    @model_validator(mode=\"after\")\n    def check_passwords_match(self)\
+    \ -> \"CreateUserRequest\":\n        if self.password != self.password_confirmation:\n            raise ValueError(\"\
+    Passwords do not match\")\n        return self\n\nclass UserResponse(BaseModel):\n    model_config = ConfigDict(from_attributes=True)\n\
+    \    id: int\n    name: str\n    email: str\n    created_at: datetime\n    # No password field — never exposed in response\n\
+    \n@router.post(\"/users\", response_model=UserResponse, status_code=201)\nasync def create_user(dto: CreateUserRequest,\
+    \ db: AsyncSession = Depends(get_db)):\n    user = await UserService(db).create(dto)\n    return user\n"
+  example_bad: "# Wrong: Same model for request and response — leaks internal fields\nclass User(BaseModel):\n    id: int\
+    \ | None = None          # Nullable for create, required for response\n    name: str\n    email: str\n    hashed_password:\
+    \ str | None = None  # Exposed in response!\n    is_admin: bool = False               # Attackers can set admin=True\n\
+    \    created_at: datetime | None = None\n\n@router.post(\"/users\")\nasync def create_user(user: User):\n    # Attacker\
+    \ sends: { \"name\": \"Hacker\", \"is_admin\": true }\n    db.add(UserModel(**user.model_dump()))  # is_admin=True persisted!\n"
+  when_applies: Projects using FastAPI async web services, Pydantic data validation, or Python codebases
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities
+  sources: ["https://docs.pydantic.dev/latest/concepts/validators/"]
+- id: CR-FAPI-005
+  text: Use discriminated unions with Annotated and Literal for polymorphic request/response bodies. Never use Union without
+    discriminator — it causes ambiguous parsing.
+  why: Union[CreditCard, BankTransfer] without a discriminator makes Pydantic try each type in order — the first that validates
+    wins, which can silently parse a BankTransfer as a CreditCard if fields overlap. Discriminated unions use a literal field
+    to unambiguously select the correct type, providing clear error messages and correct OpenAPI schemas.
+  how_to_do_right: '1. Add a type field with Literal value to each variant.
+
+    2. Use Annotated[Union[...], Field(discriminator=''type'')] for the parent field.
+
+    3. Each variant''s Literal type value must be unique.
+
+    4. FastAPI generates proper oneOf OpenAPI schema with discriminated unions.
+
+    5. Error messages clearly state which variant failed and why.
+
+    '
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [fastapi, pydantic]
+  domains:
+    domain: [architecture]
+    concern: [backend]
+  example_good: "from typing import Annotated, Literal, Union\nfrom pydantic import BaseModel, Field\n\nclass CreditCardPayment(BaseModel):\n\
+    \    type: Literal[\"credit_card\"]\n    card_number: str\n    expiry: str\n    cvv: str\n\nclass BankTransferPayment(BaseModel):\n\
+    \    type: Literal[\"bank_transfer\"]\n    account_number: str\n    routing_number: str\n\nclass CryptoPayment(BaseModel):\n\
+    \    type: Literal[\"crypto\"]\n    wallet_address: str\n    network: str\n\nPaymentMethod = Annotated[\n    Union[CreditCardPayment,\
+    \ BankTransferPayment, CryptoPayment],\n    Field(discriminator=\"type\"),\n]\n\nclass OrderRequest(BaseModel):\n    amount:\
+    \ Decimal\n    payment: PaymentMethod\n\n# Request: { \"amount\": 99.99, \"payment\": { \"type\": \"credit_card\", \"\
+    card_number\": \"...\" } }\n# Clear error if type is invalid: \"Input tag 'paypal' not in ['credit_card', 'bank_transfer',\
+    \ 'crypto']\"\n"
+  example_bad: "# Wrong: Union without discriminator — ambiguous parsing\nclass CreditCardPayment(BaseModel):\n    number:\
+    \ str\n    expiry: str\n\nclass BankTransferPayment(BaseModel):\n    number: str  # Same field name as CreditCard!\n \
+    \   bank_code: str\n\nclass OrderRequest(BaseModel):\n    payment: CreditCardPayment | BankTransferPayment\n    # BankTransfer\
+    \ with number=\"123\" + bank_code=\"456\"\n    # Pydantic tries CreditCard first, sees number=\"123\", ignores bank_code\
+    \ → WRONG TYPE\n"
+  when_applies: Projects using FastAPI async web services, Pydantic data validation, or Python codebases
+  when_not_applies: small scripts under 100 lines, single-purpose utilities
+  sources: ["https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions"]
+- id: CR-FAPI-006
+  text: 'Configure Gunicorn with Uvicorn workers for production: workers = (2 * CPU) + 1. Use async connection pooling for
+    database and HTTP clients.'
+  why: A single Uvicorn process uses one CPU core. Without Gunicorn managing multiple workers, your multi-core server uses
+    12.5% of its capacity (1 out of 8 cores). Without connection pooling, each request creates a new database connection —
+    connection setup takes 10-50ms and PostgreSQL has a hard limit on concurrent connections.
+  how_to_do_right: '1. Use Gunicorn with UvicornWorker: gunicorn -k uvicorn.workers.UvicornWorker.
+
+    2. Set workers = (2 * CPU) + 1 for the optimal process count.
+
+    3. Create a single AsyncEngine at startup with pool_size and max_overflow.
+
+    4. Create a single httpx.AsyncClient at startup and reuse across requests.
+
+    5. Use lifespan context manager for startup/shutdown resource management.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, uvicorn, gunicorn]
+  domains:
+    domain: [architecture, operations, deployment, performance]
+    concern: [backend]
+  example_good: "# gunicorn.conf.py\nimport multiprocessing\n\nbind = \"0.0.0.0:8000\"\nworkers = multiprocessing.cpu_count()\
+    \ * 2 + 1\nworker_class = \"uvicorn.workers.UvicornWorker\"\ntimeout = 120\nkeepalive = 5\nmax_requests = 1000\nmax_requests_jitter\
+    \ = 50\n\n# app.py — lifespan for resource management\nfrom contextlib import asynccontextmanager\nfrom sqlalchemy.ext.asyncio\
+    \ import create_async_engine, async_sessionmaker\n\n@asynccontextmanager\nasync def lifespan(app: FastAPI):\n    # Startup:\
+    \ create shared resources\n    app.state.engine = create_async_engine(\n        DATABASE_URL,\n        pool_size=10, \
+    \       # Connections per worker\n        max_overflow=5,      # Burst capacity\n        pool_recycle=1800,   # Recycle\
+    \ connections every 30 min\n    )\n    app.state.http_client = httpx.AsyncClient(timeout=30.0)\n    yield\n    # Shutdown:\
+    \ clean up\n    await app.state.http_client.aclose()\n    await app.state.engine.dispose()\n\napp = FastAPI(lifespan=lifespan)\n"
+  example_bad: "# Wrong: Single process, no pooling\n# Command: uvicorn app:app --host 0.0.0.0\n# = 1 process, 1 CPU core\
+    \ used out of 8\n\n# Wrong: New connection per request\n@router.get(\"/users/{user_id}\")\nasync def get_user(user_id:\
+    \ int):\n    engine = create_async_engine(DATABASE_URL)  # New engine per request!\n    async with engine.connect() as\
+    \ conn:\n        result = await conn.execute(select(User).where(User.id == user_id))\n    await engine.dispose()  # Created\
+    \ and destroyed per request — 50ms overhead\n"
+  when_applies: Projects using FastAPI async web services, Uvicorn, Gunicorn, or Python codebases
+  sources: ["https://fastapi.tiangolo.com/deployment/server-workers/"]
+- id: CR-FAPI-007
+  text: Use StreamingResponse for large file downloads and server-sent events. Never load entire files into memory.
+  why: Loading a 500MB file into memory with return FileResponse(open('file.bin').read()) consumes 500MB of RAM per concurrent
+    download. With 10 concurrent downloads, that is 5GB of RAM. StreamingResponse sends data in chunks using constant memory
+    (typically 64KB), regardless of file size.
+  how_to_do_right: '1. Use StreamingResponse with a generator function for large files.
+
+    2. Set appropriate Content-Type and Content-Disposition headers.
+
+    3. Use chunk_size of 64KB-1MB depending on network conditions.
+
+    4. For SSE (Server-Sent Events), use text/event-stream media type.
+
+    5. Handle client disconnection in the generator (check if client is still connected).
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [architecture, performance]
+    concern: [backend]
+  example_good: "from fastapi.responses import StreamingResponse\nfrom pathlib import Path\n\n@router.get(\"/downloads/{file_id}\"\
+    )\nasync def download_file(file_id: str):\n    file_path = Path(f\"/storage/{file_id}\")\n    if not file_path.exists():\n\
+    \        raise HTTPException(status_code=404, detail=\"File not found\")\n\n    async def file_stream():\n        async\
+    \ with aiofiles.open(file_path, \"rb\") as f:\n            while chunk := await f.read(65536):  # 64KB chunks\n      \
+    \          yield chunk\n\n    return StreamingResponse(\n        file_stream(),\n        media_type=\"application/octet-stream\"\
+    ,\n        headers={\n            \"Content-Disposition\": f'attachment; filename=\"{file_path.name}\"',\n           \
+    \ \"Content-Length\": str(file_path.stat().st_size),\n        },\n    )\n\n# Server-Sent Events\n@router.get(\"/events/{channel}\"\
+    )\nasync def event_stream(channel: str):\n    async def generate():\n        async for event in subscribe(channel):\n\
+    \            yield f\"data: {event.json()}\\n\\n\"\n\n    return StreamingResponse(generate(), media_type=\"text/event-stream\"\
+    )\n"
+  example_bad: "# Wrong: Loads entire file into memory\n@router.get(\"/downloads/{file_id}\")\nasync def download_file(file_id:\
+    \ str):\n    with open(f\"/storage/{file_id}\", \"rb\") as f:\n        content = f.read()  # 500MB loaded into RAM\n \
+    \   return Response(\n        content=content,  # 500MB in memory per request\n        media_type=\"application/octet-stream\"\
+    ,\n    )\n    # 10 concurrent downloads = 5GB RAM consumed\n"
+  when_applies: Projects using FastAPI async web services or Python codebases
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using FastAPI or Python
+  sources: ["https://fastapi.tiangolo.com/advanced/custom-response/#streamingresponse"]
+- id: CR-FAPI-008
+  text: 'Use ASGI middleware for cross-cutting concerns. Order matters: security middleware (CORS, trusted hosts) must come
+    before application middleware.'
+  why: Middleware executes in the order added to the application. Adding CORS middleware after rate limiting means CORS preflight
+    OPTIONS requests are rate-limited, breaking the browser's ability to make cross-origin requests. Adding trusted host middleware
+    after routing means forged Host headers reach your application.
+  how_to_do_right: '1. Add TrustedHostMiddleware first — reject forged hosts immediately.
+
+    2. Add CORSMiddleware second — handle preflight before any processing.
+
+    3. Add GZipMiddleware for response compression.
+
+    4. Add custom middleware (logging, timing) last.
+
+    5. Use @app.middleware("http") for simple request/response middleware.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [architecture, security]
+    concern: [backend]
+  example_good: "from fastapi import FastAPI\nfrom fastapi.middleware.cors import CORSMiddleware\nfrom fastapi.middleware.trustedhost\
+    \ import TrustedHostMiddleware\nfrom fastapi.middleware.gzip import GZipMiddleware\n\napp = FastAPI()\n\n# Order matters:\
+    \ security first, then performance, then custom\napp.add_middleware(\n    TrustedHostMiddleware,\n    allowed_hosts=[\"\
+    app.example.com\", \"*.example.com\"],\n)\napp.add_middleware(\n    CORSMiddleware,\n    allow_origins=[\"https://app.example.com\"\
+    ],\n    allow_credentials=True,\n    allow_methods=[\"GET\", \"POST\", \"PUT\", \"DELETE\"],\n    allow_headers=[\"Authorization\"\
+    , \"Content-Type\"],\n    max_age=3600,\n)\napp.add_middleware(GZipMiddleware, minimum_size=1000)\n\n# Custom timing middleware\n\
+    @app.middleware(\"http\")\nasync def add_timing_header(request: Request, call_next):\n    start = time.perf_counter()\n\
+    \    response = await call_next(request)\n    response.headers[\"X-Process-Time\"] = f\"{time.perf_counter() - start:.4f}\"\
+    \n    return response\n"
+  example_bad: "# Wrong: CORS after custom middleware — preflight requests fail\napp.add_middleware(RateLimitMiddleware) \
+    \ # Blocks OPTIONS preflight\napp.add_middleware(CORSMiddleware, allow_origins=[\"*\"])  # Too late\n\n# Wrong: Permissive\
+    \ CORS with credentials\napp.add_middleware(\n    CORSMiddleware,\n    allow_origins=[\"*\"],       # All origins\n  \
+    \  allow_credentials=True,    # With cookies — any site can make authenticated requests\n)\n"
+  when_applies: Projects using FastAPI async web services or Python codebases
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects
+    not using FastAPI or Python
+  sources: ["https://fastapi.tiangolo.com/tutorial/middleware/"]
+- id: CR-FAPI-009
+  text: Configure OpenAPI schema with tags, descriptions, and examples for every endpoint. Auto-generated documentation is
+    only useful if well-organized.
+  why: FastAPI auto-generates OpenAPI docs, but without organization they become an unusable wall of endpoints. Tags group
+    related endpoints, descriptions explain business context, and examples provide ready-to-use request bodies. Well-documented
+    APIs reduce support burden by 60-80% and enable API consumers to self-serve.
+  how_to_do_right: '1. Use tags parameter on routers to group endpoints by domain.
+
+    2. Add docstrings to endpoint functions — they become endpoint descriptions.
+
+    3. Use Body(examples=[...]) for request body examples.
+
+    4. Use response_model with JSON schema examples via model_config.
+
+    5. Define openapi_tags metadata for tag descriptions.
+
+    '
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [architecture]
+    concern: [backend]
+  example_good: "# main.py — tag metadata\ntags_metadata = [\n    {\"name\": \"orders\", \"description\": \"Order management\
+    \ — CRUD + status transitions\"},\n    {\"name\": \"payments\", \"description\": \"Payment processing — charges, refunds,\
+    \ disputes\"},\n    {\"name\": \"auth\", \"description\": \"Authentication — login, register, token refresh\"},\n]\n\n\
+    app = FastAPI(\n    title=\"E-Commerce API\",\n    version=\"2.0.0\",\n    description=\"REST API for order management\
+    \ and payment processing\",\n    openapi_tags=tags_metadata,\n)\n\n# Router with tag\nrouter = APIRouter(prefix=\"/orders\"\
+    , tags=[\"orders\"])\n\n@router.post(\n    \"/\",\n    status_code=201,\n    summary=\"Create a new order\",\n    response_description=\"\
+    The created order with generated ID\",\n)\nasync def create_order(\n    dto: Annotated[\n        CreateOrderRequest,\n\
+    \        Body(\n            examples=[\n                {\n                    \"summary\": \"Simple order\",\n      \
+    \              \"value\": {\n                        \"items\": [{\"product_id\": \"abc-123\", \"quantity\": 2}],\n  \
+    \                      \"shipping_address_id\": \"addr-456\",\n                    },\n                }\n           \
+    \ ]\n        ),\n    ],\n) -> OrderResponse:\n    \"\"\"\n    Create a new order from the current user's selection.\n\n\
+    \    - Validates product availability and pricing\n    - Reserves inventory for 15 minutes\n    - Returns order with estimated\
+    \ delivery date\n    \"\"\"\n    ...\n"
+  example_bad: "# Wrong: No organization — unusable documentation\n@app.post(\"/orders\")\nasync def f1(data: dict):  # No\
+    \ type hints, no docs\n    ...\n\n@app.get(\"/orders/{id}\")\nasync def f2(id):  # No parameter type, no description\n\
+    \    ...\n\n@app.post(\"/pay\")  # Inconsistent naming\nasync def f3(x: dict):\n    ...\n"
+  when_applies: Projects using FastAPI async web services or Python codebases
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using FastAPI or Python
+  sources: ["https://fastapi.tiangolo.com/tutorial/schema-extra-examples/"]
+- id: CR-FAPI-010
+  text: 'Use WebSocket with proper connection management: authenticate on connect, handle disconnections gracefully, and implement
+    heartbeat/ping-pong.'
+  why: WebSocket connections are long-lived and stateful. Without authentication on connect, anyone can open a WebSocket and
+    receive data. Without heartbeat, dead connections consume server resources indefinitely. Without graceful disconnection
+    handling, the server accumulates zombie connections and eventually runs out of file descriptors.
+  how_to_do_right: '1. Authenticate in the WebSocket handshake (query params or first message).
+
+    2. Implement ping/pong heartbeat to detect dead connections.
+
+    3. Use a connection manager to track active connections.
+
+    4. Handle WebSocketDisconnect exceptions for cleanup.
+
+    5. Set connection limits per user to prevent resource exhaustion.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    platform: [websocket]
+  domains:
+    domain: [architecture, security, performance]
+    concern: [backend]
+  example_good: "class ConnectionManager:\n    def __init__(self):\n        self.active: dict[str, WebSocket] = {}\n\n   \
+    \ async def connect(self, user_id: str, websocket: WebSocket):\n        await websocket.accept()\n        # Disconnect\
+    \ existing connection for same user\n        if user_id in self.active:\n            await self.disconnect(user_id)\n\
+    \        self.active[user_id] = websocket\n\n    async def disconnect(self, user_id: str):\n        ws = self.active.pop(user_id,\
+    \ None)\n        if ws:\n            try:\n                await ws.close()\n            except RuntimeError:\n      \
+    \          pass  # Already closed\n\n    async def send(self, user_id: str, message: dict):\n        ws = self.active.get(user_id)\n\
+    \        if ws:\n            try:\n                await ws.send_json(message)\n            except WebSocketDisconnect:\n\
+    \                await self.disconnect(user_id)\n\nmanager = ConnectionManager()\n\n@app.websocket(\"/ws\")\nasync def\
+    \ websocket_endpoint(websocket: WebSocket, token: str = Query(...)):\n    user = verify_token(token)  # Auth on connect\n\
+    \    if not user:\n        await websocket.close(code=4001, reason=\"Unauthorized\")\n        return\n    await manager.connect(user.id,\
+    \ websocket)\n    try:\n        while True:\n            data = await asyncio.wait_for(\n                websocket.receive_json(),\
+    \ timeout=60.0  # Heartbeat timeout\n            )\n            if data.get(\"type\") == \"ping\":\n                await\
+    \ websocket.send_json({\"type\": \"pong\"})\n            else:\n                await handle_message(user, data)\n   \
+    \ except (WebSocketDisconnect, asyncio.TimeoutError):\n        await manager.disconnect(user.id)\n"
+  example_bad: "# Wrong: No auth, no cleanup, no heartbeat\n@app.websocket(\"/ws\")\nasync def ws(websocket: WebSocket):\n\
+    \    await websocket.accept()  # No authentication — anyone can connect\n    while True:  # No timeout — dead connections\
+    \ persist forever\n        data = await websocket.receive_text()\n        await websocket.send_text(f\"Echo: {data}\"\
+    )\n    # No disconnect handling — zombie connections accumulate\n    # No connection tracking — can't broadcast, can't\
+    \ limit\n"
+  when_applies: Projects using FastAPI async web services, Python codebases, or real-time WebSocket connections
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities
+  sources: ["https://fastapi.tiangolo.com/advanced/websockets/"]
+- id: CR-FAPI-011
+  text: Use Annotated types with constrained fields for reusable validation. Define custom types for common patterns like
+    Email, PhoneNumber, and Pagination.
+  why: Repeating Field(min_length=1, max_length=255) on every string field is error-prone — one field will inevitably be missed.
+    Annotated types define constraints once and reuse everywhere. When constraints change (email regex update), only one definition
+    needs updating. Custom types also improve OpenAPI documentation with proper descriptions.
+  how_to_do_right: '1. Define Annotated types for common patterns in a types.py module.
+
+    2. Use Field() inside Annotated for constraints and metadata.
+
+    3. Use AfterValidator for custom validation logic.
+
+    4. Reuse types across all request/response models.
+
+    5. Include JSON schema examples in type definitions.
+
+    '
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [fastapi, pydantic]
+  domains:
+    domain: [architecture]
+    concern: [backend]
+  example_good: "# types.py — reusable constrained types\nfrom typing import Annotated\nfrom pydantic import Field, AfterValidator\n\
+    import re\n\nNonEmptyStr = Annotated[str, Field(min_length=1, max_length=500, strip_whitespace=True)]\nProductName = Annotated[str,\
+    \ Field(min_length=2, max_length=200, examples=[\"iPhone 15 Pro\"])]\nMoney = Annotated[Decimal, Field(ge=0, decimal_places=2,\
+    \ examples=[99.99])]\nQuantity = Annotated[int, Field(ge=1, le=10000)]\n\ndef validate_phone(v: str) -> str:\n    cleaned\
+    \ = re.sub(r\"[\\s\\-\\(\\)]\", \"\", v)\n    if not re.match(r\"^\\+\\d{10,15}$\", cleaned):\n        raise ValueError(\"\
+    Invalid phone number format. Use +1234567890\")\n    return cleaned\n\nPhoneNumber = Annotated[str, AfterValidator(validate_phone)]\n\
+    \n# Usage in models — clean, consistent, reusable\nclass CreateProductRequest(BaseModel):\n    name: ProductName\n   \
+    \ description: NonEmptyStr\n    price: Money\n    quantity: Quantity\n\nclass CreateUserRequest(BaseModel):\n    name:\
+    \ NonEmptyStr\n    phone: PhoneNumber\n"
+  example_bad: "# Wrong: Constraints duplicated and inconsistent across models\nclass CreateProductRequest(BaseModel):\n \
+    \   name: str = Field(min_length=2, max_length=200)\n    description: str = Field(min_length=1, max_length=500)\n\nclass\
+    \ UpdateProductRequest(BaseModel):\n    name: str = Field(min_length=1, max_length=100)  # Different constraints!\n  \
+    \  description: str  # Forgot constraints entirely\n"
+  when_applies: Projects using FastAPI async web services, Pydantic data validation, or Python codebases
+  when_not_applies: small scripts under 100 lines, single-purpose utilities
+  sources: ["https://docs.pydantic.dev/latest/concepts/types/#custom-types"]
+- id: CR-FAPI-012
+  text: Always return proper HTTP status codes and structured error responses. Use exception handlers to standardize error
+    format across the API.
+  why: Returning 200 for errors or unstructured error messages forces API consumers to parse response bodies to determine
+    success/failure. Missing error details make debugging impossible for consumers. Standardized error responses with correlation
+    IDs enable automated error handling, retry logic, and efficient debugging across distributed systems.
+  how_to_do_right: '1. Register exception handlers for common exception types.
+
+    2. Return structured error responses with: type, title, status, detail, instance.
+
+    3. Use appropriate HTTP status codes: 400 (validation), 401 (auth), 403 (forbidden), 404 (not found), 409 (conflict),
+    422 (validation), 429 (rate limit), 500 (server error).
+
+    4. Include a correlation ID for request tracing.
+
+    5. Never expose stack traces or internal details in production error responses.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [architecture]
+    concern: [backend]
+  example_good: "from fastapi import FastAPI, Request\nfrom fastapi.responses import JSONResponse\nimport uuid\n\nclass AppError(Exception):\n\
+    \    def __init__(self, status_code: int, error_type: str, detail: str):\n        self.status_code = status_code\n   \
+    \     self.error_type = error_type\n        self.detail = detail\n\nclass NotFoundError(AppError):\n    def __init__(self,\
+    \ resource: str, resource_id: str):\n        super().__init__(404, \"not_found\", f\"{resource} '{resource_id}' not found\"\
+    )\n\nclass ConflictError(AppError):\n    def __init__(self, detail: str):\n        super().__init__(409, \"conflict\"\
+    , detail)\n\n@app.exception_handler(AppError)\nasync def app_error_handler(request: Request, exc: AppError):\n    return\
+    \ JSONResponse(\n        status_code=exc.status_code,\n        content={\n            \"type\": exc.error_type,\n    \
+    \        \"title\": exc.error_type.replace(\"_\", \" \").title(),\n            \"status\": exc.status_code,\n        \
+    \    \"detail\": exc.detail,\n            \"instance\": str(request.url),\n            \"correlation_id\": request.state.correlation_id,\n\
+    \        },\n    )\n\n@app.exception_handler(Exception)\nasync def unhandled_error_handler(request: Request, exc: Exception):\n\
+    \    logger.error(f\"Unhandled error: {exc}\", exc_info=True)\n    return JSONResponse(\n        status_code=500,\n  \
+    \      content={\n            \"type\": \"internal_error\",\n            \"title\": \"Internal Server Error\",\n     \
+    \       \"status\": 500,\n            \"detail\": \"An unexpected error occurred\",\n            \"correlation_id\": request.state.correlation_id,\n\
+    \        },\n    )\n"
+  example_bad: "# Wrong: 200 for errors, unstructured responses, exposed internals\n@router.get(\"/users/{user_id}\")\nasync\
+    \ def get_user(user_id: int):\n    try:\n        user = db.query(User).get(user_id)\n        if not user:\n          \
+    \  return {\"error\": True, \"message\": \"not found\"}  # 200 status!\n        return {\"error\": False, \"data\": user}\n\
+    \    except Exception as e:\n        return {\"error\": True, \"message\": str(e)}  # Exposes stack trace\n        # {\"\
+    error\": True, \"message\": \"relation \\\"users\\\" does not exist\"}\n"
+  when_applies: Projects using FastAPI async web services or Python codebases
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using FastAPI or Python
+  sources: ["https://fastapi.tiangolo.com/tutorial/handling-errors/"]
+- id: CR-FAPI-013
+  text: Use lifespan events for application startup and shutdown. Initialize database engines, HTTP clients, and caches on
+    startup — dispose on shutdown.
+  why: Creating resources (database connections, HTTP clients) on first request adds latency to the first user's experience,
+    creates race conditions if multiple requests arrive simultaneously, and fails to cleanly release resources on shutdown.
+    Lifespan events ensure resources are ready before the first request and cleaned up on shutdown — preventing connection
+    leaks and data corruption.
+  how_to_do_right: '1. Use @asynccontextmanager lifespan function (replaces deprecated on_event).
+
+    2. Create shared resources (engine, client, cache) before yield.
+
+    3. Store resources on app.state for access in dependencies.
+
+    4. Dispose all resources after yield (shutdown).
+
+    5. Handle startup failures gracefully — log and exit, don''t serve without resources.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [architecture, operations, deployment]
+    concern: [backend]
+  example_good: "from contextlib import asynccontextmanager\nfrom sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker\n\
+    import httpx\nimport redis.asyncio as redis\n\n@asynccontextmanager\nasync def lifespan(app: FastAPI):\n    # Startup\
+    \ — create all shared resources\n    app.state.db_engine = create_async_engine(\n        settings.DATABASE_URL,\n    \
+    \    pool_size=10,\n        max_overflow=5,\n    )\n    app.state.session_factory = async_sessionmaker(\n        app.state.db_engine,\
+    \ expire_on_commit=False\n    )\n    app.state.http_client = httpx.AsyncClient(\n        timeout=30.0,\n        limits=httpx.Limits(max_connections=100),\n\
+    \    )\n    app.state.redis = redis.from_url(settings.REDIS_URL)\n\n    logger.info(\"Application started — all resources\
+    \ initialized\")\n    yield\n\n    # Shutdown — clean up all resources\n    await app.state.redis.aclose()\n    await\
+    \ app.state.http_client.aclose()\n    await app.state.db_engine.dispose()\n    logger.info(\"Application shutdown — all\
+    \ resources released\")\n\napp = FastAPI(lifespan=lifespan)\n\n# Dependency using lifespan resources\nasync def get_db(request:\
+    \ Request) -> AsyncGenerator[AsyncSession, None]:\n    async with request.app.state.session_factory() as session:\n  \
+    \      yield session\n"
+  example_bad: "# Wrong: Deprecated on_event + global mutable state\ndb_engine = None  # Global mutable — race condition on\
+    \ startup\n\n@app.on_event(\"startup\")\nasync def startup():\n    global db_engine\n    db_engine = create_async_engine(DATABASE_URL)\n\
+    \n@app.on_event(\"shutdown\")\nasync def shutdown():\n    if db_engine:\n        await db_engine.dispose()\n        #\
+    \ What if shutdown fails? Resources leak.\n\n# Wrong: No startup initialization — first request creates engine\n@router.get(\"\
+    /users\")\nasync def get_users():\n    engine = create_async_engine(DATABASE_URL)  # Created per request!\n    # ...\n"
+  when_applies: Projects using FastAPI async web services or Python codebases
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using FastAPI or Python
+  sources: ["https://fastapi.tiangolo.com/advanced/events/"]
+- id: CR-FAPI-014
+  text: Use custom APIRoute classes to extend endpoint behavior (logging, timing, request ID injection) without modifying
+    endpoint code.
+  why: Adding logging, timing, and correlation ID injection to every endpoint function creates massive boilerplate. Custom
+    APIRoute classes intercept the request/response cycle once, applying behavior to all endpoints on a router. This is more
+    maintainable than middleware because it has access to route-specific metadata and applies only to specific routers.
+  how_to_do_right: '1. Subclass APIRoute and override get_route_handler().
+
+    2. Wrap the original handler with your custom logic.
+
+    3. Assign the custom route class to the router: router.route_class = MyRoute.
+
+    4. Use for: request logging, timing headers, correlation IDs, request validation.
+
+    5. Keep middleware for truly global concerns; use route classes for router-specific concerns.
+
+    '
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [architecture, observability]
+    concern: [backend]
+  example_good: "import time\nimport uuid\nfrom fastapi import APIRouter, Request, Response\nfrom fastapi.routing import APIRoute\n\
+    \nclass TimedRoute(APIRoute):\n    def get_route_handler(self):\n        original = super().get_route_handler()\n\n  \
+    \      async def custom_handler(request: Request) -> Response:\n            # Inject correlation ID\n            correlation_id\
+    \ = request.headers.get(\"X-Correlation-ID\", str(uuid.uuid4()))\n            request.state.correlation_id = correlation_id\n\
+    \n            # Time the request\n            start = time.perf_counter()\n            response = await original(request)\n\
+    \            elapsed = time.perf_counter() - start\n\n            # Add headers\n            response.headers[\"X-Correlation-ID\"\
+    ] = correlation_id\n            response.headers[\"X-Process-Time\"] = f\"{elapsed:.4f}\"\n\n            # Log\n     \
+    \       logger.info(\n                \"request_completed\",\n                method=request.method,\n               \
+    \ path=request.url.path,\n                status=response.status_code,\n                duration_ms=round(elapsed * 1000),\n\
+    \                correlation_id=correlation_id,\n            )\n            return response\n\n        return custom_handler\n\
+    \n# Apply to router\nrouter = APIRouter(prefix=\"/api/v1\", route_class=TimedRoute)\n"
+  example_bad: "# Wrong: Boilerplate in every endpoint\n@router.get(\"/orders\")\nasync def list_orders(request: Request):\n\
+    \    correlation_id = request.headers.get(\"X-Correlation-ID\", str(uuid.uuid4()))\n    start = time.perf_counter()\n\
+    \    try:\n        orders = await service.list_orders()\n        elapsed = time.perf_counter() - start\n        logger.info(f\"\
+    GET /orders 200 {elapsed:.4f}s cid={correlation_id}\")\n        return JSONResponse(content=orders, headers={\"X-Correlation-ID\"\
+    : correlation_id})\n    except Exception:\n        elapsed = time.perf_counter() - start\n        logger.error(f\"GET\
+    \ /orders 500 {elapsed:.4f}s cid={correlation_id}\")\n        raise\n# Same boilerplate in every single endpoint function\n"
+  when_applies: Projects using FastAPI async web services or Python codebases
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using FastAPI or Python
+  sources: ["https://fastapi.tiangolo.com/advanced/custom-request-and-route/"]

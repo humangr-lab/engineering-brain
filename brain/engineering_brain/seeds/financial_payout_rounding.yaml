@@ -1,0 +1,972 @@
+layer: rules
+domain: fintech
+knowledge:
+- id: FROUND-001
+  text: >
+    NEVER use float for monetary values. Use Python's decimal.Decimal with an explicit
+    context set to prec=28 and rounding=ROUND_HALF_EVEN at module initialization.
+    Float arithmetic introduces IEEE 754 binary representation errors (0.1 + 0.2 !=
+    0.3) that compound across millions of transactions into material accounting discrepancies.
+  why: >
+    float(0.1) is actually 0.1000000000000000055511151231257827021181583404541015625.
+    A system processing 1M payouts/day at $0.01 average rounding error per transaction
+    accumulates $10K/day in unreconciled differences. Financial auditors treat any
+    non-deterministic rounding as a control failure. Real incident: a fintech startup
+    discovered $47K discrepancy after 6 months because their split-payout endpoint
+    used float division before converting to Decimal.
+  how_to_do_right: |
+    1. At module level, set the global context:
+       from decimal import Decimal, getcontext, ROUND_HALF_EVEN
+       getcontext().prec = 28
+       getcontext().rounding = ROUND_HALF_EVEN
+    2. Accept monetary input as strings, not floats:
+       amount = Decimal("100.50")   # correct
+       amount = Decimal(100.50)     # WRONG — float contamination before Decimal
+    3. Store as NUMERIC(19,4) in PostgreSQL — never FLOAT or DOUBLE PRECISION
+    4. For display, quantize at the last step only:
+       display = amount.quantize(Decimal("0.01"))
+    5. In APIs, accept/return monetary values as strings in JSON
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, sqlalchemy]
+  domains:
+    domain: [fintech, payments]
+    concern: [data_integrity, financial_precision]
+  example_good: |
+    from decimal import Decimal, getcontext, ROUND_HALF_EVEN
+    getcontext().prec = 28
+    getcontext().rounding = ROUND_HALF_EVEN
+
+    def create_payout(gross_amount_str: str) -> dict:
+        amount = Decimal(gross_amount_str)   # from string, not float
+        fee_rate = Decimal("0.025")          # 2.5%
+        fee = (amount * fee_rate).quantize(Decimal("0.01"))
+        net = amount - fee
+        return {"gross": str(amount), "fee": str(fee), "net": str(net)}
+
+    result = create_payout("1000.00")
+    assert Decimal(result["gross"]) == Decimal(result["fee"]) + Decimal(result["net"])
+  example_bad: |
+    # WRONG: float arithmetic accumulates error
+    def create_payout_bad(gross_amount: float) -> dict:
+        fee = gross_amount * 0.025        # float multiplication — imprecise
+        net = gross_amount - fee
+        # float(1000.00) * 0.025 = 24.999999999999996 (not 25.00)
+        return {"gross": gross_amount, "fee": fee, "net": net}
+        # sum(fee + net) != gross — reconciliation fails
+  when_applies: >
+    Any code path that handles monetary values: payout creation, fee calculation,
+    refund, ledger entry, tax invoice, interest accrual.
+  sources:
+    - "Python docs — decimal module: https://docs.python.org/3/library/decimal.html"
+    - "IEEE 754-2008 Standard for Floating-Point Arithmetic"
+    - "Real Python — Rounding Numbers in Python: https://realpython.com/python-rounding/"
+
+- id: FROUND-002
+  text: >
+    Use Banker's rounding (ROUND_HALF_EVEN) as the default rounding mode for all
+    financial calculations. It rounds 0.5 to the nearest even digit, eliminating
+    cumulative upward bias over millions of operations. Only deviate from it when
+    a specific regulatory rule (e.g., Brazilian IOF truncation) mandates otherwise.
+  why: >
+    Standard ROUND_HALF_UP introduces a systematic +0.5 bias: across 1M transactions
+    each with a half-cent case, you accumulate ~$5,000 extra. ROUND_HALF_EVEN
+    distributes rounding statistically evenly (rounds up half the time, down half).
+    IEEE 754 recommends ROUND_HALF_EVEN as the default. Python's decimal module
+    uses it by default. The US banking system and most international financial
+    standards mandate it.
+  how_to_do_right: |
+    1. Set globally: getcontext().rounding = ROUND_HALF_EVEN
+    2. Use quantize() to round to target precision:
+       Decimal("2.5").quantize(Decimal("1")) == Decimal("2")   # rounds to even
+       Decimal("3.5").quantize(Decimal("1")) == Decimal("4")   # rounds to even
+    3. Override per-operation only for regulatory exceptions:
+       tax = amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN)  # IOF truncate
+    4. Document every non-ROUND_HALF_EVEN usage with a comment citing the rule
+    5. In tests, include half-cent cases explicitly to verify rounding direction
+  severity: high
+  technologies:
+    lang: [python]
+    framework: []
+  domains:
+    domain: [fintech, accounting]
+    concern: [financial_precision, regulatory_compliance]
+  example_good: |
+    from decimal import Decimal, ROUND_HALF_EVEN, ROUND_DOWN
+
+    CENT = Decimal("0.01")
+
+    def round_financial(amount: Decimal) -> Decimal:
+        """Default: Banker's rounding."""
+        return amount.quantize(CENT, rounding=ROUND_HALF_EVEN)
+
+    def round_iof_brazil(amount: Decimal) -> Decimal:
+        """Brazilian IOF: truncate (floor), never round up. RFB Instrução Normativa."""
+        return amount.quantize(CENT, rounding=ROUND_DOWN)
+
+    assert round_financial(Decimal("2.225")) == Decimal("2.22")  # rounds to even 2
+    assert round_financial(Decimal("2.235")) == Decimal("2.24")  # rounds to even 4
+    assert round_iof_brazil(Decimal("2.229")) == Decimal("2.22")  # always truncate
+  example_bad: |
+    # WRONG: naive round() uses ROUND_HALF_UP in Python 2 semantics
+    # Also WRONG: Python 3 round() uses banker's rounding but on FLOATS
+    fee = round(float_amount * 0.025, 2)
+    # double error: float imprecision AND wrong context
+    # For 1M ops: systematic +bias → reconciliation gap
+  when_applies: >
+    Every call to .quantize() on a monetary Decimal. Default to ROUND_HALF_EVEN;
+    document exceptions explicitly.
+  sources:
+    - "Python docs — Rounding modes: https://docs.python.org/3/library/decimal.html#rounding-modes"
+    - "IEEE 754-2008 §4.3.3 — roundTiesToEven as default rounding attribute"
+    - "Real Python — Rounding Numbers: https://realpython.com/python-rounding/#rounding-half-to-even"
+
+- id: FROUND-003
+  text: >
+    When splitting a payout across N recipients, calculate N-1 shares using standard
+    rounding, then assign the remainder (total minus sum of N-1 shares) to the last
+    recipient. This "dust allocation" pattern guarantees sum(parts) == total exactly,
+    with no penny lost or created.
+  why: >
+    Independent rounding of each share creates a "penny problem": round($10/3) three
+    times = $3.33 + $3.33 + $3.33 = $9.99 (one cent short). Or $3.34 * 3 = $10.02
+    (two cents over). At scale — 100K daily splits — $1,000–$2,000/day in
+    unreconciled "dust" that must be absorbed somewhere. The dust-to-last pattern is
+    the industry standard (used by Stripe, Adyen, PayPal internals).
+  how_to_do_right: |
+    1. Sort recipients deterministically (e.g., by ID) for auditability
+    2. Compute each share: share_i = (total * weight_i / total_weight).quantize(CENT)
+    3. Assign shares[0..N-2] normally
+    4. Set shares[N-1] = total - sum(shares[0..N-2])
+    5. Assert: sum(shares) == total (raises if dust allocation logic is wrong)
+    6. Log the dust amount: dust = shares[N-1] - (total * weight_N-1 / total_weight)
+    7. If dust > Decimal("0.05"), flag for review (unusual — may indicate a bug)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: []
+  domains:
+    domain: [fintech, payments, marketplace]
+    concern: [financial_precision, reconciliation]
+  example_good: |
+    from decimal import Decimal
+
+    CENT = Decimal("0.01")
+
+    def split_payout(total: Decimal, weights: list[Decimal]) -> list[Decimal]:
+        """Dust-to-last-recipient allocation. Guarantees sum(parts) == total."""
+        total_weight = sum(weights)
+        shares = []
+        running_total = Decimal("0")
+
+        for i, weight in enumerate(weights[:-1]):  # all but last
+            share = (total * weight / total_weight).quantize(CENT)
+            shares.append(share)
+            running_total += share
+
+        # Last recipient gets the remainder — absorbs all rounding dust
+        shares.append(total - running_total)
+
+        assert sum(shares) == total, f"Split invariant violated: {sum(shares)} != {total}"
+        return shares
+
+    parts = split_payout(Decimal("10.00"), [Decimal("1"), Decimal("1"), Decimal("1")])
+    # e.g., [Decimal("3.33"), Decimal("3.33"), Decimal("3.34")]
+    assert sum(parts) == Decimal("10.00")
+  example_bad: |
+    # WRONG: round each share independently
+    def split_bad(total: float, n: int) -> list[float]:
+        share = round(total / n, 2)
+        return [share] * n
+        # split_bad(10.0, 3) = [3.33, 3.33, 3.33] → sum = 9.99 (1 cent missing!)
+  when_applies: >
+    Marketplace payouts, revenue sharing, invoice splitting, batch refunds,
+    any time a single total must be divided across multiple recipients.
+  sources:
+    - "Stripe — Splitting charges: https://stripe.com/docs/connect/charges-transfers"
+    - "Python docs — decimal: https://docs.python.org/3/library/decimal.html"
+    - "Alasco Engineering — Handling Money and Taxes in Python: https://alasco.tech/2020/01/31/handling-money-and-taxes-in-python/"
+
+- id: FROUND-004
+  text: >
+    In fee-then-net calculations, always compute the fee first (rounded to currency
+    precision), then derive net as total minus fee. Never compute net directly and
+    derive fee as a remainder — the two approaches produce different results at half-cent
+    boundaries, and only fee-first matches what payment processors report.
+  why: >
+    Payment processors (Stripe, Adyen, PagSeguro) charge a fee and report it as a
+    rounded amount. If you compute net = round(gross * (1 - fee_rate)) independently,
+    you may get net = $974.88 while the processor reports fee = $25.13, giving
+    gross - fee = $974.87 — a $0.01 discrepancy per transaction. Across 50K
+    daily transactions this is $500/day in unreconciled ledger entries.
+  how_to_do_right: |
+    1. fee = (gross * fee_rate).quantize(CENT, rounding=ROUND_HALF_EVEN)
+    2. net = gross - fee
+    3. Verify: fee + net == gross  (exact Decimal equality, no tolerance)
+    4. Store fee as the authoritative figure; net is always derived
+    5. In reconciliation, compare stored fee against processor-reported fee
+    6. If processor uses a different rounding mode (some use ROUND_HALF_UP),
+       replicate their exact mode for the fee calculation only
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fintech, payments, marketplace]
+    concern: [reconciliation, financial_precision]
+  example_good: |
+    from decimal import Decimal, ROUND_HALF_EVEN
+
+    CENT = Decimal("0.01")
+
+    def calculate_net_payout(gross: Decimal, fee_rate: Decimal) -> tuple[Decimal, Decimal]:
+        """Returns (fee, net). Fee computed first; net is always gross - fee."""
+        fee = (gross * fee_rate).quantize(CENT, rounding=ROUND_HALF_EVEN)
+        net = gross - fee  # exact — no second rounding
+        assert fee + net == gross
+        return fee, net
+
+    fee, net = calculate_net_payout(Decimal("1000.00"), Decimal("0.025"))
+    # fee = 25.00, net = 975.00 — exactly reconciles
+  example_bad: |
+    # WRONG: compute both independently — they may not sum to gross
+    def bad_payout(gross: float, fee_rate: float) -> tuple:
+        fee = round(gross * fee_rate, 2)
+        net = round(gross * (1 - fee_rate), 2)  # independent rounding
+        # fee + net may != gross for edge cases at half-cent boundaries
+        return fee, net
+  when_applies: >
+    Any system that applies a percentage fee to a gross amount and must reconcile
+    with an external payment processor's reported fee.
+  sources:
+    - "Python docs — decimal: https://docs.python.org/3/library/decimal.html"
+    - "Stripe — Fee calculation: https://stripe.com/docs/connect/direct-charges#collect-fees"
+
+- id: FROUND-005
+  text: >
+    Set currency-specific Decimal quantizers as module-level constants. BRL uses
+    2 decimal places (centavos), BTC uses 8 (satoshis), ETH uses 18 (wei). Never
+    hardcode Decimal("0.01") inline — use the currency's quantizer constant,
+    so that adding a new currency means updating one dictionary, not a grep-and-replace.
+  why: >
+    A system that hardcodes Decimal("0.01") everywhere silently truncates crypto
+    amounts: Decimal("0.12345678").quantize(Decimal("0.01")) = Decimal("0.12"),
+    destroying 6 decimal places of a Bitcoin amount. Real incident: a crypto exchange
+    that added BTC support by reusing BRL payout code lost satoshi-level precision
+    in accounting, creating unexplained balance differences that took 3 weeks to audit.
+  how_to_do_right: |
+    1. Define a CURRENCY_QUANTIZERS dict at module level:
+       CURRENCY_QUANTIZERS = {
+           "BRL": Decimal("0.01"),
+           "USD": Decimal("0.01"),
+           "EUR": Decimal("0.01"),
+           "BTC": Decimal("0.00000001"),   # 8 decimals (satoshi)
+           "ETH": Decimal("0.000000000000000001"),  # 18 decimals (wei)
+           "USDC": Decimal("0.000001"),    # 6 decimals
+       }
+    2. Quantize function accepts currency code:
+       def quantize(amount: Decimal, currency: str) -> Decimal:
+           q = CURRENCY_QUANTIZERS[currency]
+           return amount.quantize(q, rounding=ROUND_HALF_EVEN)
+    3. Raise KeyError for unknown currencies — fail loudly
+    4. Store currency alongside every monetary amount in the DB
+  severity: high
+  technologies:
+    lang: [python]
+    framework: []
+  domains:
+    domain: [fintech, crypto, payments]
+    concern: [financial_precision, multi_currency]
+  example_good: |
+    from decimal import Decimal, ROUND_HALF_EVEN
+
+    CURRENCY_QUANTIZERS: dict[str, Decimal] = {
+        "BRL": Decimal("0.01"),
+        "USD": Decimal("0.01"),
+        "BTC": Decimal("0.00000001"),
+        "ETH": Decimal("0.000000000000000001"),
+    }
+
+    def quantize_currency(amount: Decimal, currency: str) -> Decimal:
+        if currency not in CURRENCY_QUANTIZERS:
+            raise ValueError(f"Unknown currency: {currency}")
+        return amount.quantize(CURRENCY_QUANTIZERS[currency], rounding=ROUND_HALF_EVEN)
+
+    btc_amount = Decimal("0.00312456789")
+    rounded = quantize_currency(btc_amount, "BTC")
+    assert rounded == Decimal("0.00312457")  # 8 decimal places preserved
+  example_bad: |
+    # WRONG: hardcoded CENT for all currencies
+    def quantize_bad(amount: Decimal) -> Decimal:
+        return amount.quantize(Decimal("0.01"))   # destroys BTC precision
+        # quantize_bad(Decimal("0.00312456789")) = Decimal("0.00") — total loss!
+  when_applies: >
+    Every system that handles more than one currency, including fiat+crypto mixed
+    platforms, multi-country payment processors, or any future-proofed fintech system.
+  sources:
+    - "Python docs — decimal quantize: https://docs.python.org/3/library/decimal.html#decimal.Decimal.quantize"
+    - "ISO 4217 — Currency codes and decimal precision"
+    - "Bitcoin Wiki — Satoshi: https://en.bitcoin.it/wiki/Satoshi_(unit)"
+
+- id: FROUND-006
+  text: >
+    Configure the Decimal context explicitly at process startup using
+    localcontext() for thread-safe per-operation overrides. Never rely on the
+    global default context being correct — it may be mutated by third-party libraries.
+    Set prec=28 for all financial work; increase to 50+ only for intermediate
+    cross-currency conversions where you need extra guard digits.
+  why: >
+    Python's default Decimal context has prec=28 and ROUND_HALF_EVEN, but any
+    import of numpy, pandas, or certain ORMs may call setcontext() internally.
+    A global context mutation will silently change rounding behavior for all subsequent
+    Decimal operations in the process. Thread-unsafe context mutations in multi-worker
+    FastAPI processes caused a production incident at a Brazilian fintech where
+    worker 3 had prec=6 (set by pandas) while worker 1 had prec=28.
+  how_to_do_right: |
+    1. Set the default context explicitly at startup (e.g., in main.py or app factory):
+       from decimal import setcontext, DefaultContext, ROUND_HALF_EVEN, Context
+       setcontext(Context(prec=28, rounding=ROUND_HALF_EVEN))
+    2. For operations needing higher precision, use localcontext():
+       from decimal import localcontext
+       with localcontext() as ctx:
+           ctx.prec = 50
+           intermediate = (usd_amount * exchange_rate)  # 50-digit intermediate
+       final = intermediate.quantize(Decimal("0.01"))   # back to 2 decimals
+    3. Add a startup assertion in tests: assert getcontext().prec == 28
+    4. Never use setcontext() in library code — only in application entrypoints
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, gunicorn]
+  domains:
+    domain: [fintech, payments]
+    concern: [financial_precision, thread_safety]
+  example_good: |
+    # main.py — application entrypoint
+    from decimal import setcontext, Context, ROUND_HALF_EVEN, localcontext, Decimal
+
+    def configure_decimal_context():
+        setcontext(Context(prec=28, rounding=ROUND_HALF_EVEN))
+
+    configure_decimal_context()  # called before any worker forks
+
+    def convert_currency(amount: Decimal, rate: Decimal, target_currency: str) -> Decimal:
+        """Use extra precision for intermediate FX conversion."""
+        with localcontext() as ctx:
+            ctx.prec = 50   # guard digits for intermediate result
+            intermediate = amount * rate
+        return intermediate.quantize(Decimal("0.01"))
+  example_bad: |
+    # WRONG: relying on default context, which may be mutated
+    import pandas as pd    # may call setcontext() internally in some versions
+    from decimal import Decimal
+    # No explicit context setup
+    result = Decimal("1.005").quantize(Decimal("0.01"))
+    # If pandas mutated context to prec=6, result is wrong
+  when_applies: >
+    All Python financial applications, especially those using FastAPI with multiple
+    workers, or any codebase that imports numpy/pandas/scipy alongside Decimal.
+  sources:
+    - "Python docs — decimal context: https://docs.python.org/3/library/decimal.html#context-objects"
+    - "Python docs — localcontext: https://docs.python.org/3/library/decimal.html#decimal.localcontext"
+
+- id: FROUND-007
+  text: >
+    Store both the raw (pre-rounding) value and the rounded value in your audit log
+    for every financial rounding decision. The raw value enables forensic analysis of
+    systematic rounding patterns; the rounded value is what was actually applied.
+    This rounding audit trail is required for financial audits and fraud detection.
+  why: >
+    Without raw values, auditors cannot distinguish between legitimate rounding and
+    systematic manipulation (e.g., "salami slicing" — consistently rounding in one
+    direction to skim fractions of cents). The BACEN (Banco Central do Brasil) and
+    SEC both require that financial systems be able to reproduce any historical
+    calculation exactly. Storing only the final rounded value makes that impossible.
+  how_to_do_right: |
+    1. Create a RoundingEvent dataclass:
+       @dataclass
+       class RoundingEvent:
+           operation: str          # e.g., "fee_calculation"
+           raw_value: str          # str(Decimal) — exact representation
+           rounded_value: str      # str(quantized Decimal)
+           rounding_mode: str      # e.g., "ROUND_HALF_EVEN"
+           currency: str
+           transaction_id: str
+           timestamp: datetime
+    2. Emit RoundingEvent for every .quantize() call on a material amount
+    3. Store in append-only table or immutable log (Kafka, CloudWatch, S3)
+    4. Alert if |raw - rounded| > 0.005 for a BRL amount (unusual)
+    5. Daily reconciliation job: sum(raw) vs sum(rounded) drift should be near-zero
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, sqlalchemy]
+  domains:
+    domain: [fintech, audit, compliance]
+    concern: [audit_trail, regulatory_compliance]
+  example_good: |
+    from decimal import Decimal, ROUND_HALF_EVEN
+    from dataclasses import dataclass
+    from datetime import datetime, UTC
+
+    CENT = Decimal("0.01")
+
+    @dataclass
+    class RoundingEvent:
+        operation: str
+        raw_value: str
+        rounded_value: str
+        rounding_mode: str = "ROUND_HALF_EVEN"
+        currency: str = "BRL"
+
+    def rounded_fee(gross: Decimal, rate: Decimal, tx_id: str) -> tuple[Decimal, RoundingEvent]:
+        raw = gross * rate
+        rounded = raw.quantize(CENT, rounding=ROUND_HALF_EVEN)
+        event = RoundingEvent(
+            operation="fee_calculation",
+            raw_value=str(raw),
+            rounded_value=str(rounded),
+        )
+        return rounded, event
+  example_bad: |
+    # WRONG: no audit trail for rounding decisions
+    def compute_fee(gross: Decimal, rate: Decimal) -> Decimal:
+        return (gross * rate).quantize(Decimal("0.01"))
+    # Auditors cannot reconstruct the raw value or verify rounding mode
+  when_applies: >
+    All fee calculations, tax computations, payout splits, interest accruals — any
+    operation where rounding is applied to a value that will appear in financial records.
+  sources:
+    - "BACEN — Resolução CMN 4.658: https://www.bcb.gov.br/estabilidadefinanceira/resolucao4658"
+    - "Python docs — decimal: https://docs.python.org/3/library/decimal.html"
+
+- id: FROUND-008
+  text: >
+    Brazilian tax calculations (IOF, PIS, COFINS, IR-Fonte) use ROUND_DOWN (truncation),
+    not ROUND_HALF_EVEN. The Receita Federal (RFB) explicitly specifies truncation for
+    most tax bases. Applying banker's rounding to taxes produces values that diverge
+    from what the tax authority expects, triggering DARF reconciliation failures.
+  why: >
+    IOF (Imposto sobre Operações Financeiras) truncates to 2 decimal places per
+    Decreto 6.306/2007. IR-Fonte on financial income truncates per RFB guidance.
+    A company that applied ROUND_HALF_EVEN to IOF calculations on 5M monthly
+    transactions generated cumulative differences of ~R$8,200/month versus the
+    Receita Federal's expected values — triggering an automated DARF audit notice.
+  how_to_do_right: |
+    1. Maintain a TAX_ROUNDING_MODES dict per tax type:
+       from decimal import ROUND_DOWN, ROUND_HALF_EVEN
+       TAX_ROUNDING_MODES = {
+           "IOF": ROUND_DOWN,       # Decreto 6.306/2007
+           "PIS": ROUND_DOWN,       # Instrução Normativa RFB 247/2002
+           "COFINS": ROUND_DOWN,
+           "IRRF": ROUND_DOWN,      # RFB Instrução Normativa 1.585/2015
+           "CSLL": ROUND_DOWN,
+       }
+    2. Apply the correct mode per tax:
+       tax = base.quantize(CENT, rounding=TAX_ROUNDING_MODES[tax_type])
+    3. Add a comment with the legal reference for each ROUND_DOWN entry
+    4. In test suite, include the exact examples from the RFB published tables
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: []
+  domains:
+    domain: [fintech, fiscal, brazil]
+    concern: [regulatory_compliance, tax_calculation]
+  example_good: |
+    from decimal import Decimal, ROUND_DOWN
+
+    CENT = Decimal("0.01")
+
+    # Decreto 6.306/2007 — IOF uses truncation (ROUND_DOWN), not rounding
+    def calculate_iof(base: Decimal, rate: Decimal) -> Decimal:
+        """IOF calculation per Decreto 6.306/2007: truncate to cents."""
+        return (base * rate).quantize(CENT, rounding=ROUND_DOWN)
+
+    # Verify against Receita Federal published example
+    iof = calculate_iof(Decimal("1000.00"), Decimal("0.0038"))
+    assert iof == Decimal("3.80")  # truncated, not rounded to 3.80
+  example_bad: |
+    # WRONG: using banker's rounding for Brazilian taxes
+    def bad_iof(base: Decimal, rate: Decimal) -> Decimal:
+        return (base * rate).quantize(Decimal("0.01"))  # ROUND_HALF_EVEN by default
+        # For edge cases: 3.805 rounds to 3.80 (even), but RFB expects 3.80 (truncate)
+        # These differ on boundary values, causing DARF discrepancies
+  when_applies: >
+    All Brazilian tax calculations: IOF, PIS, COFINS, IRRF, CSLL, ISS.
+    Consult the specific Instrução Normativa for each tax — most use ROUND_DOWN.
+  sources:
+    - "Decreto 6.306/2007 — Regulamento do IOF: https://www.planalto.gov.br/ccivil_03/_ato2007-2010/2007/decreto/d6306.htm"
+    - "RFB Instrução Normativa 1.585/2015 — IRRF sobre rendimentos financeiros"
+    - "Python docs — ROUND_DOWN: https://docs.python.org/3/library/decimal.html#decimal.ROUND_DOWN"
+
+- id: FROUND-009
+  text: >
+    For interest accrual with daily compounding, carry full Decimal precision through
+    all intermediate daily calculations and only quantize the final balance when
+    presenting to users or writing to the ledger. Premature rounding of daily accruals
+    causes compounding error that grows O(n) with the number of accrual periods.
+  why: >
+    Rounding each daily interest accrual to 2 decimal places before adding it to the
+    balance introduces up to 0.005 error per day. Over 365 days on a R$100K balance
+    at 0.03% daily, this accumulated error can reach R$1.80 — material for large
+    portfolios. The correct approach is the "keep full precision internally, quantize
+    at output" pattern, which limits total error to a single rounding at the end.
+  how_to_do_right: |
+    1. Use prec=28 context throughout accrual loop
+    2. Accumulate interest additions at full Decimal precision (no quantize inside loop)
+    3. Only quantize when writing to the user-facing balance or ledger entry
+    4. Store the un-quantized "shadow balance" (string representation) alongside
+       the quantized balance for daily reconciliation
+    5. Test: daily_compound(principal, rate, 365) should match formula exactly
+       to within Decimal("0.01")
+  severity: high
+  technologies:
+    lang: [python]
+    framework: []
+  domains:
+    domain: [fintech, lending, investment]
+    concern: [financial_precision, interest_calculation]
+  example_good: |
+    from decimal import Decimal, getcontext, ROUND_HALF_EVEN
+
+    getcontext().prec = 28
+
+    CENT = Decimal("0.01")
+
+    def accrue_daily_interest(
+        principal: Decimal, daily_rate: Decimal, days: int
+    ) -> tuple[Decimal, Decimal]:
+        """Returns (final_balance_quantized, raw_balance_for_audit)."""
+        balance = principal  # full precision throughout
+        for _ in range(days):
+            interest = balance * daily_rate  # NO quantize here
+            balance = balance + interest     # accumulate at full precision
+        raw = balance
+        quantized = balance.quantize(CENT, rounding=ROUND_HALF_EVEN)
+        return quantized, raw
+
+    result, raw = accrue_daily_interest(Decimal("100000.00"), Decimal("0.0003"), 365)
+    # result is the rounded balance; raw preserves full precision for audit
+  example_bad: |
+    # WRONG: rounding inside the loop — compounding error
+    def bad_accrual(principal: float, daily_rate: float, days: int) -> float:
+        balance = principal
+        for _ in range(days):
+            interest = round(balance * daily_rate, 2)  # error per day!
+            balance = round(balance + interest, 2)     # compounds daily
+        return balance
+  when_applies: >
+    CDB, LCI, LCA, savings accounts, loan amortization, debentures, any instrument
+    with periodic (daily/monthly) compounding interest.
+  sources:
+    - "Python docs — decimal: https://docs.python.org/3/library/decimal.html"
+    - "BACEN — Resolução CMN 2.099/1994 — cálculo de juros compostos"
+    - "Alasco Engineering — Handling Money and Taxes in Python: https://alasco.tech/2020/01/31/handling-money-and-taxes-in-python/"
+
+- id: FROUND-010
+  text: >
+    In cross-currency conversions, use at least 6 extra guard digits of precision
+    for the intermediate result before quantizing to the target currency. The
+    intermediate exchange rate multiplication requires more precision than the
+    final output to avoid accumulation of round-trip errors.
+  why: >
+    Converting BRL to USD and back with only 2-decimal intermediate results loses
+    up to 0.5% of value per round trip due to truncation of the exchange rate.
+    A real incident: a multi-currency wallet that stored intermediate EUR-to-BRL
+    conversions at 2 decimals experienced R$0.02 discrepancies on every round-trip
+    for amounts under R$1, creating a systematic ledger imbalance of R$200/day on
+    10K daily conversions.
+  how_to_do_right: |
+    1. Store exchange rates at 8 decimal places minimum (e.g., "5.12345678")
+    2. During conversion, use localcontext(prec=50) for the multiplication
+    3. Quantize the intermediate to 8 decimals after multiplication
+    4. Quantize to target currency precision only for the final output:
+       with localcontext() as ctx:
+           ctx.prec = 50
+           intermediate = brl_amount * exchange_rate   # 50-digit precision
+       usd_result = intermediate.quantize(Decimal("0.01"))
+    5. Store both the exchange rate used and the intermediate value in the FX log
+    6. Provide a reconciliation endpoint that recomputes conversions from stored rates
+  severity: high
+  technologies:
+    lang: [python]
+    framework: []
+  domains:
+    domain: [fintech, fx, crypto]
+    concern: [financial_precision, multi_currency]
+  example_good: |
+    from decimal import Decimal, localcontext, ROUND_HALF_EVEN
+
+    CENT = Decimal("0.01")
+
+    def convert_brl_to_usd(brl: Decimal, rate: Decimal) -> Decimal:
+        """rate: how many USD per 1 BRL. Uses 50-digit precision for intermediate."""
+        with localcontext() as ctx:
+            ctx.prec = 50
+            intermediate = brl * rate  # high precision intermediate
+        return intermediate.quantize(CENT, rounding=ROUND_HALF_EVEN)
+
+    # rate stored as "0.19523456" (8 decimals)
+    usd = convert_brl_to_usd(Decimal("1000.00"), Decimal("0.19523456"))
+    # intermediate: full precision; result: rounded to $0.01
+  example_bad: |
+    # WRONG: using float for FX conversion
+    def bad_fx(brl: float, rate: float) -> float:
+        return round(brl * rate, 2)
+    # float precision loss in rate multiplication + rounding compounds
+    # round-trip conversion BRL→USD→BRL can lose $0.01–$0.05 per transaction
+  when_applies: >
+    Any system that converts between currencies, including fiat-to-crypto, FX hedging
+    platforms, multi-currency invoicing, and international marketplace payouts.
+  sources:
+    - "Python docs — localcontext: https://docs.python.org/3/library/decimal.html#decimal.localcontext"
+    - "IEEE 754-2008 — Guard digits and rounding in multi-step operations"
+
+- id: FROUND-011
+  text: >
+    Test financial rounding functions with property-based tests that assert
+    conservation invariants: total_in == total_out for splits, fee + net == gross
+    for fee calculations. Use hypothesis to generate adversarial edge cases at
+    half-cent boundaries that manual tests miss.
+  why: >
+    Unit tests with hand-picked values only test the examples the developer thought
+    of. Half-cent boundary cases (e.g., $1.005, $99.995) are the exact values that
+    expose rounding mode errors, but developers rarely include them. Property-based
+    testing with hypothesis generates thousands of such cases automatically.
+    A team that added hypothesis tests to their existing payout code found 3 hidden
+    rounding bugs within 10 minutes that had been in production for 8 months.
+  how_to_do_right: |
+    1. Install hypothesis: pip install hypothesis
+    2. Write conservation property tests:
+       @given(
+           total=st.decimals(min_value=Decimal("0.01"), max_value=Decimal("100000.00"),
+                             places=2, allow_nan=False, allow_infinity=False),
+           n=st.integers(min_value=2, max_value=10)
+       )
+       def test_split_conservation(total, n):
+           parts = split_payout(total, [Decimal(1)] * n)
+           assert sum(parts) == total
+    3. Test fee-first invariant with hypothesis across all amounts
+    4. Test currency quantize round-trips: quantize(x, "BRL") == x for already-rounded values
+    5. Add a regression test for every production rounding bug found
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pytest, hypothesis]
+  domains:
+    domain: [fintech, testing]
+    concern: [financial_precision, test_quality]
+  example_good: |
+    from decimal import Decimal
+    from hypothesis import given, settings
+    from hypothesis import strategies as st
+    import pytest
+
+    # Property: for all valid amounts and split counts, total is conserved
+    @given(
+        total=st.decimals(
+            min_value=Decimal("0.01"),
+            max_value=Decimal("1000000.00"),
+            places=2,
+            allow_nan=False,
+            allow_infinity=False,
+        ),
+        n=st.integers(min_value=2, max_value=20),
+    )
+    @settings(max_examples=500)
+    def test_split_payout_conservation(total, n):
+        weights = [Decimal("1")] * n
+        parts = split_payout(total, weights)
+        assert sum(parts) == total, f"Conservation violated: sum={sum(parts)}, total={total}"
+        assert all(p >= Decimal("0") for p in parts), "Negative share detected"
+  example_bad: |
+    # INSUFFICIENT: only manual examples — misses boundary cases
+    def test_split():
+        assert split_payout(Decimal("10.00"), [Decimal(1)] * 3) == [
+            Decimal("3.33"), Decimal("3.33"), Decimal("3.34")
+        ]
+        # Does not test Decimal("10.015") / 3 — a half-cent boundary case
+  when_applies: >
+    All financial calculation functions before production deployment. Run hypothesis
+    tests in CI with max_examples=500; increase to 5000 for pre-release audits.
+  sources:
+    - "Hypothesis docs — Decimal strategy: https://hypothesis.readthedocs.io/en/latest/data.html#hypothesis.strategies.decimals"
+    - "Real Python — Property-based testing: https://realpython.com/hypothesis-python/"
+
+- id: FROUND-012
+  text: >
+    For P&L (profit and loss) calculations, always compute realized P&L as
+    (exit_price - entry_price) * quantity using full Decimal precision, then
+    quantize only the final P&L figure. Never quantize entry_price or exit_price
+    before computing the spread — price precision is typically 4-6 decimal places
+    in FX and 8 in crypto.
+  why: >
+    Rounding entry and exit prices to 2 decimals before computing P&L can introduce
+    errors of up to 0.01 * quantity per trade. For a 10,000-share position, this
+    means up to $100 of P&L error per trade. A Brazilian equities broker that rounded
+    prices to R$0.01 before P&L computation reported R$45K monthly P&L discrepancy
+    against the B3 clearing house settlement, requiring a manual adjustment process.
+  how_to_do_right: |
+    1. Store prices at exchange native precision (B3: R$0.01, Nasdaq: $0.0001, crypto: 8+ decimals)
+    2. Compute P&L at full price precision:
+       pnl = (exit_price - entry_price) * quantity
+    3. Quantize pnl to display precision (typically 2 decimals) only at output
+    4. For tax purposes (IRPF on variable income), round the final P&L using ROUND_DOWN
+       per RFB Instrução Normativa 1.585
+    5. Store both raw P&L and quantized P&L in trade records
+  severity: high
+  technologies:
+    lang: [python]
+    framework: []
+  domains:
+    domain: [fintech, trading, investment]
+    concern: [financial_precision, pnl_calculation]
+  example_good: |
+    from decimal import Decimal, ROUND_HALF_EVEN, ROUND_DOWN
+
+    CENT = Decimal("0.01")
+
+    def compute_trade_pnl(
+        entry_price: Decimal,  # e.g., "52.3456" (B3 4-decimal price)
+        exit_price: Decimal,
+        quantity: Decimal,
+        for_tax: bool = False,
+    ) -> Decimal:
+        raw_pnl = (exit_price - entry_price) * quantity   # full precision
+        if for_tax:
+            # RFB IRPF: truncate P&L for tax base calculation
+            return raw_pnl.quantize(CENT, rounding=ROUND_DOWN)
+        return raw_pnl.quantize(CENT, rounding=ROUND_HALF_EVEN)
+
+    pnl = compute_trade_pnl(Decimal("52.3456"), Decimal("53.1234"), Decimal("1000"))
+    # (53.1234 - 52.3456) * 1000 = 777.80 — no intermediate rounding error
+  example_bad: |
+    # WRONG: rounding prices before P&L computation
+    def bad_pnl(entry: float, exit: float, qty: int) -> float:
+        entry_r = round(entry, 2)   # destroys sub-cent precision
+        exit_r = round(exit, 2)
+        return round((exit_r - entry_r) * qty, 2)
+    # For entry=52.3456, exit=53.1234: (53.12 - 52.35) * 1000 = 770.00 vs 777.80!
+  when_applies: >
+    Equity trading platforms, crypto exchanges, options pricing, any system that
+    computes P&L from bid/ask prices with sub-cent precision.
+  sources:
+    - "B3 — Manual de Precificação: https://www.b3.com.br/pt_br/market-data-e-indices/servicos-de-dados/market-data/"
+    - "RFB Instrução Normativa 1.585/2015 — IRPF sobre ganhos de capital em bolsa"
+    - "Python docs — decimal: https://docs.python.org/3/library/decimal.html"
+
+- id: FROUND-013
+  text: >
+    Validate payout totals with an exact Decimal equality assertion (not
+    math.isclose) after every split operation. For batch payouts, run a
+    reconciliation step that verifies sum(individual_payouts) == batch_total
+    before writing to the ledger. Treat any mismatch as a blocking error,
+    not a warning.
+  why: >
+    math.isclose uses relative tolerance, which can mask $0.01 differences on
+    large amounts and fail to catch them on small amounts. Financial reconciliation
+    must be exact — a $0.01 discrepancy in a single payout is as serious as a
+    $1,000 discrepancy because it indicates a logic error that will compound.
+    A payment platform that used math.isclose(total, sum_parts, rel_tol=1e-9)
+    passed 10K payouts with hidden 1-cent errors before an annual audit caught R$8K
+    in discrepancies.
+  how_to_do_right: |
+    1. After every split: assert sum(parts) == total (exact Decimal equality)
+    2. After every fee calculation: assert fee + net == gross
+    3. In batch processing:
+       batch_checksum = Decimal("0")
+       for payout in payouts:
+           batch_checksum += payout.amount
+       if batch_checksum != batch_total:
+           raise ReconciliationError(
+               f"Batch reconciliation failed: "
+               f"sum={batch_checksum}, expected={batch_total}, "
+               f"delta={batch_checksum - batch_total}"
+           )
+    4. Log the delta for all mismatches — even ones you handle
+    5. NEVER use math.isclose, ==pytest.approx, or float comparison for money
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: []
+  domains:
+    domain: [fintech, payments, reconciliation]
+    concern: [data_integrity, financial_precision]
+  example_good: |
+    from decimal import Decimal
+
+    class ReconciliationError(Exception):
+        pass
+
+    def reconcile_batch(payouts: list[Decimal], expected_total: Decimal) -> None:
+        """Raises ReconciliationError if batch does not sum to expected_total exactly."""
+        actual_total = sum(payouts, Decimal("0"))
+        if actual_total != expected_total:
+            delta = actual_total - expected_total
+            raise ReconciliationError(
+                f"Batch reconciliation failed: computed={actual_total}, "
+                f"expected={expected_total}, delta={delta}"
+            )
+
+    payouts = [Decimal("33.33"), Decimal("33.33"), Decimal("33.34")]
+    reconcile_batch(payouts, Decimal("100.00"))  # passes
+  example_bad: |
+    import math
+    # WRONG: tolerance-based comparison for money
+    def bad_reconcile(payouts: list[float], expected: float) -> bool:
+        return math.isclose(sum(payouts), expected, rel_tol=1e-9)
+        # math.isclose(99.99, 100.0, rel_tol=1e-9) returns False for this case,
+        # but for larger amounts the relative tolerance is too loose
+        # e.g., math.isclose(99999.99, 100000.0, rel_tol=1e-4) = True!
+  when_applies: >
+    Every batch payout, split calculation, and ledger entry. Reconciliation must
+    be run before writing to the database, not after.
+  sources:
+    - "Python docs — decimal: https://docs.python.org/3/library/decimal.html"
+    - "BACEN — Resolução CMN 3.694/2009 — controles internos em sistemas de pagamento"
+
+- id: FROUND-014
+  text: >
+    In payout systems, never perform division to derive a unit price from a total.
+    Instead, derive the total from unit prices. If you must divide (e.g., pro-rata
+    refunds), use the dust-to-last pattern and validate that no individual share
+    is negative — a sign of edge cases with very small totals and many recipients.
+  why: >
+    Division of a Decimal total by N to get unit price is non-reversible at 2-decimal
+    precision: Decimal("10.00") / 3 = Decimal("3.33333..."), and 3 * Decimal("3.33") =
+    Decimal("9.99") — the multiplication doesn't reproduce the original total. This
+    is the root cause of most payout reconciliation bugs. Always work in the direction
+    total = sum(parts), not parts = total / N.
+  how_to_do_right: |
+    1. Prefer: total = sum(unit_price * qty_i for each recipient)
+    2. If you must split: use split_payout() with dust-to-last
+    3. After division, always verify: sum(parts) == total
+    4. Check for zero or negative shares:
+       assert all(p > Decimal("0") for p in parts), "Zero or negative share detected"
+    5. For very small totals (< N * min_unit), raise an explicit error:
+       if total < Decimal("0.01") * len(recipients):
+           raise ValueError(f"Total {total} too small to split among {len(recipients)}")
+  severity: high
+  technologies:
+    lang: [python]
+    framework: []
+  domains:
+    domain: [fintech, payments, marketplace]
+    concern: [financial_precision, edge_cases]
+  example_good: |
+    from decimal import Decimal
+
+    CENT = Decimal("0.01")
+
+    def pro_rata_refund(
+        total_refund: Decimal,
+        original_payments: list[Decimal],
+    ) -> list[Decimal]:
+        """Pro-rata refund proportional to original payment amounts."""
+        grand_total = sum(original_payments)
+        if grand_total == Decimal("0"):
+            raise ValueError("Cannot pro-rata from zero total")
+        if total_refund < CENT * len(original_payments):
+            raise ValueError(f"Refund {total_refund} too small for {len(original_payments)} recipients")
+
+        refunds = []
+        running = Decimal("0")
+        for payment in original_payments[:-1]:
+            share = (total_refund * payment / grand_total).quantize(CENT)
+            refunds.append(share)
+            running += share
+        refunds.append(total_refund - running)  # dust to last
+        assert sum(refunds) == total_refund
+        return refunds
+  example_bad: |
+    # WRONG: equal division without dust handling
+    def bad_refund(total: float, n: int) -> list[float]:
+        return [round(total / n, 2)] * n
+    # bad_refund(10.00, 3) = [3.33, 3.33, 3.33] → sum = 9.99
+  when_applies: >
+    Pro-rata refunds, revenue share distributions, rent splits, invoice credit notes,
+    any partial refund that must be distributed proportionally.
+  sources:
+    - "Python docs — decimal arithmetic: https://docs.python.org/3/library/decimal.html"
+    - "Stripe — Refunds: https://stripe.com/docs/refunds"
+
+- id: FROUND-015
+  text: >
+    When receiving monetary values via API (JSON, gRPC), validate that string
+    representations parse to valid Decimal without precision loss. Reject any
+    value that arrives as a JSON number (float), and document this requirement
+    explicitly in your API contract (OpenAPI spec). Use a custom Pydantic type
+    that enforces string input and Decimal storage.
+  why: >
+    JSON has no native decimal type — all numbers are IEEE 754 doubles. When a client
+    sends {"amount": 10.50}, the JSON parser may decode it as float(10.50) = 10.5,
+    which round-trips cleanly, but {"amount": 10.15} → float(10.15) =
+    10.14999999999999928... — a value that can never equal Decimal("10.15"). A
+    payment API that accepted float amounts from JavaScript clients accumulated R$23K
+    in discrepancies over 6 months because JS clients sent {"amount": 0.1 + 0.2}
+    which equaled 0.30000000000000004 in float.
+  how_to_do_right: |
+    1. Define a Pydantic type:
+       from pydantic import GetCoreSchemaHandler
+       from pydantic_core import core_schema
+
+       class DecimalStr(Decimal):
+           @classmethod
+           def __get_pydantic_core_schema__(cls, source, handler):
+               return core_schema.no_info_plain_validator_function(
+                   lambda v: cls(str(v)) if not isinstance(v, float) else
+                   (_ for _ in ()).throw(ValueError("Use string for monetary amounts, not float"))
+               )
+    2. In OpenAPI spec, mark all monetary fields as type: string, format: decimal
+    3. Validate precision: reject strings with more decimal places than the currency allows
+    4. In test suite, verify that sending a JSON float raises a validation error
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, pydantic]
+  domains:
+    domain: [fintech, api_design, payments]
+    concern: [input_validation, financial_precision]
+  example_good: |
+    from decimal import Decimal
+    from pydantic import BaseModel, field_validator
+
+    class PayoutRequest(BaseModel):
+        amount: str   # Receive as string, not float
+        currency: str
+
+        @field_validator("amount")
+        @classmethod
+        def validate_amount(cls, v: str) -> str:
+            try:
+                d = Decimal(v)
+            except Exception:
+                raise ValueError(f"Invalid decimal: {v!r}")
+            if d <= Decimal("0"):
+                raise ValueError("Amount must be positive")
+            # Validate currency-appropriate precision
+            if "." in v and len(v.split(".")[1]) > 2:
+                raise ValueError(f"BRL amounts must have at most 2 decimal places: {v}")
+            return v
+
+        @property
+        def amount_decimal(self) -> Decimal:
+            return Decimal(self.amount)
+
+    req = PayoutRequest(amount="100.50", currency="BRL")
+    assert req.amount_decimal == Decimal("100.50")
+  example_bad: |
+    class BadPayoutRequest(BaseModel):
+        amount: float   # WRONG: JSON float contamination
+        currency: str
+    # {"amount": 10.15} → amount = 10.149999999999999 in float
+    # Decimal(10.149999...) != Decimal("10.15") — reconciliation fails
+  when_applies: >
+    All API endpoints that accept monetary values. This includes internal microservice
+    APIs, not just public-facing endpoints — float contamination can originate anywhere.
+  sources:
+    - "Python docs — Decimal from string: https://docs.python.org/3/library/decimal.html#decimal.Decimal"
+    - "Pydantic v2 — validators: https://docs.pydantic.dev/latest/concepts/validators/"
+    - "JSON spec — IEEE 754 numbers: https://datatracker.ietf.org/doc/html/rfc8259#section-6"

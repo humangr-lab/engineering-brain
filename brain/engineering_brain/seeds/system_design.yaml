@@ -1,0 +1,703 @@
+layer: patterns
+technology: General
+domain: system_design
+knowledge:
+- id: CR-SYS-HSCALE-001
+  text: Horizontal Scaling — Scale stateless services by adding more instances behind a load balancer, not by upgrading to
+    bigger machines.
+  why: 'Vertical scaling (bigger machines) has a hard ceiling — the largest EC2 instance is 24TB RAM, and you hit it fast
+    with growing traffic. Worse, vertical scaling is a single point of failure: when that one big server goes down, everything
+    goes down. Horizontal scaling has no theoretical ceiling and provides redundancy — if one instance dies, others handle
+    traffic. The catch: your application MUST be stateless (no in-memory sessions, no local file writes). A startup that stored
+    sessions in memory had to do a complete architecture rewrite at 10K concurrent users because they could not add a second
+    server without losing half the sessions on every request.'
+  how_to_do_right: '1. Make services stateless: no in-memory sessions, no local file storage for user data.
+
+    2. Move state to external stores: Redis for sessions, S3 for files, PostgreSQL for data.
+
+    3. Use a load balancer (ALB, nginx, HAProxy) to distribute requests across instances.
+
+    4. Auto-scale based on CPU/memory/request-rate thresholds (AWS ASG, K8s HPA).
+
+    5. Deploy behind an immutable image (Docker container) so every instance is identical.
+
+    6. Test with at least 3 instances during development — single-instance hides statefulness bugs.
+
+    '
+  severity: critical
+  technologies:
+    platform: [aws, gcp, kubernetes, docker]
+  domains:
+    domain: [performance, infrastructure]
+    concern: [system_design, scalability]
+  example_good: "# Stateless service — any instance can handle any request\nclass OrderService:\n    def __init__(self, db:\
+    \ Database, cache: Redis, storage: S3Client):\n        self.db = db         # External state: PostgreSQL\n        self.cache\
+    \ = cache   # External state: Redis\n        self.storage = storage  # External state: S3\n\n    def create_order(self,\
+    \ request: CreateOrderRequest) -> Order:\n        order = Order.create(request)\n        self.db.save(order)\n       \
+    \ self.cache.set(f\"order:{order.id}\", order.to_json(), ex=3600)\n        return order\n\n# kubernetes/deployment.yaml\n\
+    # replicas: 3  (can scale to 100 with HPA)\n# Each instance connects to same Redis/Postgres/S3\n"
+  example_bad: "# Stateful service — CANNOT scale horizontally\nclass OrderService:\n    orders_cache = {}  # In-memory dict\
+    \ — lost on restart, not shared between instances\n\n    def create_order(self, request):\n        order = Order.create(request)\n\
+    \        self.orders_cache[order.id] = order  # Only THIS instance has it\n        # Instance A gets the create, Instance\
+    \ B gets the read → 404\n        return order\n\n    def save_receipt(self, order_id: str, pdf: bytes):\n        with\
+    \ open(f\"/tmp/receipts/{order_id}.pdf\", \"wb\") as f:\n            f.write(pdf)  # Local file — not available on other\
+    \ instances\n"
+  sources: ["https://martinfowler.com/articles/patterns-of-distributed-systems/"]
+  when_applies: "When designing stateless services that need to handle growing traffic loads"
+- id: CR-SYS-SHARD-001
+  text: Database Sharding — Partition data across multiple database instances using a deterministic shard key to distribute
+    write load.
+  why: 'A single PostgreSQL instance tops out at ~50K write TPS on expensive hardware. When you hit that ceiling, reads can
+    scale with replicas but writes cannot — they all go to one primary. Sharding splits data so each shard handles a fraction
+    of writes. The shard key choice is critical: a bad key (like date) creates hot shards where one shard gets all recent
+    writes. A good key (like user_id) distributes evenly. Resharding (changing the number of shards) is extremely painful
+    — plan capacity 2-3 years ahead.'
+  how_to_do_right: '1. Choose a shard key that distributes writes evenly (user_id, tenant_id — NOT timestamp).
+
+    2. Hash-based sharding: shard = hash(key) % num_shards. Even distribution, hard to range-query.
+
+    3. Range-based sharding: shard by key ranges. Good for range queries, risk of hot spots.
+
+    4. Geographic sharding: shard by region. Good for data locality and compliance (GDPR).
+
+    5. Plan for 2-3x growth: resharding requires data migration and is risky in production.
+
+    6. Cross-shard queries are expensive — design your data model to keep related data on same shard.
+
+    '
+  severity: high
+  technologies:
+    platform: [postgresql, mysql, mongodb, vitess, cockroachdb]
+  domains:
+    domain: [architecture, performance]
+    concern: [system_design, data, database, scalability]
+  example_good: "# Hash-based sharding with consistent hashing\nimport hashlib\n\nNUM_SHARDS = 16\n\ndef get_shard(user_id:\
+    \ str) -> int:\n    \"\"\"Deterministic shard assignment — same user always goes to same shard.\"\"\"\n    hash_val =\
+    \ int(hashlib.sha256(user_id.encode()).hexdigest(), 16)\n    return hash_val % NUM_SHARDS\n\ndef get_db_connection(user_id:\
+    \ str) -> Connection:\n    shard = get_shard(user_id)\n    return connection_pool[f\"shard_{shard}\"]\n\n# All data for\
+    \ user_id=abc123 lives on the same shard\n# Queries within one user are single-shard (fast)\nconn = get_db_connection(\"\
+    abc123\")\nconn.execute(\"SELECT * FROM orders WHERE user_id = %s\", (\"abc123\",))\n"
+  example_bad: "# Sharding by timestamp — creates massive hot spot\ndef get_shard(created_at: datetime) -> int:\n    return\
+    \ created_at.month % NUM_SHARDS\n    # January: all writes go to shard 1\n    # Current month ALWAYS gets 100% of writes\
+    \ → defeats the purpose\n    # Old shards sit idle, current shard is overloaded\n\n# Sharding by first letter of name\n\
+    def get_shard(name: str) -> int:\n    return ord(name[0]) % NUM_SHARDS\n    # Letters are not uniformly distributed —\
+    \ 'S' shard gets 10x more than 'X'\n"
+  sources: ["https://www.mongodb.com/docs/manual/sharding/"]
+  when_applies: "When a single database can no longer handle the volume of reads, writes, or storage"
+- id: CR-SYS-REPLICA-001
+  text: Read Replicas — Scale read-heavy workloads by replicating the primary database to multiple read-only followers.
+  why: Most applications are 90%+ reads. A single primary database handling both reads and writes wastes its write capacity
+    on SELECT queries. Read replicas handle reads independently, linearly scaling read throughput. The tradeoff is replication
+    lag — a write to the primary might take 10-100ms to appear on replicas. If a user creates an order and immediately views
+    it, the replica might not have it yet. This read-after-write consistency problem has caused countless 'my order disappeared'
+    support tickets.
+  how_to_do_right: '1. Route writes to the primary, reads to replicas (connection-level routing).
+
+    2. Handle read-after-write: route reads to primary for N seconds after a write by the same user.
+
+    3. Monitor replication lag — alert if lag exceeds your consistency SLA (e.g., >1 second).
+
+    4. Use connection pooling (PgBouncer) in front of replicas to handle connection limits.
+
+    5. Replica count: start with 2 (for redundancy), scale based on read QPS.
+
+    6. Cross-region replicas for geographic read performance (but higher replication lag).
+
+    '
+  severity: high
+  technologies:
+    platform: [postgresql, mysql, aws, aurora, rds]
+  domains:
+    domain: [architecture, performance]
+    concern: [system_design, data, database, scalability]
+  example_good: "# Router sends writes to primary, reads to replicas\nclass DatabaseRouter:\n    def __init__(self, primary:\
+    \ str, replicas: list[str]):\n        self.primary = create_engine(primary)\n        self.replicas = [create_engine(r)\
+    \ for r in replicas]\n        self._replica_index = 0\n\n    def get_writer(self) -> Engine:\n        return self.primary\n\
+    \n    def get_reader(self) -> Engine:\n        # Round-robin across replicas\n        engine = self.replicas[self._replica_index\
+    \ % len(self.replicas)]\n        self._replica_index += 1\n        return engine\n\n# Read-after-write consistency: use\
+    \ primary for reads within 5s of a write\nclass ConsistentRouter(DatabaseRouter):\n    def get_reader(self, user_id: str)\
+    \ -> Engine:\n        last_write = self.cache.get(f\"write:{user_id}\")\n        if last_write and time.time() - float(last_write)\
+    \ < 5:\n            return self.primary  # Route to primary for fresh data\n        return super().get_reader()\n"
+  example_bad: "# All queries go to primary — replicas sit idle\ndb = create_engine(\"postgresql://primary:5432/mydb\")\n\n\
+    def get_orders(user_id: str):\n    return db.execute(\"SELECT * FROM orders WHERE user_id = %s\", (user_id,))\n    # This\
+    \ SELECT competes with INSERTs/UPDATEs for primary's resources\n    # At 10K reads/sec, the primary is overwhelmed and\
+    \ writes slow down\n"
+  sources: ["https://www.postgresql.org/docs/current/high-availability.html"]
+  when_applies: "When read traffic significantly exceeds write traffic and a single database is a bottleneck"
+- id: CR-SYS-CONNPOOL-001
+  text: Connection Pooling — Reuse database connections through a pool instead of opening a new connection per request.
+  why: Opening a PostgreSQL connection takes 50-100ms (TCP handshake + TLS + auth + forking a backend process). A web server
+    handling 1000 requests/second would need 1000 connections — but PostgreSQL defaults to max_connections=100 and performs
+    badly beyond ~300. Connection pooling (PgBouncer, ProxySQL) maintains a pool of persistent connections and multiplexes
+    client requests across them. Without pooling, you either exhaust connections and get 'too many connections' errors, or
+    waste 10%+ of response time on connection setup.
+  how_to_do_right: '1. Use a connection pooler: PgBouncer (PostgreSQL), ProxySQL (MySQL), or built-in (SQLAlchemy pool).
+
+    2. Pool size = 2 * CPU cores + effective_spindle_count (roughly 10-20 per app instance).
+
+    3. Transaction-mode pooling for best performance (connection returned after each transaction).
+
+    4. Session-mode pooling when using prepared statements or SET commands.
+
+    5. Set pool_timeout (how long to wait for a connection) and max_overflow (burst capacity).
+
+    6. Monitor: pool_size, checked_out, overflow, wait_time. Alert on saturation.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy]
+    library: [pgbouncer]
+    platform: [postgresql, mysql]
+  domains:
+    domain: [architecture, performance]
+    concern: [system_design, data, database]
+  example_good: "from sqlalchemy import create_engine\n\nengine = create_engine(\n    \"postgresql://user:pass@pgbouncer:6432/mydb\"\
+    ,\n    pool_size=20,           # Persistent connections in pool\n    max_overflow=10,        # Burst connections beyond\
+    \ pool_size\n    pool_timeout=30,        # Wait 30s for connection before error\n    pool_recycle=1800,      # Recycle\
+    \ connections after 30 minutes\n    pool_pre_ping=True,     # Verify connection is alive before using\n)\n\n# Connection\
+    \ is borrowed from pool, used, and returned automatically\nwith engine.connect() as conn:\n    result = conn.execute(text(\"\
+    SELECT * FROM users WHERE id = :id\"), {\"id\": uid})\n"
+  example_bad: "import psycopg2\n\ndef get_user(user_id: str):\n    # NEW connection for EVERY request — 50-100ms overhead\
+    \ each time\n    conn = psycopg2.connect(\"dbname=mydb user=admin\")\n    cursor = conn.cursor()\n    cursor.execute(\"\
+    SELECT * FROM users WHERE id = %s\", (user_id,))\n    result = cursor.fetchone()\n    conn.close()  # Connection destroyed\
+    \ — next request pays setup cost again\n    return result\n    # At 1000 req/sec: 1000 concurrent connections → PostgreSQL\
+    \ collapses\n"
+  sources: ["https://www.pgbouncer.org/config.html"]
+  when_applies: "When managing database connections in applications with many concurrent requests"
+- id: CR-SYS-LBALG-001
+  text: 'Load Balancing Algorithms — Choose the algorithm based on your workload: round-robin for uniform requests, least-connections
+    for variable latency, consistent-hash for caching.'
+  why: Round-robin sends requests 1-2-3-1-2-3 regardless of server load. If server 2 is processing a slow database query,
+    it still gets the next request, creating a pile-up. Least-connections sends to the server with fewest active connections,
+    naturally avoiding overloaded servers. Consistent hashing routes the same key (user_id, session) to the same server, enabling
+    local caching — but if that server dies, only its portion of traffic is redistributed. A video streaming service switched
+    from round-robin to least-connections and reduced P99 latency by 40% because long video transcoding requests stopped pile-up
+    on single servers.
+  how_to_do_right: '1. Round-robin: good default when requests are uniform and fast (<50ms).
+
+    2. Least-connections: best for variable-latency workloads (API backends, databases).
+
+    3. Weighted round-robin: when servers have different capacities (4-core vs 8-core).
+
+    4. Consistent hashing: when you need session affinity or per-server caching.
+
+    5. Random with two choices ("power of two"): simple, performs near-optimal, no state needed.
+
+    6. Configure health checks: remove unhealthy servers from rotation within seconds.
+
+    '
+  severity: high
+  technologies:
+    library: [aws alb]
+    platform: [nginx, haproxy, envoy]
+  domains:
+    domain: [infrastructure, performance]
+    concern: [system_design, networking]
+  example_good: "# nginx.conf — least connections for API backend\nupstream api_backend {\n    least_conn;               \
+    \           # Route to least busy server\n    server api-1.internal:8080 weight=3; # 8-core: higher weight\n    server\
+    \ api-2.internal:8080 weight=2; # 4-core: lower weight\n    server api-3.internal:8080 weight=2;\n}\n\nserver {\n    location\
+    \ /api/ {\n        proxy_pass http://api_backend;\n        proxy_connect_timeout 5s;\n        proxy_read_timeout 30s;\n\
+    \    }\n}\n"
+  example_bad: "# Round-robin for variable-latency workload — creates pile-ups\nupstream api_backend {\n    server api-1.internal:8080;\
+    \  # Currently processing 50 slow queries\n    server api-2.internal:8080;  # Idle\n    server api-3.internal:8080;  #\
+    \ Idle\n    # Round-robin sends NEXT request to api-1 even though it's overloaded\n    # No health checks — if api-2 is\
+    \ down, requests timeout silently\n}\n"
+  sources: ["https://nginx.org/en/docs/http/load_balancing.html"]
+  when_applies: "When choosing load balancing algorithms for distributing traffic across backend instances"
+- id: CR-SYS-LBHEALTH-001
+  text: Health Checks — Configure both active (periodic probe) and passive (request-based) health checks to remove failing
+    servers from rotation.
+  why: 'Without health checks, a load balancer sends traffic to dead servers, causing timeouts and errors for users. Active
+    health checks probe servers periodically (e.g., GET /healthz every 5s) and remove servers that fail N consecutive checks.
+    Passive health checks monitor real traffic and remove servers that return too many 5xx errors. You need both: active catches
+    servers that are completely down, passive catches servers that are up but failing requests (e.g., database connection
+    lost, disk full). A payment processor without health checks sent 33% of transactions to a server with a broken database
+    connection for 8 minutes before anyone noticed.'
+  how_to_do_right: '1. Implement a /healthz endpoint that checks critical dependencies (DB, Redis, disk space).
+
+    2. /healthz should return 200 when healthy, 503 when degraded. Include dependency status in body.
+
+    3. Active check interval: 5-10 seconds. Mark unhealthy after 3 consecutive failures.
+
+    4. Mark healthy after 2 consecutive successes (prevent flapping).
+
+    5. Passive checks: mark unhealthy after 5 errors in 10 seconds on real traffic.
+
+    6. Deep health vs shallow health: /healthz checks deps, /readyz checks if ready for traffic.
+
+    '
+  severity: critical
+  technologies:
+    library: [aws alb]
+    platform: [nginx, haproxy, kubernetes]
+  domains:
+    domain: [reliability, observability]
+    concern: [system_design, monitoring]
+  example_good: "# Deep health check endpoint — verifies actual dependencies\n@app.get(\"/healthz\")\nasync def health_check():\n\
+    \    checks = {}\n    try:\n        await db.execute(text(\"SELECT 1\"))\n        checks[\"database\"] = \"ok\"\n    except\
+    \ Exception as e:\n        checks[\"database\"] = f\"failed: {e}\"\n\n    try:\n        await redis.ping()\n        checks[\"\
+    redis\"] = \"ok\"\n    except Exception as e:\n        checks[\"redis\"] = f\"failed: {e}\"\n\n    healthy = all(v ==\
+    \ \"ok\" for v in checks.values())\n    return JSONResponse(\n        status_code=200 if healthy else 503,\n        content={\"\
+    status\": \"healthy\" if healthy else \"degraded\", \"checks\": checks}\n    )\n\n# nginx health check configuration\n\
+    # upstream api { server api-1:8080; server api-2:8080; }\n# health_check interval=5s fails=3 passes=2 uri=/healthz;\n"
+  example_bad: "# Shallow health check — lies about actual health\n@app.get(\"/healthz\")\ndef health_check():\n    return\
+    \ {\"status\": \"ok\"}  # Always returns 200 even if DB is down!\n    # Load balancer thinks server is healthy\n    #\
+    \ Real requests hit the broken DB and get 500 errors\n    # Passive health checks eventually catch it — but 100s of users\
+    \ already failed\n"
+  sources: ["https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/"]
+  when_applies: "When configuring health checks for load balancers to detect and route around failed backends"
+- id: CR-SYS-CACHE-001
+  text: Cache-Aside (Lazy Loading) — Application checks cache first; on miss, reads from DB, writes result to cache, and returns.
+  why: 'Cache-aside is the most common caching pattern because it is simple and the application controls exactly what gets
+    cached and when. The cache only contains data that has been requested (naturally warm for hot data). The tradeoff: cache
+    misses incur a triple penalty (cache lookup + DB read + cache write), and the cache can serve stale data if the DB is
+    updated without invalidating the cache. A news site using cache-aside without invalidation showed users outdated headlines
+    for up to 5 minutes after publishing because TTL was set too high.'
+  how_to_do_right: '1. Read path: check cache → on miss, read DB → write to cache → return.
+
+    2. Write path: write to DB → invalidate (delete) the cache key. Do NOT update cache on write.
+
+    3. Set TTL based on data staleness tolerance (5min for news, 1hr for product catalog).
+
+    4. Use consistent key naming: f"{entity}:{id}" (e.g., "user:abc123").
+
+    5. Handle cache failures gracefully — fall back to DB (cache is an optimization, not a requirement).
+
+    6. Monitor cache hit rate — below 80% means your TTL or key strategy needs work.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    platform: [redis, memcached]
+  domains:
+    domain: [performance]
+    concern: [system_design, caching]
+  example_good: "class UserRepository:\n    def __init__(self, db: Database, cache: Redis):\n        self.db = db\n      \
+    \  self.cache = cache\n        self.TTL = 3600  # 1 hour\n\n    def get_user(self, user_id: str) -> User | None:\n   \
+    \     # 1. Check cache\n        cached = self.cache.get(f\"user:{user_id}\")\n        if cached:\n            return User.from_json(cached)\n\
+    \n        # 2. Cache miss — read from DB\n        user = self.db.query(User).get(user_id)\n        if user:\n        \
+    \    # 3. Populate cache for next time\n            self.cache.set(f\"user:{user_id}\", user.to_json(), ex=self.TTL)\n\
+    \        return user\n\n    def update_user(self, user_id: str, data: dict) -> User:\n        user = self.db.query(User).get(user_id)\n\
+    \        user.update(data)\n        self.db.commit()\n        # 4. Invalidate cache — next read will get fresh data from\
+    \ DB\n        self.cache.delete(f\"user:{user_id}\")\n        return user\n"
+  example_bad: "def get_user(user_id: str):\n    # No cache — every request hits the database\n    return db.query(User).get(user_id)\n\
+    \ndef update_user(user_id: str, data: dict):\n    user = db.query(User).get(user_id)\n    user.update(data)\n    db.commit()\n\
+    \    # Update cache with new value — BUT what if DB write succeeded and\n    # cache write fails? Cache has stale data\
+    \ with no TTL to fix it.\n    cache.set(f\"user:{user_id}\", user.to_json())  # No TTL = stale forever\n"
+  sources: ["https://redis.io/docs/latest/develop/use/client-side-caching/"]
+  when_applies: "When adding caching layers to reduce database load and improve response latency"
+- id: CR-SYS-STAMPEDE-001
+  text: Thundering Herd Prevention — Use cache stampede protection (locking, probabilistic early expiry, or stale-while-revalidate)
+    to prevent simultaneous DB hits on cache expiry.
+  why: When a popular cache key expires, hundreds of concurrent requests all see a cache miss simultaneously and ALL hit the
+    database with the same query. For a product page viewed 1000 times/second, this means 1000 identical DB queries in the
+    same millisecond — potentially crashing the database. This is the thundering herd (cache stampede) problem. Black Friday
+    traffic to a product page caused a 3-minute database outage because the product cache key expired and 5000 concurrent
+    requests all queried the same row simultaneously.
+  how_to_do_right: '1. Lock-based: first request acquires a lock, others wait or serve stale data.
+
+    2. Probabilistic early expiry (PER): randomly refresh before TTL expires (XFetch algorithm).
+
+    3. Stale-while-revalidate: serve stale data immediately, refresh in background.
+
+    4. Never-expire with background refresh: cache never expires, a background job keeps it fresh.
+
+    5. Combine strategies: lock-based for low-traffic keys, PER for high-traffic keys.
+
+    6. Monitor cache miss spikes — a sudden spike on one key = stampede in progress.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    platform: [redis, memcached]
+  domains:
+    domain: [performance, reliability]
+    concern: [system_design, caching]
+  example_good: "import time, random\n\nclass StampedeProtectedCache:\n    def __init__(self, cache: Redis, db: Database):\n\
+    \        self.cache = cache\n        self.db = db\n\n    def get_or_compute(self, key: str, compute_fn, ttl: int = 3600)\
+    \ -> Any:\n        cached = self.cache.get(key)\n        if cached:\n            data = json.loads(cached)\n         \
+    \   # Probabilistic early expiry: 5% chance of refresh in last 10% of TTL\n            remaining_ttl = self.cache.ttl(key)\n\
+    \            if remaining_ttl > 0 and remaining_ttl < ttl * 0.1:\n                if random.random() < 0.05:\n       \
+    \             # Background refresh — current request still returns cached data\n                    self._refresh_in_background(key,\
+    \ compute_fn, ttl)\n            return data\n\n        # Cache miss — acquire lock to prevent stampede\n        lock =\
+    \ self.cache.lock(f\"lock:{key}\", timeout=10)\n        if lock.acquire(blocking_timeout=5):\n            try:\n     \
+    \           # Double-check: another thread may have populated cache\n                cached = self.cache.get(key)\n  \
+    \              if cached:\n                    return json.loads(cached)\n                result = compute_fn()\n    \
+    \            self.cache.set(key, json.dumps(result), ex=ttl)\n                return result\n            finally:\n  \
+    \              lock.release()\n        else:\n            # Could not acquire lock — serve stale or compute anyway\n \
+    \           return compute_fn()\n"
+  example_bad: "def get_product(product_id: str):\n    cached = cache.get(f\"product:{product_id}\")\n    if cached:\n   \
+    \     return json.loads(cached)\n    # Cache miss — NO stampede protection\n    # 1000 concurrent requests ALL execute\
+    \ this query simultaneously\n    product = db.query(Product).get(product_id)\n    cache.set(f\"product:{product_id}\"\
+    , json.dumps(product), ex=300)\n    return product\n    # When TTL expires: 1000 identical queries in 1ms → database overload\n"
+  sources: ["https://redis.io/blog/redis-cache-stampede/"]
+  when_applies: "When popular cache keys expire simultaneously causing a thundering herd to the database"
+- id: CR-SYS-MSGQ-001
+  text: Pub/Sub vs Point-to-Point — Use pub/sub (fan-out) when multiple consumers need the same message; use point-to-point
+    (work queue) when each message should be processed exactly once.
+  why: Using point-to-point when you need fan-out means building complex routing logic to duplicate messages. Using pub/sub
+    when you need exactly-once processing means multiple consumers process the same message, causing duplicate side effects
+    (double charges, double emails). A billing system accidentally used pub/sub for payment processing — both the billing
+    service and the analytics service processed the same 'charge customer' event, resulting in double charges.
+  how_to_do_right: '1. Pub/sub (topic): use when multiple independent consumers need the same event (order.created → billing
+    + analytics + email + inventory).
+
+    2. Point-to-point (queue): use when each task should be processed by exactly one worker (send email, resize image, generate
+    PDF).
+
+    3. Combine both: publish to a topic, each consumer group has its own queue (Kafka consumer groups, RabbitMQ bindings).
+
+    4. Idempotent consumers: even with point-to-point, at-least-once delivery means duplicates are possible. Design for it.
+
+    5. Dead letter queue (DLQ): messages that fail N times go to a DLQ for investigation, not dropped silently.
+
+    '
+  severity: high
+  technologies:
+    library: [redis streams]
+    platform: [kafka, rabbitmq, sqs, sns]
+  domains:
+    domain: [architecture, messaging]
+    concern: [system_design]
+  example_good: "# Pub/Sub for events (fan-out to multiple consumers)\n# order.created topic → multiple consumer groups\n\
+    async def publish_order_created(order: Order):\n    await event_bus.publish(\"order.created\", {\n        \"order_id\"\
+    : order.id,\n        \"customer_id\": order.customer_id,\n        \"total\": str(order.total),\n        \"items\": [item.to_dict()\
+    \ for item in order.items],\n    })\n\n# Consumer group: billing (processes independently)\n@consumer_group(\"billing\"\
+    )\nasync def handle_billing(event: OrderCreated):\n    await billing_service.charge(event.customer_id, event.total)\n\n\
+    # Consumer group: notifications (processes independently)\n@consumer_group(\"notifications\")\nasync def handle_notification(event:\
+    \ OrderCreated):\n    await email_service.send_confirmation(event.customer_id, event.order_id)\n\n# Point-to-point for\
+    \ tasks (exactly one worker processes each)\nasync def enqueue_pdf_generation(order_id: str):\n    await task_queue.enqueue(\"\
+    generate_pdf\", {\"order_id\": order_id})\n"
+  example_bad: "# Using pub/sub for task processing — duplicate work\nasync def process_payment(event):\n    # Both billing-worker-1\
+    \ and billing-worker-2 receive this event\n    # BOTH charge the customer → double charge!\n    await stripe.charge(event[\"\
+    customer_id\"], event[\"amount\"])\n\n# Using point-to-point for events — cannot add consumers\nasync def handle_order(message):\n\
+    \    await bill_customer(message)       # Coupled: one handler does everything\n    await send_email(message)        \
+    \   # If email fails, billing is retried too\n    await update_inventory(message)     # If inventory fails, billing is\
+    \ retried too\n    # Cannot add analytics without modifying this handler\n"
+  sources: ["https://kafka.apache.org/documentation/"]
+  when_applies: "When decoupling producers from consumers using asynchronous message queues"
+- id: CR-SYS-DLQ-001
+  text: Dead Letter Queues — Route messages that fail processing after N retries to a separate dead letter queue for investigation
+    instead of silently dropping them.
+  why: Without a DLQ, a message that causes a processing error enters an infinite retry loop (consuming resources and blocking
+    other messages) or is silently dropped (data loss). Both are production incidents. A DLQ captures the failed message with
+    its error context, allowing operators to investigate the root cause, fix the bug, and replay the messages. An e-commerce
+    company lost 3000 orders because their payment processor rejected messages with a new field, and the queue silently dropped
+    them after 3 retries.
+  how_to_do_right: '1. Configure max retries (typically 3-5) with exponential backoff between retries.
+
+    2. After max retries, move message to a DLQ (separate queue/topic) with error metadata.
+
+    3. DLQ must be monitored: alert when messages arrive. DLQ depth > 0 = something is wrong.
+
+    4. Include error details, retry count, and timestamp in the DLQ message.
+
+    5. Build a replay mechanism: after fixing the bug, replay DLQ messages to the original queue.
+
+    6. DLQ retention: keep messages for 7-14 days. Set up archival for compliance-sensitive data.
+
+    '
+  severity: high
+  technologies:
+    library: [redis streams]
+    platform: [kafka, rabbitmq, sqs]
+  domains:
+    domain: [architecture, messaging, reliability]
+    concern: [system_design]
+  example_good: "class ResilientConsumer:\n    MAX_RETRIES = 3\n    BACKOFF_BASE = 2  # seconds\n\n    async def process_with_dlq(self,\
+    \ message: Message):\n        retries = message.metadata.get(\"retry_count\", 0)\n        try:\n            await self.handler(message)\n\
+    \            await message.ack()\n        except Exception as e:\n            if retries >= self.MAX_RETRIES:\n      \
+    \          # Move to DLQ with full error context\n                await self.dlq.publish({\n                    \"original_message\"\
+    : message.body,\n                    \"error\": str(e),\n                    \"traceback\": traceback.format_exc(),\n\
+    \                    \"retry_count\": retries,\n                    \"failed_at\": datetime.utcnow().isoformat(),\n  \
+    \                  \"queue\": message.source_queue,\n                })\n                await message.ack()  # Remove\
+    \ from main queue\n                logger.error(f\"Message sent to DLQ after {retries} retries: {e}\")\n            else:\n\
+    \                # Retry with exponential backoff\n                delay = self.BACKOFF_BASE ** retries\n            \
+    \    await message.nack(requeue=True, delay=delay)\n"
+  example_bad: "async def process_message(message):\n    try:\n        await handler(message)\n    except Exception:\n   \
+    \     pass  # Silently swallow error — message is lost forever!\n\n# Or worse: infinite retry without backoff\nasync def\
+    \ process_message(message):\n    while True:\n        try:\n            await handler(message)\n            break\n  \
+    \      except Exception:\n            await asyncio.sleep(1)  # Infinite loop on poison messages\n            # Blocks\
+    \ the consumer — no other messages processed\n"
+  sources: ["https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html"]
+  when_applies: "When handling messages that repeatedly fail processing in queue-based systems"
+- id: CR-SYS-APIVER-001
+  text: API Versioning — Version your API from day one using URL path versioning (/v1/) for public APIs and header versioning
+    for internal APIs.
+  why: 'Without versioning, every breaking change forces all clients to update simultaneously — which is impossible for public
+    APIs with external consumers. URL path versioning (/v1/users) is the most visible and debuggable approach — you can see
+    the version in access logs, browser URLs, and curl commands. Header versioning (Accept: application/vnd.api+json;version=2)
+    is cleaner but invisible in logs and harder to test. A fintech company shipped a breaking API change without versioning
+    and broke 47 partner integrations simultaneously, causing a 24-hour escalation.'
+  how_to_do_right: '1. URL path versioning for public/partner APIs: /api/v1/users, /api/v2/users.
+
+    2. Header versioning for internal APIs: Accept: application/vnd.myapp.v2+json.
+
+    3. Support at least N-1 versions. Deprecation timeline: announce 6 months before removal.
+
+    4. Breaking changes = new version. Additive changes (new fields) = same version.
+
+    5. Default to latest version for new clients, pin version for existing integrations.
+
+    6. Document migration guide for each version bump. Include before/after examples.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, flask, backend, express]
+    platform: [rest]
+  domains:
+    domain: [architecture, api]
+    concern: [system_design, compatibility]
+  example_good: "# FastAPI with URL path versioning\nfrom fastapi import APIRouter\n\nv1_router = APIRouter(prefix=\"/api/v1\"\
+    )\nv2_router = APIRouter(prefix=\"/api/v2\")\n\n@v1_router.get(\"/users/{user_id}\")\ndef get_user_v1(user_id: str):\n\
+    \    \"\"\"V1: Returns flat user object.\"\"\"\n    user = user_service.get(user_id)\n    return {\"id\": user.id, \"\
+    name\": user.name, \"email\": user.email}\n\n@v2_router.get(\"/users/{user_id}\")\ndef get_user_v2(user_id: str):\n  \
+    \  \"\"\"V2: Returns nested user object with profile.\"\"\"\n    user = user_service.get(user_id)\n    return {\n    \
+    \    \"id\": user.id,\n        \"profile\": {\"name\": user.name, \"email\": user.email, \"avatar\": user.avatar_url},\n\
+    \        \"metadata\": {\"created_at\": user.created_at.isoformat()},\n    }\n\n# Both versions coexist — clients migrate\
+    \ at their own pace\napp.include_router(v1_router)\napp.include_router(v2_router)\n"
+  example_bad: "# No versioning — every change breaks all clients\n@app.get(\"/api/users/{user_id}\")\ndef get_user(user_id:\
+    \ str):\n    user = user_service.get(user_id)\n    # V1: returned {\"name\": \"...\"} (string)\n    # V2: changed to {\"\
+    name\": {\"first\": \"...\", \"last\": \"...\"}} (object)\n    # ALL clients parsing name as string break immediately\n\
+    \    return {\"name\": {\"first\": user.first_name, \"last\": user.last_name}}\n"
+  sources: ["https://stripe.com/docs/api/versioning"]
+  when_applies: "When evolving API contracts without breaking existing clients"
+- id: CR-SYS-PAGINATION-001
+  text: Cursor-Based Pagination — Use cursor-based (keyset) pagination for real-time data with frequent inserts; use offset
+    pagination only for static datasets.
+  why: Offset pagination (LIMIT 20 OFFSET 1000) scans and discards 1000 rows before returning 20. At page 500, the database
+    scans 10,000 rows and discards 9,980. Performance degrades linearly with page depth. Worse, if new rows are inserted between
+    page requests, users see duplicate or missing items. Cursor-based pagination (WHERE id > :last_seen_id LIMIT 20) uses
+    an indexed column as a bookmark, maintaining O(1) performance at any depth and stable results during inserts. Twitter,
+    Stripe, and Slack all use cursor-based pagination for their APIs.
+  how_to_do_right: '1. Cursor-based: use an indexed column (id, created_at) as the cursor. Return next_cursor in response.
+
+    2. Encode cursors as opaque tokens (base64 of the value) so clients cannot guess or manipulate them.
+
+    3. Support forward and backward pagination: after/before cursors.
+
+    4. Return has_next_page and has_previous_page booleans for UI navigation.
+
+    5. Offset pagination is OK for: admin dashboards, search results, static reports.
+
+    6. Default page size: 20-50 items. Max page size: 100. Enforce server-side limits.
+
+    '
+  severity: high
+  technologies:
+    lang: [graphql, python]
+    framework: [fastapi]
+    platform: [postgresql, rest]
+  domains:
+    domain: [architecture, api, performance]
+    concern: [system_design]
+  example_good: "import base64\nfrom datetime import datetime\n\n@app.get(\"/api/v1/orders\")\ndef list_orders(after: str\
+    \ | None = None, limit: int = 20):\n    limit = min(limit, 100)  # Server-side cap\n\n    query = db.query(Order).order_by(Order.created_at.desc())\n\
+    \    if after:\n        cursor_value = base64.b64decode(after).decode()\n        cursor_time = datetime.fromisoformat(cursor_value)\n\
+    \        query = query.filter(Order.created_at < cursor_time)\n\n    orders = query.limit(limit + 1).all()  # Fetch one\
+    \ extra to check has_next\n    has_next = len(orders) > limit\n    orders = orders[:limit]\n\n    next_cursor = None\n\
+    \    if has_next and orders:\n        next_cursor = base64.b64encode(\n            orders[-1].created_at.isoformat().encode()\n\
+    \        ).decode()\n\n    return {\n        \"data\": [o.to_dict() for o in orders],\n        \"pagination\": {\"next_cursor\"\
+    : next_cursor, \"has_next_page\": has_next},\n    }\n"
+  example_bad: "@app.get(\"/api/v1/orders\")\ndef list_orders(page: int = 1, limit: int = 20):\n    offset = (page - 1) *\
+    \ limit\n    # At page 500: SELECT * FROM orders OFFSET 10000 LIMIT 20\n    # Database scans 10,020 rows, discards 10,000\n\
+    \    # Takes 2 seconds instead of 2 milliseconds\n    orders = db.query(Order).offset(offset).limit(limit).all()\n   \
+    \ # If new orders are inserted between page 1 and page 2 requests,\n    # user sees duplicate orders or misses orders\
+    \ entirely\n    return {\"data\": [o.to_dict() for o in orders], \"page\": page}\n"
+  sources: ["https://www.postgresql.org/docs/current/queries-limit.html"]
+  when_applies: "When designing APIs that return large result sets to clients"
+- id: CR-SYS-IDEMPOTENT-001
+  text: Idempotency Keys — Make non-idempotent operations (POST, payment charges) safe to retry by accepting a client-generated
+    idempotency key.
+  why: 'Networks are unreliable. A client sends a POST /charges request, the server processes it and charges the customer,
+    but the response is lost due to a network timeout. The client retries, and without idempotency protection, the customer
+    is charged twice. Stripe processes billions of dollars and requires idempotency keys on all charge requests. Without them,
+    every network hiccup is a potential double-charge. The fix is simple: the server stores the result keyed by the idempotency
+    key and returns the stored result on retry.'
+  how_to_do_right: '1. Accept an Idempotency-Key header (UUID generated by the client).
+
+    2. Before processing, check if the key already has a stored result.
+
+    3. If found: return the stored result (same status code, same body). Do NOT reprocess.
+
+    4. If not found: process the request, store the result with the key, return the result.
+
+    5. Key storage: Redis with TTL (24-48 hours) or a database table.
+
+    6. The key should be scoped per user/account to prevent cross-user collisions.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, flask]
+    platform: [rest, redis]
+  domains:
+    domain: [architecture, api, reliability]
+    concern: [system_design]
+  example_good: "@app.post(\"/api/v1/charges\")\nasync def create_charge(\n    body: ChargeRequest,\n    idempotency_key:\
+    \ str = Header(..., alias=\"Idempotency-Key\"),\n    user: User = Depends(get_current_user),\n):\n    cache_key = f\"\
+    idempotency:{user.id}:{idempotency_key}\"\n\n    # Check for existing result\n    existing = await redis.get(cache_key)\n\
+    \    if existing:\n        stored = json.loads(existing)\n        return JSONResponse(\n            status_code=stored[\"\
+    status_code\"],\n            content=stored[\"body\"],\n        )\n\n    # Process the charge\n    result = await payment_service.charge(user.id,\
+    \ body.amount, body.currency)\n    response_body = {\"charge_id\": result.id, \"status\": result.status}\n\n    # Store\
+    \ result for 24 hours\n    await redis.set(cache_key, json.dumps({\n        \"status_code\": 201,\n        \"body\": response_body,\n\
+    \    }), ex=86400)\n\n    return JSONResponse(status_code=201, content=response_body)\n"
+  example_bad: "@app.post(\"/api/v1/charges\")\nasync def create_charge(body: ChargeRequest, user: User = Depends(get_current_user)):\n\
+    \    # No idempotency protection — every call creates a new charge\n    result = await payment_service.charge(user.id,\
+    \ body.amount)\n    return {\"charge_id\": result.id, \"status\": result.status}\n    # Client timeout → retry → DOUBLE\
+    \ CHARGE!\n    # 0.1% of requests fail due to network issues\n    # At 10K charges/day = 10 double charges per day = angry\
+    \ customers\n"
+  sources: ["https://stripe.com/docs/api/idempotent_requests"]
+  when_applies: "When designing APIs where clients may retry requests due to network failures"
+- id: CR-SYS-CAP-001
+  text: CAP Theorem — In a distributed system experiencing a network partition, you must choose between consistency and availability.
+    Design for your actual requirements, not theoretical ideals.
+  why: 'CAP says during a network partition (P), you get either Consistency (C) — all nodes return the same data — or Availability
+    (A) — all nodes respond to requests. You cannot have both during a partition. But partitions are rare, so the real question
+    (PACELC) is: when there is no partition, do you prefer latency or consistency? A banking system must choose consistency
+    (CP) — showing wrong balances is unacceptable. A social media feed can choose availability (AP) — showing a slightly stale
+    feed is better than showing nothing. The mistake is treating all data the same: user passwords need strong consistency;
+    ''like'' counts can be eventually consistent.'
+  how_to_do_right: '1. Classify your data by consistency requirements. Not all data needs the same level.
+
+    2. CP (consistency + partition tolerance): financial transactions, inventory counts, user auth.
+
+    3. AP (availability + partition tolerance): social feeds, analytics, caches, read-heavy content.
+
+    4. Use PACELC for non-partition scenarios: low-latency reads often prefer eventual consistency.
+
+    5. Strong consistency tools: Raft-based databases (etcd, CockroachDB), PostgreSQL with synchronous replication.
+
+    6. Eventual consistency tools: DynamoDB, Cassandra, Redis Cluster, most CDNs.
+
+    '
+  severity: high
+  technologies:
+    platform: [postgresql, dynamodb, cassandra, cockroachdb, redis]
+  domains:
+    domain: [architecture]
+    concern: [system_design, distributed_systems, consistency]
+  example_good: "# Mixed consistency model — different strategies for different data\nclass OrderSystem:\n    def __init__(self):\n\
+    \        # CP: financial data — strong consistency, synchronous replication\n        self.order_db = PostgreSQL(replication=\"\
+    synchronous\")\n\n        # AP: product views — eventual consistency, high availability\n        self.analytics_db = DynamoDB(consistency=\"\
+    eventual\")\n\n        # AP: product catalog — cached, stale is OK\n        self.catalog_cache = Redis(cluster_mode=True)\n\
+    \n    def place_order(self, order: Order):\n        # Strong consistency: both debit and credit must succeed together\n\
+    \        with self.order_db.transaction():\n            self.order_db.debit_inventory(order.items)\n            self.order_db.create_order(order)\n\
+    \        # Eventual consistency: analytics can lag\n        self.analytics_db.increment_async(\"orders_placed\", 1)\n\n\
+    \    def get_product(self, product_id: str):\n        # Eventual consistency is fine: showing stale price for 5s is acceptable\n\
+    \        return self.catalog_cache.get(f\"product:{product_id}\")\n"
+  example_bad: "# Treating all data with the same consistency model\nclass OrderSystem:\n    def __init__(self):\n       \
+    \ # Everything in eventually-consistent DynamoDB — including financial data\n        self.db = DynamoDB(consistency=\"\
+    eventual\")\n\n    def place_order(self, order: Order):\n        self.db.put_item(\"orders\", order.to_dict())\n     \
+    \   self.db.update_item(\"inventory\", decrement=order.quantity)\n        # PROBLEM: order is created but inventory decrement\
+    \ hasn't propagated\n        # Another request reads stale inventory → overselling\n"
+  sources: ["https://martinfowler.com/articles/patterns-of-distributed-systems/generation.html"]
+  when_applies: "When choosing between consistency and availability for distributed data stores"
+- id: CR-SYS-STORAGE-001
+  text: Polyglot Persistence — Use the right storage technology for each data access pattern instead of forcing everything
+    into one database.
+  why: Relational databases excel at ACID transactions and complex queries but are slow at full-text search, graph traversals,
+    and time-series aggregation. Forcing all data into PostgreSQL means building search with LIKE '%query%' (no relevance
+    ranking), graph queries with recursive CTEs (slow beyond 3 hops), and time-series with GROUP BY date_trunc (no downsampling).
+    A monitoring platform stored metrics in PostgreSQL — a 30-day dashboard query took 45 seconds. After moving metrics to
+    TimescaleDB (same SQL, optimized for time-series), the same query ran in 200ms.
+  how_to_do_right: '1. Relational (PostgreSQL/MySQL): transactions, foreign keys, complex joins, source of truth.
+
+    2. Document (MongoDB/DynamoDB): flexible schemas, denormalized reads, JSON-heavy workloads.
+
+    3. Key-Value (Redis/DynamoDB): caching, sessions, rate limiting, feature flags.
+
+    4. Search (Elasticsearch/Meilisearch): full-text search with relevance, faceted filtering.
+
+    5. Time-Series (TimescaleDB/InfluxDB): metrics, logs, IoT data, downsampling.
+
+    6. Graph (Neo4j/FalkorDB): relationships, recommendations, fraud detection, social networks.
+
+    7. Keep the relational DB as the source of truth. Other stores are projections updated via events.
+
+    '
+  severity: high
+  technologies:
+    platform: [postgresql, redis, elasticsearch, neo4j, timescaledb, mongodb]
+  domains:
+    domain: [architecture]
+    concern: [system_design, data, database]
+  example_good: "# Each data type in the optimal storage\nclass DataLayer:\n    # Source of truth: PostgreSQL (ACID, relations,\
+    \ transactions)\n    orders_db: PostgreSQL      # Orders, customers, payments\n\n    # Search: Elasticsearch (full-text,\
+    \ relevance ranking, facets)\n    product_search: Elasticsearch  # Product catalog search\n\n    # Cache: Redis (sub-ms\
+    \ reads, TTL, atomic operations)\n    cache: Redis               # Session data, rate limits, hot product data\n\n   \
+    \ # Time-series: TimescaleDB (continuous aggregates, retention policies)\n    metrics_db: TimescaleDB    # Request latency,\
+    \ error rates, business metrics\n\n    # Graph: FalkorDB (relationship queries, recommendations)\n    graph_db: FalkorDB\
+    \         # User→Product recommendations, fraud detection\n\n# Event-driven sync: PostgreSQL changes → event → update\
+    \ search/cache/graph\n@on_event(\"product.updated\")\nasync def sync_product(event: ProductUpdated):\n    await product_search.index(event.product)\n\
+    \    await cache.delete(f\"product:{event.product_id}\")\n    await graph_db.update_node(\"Product\", event.product_id,\
+    \ event.properties)\n"
+  example_bad: "# Everything in PostgreSQL — round peg in square hole\nclass DataLayer:\n    db: PostgreSQL\n\n    def search_products(self,\
+    \ query: str):\n        # Full-text search with LIKE — no relevance ranking, no fuzzy matching\n        return db.execute(\n\
+    \            \"SELECT * FROM products WHERE name ILIKE %s\", (f\"%{query}%\",)\n        )  # Scans entire table, returns\
+    \ unranked results\n\n    def get_recommendations(self, user_id: str):\n        # Graph traversal with recursive CTE —\
+    \ 10 seconds at 3 hops\n        return db.execute(\"\"\"\n            WITH RECURSIVE recs AS (\n                SELECT\
+    \ product_id FROM purchases WHERE user_id = %s\n                UNION\n                SELECT p2.product_id FROM purchases\
+    \ p2\n                JOIN recs ON p2.user_id IN (\n                    SELECT user_id FROM purchases WHERE product_id\
+    \ = recs.product_id\n                )\n            ) SELECT * FROM recs LIMIT 10\n        \"\"\", (user_id,))  # Explodes\
+    \ with data volume\n"
+  sources: ["https://martinfowler.com/bliki/CQRS.html"]
+  when_applies: "When selecting storage engines based on access patterns, consistency, and scale requirements"
+- id: CR-SYS-RATELIMIT-001
+  text: Token Bucket Rate Limiting — Use the token bucket algorithm for API rate limiting, allowing bursts while enforcing
+    an average rate.
+  why: 'Fixed window rate limiting (100 requests per minute) has a boundary problem: a client can send 100 requests at 0:59
+    and 100 more at 1:01 — 200 requests in 2 seconds while technically staying within limits. Sliding window fixes the boundary
+    but is memory-intensive. Token bucket is the best balance: it allows short bursts (good for user experience) while enforcing
+    a steady average rate (protecting the server). AWS, Cloudflare, and Stripe all use token bucket. Without rate limiting,
+    a single client can monopolize server resources or brute-force authentication.'
+  how_to_do_right: '1. Token bucket: bucket holds N tokens (burst capacity), refills at R tokens/second (sustained rate).
+
+    2. Each request consumes 1 token. If bucket is empty, request is rejected (429 Too Many Requests).
+
+    3. Set different limits per endpoint: auth endpoints (5/min), read endpoints (100/min), write endpoints (20/min).
+
+    4. Include rate limit headers: X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset.
+
+    5. Rate limit by: API key (for partners), user ID (for authenticated), IP (for anonymous).
+
+    6. Use Redis for distributed rate limiting across multiple server instances.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, flask]
+    platform: [redis, nginx]
+  domains:
+    domain: [architecture, api, security]
+    concern: [system_design]
+  example_good: "import time\nfrom redis import Redis\n\nclass TokenBucketRateLimiter:\n    def __init__(self, redis: Redis,\
+    \ max_tokens: int, refill_rate: float):\n        self.redis = redis\n        self.max_tokens = max_tokens      # Burst\
+    \ capacity\n        self.refill_rate = refill_rate    # Tokens per second\n\n    def allow_request(self, key: str) ->\
+    \ tuple[bool, dict]:\n        now = time.time()\n        pipe = self.redis.pipeline()\n\n        # Atomic token bucket\
+    \ with Lua script\n        lua = \"\"\"\n        local key = KEYS[1]\n        local max_tokens = tonumber(ARGV[1])\n \
+    \       local refill_rate = tonumber(ARGV[2])\n        local now = tonumber(ARGV[3])\n\n        local bucket = redis.call('hmget',\
+    \ key, 'tokens', 'last_refill')\n        local tokens = tonumber(bucket[1]) or max_tokens\n        local last_refill =\
+    \ tonumber(bucket[2]) or now\n\n        local elapsed = now - last_refill\n        tokens = math.min(max_tokens, tokens\
+    \ + elapsed * refill_rate)\n\n        local allowed = tokens >= 1\n        if allowed then tokens = tokens - 1 end\n\n\
+    \        redis.call('hmset', key, 'tokens', tokens, 'last_refill', now)\n        redis.call('expire', key, math.ceil(max_tokens\
+    \ / refill_rate) * 2)\n\n        return {allowed and 1 or 0, math.floor(tokens)}\n        \"\"\"\n        result = self.redis.eval(lua,\
+    \ 1, key, self.max_tokens, self.refill_rate, now)\n        allowed, remaining = bool(result[0]), result[1]\n\n       \
+    \ headers = {\n            \"X-RateLimit-Limit\": str(self.max_tokens),\n            \"X-RateLimit-Remaining\": str(remaining),\n\
+    \            \"X-RateLimit-Reset\": str(int(now + (self.max_tokens - remaining) / self.refill_rate)),\n        }\n   \
+    \     return allowed, headers\n"
+  example_bad: "# Fixed window — boundary exploit: 200 requests in 2 seconds\nrequest_counts = {}  # In-memory — lost on restart,\
+    \ not shared across instances\n\ndef check_rate_limit(user_id: str) -> bool:\n    minute = int(time.time() / 60)\n   \
+    \ key = f\"{user_id}:{minute}\"\n    request_counts[key] = request_counts.get(key, 0) + 1\n    return request_counts[key]\
+    \ <= 100\n    # Exploit: 100 requests at 0:59 + 100 at 1:00 = 200 in 1 second\n    # In-memory: each server has its own\
+    \ counter — 3 servers = 300 effective limit\n    # No rate limit headers: clients can't back off gracefully\n"
+  sources: ["https://cloud.google.com/architecture/rate-limiting-strategies-techniques"]
+  when_applies: "When protecting APIs from abuse, overload, or ensuring fair usage across tenants"
