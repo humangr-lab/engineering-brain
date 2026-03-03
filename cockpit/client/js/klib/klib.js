@@ -6,8 +6,6 @@ import { state, subscribe } from '../state.js';
 import { buildFilters } from './filters.js';
 import { renderList } from './list.js';
 import { renderDetail } from './detail.js';
-import { initForceGraph, destroyForceGraph } from './force-graph.js';
-import { stopLoop, startLoop } from '../scene/engine.js';
 
 let _history = [];
 let _historyIdx = -1;
@@ -27,15 +25,6 @@ export function initKlib() {
   if (backBtn) backBtn.addEventListener('click', navigateBack);
   if (fwdBtn) fwdBtn.addEventListener('click', navigateForward);
 
-  // View mode toggle (list/graph)
-  document.querySelectorAll('.klib-view-btn').forEach(b => {
-    b.addEventListener('click', () => {
-      document.querySelectorAll('.klib-view-btn').forEach(x => x.classList.remove('active'));
-      b.classList.add('active');
-      state.klibViewMode = b.dataset.view;
-    });
-  });
-
   // Group-by buttons
   document.querySelectorAll('#klibGroupBy .klib-sort-btn').forEach(b => {
     b.addEventListener('click', () => {
@@ -52,22 +41,7 @@ export function initKlib() {
   }));
 
   _unsubs.push(subscribe('klibGroupBy', () => {
-    if (state.klibOpen && state.klibViewMode === 'list') _renderCenter();
-  }));
-
-  _unsubs.push(subscribe('klibViewMode', (mode) => {
-    const center = document.getElementById('klibCenter');
-    if (mode === 'graph') {
-      center?.classList.add('graph-mode');
-      stopLoop();  // Pause main 3D scene — free GPU for force graph
-      const filtered = _applyFilters(state.nodes);
-      initForceGraph(filtered, state.edges);
-    } else {
-      center?.classList.remove('graph-mode');
-      destroyForceGraph();
-      startLoop(); // Resume main 3D scene
-      _renderCenter();
-    }
+    if (state.klibOpen) _renderCenter();
   }));
 
   _unsubs.push(subscribe('klibSelectedNode', (nodeId) => {
@@ -77,11 +51,6 @@ export function initKlib() {
   _unsubs.push(subscribe('klibFilters', () => {
     if (state.klibOpen) {
       _renderCenter();
-      // If in graph mode, rebuild graph with filtered nodes
-      if (state.klibViewMode === 'graph') {
-        const filtered = _applyFilters(state.nodes);
-        initForceGraph(filtered, state.edges);
-      }
     }
   }));
 
@@ -109,7 +78,6 @@ export function openKlib() {
 export function closeKlib() {
   state.klibOpen = false;
   document.getElementById('klibOv')?.classList.remove('open');
-  destroyForceGraph();
 }
 
 function _renderKlib() {

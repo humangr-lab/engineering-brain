@@ -291,7 +291,6 @@ Background color: `--theme-bg: #f0f1f4` (light gray, RGB 240,241,244)
 | `.md-step-d` (step description) | `--text2` #8b95aa | card bg ~#121424 | ~5.2:1 | PASS |
 | `.md-bar-seg.u` (uncertainty bar text) | rgba(232,236,244,.6) ~#8a8e93 | ~#4b5563 | ~1.8:1 | **FAIL** |
 | `.kn-techs` (node technologies) | `--text3` #4a5268 | ~#060812 | ~2.6:1 | **FAIL** |
-| `.fg-legend-foot` | #5a6578 | ~#060812 | ~2.8:1 | **FAIL** |
 | `.sc-sub` (submap subtitle) | rgba(255,255,255,.55) | varies | Unpredictable | **RISKY** |
 | `.edge-label` | rgba(255,255,255,.45) | varies (3D scene) | ~2.5:1 typical | **FAIL** |
 | Inactive legend items | 35% opacity on `--theme-legend` | `--theme-bg` | ~1.6:1 | **FAIL** |
