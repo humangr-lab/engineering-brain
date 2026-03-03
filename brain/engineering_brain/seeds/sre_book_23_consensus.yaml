@@ -1,0 +1,113 @@
+layer: rules
+technology: SRE
+domain: distributed_systems
+knowledge:
+- id: CR-SRE-CONS-001
+  text: Use existing consensus implementations (Raft, Paxos, ZAB) — never build your own. Distributed consensus is one of the hardest problems in computer science, and subtle bugs in consensus implementations
+    have caused data loss at every major cloud provider.
+  why: 'Google''s Chapter 23 on Distributed Consensus warns explicitly against building custom consensus algorithms. Google itself uses Paxos (via Chubby and Spanner) and invested thousands of engineer-years
+    making it correct and performant. Even with that investment, they found subtle bugs years after deployment. The problem is that distributed consensus has failure modes that are nearly impossible to
+    discover through testing: network partitions that create split-brain, message reordering that violates linearizability, and timing-dependent bugs that only manifest under specific load patterns. Google
+    recommends using well-tested implementations (etcd/Raft, ZooKeeper/ZAB, Consul) because these have been battle-tested by millions of deployments. Building your own is not engineering — it is hubris.
+
+    '
+  how_to_do_right: '1. Use etcd (Raft), ZooKeeper (ZAB), or Consul for distributed consensus. Do not implement your own.
+
+    2. If you need consensus, clearly identify WHAT needs consensus: leader election, distributed locking, configuration distribution, or replicated state machine.
+
+    3. Understand the CAP tradeoffs of your consensus system: during a network partition, does it prioritize consistency (rejects writes) or availability (risks stale reads)?
+
+    4. Monitor consensus health: leader election frequency, replication lag, quorum status. A consensus system losing quorum is a critical emergency.
+
+    5. Test network partition scenarios: what happens when the leader is isolated? When a minority is isolated? When the network heals?
+
+    6. Set appropriate election timeouts: too short causes unnecessary leader elections (instability), too long causes extended unavailability during real leader failures.
+
+    '
+  example_good: "# Use existing consensus implementation (etcd/Raft) — never roll your own\nimport etcd3\n\nclass DistributedLock:\n    \"\"\"Leader election using etcd — battle-tested Raft implementation.\"\"\"\n    def __init__(self, etcd_host: str = \"localhost\", etcd_port: int = 2379):\n        self.client = etcd3.client(host=etcd_host, port=etcd_port)\n\n    def elect_leader(self, election_name: str, candidate_id: str):\n        election = self.client.election(election_name)\n        election.campaign(candidate_id.encode())\n        log.info(f\"{candidate_id} elected as leader for {election_name}\")\n        return election\n\n    def acquire_lock(self, lock_name: str, ttl: int = 30) -> etcd3.Lock:\n        \"\"\"Distributed lock with TTL (lease-based, auto-expires).\"\"\"\n        lock = self.client.lock(lock_name, ttl=ttl)\n        lock.acquire()\n        return lock\n"
+  example_bad: "# Custom consensus implementation — subtle bugs guaranteed\nclass MyConsensus:\n    def elect_leader(self, nodes):\n        # \"Simple\" leader election — what could go wrong?\n        for node in nodes:\n            if node.is_alive():\n                node.is_leader = True\n                return node\n        # BUG: network partition → two nodes both think they're alive\n        # BUG: no fencing tokens → split-brain data corruption\n        # BUG: no lease expiry → dead leader blocks forever\n        # BUG: message reordering → violates linearizability\n        # These bugs appear after months in production\n"
+  when_applies: When a system requires distributed consensus for leader election, distributed locking, or configuration distribution and the team is considering building a custom solution.
+  severity: critical
+  technologies:
+    platform: [kubernetes, networking]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, consensus]
+  sources:
+  - url: https://sre.google/sre-book/managing-critical-state/
+    title: 'Google SRE Book — Chapter 23: Managing Critical State: Distributed Consensus for Reliability'
+  validation_status: cross_checked
+- id: CR-SRE-CONS-002
+  text: Distributed consensus is expensive — use it only for critical state that MUST be consistent. Configuration, leader election, and distributed locks need consensus. User session data, caches, and
+    metrics do not. Every problem you solve with consensus costs latency and availability.
+  why: 'Google uses consensus selectively because it imposes real costs. Every consensus operation requires a majority of replicas to agree, which means: write latency = round-trip to the slowest majority
+    member (P50 latency of 3 replicas is dominated by the slowest), availability requires majority quorum (with 3 replicas, losing 2 means unavailability), and throughput is limited by the leader''s ability
+    to replicate. For data that requires strong consistency (who is the leader? what is the current configuration? is this lock held?), these costs are necessary. For data where eventual consistency is
+    acceptable (user preferences, analytics, caches), using consensus is over-engineering that costs latency and reduces availability. Google''s rule: consensus for coordination, eventual consistency for
+    data that tolerates staleness.
+
+    '
+  how_to_do_right: '1. Categorize your data: "Must be strongly consistent" (leader election, locks, config) vs "Can be eventually consistent" (user data, caches, metrics).
+
+    2. Use consensus ONLY for the first category. Use simpler replication (async replicas, CRDT, last-writer-wins) for the second.
+
+    3. Keep consensus state small. If your consensus system stores more than a few GB, you are likely using it for data that should be in a database.
+
+    4. Minimize the number of consensus operations per request. Ideally zero (use cached state), occasionally one (leader check), never multiple.
+
+    5. Use leases (time-bounded locks) instead of permanent locks. Permanent locks + dead client = permanent deadlock.
+
+    6. Monitor consensus operation latency separately from application latency. A spike in consensus latency affects everything.
+
+    '
+  example_good: "# Use consensus only for coordination — not for bulk data\nimport etcd3\n\nclass ServiceCoordinator:\n    \"\"\"Consensus for coordination only. Data goes in the database.\"\"\"\n    def __init__(self):\n        self.etcd = etcd3.client()  # Small state: config, locks, leader\n        self.db = PostgresDB()       # Large state: user data, analytics\n\n    def get_leader(self) -> str:\n        \"\"\"Consensus: who is the leader? (1 key, ~100 bytes)\"\"\"\n        return self.etcd.get(\"/leader\").decode()\n\n    def get_config(self, key: str) -> dict:\n        \"\"\"Consensus: current config (small, must be consistent).\"\"\"\n        return json.loads(self.etcd.get(f\"/config/{key}\"))\n\n    def get_user_data(self, user_id: str) -> dict:\n        \"\"\"Database: user data (large, eventual consistency OK).\"\"\"\n        return self.db.query(\"SELECT * FROM users WHERE id = %s\", user_id)\n        # NOT in etcd — would waste consensus throughput on bulk data\n"
+  example_bad: "# Store everything in consensus system — expensive and slow\nimport etcd3\n\ndef save_user_session(user_id, session_data):\n    etcd = etcd3.client()\n    # Storing user sessions in etcd — each write requires quorum\n    etcd.put(f\"/sessions/{user_id}\", json.dumps(session_data))\n    # 10,000 users × 1 session update/sec = 10,000 consensus ops/sec\n    # etcd throughput limit: ~10,000 writes/sec\n    # Session data doesn't need strong consistency — Redis would work\n    # Leader is overwhelmed replicating session data instead of config\n"
+  when_applies: When deciding which data requires distributed consensus versus simpler replication, to avoid overloading consensus systems with data that tolerates eventual consistency.
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kubernetes, networking]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, consensus]
+  sources:
+  - url: https://sre.google/sre-book/managing-critical-state/
+    title: 'Google SRE Book — Chapter 23: Managing Critical State: Distributed Consensus for Reliability'
+  validation_status: cross_checked
+- id: CR-SRE-CONS-003
+  text: Leader election must handle the "split-brain" problem — where two nodes both believe they are the leader. This is not a theoretical concern; it happens in production when networks partition. Without
+    fencing tokens or lease-based leadership, split-brain causes data corruption.
+  why: 'Google''s treatment of leader election emphasizes that split-brain is not a rare edge case — it is a routine production event. Networks partition, GC pauses cause heartbeat timeouts, and clock skew
+    causes lease disagreements. The classic failure: Node A is the leader. A network partition isolates Node A from Nodes B and C. B and C elect a new leader (B). Now both A and B believe they are the leader.
+    Both accept writes. When the partition heals, the system has two conflicting histories that cannot be automatically reconciled — data is corrupt. Google''s defense: fencing tokens (monotonically increasing
+    generation numbers attached to every write) and lease-based leadership (the leader must renew its lease periodically; if it can''t reach quorum, it steps down). A write with an old fencing token is
+    rejected because the system knows a newer leader exists.
+
+    '
+  how_to_do_right: '1. Use fencing tokens: every leader election increments a generation number. All writes include this number. Storage rejects writes with stale generation numbers.
+
+    2. Use lease-based leadership: the leader holds a lease that expires after N seconds. If the leader cannot renew the lease (lost quorum), it MUST stop accepting writes.
+
+    3. When the old leader''s lease expires, it MUST assume it is no longer the leader — even if it hasn''t received a "you''re fired" message. Network partitions prevent such messages.
+
+    4. Storage systems must validate fencing tokens: if a write arrives with generation 5 but the storage has already seen generation 6, reject the write.
+
+    5. Test split-brain scenarios: partition the leader from quorum and verify that a new leader is elected AND the old leader stops accepting writes.
+
+    6. Monitor leader election events. More than 1 election per hour suggests instability (network issues, GC pauses, or misconfigured timeouts).
+
+    '
+  example_good: "# Fencing tokens + lease-based leadership to prevent split-brain\nclass LeaseBasedLeader:\n    def __init__(self, etcd_client, ttl_sec: int = 10):\n        self.etcd = etcd_client\n        self.ttl = ttl_sec\n        self.lease = None\n        self.generation = 0\n\n    def campaign(self, candidate_id: str):\n        self.lease = self.etcd.lease(self.ttl)\n        # Lease auto-expires if we can't renew (lost quorum)\n        self.etcd.put(\"/leader\", candidate_id, lease=self.lease)\n        self.generation = self.etcd.get(\"/generation\") + 1\n        self.etcd.put(\"/generation\", str(self.generation))\n\n    def write_with_fencing(self, key: str, value: str):\n        \"\"\"Include generation number — storage rejects stale writes.\"\"\"\n        current_gen = int(self.etcd.get(\"/generation\"))\n        if self.generation < current_gen:\n            raise StaleLeaderError(\n                f\"My generation {self.generation} < current {current_gen} — stepping down\"\n            )\n        self.storage.write(key, value, fencing_token=self.generation)\n\n    def must_step_down(self) -> bool:\n        \"\"\"If lease expired, assume we are no longer leader.\"\"\"\n        return self.lease is None or self.lease.remaining_ttl <= 0\n"
+  example_bad: "# Leader election without fencing — split-brain guaranteed\nclass NaiveLeader:\n    def __init__(self):\n        self.is_leader = False\n\n    def campaign(self):\n        # No lease, no fencing token\n        self.is_leader = True\n\n    def write(self, key, value):\n        if self.is_leader:\n            db.write(key, value)\n        # Network partition: both Node A and Node B think they're leader\n        # Both accept writes → two conflicting histories\n        # When partition heals → data corruption\n        # No fencing token → storage can't reject stale writes\n        # No lease → old leader never steps down\n"
+  when_applies: When implementing leader election in distributed systems where network partitions can cause split-brain scenarios with two nodes both believing they are the leader.
+  severity: critical
+  technologies:
+    lang: [general]
+    platform: [redis, kubernetes, networking]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, consensus, data_integrity]
+  sources:
+  - url: https://sre.google/sre-book/managing-critical-state/
+    title: 'Google SRE Book — Chapter 23: Managing Critical State: Distributed Consensus for Reliability'
+  validation_status: cross_checked

@@ -1,0 +1,528 @@
+layer: rules
+technology: Flink
+domain: streaming
+knowledge:
+- id: CR-FLINK-001
+  text: Use event time with watermarks for all production stream processing — processing time produces non-deterministic,
+    non-reproducible results.
+  why: Processing time uses the wall clock of the machine processing the record. If a stream processor restarts, replays from
+    Kafka, or experiences backpressure, the same event gets a different processing timestamp — making results non-reproducible.
+    Event time uses the timestamp embedded in the event itself, producing identical results regardless of when or how many
+    times the event is processed. This is critical for correctness in financial calculations, SLA monitoring, and any analytics
+    where timing matters.
+  how_to_do_right: Extract event time using WatermarkStrategy.forBoundedOutOfOrderness(Duration) with a bound that matches
+    your data's maximum expected lateness. Assign watermarks at the source (Kafka consumer, file reader) not mid-pipeline.
+    Use BoundedOutOfOrderness for most cases. Set allowedLateness on windows to handle stragglers without losing them. Configure
+    side outputs to capture late events for separate processing.
+  severity: critical
+  technologies:
+    lang: [java]
+    platform: [flink, kafka]
+  domains:
+    domain: [architecture, reliability]
+    concern: [streaming, data, engineering]
+  example_good: "// Java Flink — event time with bounded out-of-orderness\nimport org.apache.flink.api.common.eventtime.*;\n\
+    \nDataStream<Event> events = env\n    .fromSource(kafkaSource, WatermarkStrategy\n        .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(30))\n\
+    \        .withTimestampAssigner((event, timestamp) -> event.getTimestamp()),\n        \"Kafka Source\"\n    );\n\n// Late\
+    \ events captured via side output\nOutputTag<Event> lateTag = new OutputTag<Event>(\"late-events\"){};\n\nSingleOutputStreamOperator<AggResult>\
+    \ result = events\n    .keyBy(Event::getUserId)\n    .window(TumblingEventTimeWindows.of(Time.minutes(5)))\n    .allowedLateness(Time.minutes(10))\
+    \      // Extra grace period\n    .sideOutputLateData(lateTag)             // Capture very late events\n    .aggregate(new\
+    \ EventAggregator());\n\n// Process late events separately\nDataStream<Event> lateEvents = result.getSideOutput(lateTag);\n\
+    lateEvents.addSink(lateSink);\n"
+  example_bad: "// Processing time — non-deterministic results\nDataStream<Event> events = env.fromSource(kafkaSource,\n \
+    \   WatermarkStrategy.noWatermarks(), \"Kafka Source\");\n\nevents.keyBy(Event::getUserId)\n    .window(TumblingProcessingTimeWindows.of(Time.minutes(5)))\n\
+    \    .aggregate(new EventAggregator());\n// Replay from Kafka: same events produce different window assignments\n// Backpressure:\
+    \ events delayed 2 minutes → wrong window\n// Cannot reproduce results for debugging or auditing\n"
+  when_applies: Any project using Apache Flink stream processing, Java/JVM applications, or Apache Kafka event streaming
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/"]
+- id: CR-FLINK-002
+  text: Set watermark interval and out-of-orderness bound based on measured data characteristics — too tight drops data, too
+    loose increases latency.
+  why: The out-of-orderness bound determines how long Flink waits for late events before closing a window. Setting it too
+    low (e.g., 1 second when data is 30 seconds out of order) causes late events to be dropped — silent data loss. Setting
+    it too high (e.g., 1 hour) means windows do not emit results until 1 hour after the window ends — unacceptable latency
+    for real-time dashboards. The correct value requires analyzing your actual data's lateness distribution.
+  how_to_do_right: 'Measure the p99 lateness of your data: timestamp_when_processed - event_timestamp. Set the bound slightly
+    above p99 (e.g., if p99 lateness is 20 seconds, set bound to 30 seconds). Use allowedLateness to capture events between
+    p99 and p99.9. Use side outputs for events beyond allowedLateness. Monitor watermark progress in Flink''s web UI — if
+    watermarks lag far behind processing time, your bound is too tight or your source has issues.'
+  severity: high
+  technologies:
+    lang: [java]
+    platform: [flink]
+  domains:
+    domain: [architecture]
+    concern: [streaming, data, engineering]
+  example_good: "// Bound based on measured p99 lateness of 20 seconds\nWatermarkStrategy<Event> strategy = WatermarkStrategy\n\
+    \    .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(30))  // p99 + margin\n    .withTimestampAssigner((event, ts)\
+    \ -> event.getTimestamp())\n    .withIdleness(Duration.ofMinutes(5));  // Handle idle partitions\n\n// Window with extra\
+    \ allowedLateness for p99.9 events\nevents.keyBy(Event::getUserId)\n    .window(TumblingEventTimeWindows.of(Time.minutes(5)))\n\
+    \    .allowedLateness(Time.minutes(2))  // Accept events up to 2 min after watermark\n    .sideOutputLateData(lateTag)\
+    \        // Capture anything beyond 2 min\n    .aggregate(new EventAggregator());\n"
+  example_bad: '// 1 second bound when data is 30 seconds out of order
+
+    WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofSeconds(1))
+
+    // 95% of events arrive "late" → dropped, massive data loss
+
+
+    // 1 hour bound when data is 30 seconds out of order
+
+    WatermarkStrategy.<Event>forBoundedOutOfOrderness(Duration.ofHours(1))
+
+    // Every window result delayed by 1 hour — real-time dashboard shows 1-hour-old data
+
+    '
+  when_applies: Projects using Apache Flink stream processing or Java/JVM applications
+  when_not_applies: batch-only workloads, simple request-response systems. projects not using Flink or Java
+  sources: ["https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/event-time/generating_watermarks/"]
+- id: CR-FLINK-003
+  text: 'Choose the right window type for your use case: tumbling for fixed buckets, sliding for moving averages, session
+    for activity-based grouping.'
+  why: Window types determine how events are grouped for aggregation. Tumbling windows (fixed, non-overlapping) are simplest
+    and emit exactly one result per window. Sliding windows (overlapping) emit results at every slide interval — suitable
+    for moving averages but produce N results per event (where N = window_size/slide_interval). Session windows (gap-based)
+    group events by activity periods — suitable for user sessions but have variable size and unbounded state until the gap
+    timeout. Choosing the wrong window type leads to either incorrect semantics or unnecessary resource usage.
+  how_to_do_right: 'Tumbling: hourly/daily aggregations, billing periods, batch-like processing. Sliding: 5-minute moving
+    average updated every 1 minute, alerting on rolling metrics. Session: user sessions (group all clicks until 30 min of
+    inactivity), conversation grouping. Global: when you want custom triggers. Always set watermarks before windowing. For
+    session windows, set a reasonable gap timeout to bound state.'
+  severity: high
+  technologies:
+    lang: [java]
+    platform: [flink]
+  domains:
+    domain: [architecture]
+    concern: [streaming, data, engineering]
+  example_good: "// Tumbling: hourly revenue aggregation (non-overlapping, one result per hour)\nrevenue.keyBy(Order::getRegion)\n\
+    \    .window(TumblingEventTimeWindows.of(Time.hours(1)))\n    .sum(\"amount\");\n\n// Sliding: 5-minute moving average,\
+    \ updated every 1 minute\nmetrics.keyBy(Metric::getServerId)\n    .window(SlidingEventTimeWindows.of(Time.minutes(5),\
+    \ Time.minutes(1)))\n    .aggregate(new AverageAggregator());\n\n// Session: user activity sessions with 30-minute gap\n\
+    clickstream.keyBy(Click::getUserId)\n    .window(EventTimeSessionWindows.withGap(Time.minutes(30)))\n    .process(new\
+    \ SessionAnalyzer());\n"
+  example_bad: "// Sliding window with tiny slide = explosion of results\nmetrics.keyBy(Metric::getServerId)\n    .window(SlidingEventTimeWindows.of(Time.hours(1),\
+    \ Time.seconds(1)))\n    .aggregate(new AverageAggregator());\n// Each event contributes to 3600 windows (1 hour / 1 second)\n\
+    // 3600x state and output — OOM, extreme network/disk usage\n\n// Session window without gap timeout awareness\nclickstream.keyBy(Click::getUserId)\n\
+    \    .window(EventTimeSessionWindows.withGap(Time.hours(24)))\n    .process(new SessionAnalyzer());\n// Active users never\
+    \ close their session → unbounded state growth\n"
+  when_applies: Projects using Apache Flink stream processing or Java/JVM applications
+  when_not_applies: batch-only workloads, simple request-response systems. projects not using Flink or Java
+  sources: ["https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/windows/"]
+- id: CR-FLINK-004
+  text: Use RocksDB state backend for production workloads — the default heap-based backend cannot survive large state sizes.
+  why: The HashMapStateBackend (default) stores all keyed state in JVM heap memory. When state exceeds available heap (e.g.,
+    millions of keys in a windowed aggregation), the job OOMs with no recovery. The RocksDBStateBackend stores state on local
+    disk with an in-memory cache, supporting state sizes up to terabytes per TaskManager. It also enables incremental checkpoints
+    (only changed data checkpointed), reducing checkpoint size from GB to MB for large stateful jobs.
+  how_to_do_right: 'Set state.backend=rocksdb in flink-conf.yaml or programmatically. Enable incremental checkpoints: state.backend.incremental=true.
+    Configure RocksDB write buffer and block cache sizes based on available memory. Monitor RocksDB metrics (compaction, write
+    amplification) via Flink metrics. Use managed memory (taskmanager.memory.managed.fraction) for RocksDB — do not let it
+    compete with JVM heap.'
+  severity: critical
+  technologies:
+    lang: [java]
+    library: [rocksdb]
+    platform: [flink]
+  domains:
+    domain: [architecture, performance, reliability]
+    concern: [streaming]
+  example_good: '// Programmatic RocksDB configuration
+
+    import org.apache.flink.contrib.streaming.state.EmbeddedRocksDBStateBackend;
+
+
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+
+    EmbeddedRocksDBStateBackend rocksDb = new EmbeddedRocksDBStateBackend(true); // incremental
+
+    env.setStateBackend(rocksDb);
+
+
+    // flink-conf.yaml production settings
+
+    // state.backend: rocksdb
+
+    // state.backend.incremental: true
+
+    // state.backend.rocksdb.localdir: /mnt/ssd/flink-state
+
+    // taskmanager.memory.managed.fraction: 0.4  # 40% for RocksDB
+
+    // state.checkpoints.dir: s3://flink-checkpoints/
+
+    '
+  example_bad: '// Default HashMap backend — OOMs on large state
+
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+    // state.backend defaults to hashmap
+
+    // 10 million keys × 1KB per entry = 10GB state
+
+    // JVM heap = 8GB → OOM, job crashes, state lost
+
+
+    // RocksDB without incremental checkpoints
+
+    // state.backend: rocksdb
+
+    // state.backend.incremental: false  # Full checkpoint every time
+
+    // 500GB state = 500GB checkpoint per interval = I/O bottleneck
+
+    '
+  when_applies: Any project using Apache Flink stream processing, RocksDB, or Java/JVM applications
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/state/state_backends/"]
+- id: CR-FLINK-005
+  text: Configure checkpointing with exactly-once semantics and appropriate intervals — too frequent wastes resources, too
+    infrequent loses progress.
+  why: Checkpoints are Flink's mechanism for fault tolerance and exactly-once semantics. Without checkpoints, a TaskManager
+    failure loses all in-flight state, and the job restarts from scratch. Too-frequent checkpoints (every 1 second) spend
+    more time checkpointing than processing, especially with large state. Too-infrequent checkpoints (every 30 minutes) mean
+    a failure replays 30 minutes of data from Kafka, which can take longer than 30 minutes if the source is high-throughput
+    — causing the job to never catch up.
+  how_to_do_right: Set checkpoint interval between 1-10 minutes for most production jobs. Use EXACTLY_ONCE mode for correct
+    results. Set minPauseBetweenCheckpoints to half the interval to prevent checkpoint overlap. Set checkpointTimeout to 10-30
+    minutes. Enable unaligned checkpoints for jobs with backpressure (Flink 1.11+). Use externalized checkpoints (RETAIN_ON_CANCELLATION)
+    so you can resume after manual cancellation.
+  severity: critical
+  technologies:
+    lang: [java]
+    platform: [flink]
+  domains:
+    domain: [architecture, reliability]
+    concern: [streaming]
+  example_good: "import org.apache.flink.streaming.api.CheckpointingMode;\nimport org.apache.flink.streaming.api.environment.CheckpointConfig;\n\
+    \nStreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();\n\n// Enable checkpointing every\
+    \ 5 minutes with exactly-once\nenv.enableCheckpointing(300_000, CheckpointingMode.EXACTLY_ONCE);\n\nCheckpointConfig config\
+    \ = env.getCheckpointConfig();\nconfig.setMinPauseBetweenCheckpoints(150_000);   // 2.5 min between checkpoints\nconfig.setCheckpointTimeout(600_000);\
+    \             // 10 min timeout\nconfig.setMaxConcurrentCheckpoints(1);            // No concurrent checkpoints\nconfig.setTolerableCheckpointFailureNumber(3);\
+    \    // Tolerate 3 failures before job fails\n\n// Retain checkpoints on cancellation for manual resume\nconfig.setExternalizedCheckpointCleanup(\n\
+    \    CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION\n);\n\n// Enable unaligned checkpoints for\
+    \ backpressure tolerance\nconfig.enableUnalignedCheckpoints();\n"
+  example_bad: '// No checkpointing — all state lost on failure
+
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+    // env.enableCheckpointing() not called
+
+    // TaskManager crash = restart from scratch, hours of reprocessing
+
+
+    // Checkpoint every 1 second — checkpoint overhead > processing time
+
+    env.enableCheckpointing(1000);
+
+    // 500GB state: each checkpoint takes 30 seconds
+
+    // Checkpoint overlaps with next checkpoint → cascading delays
+
+    '
+  when_applies: Any project using Apache Flink stream processing or Java/JVM applications
+  when_not_applies: batch-only workloads, simple request-response systems. projects not using Flink or Java
+  sources: ["https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/state/checkpoints/"]
+- id: CR-FLINK-006
+  text: Take savepoints before every application upgrade, schema change, or topology modification — savepoints are your rollback
+    mechanism.
+  why: Unlike checkpoints (automatic, managed by Flink), savepoints are manual, portable snapshots of the job's complete state.
+    When you upgrade your application code, change the parallelism, or modify the job graph, checkpoints from the old version
+    are incompatible. Without a savepoint, you must restart from scratch and reprocess all historical data. Savepoints also
+    enable A/B testing (run two versions from the same savepoint), debugging (restore to a known state), and migration between
+    Flink clusters.
+  how_to_do_right: 'Take a savepoint before every deployment: flink savepoint <jobId> s3://savepoints/. Verify the savepoint
+    completed successfully before stopping the old job. Resume from savepoint: flink run -s s3://savepoints/<savepoint-dir>
+    newJob.jar. Assign stable UIDs to all operators (uid(''operator-name'')) so Flink can match state across versions. Test
+    savepoint compatibility in staging before production. Keep savepoints for at least 2 versions for rollback.'
+  severity: high
+  technologies:
+    lang: [java]
+    platform: [flink]
+  domains:
+    domain: [architecture, operations, reliability]
+    concern: [streaming]
+  example_good: "// Assign stable UIDs to all stateful operators\nevents\n    .keyBy(Event::getUserId)\n    .window(TumblingEventTimeWindows.of(Time.hours(1)))\n\
+    \    .aggregate(new EventAggregator())\n    .uid(\"hourly-event-aggregator\")    // Stable UID for savepoint mapping\n\
+    \    .name(\"Hourly Event Aggregator\")\n    .keyBy(AggResult::getRegion)\n    .process(new AlertProcessor())\n    .uid(\"\
+    alert-processor\")            // Stable UID\n    .name(\"Alert Processor\");\n\n// Deployment script:\n// 1. flink savepoint\
+    \ $JOB_ID s3://savepoints/v2.3/\n// 2. Verify: flink savepoint status s3://savepoints/v2.3/\n// 3. flink cancel $JOB_ID\n\
+    // 4. flink run -s s3://savepoints/v2.3/ new-app-v2.4.jar\n"
+  example_bad: "// No UIDs — savepoint restoration fails on any code change\nevents\n    .keyBy(Event::getUserId)\n    .window(TumblingEventTimeWindows.of(Time.hours(1)))\n\
+    \    .aggregate(new EventAggregator())\n    // No .uid() — Flink auto-generates UID from operator position\n    // Adding\
+    \ a new operator shifts all positions → state mapping broken\n    .keyBy(AggResult::getRegion)\n    .process(new AlertProcessor());\n\
+    \n// Deployment without savepoint: stop old job, start new\n// All in-flight state lost, hours of reprocessing from Kafka\n"
+  when_applies: Projects using Apache Flink stream processing or Java/JVM applications
+  when_not_applies: batch-only workloads, simple request-response systems. projects not using Flink or Java
+  sources: ["https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/state/savepoints/"]
+- id: CR-FLINK-007
+  text: Use Flink CEP for temporal pattern detection on event streams — define patterns declaratively, not with ad-hoc state
+    machines.
+  why: Building custom state machines for pattern detection (e.g., 'login failure followed by successful login within 5 minutes
+    from different IP') requires managing timers, partial matches, timeouts, and match expiration manually. This code is error-prone,
+    hard to test, and difficult to modify. Flink CEP provides a declarative pattern API that handles all state management,
+    timer registration, and timeout cleanup automatically, with exactly-once guarantees inherited from checkpoints.
+  how_to_do_right: 'Define patterns using the Pattern API: begin, followedBy, within. Use conditions (where clause) for filtering
+    matches. Use quantifiers (times, oneOrMore, optional) for repeated events. Set the within() duration to bound state. Extract
+    matches with PatternStream.select(). Handle timeouts with PatternStream.flatSelect() and timeout side output. Keep patterns
+    simple — complex nested patterns create combinatorial state explosion.'
+  severity: medium
+  technologies:
+    lang: [java]
+    library: [cep]
+    platform: [flink]
+  domains:
+    domain: [architecture, security]
+    concern: [streaming, fraud_detection]
+  example_good: "import org.apache.flink.cep.CEP;\nimport org.apache.flink.cep.pattern.Pattern;\nimport org.apache.flink.cep.pattern.conditions.SimpleCondition;\n\
+    \n// Pattern: 3 failed logins followed by success within 10 minutes\nPattern<LoginEvent, ?> suspiciousLogin = Pattern\n\
+    \    .<LoginEvent>begin(\"failures\")\n    .where(new SimpleCondition<LoginEvent>() {\n        public boolean filter(LoginEvent\
+    \ event) {\n            return !event.isSuccess();\n        }\n    })\n    .times(3)                                 \
+    \       // Exactly 3 failures\n    .consecutive()                                   // Must be consecutive\n    .followedBy(\"\
+    success\")\n    .where(new SimpleCondition<LoginEvent>() {\n        public boolean filter(LoginEvent event) {\n      \
+    \      return event.isSuccess();\n        }\n    })\n    .within(Time.minutes(10));                       // All within\
+    \ 10 minutes\n\nDataStream<LoginEvent> loginStream = ...;\nPatternStream<LoginEvent> patternStream = CEP.pattern(\n  \
+    \  loginStream.keyBy(LoginEvent::getUserId),\n    suspiciousLogin\n);\n\nDataStream<Alert> alerts = patternStream.select(\n\
+    \    (Map<String, List<LoginEvent>> match) -> {\n        List<LoginEvent> failures = match.get(\"failures\");\n      \
+    \  LoginEvent success = match.get(\"success\").get(0);\n        return new Alert(success.getUserId(), failures.size(),\
+    \ \"BRUTE_FORCE\");\n    }\n);\n"
+  example_bad: "// Manual state machine — error-prone, no timeout cleanup\npublic class ManualPatternDetector extends KeyedProcessFunction<String,\
+    \ LoginEvent, Alert> {\n    ValueState<Integer> failureCount;\n    ValueState<Long> firstFailureTime;\n\n    public void\
+    \ processElement(LoginEvent event, Context ctx, Collector<Alert> out) {\n        if (!event.isSuccess()) {\n         \
+    \   failureCount.update(failureCount.value() + 1);  // NPE if null\n            // Need to register timer for timeout\
+    \ cleanup\n            // Need to handle concurrent patterns\n            // Need to handle out-of-order events\n    \
+    \        // Need to handle exactly-once on checkpoint recovery\n            // ... 200 lines of fragile state management\
+    \ code ...\n        }\n    }\n}\n"
+  when_applies: Projects using Apache Flink stream processing, CEP, or Java/JVM applications
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://nightlies.apache.org/flink/flink-docs-stable/docs/libs/cep/"]
+- id: CR-FLINK-008
+  text: Use Flink's Async I/O operator for external service calls (database lookups, API calls) to avoid blocking the processing
+    thread.
+  why: A synchronous database lookup in a MapFunction blocks the processing thread until the response arrives. With 100ms
+    average lookup latency, each task processes a maximum of 10 events/second regardless of CPU availability. With 4 parallel
+    tasks, the entire job caps at 40 events/second. Async I/O allows hundreds of concurrent lookups per task, utilizing network
+    I/O parallelism. A single task can achieve 1000+ events/second with the same 100ms lookup latency.
+  how_to_do_right: Implement AsyncFunction or RichAsyncFunction. Use a non-blocking HTTP/DB client (async JDBC, Netty-based
+    HTTP). Set capacity (max concurrent requests) to match the external service's connection pool. Use orderedWait for ordered
+    results or unorderedWait for higher throughput. Set timeout to the external service's SLA. Handle timeout and failure
+    in the timeout callback.
+  severity: high
+  technologies:
+    lang: [java]
+    platform: [flink]
+  domains:
+    domain: [architecture, performance]
+    concern: [streaming]
+  example_good: "import org.apache.flink.streaming.api.functions.async.RichAsyncFunction;\nimport org.apache.flink.streaming.api.functions.async.ResultFuture;\n\
+    import java.util.concurrent.CompletableFuture;\n\npublic class AsyncDatabaseLookup extends RichAsyncFunction<Event, EnrichedEvent>\
+    \ {\n    private transient AsyncDatabaseClient dbClient;\n\n    @Override\n    public void open(Configuration parameters)\
+    \ {\n        dbClient = new AsyncDatabaseClient(connectionPool(maxConnections: 100));\n    }\n\n    @Override\n    public\
+    \ void asyncInvoke(Event event, ResultFuture<EnrichedEvent> future) {\n        CompletableFuture<UserProfile> profileFuture\
+    \ =\n            dbClient.queryAsync(\"SELECT * FROM users WHERE id = ?\", event.getUserId());\n\n        profileFuture.thenAccept(profile\
+    \ -> {\n            future.complete(Collections.singleton(\n                new EnrichedEvent(event, profile)\n      \
+    \      ));\n        }).exceptionally(ex -> {\n            future.complete(Collections.singleton(\n                new\
+    \ EnrichedEvent(event, UserProfile.UNKNOWN)  // Fallback\n            ));\n            return null;\n        });\n   \
+    \ }\n\n    @Override\n    public void timeout(Event event, ResultFuture<EnrichedEvent> future) {\n        future.complete(Collections.singleton(\n\
+    \            new EnrichedEvent(event, UserProfile.UNKNOWN)  // Timeout fallback\n        ));\n    }\n}\n\n// Wire into\
+    \ pipeline: 100 concurrent lookups, 5-second timeout, ordered\nAsyncDataStream.orderedWait(\n    eventStream,\n    new\
+    \ AsyncDatabaseLookup(),\n    5, TimeUnit.SECONDS,      // Timeout\n    100                        // Max concurrent requests\n\
+    );\n"
+  example_bad: "// Synchronous lookup blocks processing thread\nevents.map(new MapFunction<Event, EnrichedEvent>() {\n   \
+    \ public EnrichedEvent map(Event event) {\n        // Blocks thread for 100ms per event\n        UserProfile profile =\
+    \ database.query(\n            \"SELECT * FROM users WHERE id = ?\", event.getUserId()\n        );\n        return new\
+    \ EnrichedEvent(event, profile);\n    }\n});\n// 4 parallel tasks × 10 events/sec = 40 events/sec max throughput\n// With\
+    \ async: 4 tasks × 100 concurrent × 10/sec = 4000 events/sec\n"
+  when_applies: Projects using Apache Flink stream processing or Java/JVM applications
+  when_not_applies: batch-only workloads, simple request-response systems. projects not using Flink or Java
+  sources: ["https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/asyncio/"]
+- id: CR-FLINK-009
+  text: Use Flink SQL or Table API for ETL and analytics on streams — it provides the same optimizations as batch SQL with
+    streaming semantics.
+  why: Flink SQL unifies batch and streaming under a single API. The query optimizer applies filter pushdown, join reordering,
+    and cost-based optimization automatically. For common operations (aggregations, joins, filters, projections), SQL is more
+    concise and often faster than the DataStream API because the optimizer can reason about the entire query plan. It also
+    makes streaming pipelines accessible to analysts who know SQL but not Java.
+  how_to_do_right: Register streaming sources as tables using CREATE TABLE DDL or TableEnvironment.from(). Write standard
+    SQL queries with GROUP BY, JOIN, and WHERE. Use TUMBLE, HOP, SESSION window functions for windowed aggregations. Declare
+    watermark strategies in DDL (WATERMARK FOR event_time AS event_time - INTERVAL '30' SECOND). Use temporal joins (FOR SYSTEM_TIME
+    AS OF) for joining a stream with a changing dimension table.
+  severity: medium
+  technologies:
+    lang: [sql, java]
+    platform: [flink]
+  domains:
+    domain: [architecture]
+    concern: [streaming, data, engineering]
+  example_good: "// Flink SQL — windowed aggregation with watermarks\ntableEnv.executeSql(\"\"\"\n    CREATE TABLE orders\
+    \ (\n        order_id STRING,\n        user_id STRING,\n        amount DECIMAL(10,2),\n        event_time TIMESTAMP(3),\n\
+    \        WATERMARK FOR event_time AS event_time - INTERVAL '30' SECOND\n    ) WITH (\n        'connector' = 'kafka',\n\
+    \        'topic' = 'orders',\n        'properties.bootstrap.servers' = 'broker:9092',\n        'format' = 'json'\n   \
+    \ )\n\"\"\");\n\n// Hourly revenue by region with event-time windows\nTable result = tableEnv.sqlQuery(\"\"\"\n    SELECT\n\
+    \        region,\n        TUMBLE_START(event_time, INTERVAL '1' HOUR) AS window_start,\n        SUM(amount) AS total_revenue,\n\
+    \        COUNT(DISTINCT user_id) AS unique_users\n    FROM orders\n    GROUP BY region, TUMBLE(event_time, INTERVAL '1'\
+    \ HOUR)\n\"\"\");\n\n// Temporal join — enrich orders with latest user profile\ntableEnv.sqlQuery(\"\"\"\n    SELECT o.order_id,\
+    \ o.amount, u.name, u.tier\n    FROM orders o\n    JOIN user_profiles FOR SYSTEM_TIME AS OF o.event_time AS u\n      \
+    \  ON o.user_id = u.user_id\n\"\"\");\n"
+  example_bad: "// Equivalent DataStream API — more code, no optimizer benefit\nevents\n    .keyBy(event -> event.getRegion())\n\
+    \    .window(TumblingEventTimeWindows.of(Time.hours(1)))\n    .aggregate(new ComplexAggregator())  // Manual aggregation\
+    \ logic\n    .keyBy(result -> result.getRegion())\n    .connect(userProfiles.keyBy(UserProfile::getUserId))\n    .process(new\
+    \ ManualTemporalJoin());  // Manual temporal join logic\n// 100 lines of Java vs 10 lines of SQL for the same result\n"
+  when_applies: Projects using Apache Flink stream processing, SQL, or Java/JVM applications
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/sql/queries/window-tvf/"]
+- id: CR-FLINK-010
+  text: Use side outputs to handle exceptional events (late data, validation failures, dead letters) without branching the
+    main pipeline.
+  why: Without side outputs, handling exceptional events requires either dropping them silently (data loss), mixing them into
+    the main output (pollutes downstream), or creating separate parallel pipelines (resource duplication). Side outputs allow
+    a single operator to emit events to multiple output streams typed by OutputTag, keeping the main pipeline clean while
+    capturing exceptions for separate processing. This is the Flink equivalent of Kafka's Dead Letter Topic pattern.
+  how_to_do_right: 'Define OutputTag<T> for each exceptional event type. In a ProcessFunction, use ctx.output(tag, event)
+    to emit to side outputs. Collect side outputs from the main result using getSideOutput(tag). Route side outputs to separate
+    sinks (DLT, error log, retry queue). Use side outputs for: late events, validation failures, events requiring manual review,
+    metrics/audit events.'
+  severity: medium
+  technologies:
+    lang: [java]
+    platform: [flink]
+  domains:
+    domain: [architecture, reliability]
+    concern: [streaming]
+  example_good: "// Define side output tags\nOutputTag<Event> invalidTag = new OutputTag<Event>(\"invalid-events\"){};\nOutputTag<Event>\
+    \ auditTag = new OutputTag<Event>(\"audit-events\"){};\n\nSingleOutputStreamOperator<ProcessedEvent> mainStream = events\n\
+    \    .keyBy(Event::getUserId)\n    .process(new ProcessFunction<Event, ProcessedEvent>() {\n        @Override\n      \
+    \  public void processElement(Event event, Context ctx,\n                                   Collector<ProcessedEvent>\
+    \ out) {\n            // Audit trail for all events\n            ctx.output(auditTag, event);\n\n            // Validation\n\
+    \            if (!isValid(event)) {\n                ctx.output(invalidTag, event);  // Route to error sink\n        \
+    \        return;\n            }\n\n            out.collect(process(event));  // Main output\n        }\n    });\n\n//\
+    \ Main stream → primary sink\nmainStream.addSink(primarySink);\n\n// Invalid events → dead letter queue\nmainStream.getSideOutput(invalidTag).addSink(deadLetterSink);\n\
+    \n// Audit events → audit log\nmainStream.getSideOutput(auditTag).addSink(auditSink);\n"
+  example_bad: '// Filter-based branching — processes every event twice
+
+    DataStream<Event> valid = events.filter(Event::isValid);
+
+    DataStream<Event> invalid = events.filter(e -> !e.isValid());
+
+    // Each event passes through the filter operator TWICE
+
+    // Double the processing, double the network I/O
+
+
+    // Or: silently drop invalid events
+
+    events.filter(Event::isValid).map(this::process);
+
+    // Invalid events vanish — no trace, no recovery, no alerting
+
+    '
+  when_applies: Projects using Apache Flink stream processing or Java/JVM applications
+  when_not_applies: batch-only workloads, simple request-response systems. projects not using Flink or Java
+  sources: ["https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/side_output/"]
+- id: CR-FLINK-011
+  text: Monitor and resolve backpressure at the source — Flink's backpressure propagation is automatic but can cause cascading
+    performance issues.
+  why: 'When a downstream operator cannot keep up with its input rate (slow sink, expensive computation), Flink automatically
+    propagates backpressure upstream through the network buffers. While this prevents data loss, sustained backpressure causes:
+    checkpoint barriers to queue behind data records (checkpoints take longer or timeout), watermark propagation to stall
+    (windows do not emit), and source lag to grow. The root cause is always the slowest operator, but the symptoms appear
+    everywhere.'
+  how_to_do_right: 'Use the Flink Web UI''s backpressure monitoring tab to identify the bottleneck operator (the one that
+    is NOT backpressured but whose upstream IS backpressured). Common fixes: increase parallelism of the bottleneck operator,
+    optimize the slow operation (async I/O for DB lookups, batch writes to sinks), increase sink throughput (more Kafka partitions,
+    larger batch size). Enable unaligned checkpoints to decouple checkpoint progress from backpressure.'
+  severity: high
+  technologies:
+    lang: [java]
+    platform: [flink]
+  domains:
+    domain: [architecture, performance, observability]
+    concern: [streaming, monitoring]
+  example_good: "// Enable unaligned checkpoints to prevent checkpoint timeout during backpressure\nCheckpointConfig config\
+    \ = env.getCheckpointConfig();\nconfig.enableUnalignedCheckpoints();\nconfig.setAlignedCheckpointTimeout(Duration.ofSeconds(30));\n\
+    \n// Increase parallelism of bottleneck operator only\nDataStream<Result> processed = events\n    .keyBy(Event::getKey)\n\
+    \    .process(new ExpensiveProcessor())\n    .setParallelism(32)     // Scale the bottleneck\n    .name(\"Expensive Processor\"\
+    );\n\n// Use async I/O to unblock the processing thread\nAsyncDataStream.unorderedWait(\n    events, new AsyncDbLookup(),\
+    \ 5, TimeUnit.SECONDS, 200\n);\n\n// Flink metrics to monitor:\n// - isBackPressured (per task, boolean)\n// - buffers.outPoolUsage\
+    \ (>0.9 = downstream slow)\n// - buffers.inPoolUsage (>0.9 = this operator slow)\n"
+  example_bad: "// Synchronous sink with no batching — creates backpressure\nprocessed.addSink(new SinkFunction<Result>()\
+    \ {\n    public void invoke(Result value) {\n        // Synchronous HTTP call per event — 50ms each\n        httpClient.post(\"\
+    /api/results\", value);\n    }\n});\n// Sink throughput: 20 events/sec per task\n// If input rate is 1000 events/sec →\
+    \ backpressure to source\n// Watermarks stall, checkpoints timeout, consumer lag grows\n"
+  when_applies: Projects using Apache Flink stream processing or Java/JVM applications
+  when_not_applies: batch-only workloads, simple request-response systems. projects not using Flink or Java
+  sources: ["https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/monitoring/back_pressure/"]
+- id: CR-FLINK-012
+  text: Configure TaskManager memory segments correctly — Flink's memory model has distinct regions that must be sized independently.
+  why: 'Flink divides TaskManager memory into: framework heap (Flink internals), task heap (user code), managed memory (RocksDB,
+    sorting, caching), network memory (shuffle buffers), and JVM metaspace/overhead. Misconfiguring any region causes either
+    OOM (region too small) or waste (region too large). The most common production issue is network buffer exhaustion during
+    backpressure (causes ''Insufficient number of network buffers'' error) and managed memory starvation for RocksDB.'
+  severity: high
+  technologies:
+    lang: [java]
+    library: [yarn]
+    platform: [flink, kubernetes]
+  domains:
+    domain: [architecture, operations, performance]
+    concern: [streaming]
+  example_good: '# flink-conf.yaml — production TaskManager memory config
+
+    taskmanager.memory.process.size: 8g           # Total container memory
+
+    taskmanager.memory.framework.heap.size: 256m  # Flink runtime overhead
+
+    taskmanager.memory.task.heap.size: 2g         # User code heap (UDFs, objects)
+
+    taskmanager.memory.managed.fraction: 0.4      # 40% for RocksDB/sort/cache
+
+    taskmanager.memory.network.fraction: 0.1      # 10% for network buffers
+
+    taskmanager.memory.network.min: 256m          # Minimum network buffers
+
+    taskmanager.memory.network.max: 1g            # Maximum network buffers
+
+    taskmanager.memory.jvm-overhead.fraction: 0.1 # 10% for JVM metaspace, thread stacks
+
+    taskmanager.numberOfTaskSlots: 4              # Tasks per TaskManager
+
+
+    # Key: managed memory fraction determines RocksDB performance
+
+    # Too low → RocksDB spills to disk excessively, slow state access
+
+    # Too high → not enough heap for user code, OOM in UDFs
+
+    '
+  example_bad: '# Default config — inadequate for stateful production jobs
+
+    taskmanager.memory.process.size: 1g
+
+    # 1GB total for everything: heap, managed, network, JVM
+
+    # RocksDB state > 500MB → OOM
+
+    # High-parallelism job → network buffer exhaustion
+
+
+    # All memory to heap, nothing for managed/network
+
+    taskmanager.memory.task.heap.size: 7g
+
+    taskmanager.memory.managed.fraction: 0.0  # No managed memory
+
+    # RocksDB has no cache → every state access reads from disk
+
+    # 100x slower state reads, checkpoint timeouts
+
+    '
+  how_to_do_right: 'Start with process.size matching your container allocation. Allocate managed.fraction based on state backend:
+    0.4 for RocksDB-heavy jobs, 0.1 for stateless jobs. Set network.fraction to 0.1-0.15 for shuffle-heavy jobs. Reserve task.heap
+    for your UDF memory needs. Monitor memory regions in Flink metrics. Increase network.min if you see ''Insufficient number
+    of network buffers'' errors.'
+  when_applies: Projects using Apache Flink stream processing, Java/JVM applications, Kubernetes-orchestrated deployments,
+    or YARN
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://nightlies.apache.org/flink/flink-docs-stable/docs/deployment/memory/mem_setup_tm/"]

@@ -1,0 +1,217 @@
+layer: rules
+technology: SRE
+domain: security
+knowledge:
+- id: CR-SRE-AUTH-001
+  text: Authentication and authorization are separate concerns — authentication verifies identity (who are you?), authorization verifies permission (can you do this?). Conflating them leads to systems where
+    authentication bypass grants full access, or where authorization logic is scattered across every endpoint.
+  why: 'Google''s BeyondCorp and zero-trust security model separates identity verification from access control. The common mistake: a middleware checks "is the user logged in?" and if yes, allows all operations.
+    This means any authenticated user (including compromised accounts, internal malicious actors, or over-privileged service accounts) can access any resource. The correct architecture: authentication middleware
+    verifies identity and attaches identity context (user ID, roles, groups) to the request. Separate authorization middleware or per-endpoint logic checks whether THIS identity can perform THIS action
+    on THIS resource. This separation allows: centralized authentication (one SSO system), distributed authorization (each service defines its own permissions), and independent auditing of each concern.
+
+    '
+  how_to_do_right: '1. Authentication layer (centralized): verify identity, issue tokens with claims (user_id, roles, groups). One implementation, reused everywhere.
+
+    2. Authorization layer (per-service): check if the authenticated identity has permission for the specific action on the specific resource.
+
+    3. Use RBAC or ABAC for authorization: Role-Based (user has "admin" role → can delete) or Attribute-Based (user.department == resource.department → can view).
+
+    4. Never trust client-supplied authorization data: the client sends the token (identity), the server looks up permissions from its own database.
+
+    5. Log authentication AND authorization decisions: who accessed what, who was denied what. Essential for security auditing.
+
+    6. Implement least privilege: default deny. Users start with no permissions and are explicitly granted the minimum needed for their role.
+
+    '
+  example_good: "from functools import wraps\nfrom flask import request, g\n\ndef authenticate(f):\n    \"\"\"Layer 1: Verify identity — centralized.\"\"\"\n    @wraps(f)\n    def wrapper(*args, **kwargs):\n        token = request.headers.get('Authorization', '').replace('Bearer ', '')\n        identity = auth_service.verify_token(token)  # Centralized auth\n        if not identity:\n            return {'error': 'UNAUTHENTICATED'}, 401\n        g.identity = identity  # Attach identity context to request\n        return f(*args, **kwargs)\n    return wrapper\n\ndef authorize(resource: str, action: str):\n    \"\"\"Layer 2: Check permission — per-endpoint.\"\"\"\n    def decorator(f):\n        @wraps(f)\n        def wrapper(*args, **kwargs):\n            if not policy_engine.check(g.identity, resource, action):\n                audit_log.record(g.identity.user_id, resource, action, 'DENIED')\n                return {'error': 'FORBIDDEN'}, 403\n            audit_log.record(g.identity.user_id, resource, action, 'ALLOWED')\n            return f(*args, **kwargs)\n        return wrapper\n    return decorator\n\n@app.route('/api/users/<user_id>', methods=['DELETE'])\n@authenticate\n@authorize(resource='users', action='delete')\ndef delete_user(user_id):\n    return user_service.delete(user_id)\n"
+  example_bad: "from flask import request\n\n@app.route('/api/users/<user_id>', methods=['DELETE'])\ndef delete_user(user_id):\n    # Authentication only — no authorization\n    token = request.headers.get('Authorization')\n    if not verify_token(token):\n        return {'error': 'Unauthorized'}, 401\n    # ANY authenticated user can delete ANY other user!\n    # No permission check, no role verification\n    # Compromised low-privilege account has admin access\n    return user_service.delete(user_id)\n"
+  when_applies: "When building any system with user access — separate authentication (who are you?) from authorization (can you do this?) to prevent privilege escalation."
+  severity: high
+  technologies:
+    lang: [general]
+  domains:
+    domain: [reliability, security]
+    concern: [authentication, authorization]
+  sources:
+  - url: https://sre.google/sre-book/reliable-product-launches/
+    title: 'Google SRE Book — Chapter 27: Reliable Product Launches at Scale'
+  validation_status: cross_checked
+- id: CR-SRE-AUTH-002
+  text: API keys are not authentication — they identify the caller but don't verify identity. An API key in a URL, header, or config file that leaks gives the attacker full access with no revocation granularity.
+    Use API keys for identification and rate limiting; use OAuth/JWT for authentication.
+  why: 'Google''s API security practices distinguish between identification (which application is calling?) and authentication (which user is acting?). API keys are shared secrets — anyone who knows the
+    key can use it. Common leak vectors: committed to git (GitHub reports scanning 1M+ leaked API keys), logged in server logs (keys in URLs appear in access logs), shared in Slack/email (persisted forever),
+    and embedded in client-side code (visible in browser dev tools). Once leaked, an API key grants the attacker whatever access the key has — and revoking the key breaks all legitimate clients using it.
+    OAuth tokens, by contrast, are per-user, short-lived, and scoped — a leaked token expires in minutes and affects only one user.
+
+    '
+  how_to_do_right: '1. Use API keys for application identification and rate limiting only. Use OAuth2/JWT for user authentication.
+
+    2. Never put API keys in URLs: they appear in server logs, browser history, and proxy logs. Use headers (Authorization or X-API-Key).
+
+    3. Scope API keys to specific operations: a read-only key, a write key, an admin key. Least privilege per key.
+
+    4. Rotate API keys regularly: generate new key → update clients → deactivate old key. Have a rotation runbook.
+
+    5. Store API keys in secrets managers (Vault, AWS Secrets Manager): never in environment variables in CI/CD config files, never in code.
+
+    6. Monitor API key usage: which keys are used, from which IPs, for which operations. Detect anomalous usage (key used from new country, unusual operation volume).
+
+    '
+  example_good: "import jwt\nimport time\nfrom datetime import datetime, timedelta\n\n# API key: for identification and rate limiting only\ndef identify_client(request) -> str:\n    api_key = request.headers.get('X-API-Key')\n    client = api_key_store.lookup(api_key)  # Returns client_id, not permissions\n    if not client:\n        raise ValueError('Invalid API key')\n    return client.client_id\n\n# OAuth2 JWT: for user authentication\ndef authenticate_user(request) -> dict:\n    token = request.headers.get('Authorization', '').replace('Bearer ', '')\n    payload = jwt.decode(token, public_key, algorithms=['RS256'])\n    if payload['exp'] < time.time():\n        raise ValueError('Token expired')  # Short-lived: 15 min\n    return {'user_id': payload['sub'], 'scopes': payload['scopes']}\n\n# API keys stored in secrets manager, never in code\n# from vault import get_secret\n# api_key = get_secret('payment-service/api-key')\n"
+  example_bad: "# API key used as authentication — shared secret with no expiry\nAPI_KEY = 'sk_live_abc123xyz'  # Hardcoded in source code!\n\n@app.route('/api/payments', methods=['POST'])\ndef create_payment():\n    key = request.args.get('api_key')  # In URL! Appears in server logs, browser history\n    if key != API_KEY:\n        return {'error': 'Unauthorized'}, 401\n    # Anyone who sees this URL has full payment creation access\n    # Key committed to git, visible in GitHub search\n    # Key in access logs, proxy logs, browser history\n    # Revoking key breaks ALL clients — no per-user granularity\n"
+  when_applies: "When implementing API authentication — use API keys for identification/rate-limiting only; use OAuth2/JWT for actual user authentication."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [http]
+  domains:
+    domain: [reliability, security]
+    concern: [authentication, api_keys]
+  sources:
+  - url: https://sre.google/sre-book/reliable-product-launches/
+    title: 'Google SRE Book — Chapter 27: Reliable Product Launches at Scale'
+  validation_status: cross_checked
+- id: CR-SRE-AUTH-003
+  text: Service-to-service authentication must use mutual TLS (mTLS) or signed tokens — not shared secrets, IP allowlists, or "internal network" as the security boundary. Any service that accepts unauthenticated
+    internal requests is one misconfiguration away from being accessed by any workload in the cluster.
+  why: 'Google''s BeyondCorp model assumes the network is hostile — even the internal network. The common mistake: services inside a Kubernetes cluster trust each other because "they''re on the internal
+    network." But Kubernetes pods can be compromised, lateral movement is trivial once inside the cluster, and network policies are often misconfigured or absent. Without service-to-service authentication:
+    any pod can call any other pod, a compromised low-privilege service can call the admin API, and there''s no audit trail of which service called which. mTLS (mutual TLS) solves this: each service has
+    a unique certificate, every connection is encrypted, both sides verify identity, and the service mesh (Istio, Linkerd) manages certificates automatically.
+
+    '
+  how_to_do_right: '1. Use mTLS for all service-to-service communication: Istio or Linkerd handle certificate issuance, rotation, and verification automatically.
+
+    2. If no service mesh: use JWTs signed by a trusted issuer (internal CA). Each service verifies the JWT on every request.
+
+    3. Never use IP allowlists as the only control: IPs change with deployments, pods can be reassigned, and MITM is possible within the network.
+
+    4. Never use shared secrets (one API key for all services): a leaked key compromises all service-to-service communication.
+
+    5. Apply authorization on top of authentication: service A is authenticated → but can it call this specific endpoint of service B? Define inter-service policies.
+
+    6. Log all service-to-service calls: which service called which, when, what operation. Essential for incident investigation and compliance.
+
+    '
+  example_good: "# Istio mTLS: automatic certificate management\n# istio-config.yaml\n# apiVersion: security.istio.io/v1beta1\n# kind: PeerAuthentication\n# metadata:\n#   name: default\n#   namespace: production\n# spec:\n#   mtls:\n#     mode: STRICT  # All service-to-service traffic encrypted with mTLS\n\n# Authorization policy: service A can only call specific endpoints of service B\n# apiVersion: security.istio.io/v1beta1\n# kind: AuthorizationPolicy\n# metadata:\n#   name: payment-service-policy\n# spec:\n#   selector:\n#     matchLabels:\n#       app: payment-service\n#   rules:\n#   - from:\n#     - source:\n#         principals: ['cluster.local/ns/production/sa/order-service']\n#     to:\n#     - operation:\n#         methods: ['POST']\n#         paths: ['/api/payments']\n\nimport logging\nlogger = logging.getLogger('service_calls')\n\ndef log_service_call(source: str, destination: str, method: str, path: str):\n    logger.info(f's2s_call source={source} dest={destination} method={method} path={path}')\n"
+  example_bad: "# No service-to-service authentication\n# 'Internal network is safe' — every pod trusts every other pod\n\n@app.route('/admin/delete-all-users', methods=['POST'])\ndef delete_all_users():\n    # No authentication check — any pod in the cluster can call this\n    # Compromised logging pod can call admin endpoint\n    # No audit trail of which service called\n    db.execute('DELETE FROM users')\n    return {'status': 'deleted'}\n\n# IP allowlist as only control:\n# if request.remote_addr not in ALLOWED_IPS:\n#     return 403\n# IPs change with deployments, pods get reassigned\n"
+  when_applies: "When building microservices that communicate within a cluster — use mTLS or signed tokens for service-to-service authentication, never trust the network."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kubernetes, grpc, istio]
+  domains:
+    domain: [architecture, reliability, security]
+    concern: [microservices, service_mesh, authentication, mtls]
+  sources:
+  - url: https://sre.google/sre-book/reliable-product-launches/
+    title: 'Google SRE Book — Chapter 27: Reliable Product Launches at Scale'
+  validation_status: cross_checked
+- id: CR-SRE-AUTH-004
+  text: Password hashing must use bcrypt, scrypt, or Argon2 — never MD5, SHA-1, SHA-256, or any fast hash. Fast hashes enable brute-force attacks that try billions of passwords per second. Slow hashes (100ms
+    per attempt) make brute-force impractical.
+  why: 'Google''s security practices mandate slow hashes for password storage because the speed of the hash function is the primary defense against offline brute-force attacks. After a database breach,
+    the attacker has the hashed passwords. With SHA-256 on a modern GPU: 10 billion hashes/second → 8-character alphanumeric password cracked in ~3 hours. With bcrypt (cost factor 12): 300 hashes/second
+    → same password takes ~600 years. The 10-billion-to-300 ratio is the entire defense. MD5 and SHA are designed to be fast (for checksums, signatures) — using them for passwords is using the wrong tool.
+    bcrypt, scrypt, and Argon2 are designed to be slow and memory-hard, specifically to resist GPU and ASIC attacks.
+
+    '
+  how_to_do_right: '1. Use Argon2id (recommended by OWASP 2024): Argon2id with minimum 19MB memory, 2 iterations, 1 parallelism.
+
+    2. If Argon2 not available: bcrypt with cost factor 12 (adjustable for ~100ms per hash on your hardware).
+
+    3. If bcrypt not available: scrypt with N=2^14, r=8, p=5.
+
+    4. Never use MD5, SHA-1, SHA-256, SHA-512 for password storage. Even with salt, they''re too fast.
+
+    5. Always use unique salts per password: bcrypt and Argon2 include salts automatically. Don''t implement your own salting.
+
+    6. Re-hash on login when upgrading algorithms: if user''s password uses old hash, verify with old algorithm, then re-hash with new algorithm and store.
+
+    '
+  example_good: "import argon2\nimport bcrypt\n\n# Preferred: Argon2id (OWASP 2024 recommendation)\nhasher = argon2.PasswordHasher(\n    time_cost=2,        # 2 iterations\n    memory_cost=19456,  # 19MB memory\n    parallelism=1,\n)\n\ndef hash_password(password: str) -> str:\n    return hasher.hash(password)  # Salt included automatically\n\ndef verify_password(password: str, hash: str) -> bool:\n    try:\n        return hasher.verify(hash, password)\n    except argon2.exceptions.VerifyMismatchError:\n        return False\n\n# Fallback: bcrypt with cost factor 12\ndef hash_password_bcrypt(password: str) -> str:\n    return bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()\n\n# Re-hash on login when upgrading algorithms\ndef login(username: str, password: str):\n    user = db.get_user(username)\n    if user.hash_algo == 'bcrypt' and bcrypt.checkpw(password.encode(), user.hash.encode()):\n        # Upgrade to Argon2 transparently\n        user.password_hash = hash_password(password)\n        user.hash_algo = 'argon2id'\n        db.update_user(user)\n        return True\n    return hasher.verify(user.password_hash, password)\n"
+  example_bad: "import hashlib\n\ndef hash_password(password: str) -> str:\n    # SHA-256 is a FAST hash — 10 billion hashes/second on GPU\n    # 8-char alphanumeric password cracked in ~3 hours\n    return hashlib.sha256(password.encode()).hexdigest()\n\ndef hash_password_md5(password: str) -> str:\n    # MD5 is even faster — and has known collision attacks\n    return hashlib.md5(password.encode()).hexdigest()\n\n# No salt — identical passwords have identical hashes (rainbow table attack)\n# No work factor — cannot increase difficulty over time\n"
+  when_applies: "When storing any user passwords — always use bcrypt, scrypt, or Argon2; never use MD5, SHA-1, or SHA-256 for password hashing."
+  severity: critical
+  technologies:
+    lang: [general, python]
+  domains:
+    domain: [reliability, security]
+    concern: [authentication, passwords, cryptography]
+  sources:
+  - url: https://sre.google/sre-book/reliable-product-launches/
+    title: 'Google SRE Book — Chapter 27: Reliable Product Launches at Scale'
+  validation_status: cross_checked
+- id: CR-SRE-AUTH-005
+  text: Session management must handle concurrent sessions, session fixation, and session hijacking. A session token that never rotates, never expires, and is stored in localStorage is a maximum-vulnerability
+    configuration.
+  why: 'Google''s security practices treat session management as critical infrastructure because a stolen session token gives the attacker full access to the user''s account. Session fixation: attacker
+    sets the session ID before the user authenticates, then uses the same session ID after authentication. Session hijacking: attacker steals the session token via XSS, network interception, or physical
+    access. Concurrent sessions: user''s account is compromised, but the attacker''s session remains valid even after the user changes their password. Without session rotation on authentication, fixation
+    attacks succeed. Without httpOnly cookies, XSS steals the session. Without session invalidation on password change, compromised sessions persist indefinitely.
+
+    '
+  how_to_do_right: '1. Rotate session ID after authentication: create a new session on login, invalidate the old one. Prevents session fixation.
+
+    2. Store sessions in httpOnly, Secure, SameSite=Strict cookies: prevents XSS from reading the session, prevents CSRF from using it.
+
+    3. Never store session tokens in localStorage or sessionStorage: accessible to any JavaScript on the page (XSS target).
+
+    4. Invalidate all sessions on password change: the user changing their password should log out all other sessions.
+
+    5. Set session expiry: absolute (max 8 hours) and idle (30 minutes of inactivity). Re-authenticate for sensitive operations.
+
+    6. Limit concurrent sessions per user: if a user typically has 2-3 sessions, alert on 10+ concurrent sessions (indicator of credential compromise).
+
+    '
+  example_good: "import secrets\nimport time\nfrom typing import Optional\n\nclass SessionManager:\n    def __init__(self, session_store, max_idle_seconds=1800, max_absolute_seconds=28800):\n        self.store = session_store\n        self.max_idle = max_idle_seconds      # 30 min idle timeout\n        self.max_absolute = max_absolute_seconds  # 8 hour absolute timeout\n\n    def create_session(self, user_id: str) -> str:\n        session_id = secrets.token_urlsafe(32)  # Cryptographically random\n        self.store.set(session_id, {\n            'user_id': user_id,\n            'created_at': time.time(),\n            'last_active': time.time(),\n        })\n        return session_id\n\n    def rotate_on_login(self, old_session_id: str, user_id: str) -> str:\n        \"\"\"Prevent session fixation: new session on authentication.\"\"\"\n        self.store.delete(old_session_id)\n        return self.create_session(user_id)\n\n    def invalidate_all_sessions(self, user_id: str):\n        \"\"\"Called on password change — log out all other sessions.\"\"\"\n        for session_id in self.store.get_sessions_for_user(user_id):\n            self.store.delete(session_id)\n\n    def validate(self, session_id: str) -> Optional[dict]:\n        session = self.store.get(session_id)\n        if not session:\n            return None\n        if time.time() - session['last_active'] > self.max_idle:\n            self.store.delete(session_id)\n            return None  # Idle timeout\n        if time.time() - session['created_at'] > self.max_absolute:\n            self.store.delete(session_id)\n            return None  # Absolute timeout\n        session['last_active'] = time.time()\n        self.store.set(session_id, session)\n        return session\n\n# Cookie settings: httpOnly=True, Secure=True, SameSite=Strict\n"
+  example_bad: "# Session token in localStorage — XSS can steal it\n# localStorage.setItem('session', token);\n\nclass BadSessionManager:\n    def login(self, user_id):\n        # No session rotation — reuses pre-authentication session ID\n        # Attacker sets session ID → user authenticates → attacker has access\n        session['user_id'] = user_id\n        return session.id  # Same session ID as before login!\n\n    def change_password(self, user_id, new_password):\n        db.update_password(user_id, new_password)\n        # Doesn't invalidate other sessions!\n        # Attacker's session remains valid after password change\n\n    # No idle timeout, no absolute timeout\n    # Session valid forever once created\n"
+  when_applies: "When implementing user sessions in any web application — handle session fixation, hijacking, rotation on login, and invalidation on password change."
+  severity: high
+  technologies:
+    lang: [general]
+    framework: [web, django, flask]
+  domains:
+    domain: [reliability, security]
+    concern: [authentication, sessions]
+  sources:
+  - url: https://sre.google/sre-book/reliable-product-launches/
+    title: 'Google SRE Book — Chapter 27: Reliable Product Launches at Scale'
+  validation_status: cross_checked
+- id: CR-SRE-AUTH-006
+  text: Audit logs must be append-only, tamper-evident, and separate from application logs — an attacker who compromises the application should not be able to delete or modify audit trails. Store audit
+    logs in a separate system with different access controls.
+  why: 'Google''s security and compliance practices require audit logs for: who accessed what data, who performed what action, who changed what permission, and when did each event occur. If audit logs are
+    stored alongside application logs, an attacker who compromises the application can modify or delete audit evidence. If audit logs are in the same database, a SQL injection that drops tables eliminates
+    the evidence. The solution: separate audit log storage with write-only access from the application. The application can append new audit events but cannot read, modify, or delete existing events. Only
+    a separate security team has read access for investigation.
+
+    '
+  how_to_do_right: '1. Separate audit log storage: different database, different service account, different access controls. The application writes, security reads.
+
+    2. Write-only access: the application''s service account has INSERT permission only. No UPDATE, DELETE, or TRUNCATE.
+
+    3. Include in every audit event: who (user ID, IP), what (action, resource), when (timestamp), result (success/failure), and context (request ID for correlation).
+
+    4. Tamper-evident: use hash chains (each event includes hash of previous event) or write to immutable storage (S3 with Object Lock, WORM storage).
+
+    5. Retain audit logs per compliance requirements: SOC 2 requires 1 year, HIPAA requires 6 years, PCI-DSS requires 1 year. Configure retention before deployment.
+
+    6. Alert on gaps: if audit log ingestion stops for 5 minutes, alert immediately — either the application is down or audit logging was disabled (security incident).
+
+    '
+  example_good: "import hashlib\nimport json\nimport time\nfrom typing import Optional\n\nclass AuditLogger:\n    \"\"\"Append-only audit log with tamper detection.\"\"\"\n\n    def __init__(self, audit_db):\n        self.db = audit_db  # Separate DB, write-only app permissions\n        self.last_hash = None\n\n    def record(self, user_id: str, action: str, resource: str,\n               result: str, request_id: str, ip_address: str):\n        event = {\n            'who': user_id,\n            'what': action,\n            'resource': resource,\n            'result': result,  # 'allowed' or 'denied'\n            'when': time.time(),\n            'request_id': request_id,\n            'ip': ip_address,\n            'prev_hash': self.last_hash,\n        }\n        # Hash chain for tamper detection\n        event_hash = hashlib.sha256(json.dumps(event, sort_keys=True).encode()).hexdigest()\n        event['hash'] = event_hash\n        self.last_hash = event_hash\n\n        # INSERT only — app has no UPDATE/DELETE permission\n        self.db.execute(\n            'INSERT INTO audit_log (event_hash, event_data, created_at) VALUES (%s, %s, NOW())',\n            (event_hash, json.dumps(event))\n        )\n\n    def detect_tampering(self) -> bool:\n        \"\"\"Verify hash chain integrity.\"\"\"\n        events = self.db.query('SELECT event_data FROM audit_log ORDER BY created_at')\n        prev_hash = None\n        for event_json in events:\n            event = json.loads(event_json)\n            if event.get('prev_hash') != prev_hash:\n                return True  # Tampering detected\n            prev_hash = event['hash']\n        return False\n"
+  example_bad: "import logging\n\nlogger = logging.getLogger('app')  # Same logger as application!\n\ndef audit_action(user_id, action):\n    logger.info(f'User {user_id} performed {action}')\n    # Stored in same log file as application logs\n    # Attacker who compromises app can delete audit evidence\n    # No hash chain — modifications are undetectable\n    # No separate access controls — same permissions as app\n    # Missing: IP, request_id, result, resource details\n"
+  when_applies: "When building any system that requires security auditing or compliance — audit logs must be append-only, tamper-evident, and stored separately from application logs."
+  severity: high
+  technologies:
+    lang: [general]
+  domains:
+    domain: [reliability, security, compliance]
+    concern: [audit, authentication]
+  sources:
+  - url: https://sre.google/sre-book/reliable-product-launches/
+    title: 'Google SRE Book — Chapter 27: Reliable Product Launches at Scale'
+  validation_status: cross_checked

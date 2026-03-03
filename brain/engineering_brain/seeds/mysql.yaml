@@ -1,0 +1,643 @@
+layer: rules
+technology: MySQL
+domain: database
+knowledge:
+- id: CR-MY-IDB-001
+  text: Understand that in InnoDB, the primary key IS the clustered index — the table data is physically stored ordered by
+    the primary key, making PK choice the most impactful design decision.
+  why: InnoDB stores rows in a B+ tree ordered by the primary key (clustered index). Every secondary index entry stores the
+    primary key value as a pointer to the actual row. A large primary key (UUID = 36 bytes) means every secondary index carries
+    36 bytes per entry instead of 4-8 bytes for an auto-increment integer. With 5 secondary indexes on a 100M row table, a
+    UUID PK adds 5 * 100M * 28 extra bytes = 14GB of wasted index space. Random UUIDs also cause random inserts into the clustered
+    index, fragmenting pages and causing 50%+ page splits. Auto-increment PKs append to the end of the B+ tree — sequential,
+    fast, and compact.
+  how_to_do_right: Use BIGINT AUTO_INCREMENT as the primary key for most tables. If you need UUIDs for external references,
+    store them as BINARY(16) (not VARCHAR(36)) and use uuid_to_bin() with swap_flag=1 for time-ordered UUIDs. If using UUIDv7
+    (time-ordered), BINARY(16) is acceptable as PK. Always define an explicit PK — without one, InnoDB creates a hidden 6-byte
+    row ID, which you cannot use in queries.
+  severity: critical
+  technologies:
+    library: [innodb]
+    platform: [mysql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, schema_design]
+  example_good: "-- Auto-increment PK — compact, sequential, efficient\nCREATE TABLE orders (\n  id BIGINT UNSIGNED NOT NULL\
+    \ AUTO_INCREMENT PRIMARY KEY,\n  customer_id BIGINT UNSIGNED NOT NULL,\n  total DECIMAL(10,2) NOT NULL,\n  created_at\
+    \ DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,\n  INDEX idx_customer (customer_id),\n  INDEX idx_created (created_at)\n\
+    ) ENGINE=InnoDB;\n\n-- If UUID needed for external API: store as BINARY(16)\nCREATE TABLE users (\n  id BIGINT UNSIGNED\
+    \ NOT NULL AUTO_INCREMENT PRIMARY KEY,\n  uuid BINARY(16) NOT NULL DEFAULT (UUID_TO_BIN(UUID(), 1)),\n  email VARCHAR(255)\
+    \ NOT NULL,\n  UNIQUE INDEX idx_uuid (uuid),\n  UNIQUE INDEX idx_email (email)\n) ENGINE=InnoDB;\n\n-- Lookup by UUID:\
+    \ SELECT * FROM users WHERE uuid = UUID_TO_BIN(?, 1);\n-- Return UUID to API: SELECT BIN_TO_UUID(uuid, 1) AS uuid FROM\
+    \ users;\n"
+  example_bad: "-- UUID as VARCHAR PK — worst case scenario\nCREATE TABLE orders (\n  id VARCHAR(36) PRIMARY KEY DEFAULT (UUID()),\
+    \  -- 36 bytes in every secondary index\n  customer_id VARCHAR(36),                       -- Another 36-byte FK\n  total\
+    \ DECIMAL(10,2),\n  INDEX idx_customer (customer_id)\n);\n\n-- Problems:\n-- 1. PK size: 36 bytes vs 8 bytes (BIGINT)\
+    \ = 4.5x larger\n-- 2. Every secondary index carries 36-byte PK = massive indexes\n-- 3. Random UUID inserts cause page\
+    \ splits = 50% page utilization\n-- 4. VARCHAR comparison is slower than integer comparison\n\n-- No explicit PK — InnoDB\
+    \ creates hidden row ID\nCREATE TABLE logs (\n  message TEXT,\n  created_at DATETIME\n);\n-- Hidden 6-byte row ID: cannot\
+    \ query by PK, cannot use in replication filters\n"
+  when_applies: Any project using MySQL/MariaDB databases or InnoDB
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using MySQL or
+    InnoDB
+  sources: ["https://dev.mysql.com/doc/refman/8.0/en/innodb-index-types.html"]
+- id: CR-MY-IDB-002
+  text: Tune innodb_buffer_pool_size to 70-80% of available RAM on dedicated database servers — this is the single most impactful
+    MySQL performance setting.
+  why: The buffer pool is InnoDB's in-memory cache for table data and index pages. When a query needs data not in the buffer
+    pool, it reads from disk — 100-1000x slower than memory. The default buffer pool size is 128MB, which is absurdly small
+    for production. On a server with 64GB RAM, this means 99.8% of data reads hit disk. Setting the buffer pool to 50GB means
+    frequently accessed data stays in memory. Monitor the buffer pool hit rate with SHOW STATUS LIKE 'Innodb_buffer_pool_read%'
+    — it should be >99% for a properly sized pool. Below 95%, your database is I/O-bound.
+  how_to_do_right: Set innodb_buffer_pool_size to 70-80% of total RAM on dedicated MySQL servers (leave 20-30% for OS, connections,
+    and other processes). Set innodb_buffer_pool_instances to 8-16 for pools >1GB (reduces contention). Enable innodb_buffer_pool_dump_at_shutdown
+    and innodb_buffer_pool_load_at_startup for warm restart. Monitor with SHOW ENGINE INNODB STATUS and SHOW GLOBAL STATUS
+    LIKE 'Innodb_buffer_pool%'.
+  severity: critical
+  technologies:
+    library: [innodb]
+    platform: [mysql]
+  domains:
+    domain: [architecture, performance, operations]
+    concern: [data, database]
+  example_good: '# my.cnf — production server with 64GB RAM
+
+    [mysqld]
+
+    innodb_buffer_pool_size = 48G        # 75% of 64GB
+
+    innodb_buffer_pool_instances = 16    # Reduce contention (1 per GB)
+
+    innodb_buffer_pool_dump_at_shutdown = ON
+
+    innodb_buffer_pool_load_at_startup = ON
+
+
+    # Monitor buffer pool hit rate
+
+    # mysql> SHOW GLOBAL STATUS LIKE ''Innodb_buffer_pool_read%'';
+
+    # +---------------------------------------+----------+
+
+    # | Variable_name                         | Value    |
+
+    # +---------------------------------------+----------+
+
+    # | Innodb_buffer_pool_read_requests      | 89234567 | (logical reads)
+
+    # | Innodb_buffer_pool_reads              | 12345    | (disk reads)
+
+    # +---------------------------------------+----------+
+
+    # Hit rate: 1 - (12345/89234567) = 99.99% — excellent
+
+
+    # Online change (MySQL 5.7+):
+
+    SET GLOBAL innodb_buffer_pool_size = 48 * 1024 * 1024 * 1024;
+
+    '
+  example_bad: '# Default buffer pool — 128MB on a 64GB server
+
+    innodb_buffer_pool_size = 128M  # DEFAULT
+
+    # 99.8% of RAM is wasted
+
+    # Buffer pool hit rate: 60-70% — every third read hits disk
+
+    # Query latency: 5-10x higher than properly tuned
+
+
+    # Over-allocating — leaves no room for OS
+
+    innodb_buffer_pool_size = 60G  # 93% of 64GB
+
+    # OS page cache starved → file I/O slows down
+
+    # Connection memory (per-thread buffers) causes OOM
+
+    # swap starts → catastrophic performance collapse
+
+    '
+  when_applies: Any project using MySQL/MariaDB databases or InnoDB
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using MySQL or
+    InnoDB
+  sources: ["https://dev.mysql.com/doc/refman/8.0/en/innodb-buffer-pool.html"]
+- id: CR-MY-IDB-003
+  text: Understand covering indexes in MySQL — when all columns in a SELECT are in the index, InnoDB skips the clustered index
+    lookup entirely (Using index in EXPLAIN Extra).
+  why: 'In InnoDB, a secondary index lookup is two B-tree traversals: first the secondary index to find the primary key, then
+    the clustered index (primary key B-tree) to find the row data. This second lookup is random I/O — the most expensive operation.
+    A covering index contains all columns the query needs, so InnoDB satisfies the query from the secondary index alone —
+    one traversal instead of two. EXPLAIN shows ''Using index'' in the Extra column for covered queries. For queries returning
+    many rows, covering indexes can be 5-10x faster because they eliminate all clustered index random lookups.'
+  how_to_do_right: 'Check EXPLAIN output for queries scanning many rows. If Extra does not show ''Using index'', the query
+    is doing clustered index lookups per row. Add the missing columns to the index. Order matters: put equality columns first,
+    range columns last, and include any columns in SELECT, WHERE, ORDER BY, or GROUP BY. Use the ''invisible index'' feature
+    (MySQL 8.0+) to test index changes without affecting production queries.'
+  severity: high
+  technologies:
+    library: [innodb]
+    platform: [mysql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database]
+  example_good: '-- Covering index: all queried columns in the index
+
+    CREATE INDEX idx_covering ON orders (customer_id, status, total, created_at);
+
+
+    -- This query is fully covered — no clustered index lookup
+
+    EXPLAIN SELECT customer_id, status, total, created_at
+
+    FROM orders
+
+    WHERE customer_id = 123 AND status = ''pending'';
+
+    -- type: ref, Extra: Using index  ← COVERED!
+
+    -- Reads only secondary index B-tree, skips data pages entirely
+
+
+    -- Test with invisible index before adding to production
+
+    CREATE INDEX idx_test ON orders (status, created_at) INVISIBLE;
+
+    -- Optimizer ignores it; manually test with:
+
+    SET optimizer_switch = ''use_invisible_indexes=on'';
+
+    EXPLAIN SELECT ...;  -- Verify it helps
+
+    ALTER TABLE orders ALTER INDEX idx_test VISIBLE;  -- Promote to production
+
+    '
+  example_bad: "-- Index does not cover the query — extra clustered index lookups\nCREATE INDEX idx_customer ON orders (customer_id);\n\
+    \nEXPLAIN SELECT customer_id, status, total\nFROM orders WHERE customer_id = 123;\n-- type: ref, Extra: NULL  ← NOT covered\n\
+    -- For each of 500 matching rows: secondary index → PK → clustered index\n-- 500 random I/O operations to fetch status\
+    \ and total from data pages\n\n-- Adding unnecessary columns to the index (bloat)\nCREATE INDEX idx_all ON orders (customer_id,\
+    \ status, total, created_at,\n  shipping_address, billing_address, notes);\n-- Covering but the index is nearly as large\
+    \ as the table\n-- Write overhead: every INSERT/UPDATE rewrites this massive index\n"
+  when_applies: Projects using MySQL/MariaDB databases or InnoDB
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using MySQL or
+    InnoDB
+  sources: ["https://dev.mysql.com/doc/refman/8.0/en/index-extensions.html"]
+- id: CR-MY-QRY-001
+  text: Read EXPLAIN output systematically — the type column (ALL→index→range→ref→eq_ref→const) indicates access method quality,
+    and every ALL on a large table is a red flag.
+  why: 'EXPLAIN reveals how MySQL executes a query. The type column shows the access method: ALL (full table scan), index
+    (full index scan), range (index range scan), ref (index lookup), eq_ref (unique index lookup per join row), const (single
+    row by PK). Each step up is an order of magnitude improvement. A join between two tables with type=ALL on both means N*M
+    row comparisons. Converting one to eq_ref means N lookups of O(1) each. The rows column shows MySQL''s estimate of rows
+    examined — multiply across joins for total work. If actual rows >> estimated rows, statistics are stale (run ANALYZE TABLE).'
+  how_to_do_right: 'Run EXPLAIN on every slow query. Check type: ALL = add index, index = refine index (maybe covering), range
+    = acceptable for bounded scans. Check rows: multiply across joins to estimate total work. Check Extra: ''Using filesort''
+    = add index for ORDER BY, ''Using temporary'' = query requires temp table. In MySQL 8.0+, use EXPLAIN ANALYZE for actual
+    execution times (like PostgreSQL). Compare estimated vs actual rows to find bad statistics.'
+  severity: critical
+  technologies:
+    platform: [mysql]
+  domains:
+    domain: [architecture, performance, quality]
+    concern: [data, database, debugging]
+  example_good: '-- EXPLAIN ANALYZE (MySQL 8.0.18+) — actual execution data
+
+    EXPLAIN ANALYZE
+
+    SELECT o.id, o.total, c.name
+
+    FROM orders o
+
+    JOIN customers c ON c.id = o.customer_id
+
+    WHERE o.status = ''pending'' AND o.created_at > ''2026-01-01''
+
+    ORDER BY o.created_at DESC
+
+    LIMIT 20;
+
+
+    -- Good output:
+
+    -- -> Limit: 20 row(s)  (actual time=0.2..0.8 rows=20)
+
+    --   -> Nested loop join  (actual time=0.2..0.7 rows=20)
+
+    --     -> Index range scan on o using idx_status_created  (actual time=0.1..0.3 rows=20)
+
+    --     -> Single-row index lookup on c using PRIMARY  (actual time=0.01..0.01 rows=1 loops=20)
+
+
+    -- Supporting indexes:
+
+    CREATE INDEX idx_status_created ON orders (status, created_at DESC);
+
+    -- type=range for orders (bounded scan), type=eq_ref for customers (PK lookup)
+
+    '
+  example_bad: '-- No indexes — full table scans everywhere
+
+    EXPLAIN SELECT o.id, o.total, c.name
+
+    FROM orders o
+
+    JOIN customers c ON c.id = o.customer_id
+
+    WHERE o.status = ''pending'';
+
+
+    -- Bad output:
+
+    -- id | type | table | rows    | Extra
+
+    -- 1  | ALL  | o     | 5000000 | Using where        ← FULL TABLE SCAN
+
+    -- 2  | ALL  | c     | 100000  | Using where; Using join buffer  ← FULL SCAN
+
+    -- Total work: 5M × 100K = 500 BILLION comparisons
+
+
+    -- Ignoring "Using filesort" on large result sets
+
+    -- Extra: Using filesort
+
+    -- MySQL sorts ALL matching rows in memory or on disk
+
+    -- For 1M rows: minutes of sort time that an index eliminates
+
+    '
+  when_applies: Any project using MySQL/MariaDB databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using MySQL
+  sources: ["https://dev.mysql.com/doc/refman/8.0/en/explain-output.html"]
+- id: CR-MY-REP-001
+  text: Use GTID-based replication for reliable failover — position-based replication breaks on topology changes and makes
+    point-in-time recovery error-prone.
+  why: Traditional position-based replication identifies transactions by binlog file and position (mysql-bin.000042, position
+    12345). When the primary fails and a replica is promoted, every other replica must be reconfigured with the new primary's
+    file and position — which differ from the old primary's. Getting this wrong causes data loss or duplication. GTIDs (Global
+    Transaction Identifiers) give each transaction a unique UUID:sequence_number. Replicas track which GTIDs they have applied,
+    making it trivial to reconfigure replication to any new primary. GTID also enables automatic failover tools (MySQL InnoDB
+    Cluster, Orchestrator) that cannot safely operate with position-based replication.
+  how_to_do_right: 'Enable GTIDs on all servers: gtid_mode=ON, enforce_gtid_consistency=ON. Set binlog_format=ROW for data
+    integrity (statement-based has non-deterministic functions). Use CHANGE REPLICATION SOURCE TO SOURCE_AUTO_POSITION=1 (no
+    manual file/position). For HA, use MySQL InnoDB Cluster (Group Replication) or Orchestrator for automatic failover. Monitor
+    with SHOW REPLICA STATUS — check Retrieved_Gtid_Set and Executed_Gtid_Set.'
+  severity: critical
+  technologies:
+    platform: [mysql]
+  domains:
+    domain: [architecture, reliability, operations]
+    concern: [data, database]
+  example_good: "# my.cnf — all servers (primary + replicas)\n[mysqld]\nserver_id = 1                       # Unique per server\n\
+    gtid_mode = ON                      # Enable GTIDs\nenforce_gtid_consistency = ON        # Reject GTID-unsafe statements\n\
+    binlog_format = ROW                  # Row-based for consistency\nlog_bin = mysql-bin\nlog_replica_updates = ON      \
+    \      # Replicas log received transactions\nbinlog_expire_logs_seconds = 604800  # 7 days retention\n\n# Semi-synchronous\
+    \ for durability (at least 1 replica confirms)\nplugin-load = \"rpl_semi_sync_source=semisync_source.so;rpl_semi_sync_replica=semisync_replica.so\"\
+    \nrpl_semi_sync_source_enabled = ON\nrpl_semi_sync_source_wait_for_replica_count = 1\n\n# Configure replica with GTID\
+    \ auto-positioning\nCHANGE REPLICATION SOURCE TO\n  SOURCE_HOST = 'primary-host',\n  SOURCE_USER = 'repl_user',\n  SOURCE_PASSWORD\
+    \ = '***',\n  SOURCE_AUTO_POSITION = 1;\nSTART REPLICA;\n"
+  example_bad: "# Position-based replication — fragile failover\nCHANGE REPLICATION SOURCE TO\n  SOURCE_HOST = 'primary-host',\n\
+    \  SOURCE_LOG_FILE = 'mysql-bin.000042',\n  SOURCE_LOG_POS = 12345;\n# Primary fails → new primary has different binlog\
+    \ file/position\n# Must manually calculate correct position → error-prone\n# Wrong position → data loss or duplicate transactions\n\
+    \n# Statement-based replication — non-deterministic\nbinlog_format = STATEMENT\n# INSERT INTO t VALUES (NOW(), UUID(),\
+    \ RAND())\n# Primary and replica get DIFFERENT values for NOW/UUID/RAND\n# Silent data divergence — discovered weeks later\n"
+  when_applies: Any project using MySQL/MariaDB databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using MySQL
+  sources: ["https://dev.mysql.com/doc/refman/8.0/en/replication-gtids.html"]
+- id: CR-MY-REP-002
+  text: Use Group Replication or InnoDB Cluster for multi-primary with automatic conflict detection — but understand that
+    write conflicts between nodes cause transaction rollback.
+  why: Traditional primary-replica allows writes on only one server. If the primary fails, manual promotion is required. Group
+    Replication provides multi-primary mode where any node accepts writes, with automatic conflict detection using write-set
+    based certification. However, conflicting writes (two nodes update the same row) cause the later transaction to be rolled
+    back with a certification error. This is not a bug — it is the distributed consensus working correctly. Applications must
+    handle certification failures with retry logic. Without understanding this, developers use multi-primary expecting it
+    to 'just work' and get mysterious transaction failures.
+  how_to_do_right: 'For most applications, use single-primary mode (one writer, automatic failover). Only use multi-primary
+    when: (1) write conflicts are rare (sharded by tenant, geographic writes), (2) your application implements retry logic
+    for certification failures, (3) you avoid hotspot rows (counters, sequence tables). Monitor with performance_schema.replication_group_member_stats
+    for certification lag and conflict counts.'
+  severity: high
+  technologies:
+    library: [innodb]
+    platform: [mysql]
+  domains:
+    domain: [architecture, reliability]
+    concern: [data, database, distributed-systems]
+  example_good: "# Single-primary Group Replication (recommended for most)\n[mysqld]\n# Group Replication settings\nplugin_load_add\
+    \ = 'group_replication.so'\ngroup_replication_group_name = \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"\ngroup_replication_start_on_boot\
+    \ = OFF\ngroup_replication_single_primary_mode = ON      # Single writer\ngroup_replication_enforce_update_everywhere_checks\
+    \ = OFF\n\n# Application handles failover via MySQL Router\n# MySQL Router auto-detects primary and routes writes\n# Read-write\
+    \ port: 6446 (always goes to primary)\n# Read-only port: 6447 (load-balanced across secondaries)\n\n# Multi-primary with\
+    \ retry logic (only if conflicts are rare)\nimport mysql.connector\nfrom mysql.connector import Error\n\ndef execute_with_retry(connection,\
+    \ query, params, max_retries=3):\n    for attempt in range(max_retries):\n        try:\n            cursor = connection.cursor()\n\
+    \            cursor.execute(query, params)\n            connection.commit()\n            return True\n        except Error\
+    \ as e:\n            if e.errno == 3101:  # ER_GRP_RPL_CERTIFICATION_FAILURE\n                connection.rollback()\n\
+    \                continue  # Retry — conflict detected\n            raise\n    return False  # All retries failed\n"
+  example_bad: '# Multi-primary without retry logic
+
+    group_replication_single_primary_mode = OFF
+
+    # Application code:
+
+    cursor.execute("UPDATE counters SET value = value + 1 WHERE id = 1")
+
+    connection.commit()
+
+    # Two nodes increment simultaneously → one gets:
+
+    # ERROR 3101: Transaction was rolled back because of a certification failure
+
+    # No retry → application shows error to user
+
+
+    # Hotspot rows in multi-primary
+
+    # Global sequence table updated by every node:
+
+    # UPDATE sequences SET next_val = next_val + 1 WHERE name = ''order_id''
+
+    # Every transaction on every node conflicts with every other
+
+    # Throughput: worse than single-primary due to constant rollbacks
+
+    '
+  when_applies: Projects using MySQL/MariaDB databases or InnoDB
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using MySQL or
+    InnoDB
+  sources: ["https://dev.mysql.com/doc/refman/8.0/en/group-replication.html"]
+- id: CR-MY-PART-001
+  text: Use RANGE partitioning for time-series data in MySQL — partition by date for fast data archival (DROP PARTITION is
+    instant) and query pruning.
+  why: 'A monolithic 500M-row table with a WHERE created_at > ''2026-01-01'' scans the full table if the range covers too
+    many rows for the optimizer to use an index. With RANGE partitioning by month, the query only scans relevant partitions
+    (partition pruning). Dropping old data is instant: ALTER TABLE t DROP PARTITION p2025_01 removes millions of rows in milliseconds
+    without generating undo log or bloating the tablespace. Without partitioning, DELETE FROM t WHERE created_at < ''2025-02-01''
+    generates massive undo log, locks rows, and takes hours for large tables.'
+  how_to_do_right: Create the table with PARTITION BY RANGE (TO_DAYS(date_col)) or PARTITION BY RANGE COLUMNS(date_col). Always
+    include the partition key in every query's WHERE clause for pruning. Automate partition creation with events or cron (create
+    next month's partition before it is needed). Verify pruning with EXPLAIN PARTITIONS. Keep the number of partitions under
+    1000 (MySQL has per-table partition overhead).
+  severity: high
+  technologies:
+    platform: [mysql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, time_series]
+  example_good: "-- Range partitioning by month\nCREATE TABLE events (\n  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,\n  event_type\
+    \ VARCHAR(50) NOT NULL,\n  payload JSON,\n  created_at DATETIME NOT NULL,\n  PRIMARY KEY (id, created_at),\n  INDEX idx_type_date\
+    \ (event_type, created_at)\n) PARTITION BY RANGE (TO_DAYS(created_at)) (\n  PARTITION p2026_01 VALUES LESS THAN (TO_DAYS('2026-02-01')),\n\
+    \  PARTITION p2026_02 VALUES LESS THAN (TO_DAYS('2026-03-01')),\n  PARTITION p2026_03 VALUES LESS THAN (TO_DAYS('2026-04-01')),\n\
+    \  PARTITION p_future VALUES LESS THAN MAXVALUE\n);\n\n-- Fast data archival — instant partition drop\nALTER TABLE events\
+    \ DROP PARTITION p2025_01;\n-- Drops millions of rows in <100ms, no undo log, no lock\n\n-- Verify partition pruning\n\
+    EXPLAIN SELECT * FROM events\nWHERE created_at >= '2026-02-01' AND created_at < '2026-02-15';\n-- partitions: p2026_02\
+    \  (only one partition scanned)\n\n-- Automate partition creation (MySQL Event)\nCREATE EVENT add_monthly_partition\n\
+    ON SCHEDULE EVERY 1 MONTH STARTS '2026-03-01 00:00:00'\nDO ALTER TABLE events REORGANIZE PARTITION p_future INTO (\n \
+    \ PARTITION p2026_03 VALUES LESS THAN (TO_DAYS('2026-04-01')),\n  PARTITION p_future VALUES LESS THAN MAXVALUE\n);\n"
+  example_bad: '-- No partitioning — DELETE for data archival
+
+    DELETE FROM events WHERE created_at < ''2025-02-01'';
+
+    -- 50M rows deleted: undo log grows to 20GB, takes 45 minutes
+
+    -- Row locks cause blocking for concurrent queries
+
+    -- innodb_undo_tablespace bloat persists until purge catches up
+
+
+    -- Forgot to include partition key in query — scans ALL partitions
+
+    SELECT * FROM events WHERE event_type = ''login'';
+
+    -- partitions: p2026_01,p2026_02,p2026_03,p_future (ALL scanned)
+
+    -- No pruning benefit — same as unpartitioned table
+
+    '
+  when_applies: Projects using MySQL/MariaDB databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using MySQL
+  sources: ["https://dev.mysql.com/doc/refman/8.0/en/partitioning-range.html"]
+- id: CR-MY-SEC-001
+  text: Use prepared statements with parameterized queries for ALL user input — string concatenation enables SQL injection,
+    the most dangerous and most preventable database vulnerability.
+  why: 'SQL injection has been the number one web application vulnerability for over 20 years. String concatenation places
+    user input directly into the SQL parse tree, allowing attackers to modify query logic: input of '' OR ''1''=''1 bypasses
+    authentication, UNION SELECT extracts data from other tables, and stacked queries can DROP TABLE or create admin accounts.
+    Prepared statements separate the SQL structure (parsed once) from the data (bound separately), making injection impossible
+    by design. The parameterized query sends the SQL template to MySQL, which parses and compiles it, then sends parameter
+    values separately — they can never be interpreted as SQL.'
+  how_to_do_right: 'Use parameterized queries in every language: Python (cursor.execute(sql, params)), Java (PreparedStatement),
+    PHP (PDO::prepare), Node.js (mysql2 with ?). Never use f-strings, string.format(), or concatenation for SQL with user
+    input. Use an ORM (SQLAlchemy, Hibernate, Sequelize) which parameterizes by default. For dynamic queries (variable column
+    lists, ORDER BY), use whitelists — not parameterization (column names cannot be parameterized).'
+  severity: critical
+  technologies:
+    platform: [mysql, postgresql, sqlite]
+  domains:
+    domain: [architecture, security]
+    concern: [data, database]
+  example_good: "import mysql.connector\n\n# Parameterized query — SQL injection IMPOSSIBLE\ndef get_user(email: str):\n \
+    \   conn = mysql.connector.connect(...)\n    cursor = conn.cursor(dictionary=True)\n    cursor.execute(\n        \"SELECT\
+    \ id, name, email FROM users WHERE email = %s\",\n        (email,)\n    )\n    return cursor.fetchone()\n\n# Even malicious\
+    \ input is treated as a string value:\nget_user(\"' OR '1'='1' --\")\n# Executes: SELECT ... WHERE email = \"' OR '1'='1'\
+    \ --\"\n# Returns: None (no user with that literal email)\n\n# SQLAlchemy ORM — parameterized by default\nfrom sqlalchemy\
+    \ import select\nstmt = select(User).where(User.email == email)\nresult = session.execute(stmt).scalar_one_or_none()\n\
+    \n# Dynamic ORDER BY with whitelist\nALLOWED_COLUMNS = {\"name\", \"created_at\", \"email\"}\ndef get_users_sorted(sort_by:\
+    \ str):\n    if sort_by not in ALLOWED_COLUMNS:\n        sort_by = \"created_at\"  # Safe default\n    cursor.execute(f\"\
+    SELECT * FROM users ORDER BY {sort_by} DESC\")\n"
+  example_bad: "# String concatenation — SQL injection vulnerability\ndef get_user(email: str):\n    cursor.execute(f\"SELECT\
+    \ * FROM users WHERE email = '{email}'\")\n    return cursor.fetchone()\n\n# Attacker input: email = \"' OR '1'='1' --\"\
+    \n# Executes: SELECT * FROM users WHERE email = '' OR '1'='1' --'\n# Returns: ALL users (authentication bypass)\n\n# Attacker\
+    \ input: email = \"'; DROP TABLE users; --\"\n# Executes: SELECT * FROM users WHERE email = ''; DROP TABLE users; --'\n\
+    # Result: users table DELETED\n\n# f-string with .format() — same vulnerability\nquery = \"SELECT * FROM users WHERE email\
+    \ = '{}'\".format(email)\ncursor.execute(query)\n"
+  when_applies: Any project using MySQL/MariaDB databases, PostgreSQL databases, or SQLite
+  when_not_applies: stateless microservices with no data persistence, pure computation modules
+  sources: ["https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html", "https://dev.mysql.com/doc/refman/8.0/en/sql-prepared-statements.html"]
+- id: CR-MY-QRY-002
+  text: Avoid SELECT * in production queries — fetch only the columns you need to reduce network transfer, enable covering
+    indexes, and prevent schema change breakage.
+  why: 'SELECT * fetches all columns from the table, even those you do not use. This prevents covering index optimization
+    (InnoDB must always visit the clustered index), increases network transfer (10 columns at 500 bytes vs 2 columns at 50
+    bytes), and breaks application code when columns are added or reordered. In a microservices environment, a new column
+    added to a table silently appears in all SELECT * results — potentially exposing sensitive data (salary, SSN) to services
+    that should not see it. Explicit column lists are also self-documenting: they show exactly what data a query needs.'
+  how_to_do_right: 'List columns explicitly in every SELECT: SELECT id, name, email FROM users. For ORM code, use .defer()
+    or .only() to control which columns are loaded. In SELECT for INSERT INTO ... SELECT, always list columns on both sides.
+    The only acceptable use of SELECT * is in ad-hoc debugging queries and subqueries inside EXISTS (where columns are not
+    returned).'
+  severity: medium
+  technologies:
+    platform: [mysql, postgresql]
+  domains:
+    domain: [architecture, performance, security]
+    concern: [data, database]
+  example_good: '-- Explicit columns — enables covering index, minimal transfer
+
+    SELECT id, name, email FROM users WHERE status = ''active'';
+
+    -- With covering index: CREATE INDEX idx ON users (status) INCLUDE (id, name, email)
+
+    -- Index Only Scan — never touches table data
+
+
+    -- ORM: load only needed columns
+
+    # SQLAlchemy
+
+    session.query(User.id, User.name).filter(User.status == ''active'')
+
+
+    # Django
+
+    User.objects.filter(status=''active'').only(''id'', ''name'', ''email'')
+
+
+    -- EXISTS subquery — SELECT * is fine (columns ignored)
+
+    SELECT * FROM orders o
+
+    WHERE EXISTS (SELECT 1 FROM returns r WHERE r.order_id = o.id);
+
+    '
+  example_bad: '-- SELECT * — all columns fetched even if unused
+
+    SELECT * FROM users WHERE status = ''active'';
+
+    -- Fetches: id, name, email, password_hash, ssn, salary, ...
+
+    -- Network: 2KB per row instead of 100 bytes
+
+    -- Cannot use covering index — always reads from clustered index
+
+    -- New column ''internal_notes'' silently exposed to API
+
+    '
+  when_applies: Projects using MySQL/MariaDB databases or PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using MySQL or
+    PostgreSQL
+  sources: ["https://dev.mysql.com/doc/refman/8.0/en/select.html"]
+- id: CR-MY-IDB-004
+  text: Use online DDL (ALGORITHM=INPLACE or INSTANT) for schema changes on large tables — avoid ALGORITHM=COPY which locks
+    the table and copies all data.
+  why: Traditional ALTER TABLE in MySQL copies the entire table to a new table with the modified schema, then swaps them.
+    For a 100GB table, this takes hours and holds a metadata lock that blocks all DML. MySQL 8.0 supports INSTANT ALTER for
+    many operations (adding columns, changing defaults, dropping columns), which completes in milliseconds by modifying only
+    metadata. INPLACE ALTER modifies the table in-place without a full copy, allowing concurrent DML during the alter. Knowing
+    which operations support INSTANT, INPLACE, or require COPY is critical for zero-downtime schema changes.
+  how_to_do_right: 'For adding nullable columns: ALTER TABLE t ADD COLUMN col TYPE DEFAULT val, ALGORITHM=INSTANT (MySQL 8.0.29+).
+    For adding indexes: ALTER TABLE t ADD INDEX idx(col), ALGORITHM=INPLACE, LOCK=NONE (allows concurrent reads+writes). For
+    column type changes: use pt-online-schema-change or gh-ost for zero-downtime migrations. Always test with ALGORITHM=INSTANT
+    first — if not supported, try INPLACE, then COPY as last resort.'
+  severity: high
+  technologies:
+    library: [innodb]
+    platform: [mysql]
+  domains:
+    domain: [architecture, operations]
+    concern: [data, database]
+  example_good: "-- INSTANT: add column — milliseconds, no lock, no copy\nALTER TABLE orders ADD COLUMN notes TEXT DEFAULT\
+    \ NULL, ALGORITHM=INSTANT;\n-- Completes in <100ms on any table size\n\n-- INPLACE: add index — allows concurrent DML\n\
+    ALTER TABLE orders ADD INDEX idx_status_date (status, created_at),\n  ALGORITHM=INPLACE, LOCK=NONE;\n-- Builds index in\
+    \ background, reads+writes continue\n-- Takes time proportional to table size but no downtime\n\n-- INSTANT: change default\
+    \ value\nALTER TABLE orders ALTER COLUMN status SET DEFAULT 'pending', ALGORITHM=INSTANT;\n\n-- INSTANT: drop column (MySQL\
+    \ 8.0.29+)\nALTER TABLE orders DROP COLUMN deprecated_field, ALGORITHM=INSTANT;\n\n-- For unsupported operations: use\
+    \ external tool\n-- pt-online-schema-change --alter \"MODIFY COLUMN price DECIMAL(12,2)\"\n-- Creates shadow table, copies\
+    \ data in chunks, swaps atomically\n"
+  example_bad: '-- Default ALTER — may choose COPY algorithm
+
+    ALTER TABLE orders MODIFY COLUMN price DECIMAL(12,2);
+
+    -- MySQL may use ALGORITHM=COPY for type change
+
+    -- 100GB table: copies all data = 2-6 hours
+
+    -- Metadata lock blocks all concurrent DML during swap phase
+
+
+    -- Forcing COPY when INPLACE is available
+
+    ALTER TABLE orders ADD INDEX idx_new (col), ALGORITHM=COPY;
+
+    -- Unnecessary full table copy
+
+    -- INPLACE would build the index without copying data
+
+    '
+  when_applies: Projects using MySQL/MariaDB databases or InnoDB
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using MySQL or
+    InnoDB
+  sources: ["https://dev.mysql.com/doc/refman/8.0/en/innodb-online-ddl.html"]
+- id: CR-MY-REP-003
+  text: Use ProxySQL or MySQL Router for transparent read/write splitting — application code should not manage database connection
+    routing directly.
+  why: Manually implementing read/write splitting in application code (separate connection pools for primary and replicas)
+    creates tight coupling between the application and database topology. Adding a replica, removing a node, or performing
+    failover requires application code changes and redeployment. ProxySQL sits between the application and MySQL, transparently
+    routing writes to the primary and reads to replicas based on query analysis. It also provides connection pooling (multiplexing
+    thousands of application connections onto a small pool), query caching, and query rewriting. MySQL Router (for InnoDB
+    Cluster) provides automatic failover awareness.
+  how_to_do_right: 'Deploy ProxySQL on each application server (as a sidecar) or as a shared pool. Configure hostgroups: writer=10
+    (primary), reader=20 (replicas). Set query rules to route SELECT to readers and everything else to writers. Use mysql_servers
+    to register primary and replicas with health checks. Application connects to ProxySQL on localhost:6033 — no topology
+    awareness needed in application code.'
+  severity: high
+  technologies:
+    library: [proxysql]
+    platform: [mysql]
+  domains:
+    domain: [architecture, performance, operations]
+    concern: [data, database, scalability]
+  example_good: "# ProxySQL configuration\n# Writer hostgroup: 10 (primary)\nINSERT INTO mysql_servers (hostgroup_id, hostname,\
+    \ port) VALUES\n  (10, 'primary.db', 3306);\n# Reader hostgroup: 20 (replicas)\nINSERT INTO mysql_servers (hostgroup_id,\
+    \ hostname, port) VALUES\n  (20, 'replica-1.db', 3306),\n  (20, 'replica-2.db', 3306);\n\n# Query rules: SELECT → readers,\
+    \ everything else → writers\nINSERT INTO mysql_query_rules (rule_id, match_pattern, destination_hostgroup) VALUES\n  (1,\
+    \ '^SELECT .* FOR UPDATE$', 10),  -- SELECT FOR UPDATE → writer\n  (2, '^SELECT', 20),                  -- All other SELECT\
+    \ → reader\n  (3, '.*', 10);                       -- Everything else → writer\n\nLOAD MYSQL SERVERS TO RUNTIME;\nLOAD\
+    \ MYSQL QUERY RULES TO RUNTIME;\n\n# Application connects to ProxySQL — topology transparent\n# DATABASE_URL=mysql://user:pass@localhost:6033/mydb\n\
+    # ProxySQL handles routing, pooling, failover automatically\n"
+  example_bad: "# Application-level routing — tight coupling\nwrite_pool = create_pool(\"primary.db:3306\")\nread_pool = create_pool(\"\
+    replica-1.db:3306\")\n\ndef get_user(user_id):\n    conn = read_pool.get_connection()   # Manual routing\n    return conn.execute(\"\
+    SELECT * FROM users WHERE id = %s\", user_id)\n\ndef update_user(user_id, data):\n    conn = write_pool.get_connection()\
+    \  # Manual routing\n    conn.execute(\"UPDATE users SET ... WHERE id = %s\", ...)\n\n# Adding replica-2 requires code\
+    \ change and redeployment\n# Failover requires code change and redeployment\n# No connection pooling between app instances\n"
+  when_applies: Projects using MySQL/MariaDB databases or ProxySQL
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using MySQL or
+    ProxySQL
+  sources: ["https://proxysql.com/documentation/", "https://dev.mysql.com/doc/mysql-router/8.0/en/"]
+- id: CR-MY-PART-002
+  text: Ensure the partition key is included in all unique indexes and the primary key — MySQL requires the partition key
+    to be part of every unique constraint.
+  why: 'MySQL enforces a unique constraint that the partition key must be part of every unique index (including the primary
+    key). This is because unique lookups must be routable to a specific partition — without the partition key, MySQL would
+    need to check all partitions for uniqueness, which is not supported. Forgetting this requirement causes a hard error:
+    ''A PRIMARY KEY must include all columns in the table''s partitioning function.'' This is a design constraint that forces
+    you to think about your partitioning key''s relationship to your data''s identity. For time-partitioned tables, this means
+    the primary key must include the time column.'
+  how_to_do_right: 'For time-partitioned tables: PRIMARY KEY (id, created_at). For UNIQUE indexes: include the partition key
+    column. If you need a globally unique auto-increment ID, use BIGINT AUTO_INCREMENT — MySQL maintains uniqueness across
+    partitions for auto-increment. For UUID-based systems, consider generating the UUID in application code and including
+    the partition key in the composite primary key.'
+  severity: high
+  technologies:
+    platform: [mysql]
+  domains:
+    domain: [architecture]
+    concern: [data, database, schema_design]
+  example_good: "-- Partition key included in primary key\nCREATE TABLE events (\n  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,\n\
+    \  event_date DATE NOT NULL,\n  event_type VARCHAR(50),\n  payload JSON,\n  PRIMARY KEY (id, event_date),      -- event_date\
+    \ must be in PK\n  INDEX idx_type (event_type, event_date)\n) PARTITION BY RANGE (TO_DAYS(event_date)) (\n  PARTITION\
+    \ p2026_01 VALUES LESS THAN (TO_DAYS('2026-02-01')),\n  PARTITION p2026_02 VALUES LESS THAN (TO_DAYS('2026-03-01'))\n\
+    );\n\n-- Unique index must include partition key\nCREATE TABLE bookings (\n  id BIGINT UNSIGNED AUTO_INCREMENT,\n  booking_date\
+    \ DATE NOT NULL,\n  room_id INT NOT NULL,\n  guest_name VARCHAR(255),\n  PRIMARY KEY (id, booking_date),\n  UNIQUE INDEX\
+    \ idx_room_date (room_id, booking_date)\n) PARTITION BY RANGE (TO_DAYS(booking_date)) (...);\n"
+  example_bad: "-- Primary key without partition column — ERROR\nCREATE TABLE events (\n  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT\
+    \ PRIMARY KEY,  -- Missing event_date\n  event_date DATE NOT NULL,\n  payload JSON\n) PARTITION BY RANGE (TO_DAYS(event_date))\
+    \ (...);\n-- ERROR 1503: A PRIMARY KEY must include all columns in the table's partitioning function\n\n-- Unique index\
+    \ without partition column — ERROR\nCREATE TABLE bookings (\n  id BIGINT AUTO_INCREMENT,\n  booking_date DATE,\n  room_id\
+    \ INT,\n  PRIMARY KEY (id, booking_date),\n  UNIQUE INDEX idx_room (room_id)  -- Missing booking_date\n) PARTITION BY\
+    \ RANGE (TO_DAYS(booking_date)) (...);\n-- ERROR 1503: A UNIQUE INDEX must include all columns in the partitioning function\n"
+  when_applies: Projects using MySQL/MariaDB databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using MySQL
+  sources: ["https://dev.mysql.com/doc/refman/8.0/en/partitioning-limitations-partitioning-keys-unique-keys.html"]

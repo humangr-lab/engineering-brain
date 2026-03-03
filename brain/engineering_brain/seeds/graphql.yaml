@@ -1,0 +1,510 @@
+layer: rules
+technology: GraphQL
+domain: api
+knowledge:
+- id: CR-GQL-001
+  text: Fields are nullable by default — use non-null (!) only when the field is guaranteed to always resolve.
+  why: Non-null fields that fail to resolve cause the error to bubble up to the nearest nullable parent, potentially nullifying
+    an entire object tree. A single failing non-null field in a list can null the entire list. Nullable fields contain errors
+    to the field itself.
+  how_to_do_right: 'Default to nullable. Mark non-null only for: ID fields, enum fields, fields with hardcoded defaults, and
+    fields computed without I/O. For lists, consider [User]! (list required, items nullable) vs [User!]! (list and items required).'
+  severity: high
+  technologies:
+    lang: [graphql]
+    library: [apollo, relay]
+  domains:
+    domain: [architecture, api]
+    concern: [backend]
+  example_good: "type User {\n  id: ID!              # Always exists — non-null\n  email: String!        # Required at creation\
+    \ — non-null\n  name: String          # Nullable — might fail to fetch from profile service\n  avatar: String        #\
+    \ Nullable — external CDN might be down\n  posts: [Post]         # Nullable list — if posts service fails, user still\
+    \ resolves\n}\n\ntype Query {\n  user(id: ID!): User   # Nullable return — user might not exist\n  users: [User!]!   \
+    \    # Non-null list with non-null items — always returns (maybe empty)\n}\n"
+  example_bad: "type User {\n  id: ID!\n  email: String!\n  name: String!         # Profile service down → null → ENTIRE User\
+    \ becomes null\n  avatar: String!       # CDN down → null → ENTIRE User becomes null\n  posts: [Post!]!       # One post\
+    \ fails to resolve → ENTIRE list becomes null\n}\n# One flaky microservice nullifies the entire response\n"
+  when_applies: Projects using GraphQL API layers, Apollo, or Relay
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps
+  sources: ["https://graphql.org/learn/schema/#lists-and-non-null"]
+- id: CR-GQL-002
+  text: Use separate input types for mutations — never reuse output types as input.
+  why: Output types have computed fields (createdAt, derivedScore), server-generated fields (id), and relational fields (author)
+    that make no sense as input. Reusing them forces clients to send garbage values. Input types define exactly what the client
+    controls.
+  how_to_do_right: 'Define input types with the Input suffix: CreateUserInput, UpdateUserInput. Make update inputs partial
+    (all fields optional). Use the output type only for responses. Different mutations can share input types if their inputs
+    are identical.'
+  severity: medium
+  technologies:
+    lang: [graphql]
+  domains:
+    domain: [architecture, api]
+    concern: [backend]
+  example_good: "input CreateUserInput {\n  email: String!\n  name: String!\n  role: Role = USER\n}\n\ninput UpdateUserInput\
+    \ {\n  name: String          # All optional for partial updates\n  avatar: String\n  role: Role\n}\n\ntype Mutation {\n\
+    \  createUser(input: CreateUserInput!): User!\n  updateUser(id: ID!, input: UpdateUserInput!): User!\n}\n\ntype User {\n\
+    \  id: ID!\n  email: String!\n  name: String!\n  role: Role!\n  createdAt: DateTime!  # Server-generated — not in input\n\
+    \  postCount: Int!       # Computed — not in input\n}\n"
+  example_bad: "# Reusing output type as input — client must send id? createdAt? postCount?\ntype Mutation {\n  createUser(input:\
+    \ User!): User!   # User has id, createdAt — nonsensical as input\n  updateUser(input: User!): User!   # Must client send\
+    \ ALL fields for partial update?\n}\n"
+  when_applies: Projects using GraphQL API layers
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps. projects not using GraphQL
+  sources: ["https://graphql.org/learn/schema/#input-types"]
+- id: CR-GQL-003
+  text: Use interfaces for types with shared fields and unions for heterogeneous types without shared fields.
+  why: 'Interfaces enforce a contract: every implementing type MUST have the interface fields. Unions are for unrelated types
+    grouped together (search results: User | Post | Comment). Using interfaces where unions fit forces artificial shared fields;
+    using unions where interfaces fit loses type safety.'
+  how_to_do_right: 'Interface: types that share behavior (Node with id, Timestamped with createdAt). Union: search results,
+    feed items, notification payloads. Use __typename for discrimination. Add inline fragments for type-specific fields.'
+  severity: medium
+  technologies:
+    lang: [graphql]
+  domains:
+    domain: [architecture, api]
+    concern: [backend]
+  example_good: "# Interface — shared contract\ninterface Node {\n  id: ID!\n}\n\ninterface Timestamped {\n  createdAt: DateTime!\n\
+    \  updatedAt: DateTime!\n}\n\ntype User implements Node & Timestamped {\n  id: ID!\n  createdAt: DateTime!\n  updatedAt:\
+    \ DateTime!\n  name: String!\n}\n\n# Union — heterogeneous search results\nunion SearchResult = User | Post | Comment\n\
+    \ntype Query {\n  search(query: String!): [SearchResult!]!\n}\n\n# Client query\n# query { search(query: \"foo\") { ...\
+    \ on User { name } ... on Post { title } } }\n"
+  example_bad: '# Union where interface fits — cannot query shared fields directly
+
+    union Content = Article | Video | Podcast
+
+    # Must inline fragment for EVERY type just to get id:
+
+    # query { content { ... on Article { id } ... on Video { id } ... on Podcast { id } } }
+
+    '
+  when_applies: Projects using GraphQL API layers
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps. projects not using GraphQL
+  sources: ["https://graphql.org/learn/schema/#interfaces", "https://graphql.org/learn/schema/#union-types"]
+- id: CR-GQL-004
+  text: Use DataLoader for batching and caching to solve the N+1 query problem — create a new DataLoader per request.
+  why: Without DataLoader, resolving a list of 100 users with their posts triggers 1 query for users + 100 queries for posts
+    (N+1). DataLoader batches all 100 post lookups into a single query. Per-request instances prevent cache leaks between
+    users.
+  how_to_do_right: Create DataLoader instances in the request context (new per request). Batch function receives array of
+    keys, returns results in same order. DataLoader auto-deduplicates keys within a request. Never share DataLoader across
+    requests.
+  severity: critical
+  technologies:
+    lang: [graphql]
+    library: [apollo, dataloader]
+  domains:
+    domain: [architecture, api, performance]
+    concern: [backend]
+  example_good: "import DataLoader from 'dataloader';\n\n// Create loaders per request — in context factory\nfunction createLoaders()\
+    \ {\n  return {\n    userById: new DataLoader(async (ids) => {\n      const users = await db.query('SELECT * FROM users\
+    \ WHERE id = ANY($1)', [ids]);\n      // Return in same order as input ids\n      const map = new Map(users.map(u => [u.id,\
+    \ u]));\n      return ids.map(id => map.get(id) || null);\n    }),\n    postsByUserId: new DataLoader(async (userIds)\
+    \ => {\n      const posts = await db.query('SELECT * FROM posts WHERE user_id = ANY($1)', [userIds]);\n      const grouped\
+    \ = groupBy(posts, 'user_id');\n      return userIds.map(id => grouped[id] || []);\n    }),\n  };\n}\n\n// Resolver —\
+    \ DataLoader batches + caches automatically\nconst resolvers = {\n  User: {\n    posts: (user, _, { loaders }) => loaders.postsByUserId.load(user.id),\n\
+    \  },\n};\n"
+  example_bad: "const resolvers = {\n  User: {\n    posts: async (user) => {\n      // N+1: this runs ONCE PER USER in the\
+    \ list\n      return db.query('SELECT * FROM posts WHERE user_id = $1', [user.id]);\n      // 100 users = 100 separate\
+    \ SQL queries\n    },\n  },\n};\n"
+  when_applies: Any project using GraphQL API layers, Apollo, or DataLoader
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps
+  sources: ["https://github.com/graphql/dataloader"]
+- id: CR-GQL-005
+  text: Use cursor-based pagination (Relay Connection spec) — not offset-based — for stable, performant pagination.
+  why: Offset pagination (LIMIT 10 OFFSET 1000) scans and discards 1000 rows before returning 10. At offset 1M, the database
+    reads 1M+ rows. It also produces duplicates/gaps when data is inserted during pagination. Cursor-based pagination uses
+    an indexed WHERE clause — constant performance regardless of page depth.
+  how_to_do_right: 'Implement Relay Connection spec: edges (with node + cursor), pageInfo (hasNextPage, endCursor). Cursors
+    are opaque (base64 encoded). Use first/after for forward, last/before for backward. Index the cursor column.'
+  severity: high
+  technologies:
+    lang: [graphql]
+    library: [relay]
+  domains:
+    domain: [architecture, api, performance]
+    concern: [backend]
+  example_good: "type UserConnection {\n  edges: [UserEdge!]!\n  pageInfo: PageInfo!\n  totalCount: Int\n}\n\ntype UserEdge\
+    \ {\n  node: User!\n  cursor: String!\n}\n\ntype PageInfo {\n  hasNextPage: Boolean!\n  hasPreviousPage: Boolean!\n  startCursor:\
+    \ String\n  endCursor: String\n}\n\ntype Query {\n  users(first: Int, after: String): UserConnection!\n}\n\n# SQL: SELECT\
+    \ * FROM users WHERE id > decode(after) ORDER BY id LIMIT first+1\n# Constant performance — uses index scan\n"
+  example_bad: "type Query {\n  users(page: Int, pageSize: Int): [User!]!\n}\n\n# SQL: SELECT * FROM users LIMIT 10 OFFSET\
+    \ (page * pageSize)\n# Page 10000: scans 100,000 rows to discard 99,990\n# Insert during pagination: user appears on both\
+    \ page 5 and page 6\n"
+  when_applies: Projects using GraphQL API layers or Relay
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps. projects not using GraphQL or Relay
+  sources: ["https://relay.dev/graphql/connections.htm"]
+- id: CR-GQL-006
+  text: Return structured errors with error codes in extensions — never expose internal error details.
+  why: GraphQL returns errors alongside data (partial success is a feature). Unstructured error messages are useless to clients
+    and dangerous when they leak internal details (SQL errors, stack traces, file paths). Structured error codes enable programmatic
+    client handling.
+  how_to_do_right: 'Define error codes as an enum: UNAUTHENTICATED, FORBIDDEN, NOT_FOUND, VALIDATION_ERROR, INTERNAL. Return
+    human-readable message + machine-readable code in extensions. Add field-level errors in extensions.field for form validation.'
+  severity: high
+  technologies:
+    lang: [graphql]
+    library: [apollo]
+  domains:
+    domain: [architecture, api, security]
+    concern: [backend]
+  example_good: "// Custom error class\nclass AppError extends GraphQLError {\n  constructor(message, code, field = null)\
+    \ {\n    super(message, {\n      extensions: {\n        code,\n        ...(field && { field }),\n      },\n    });\n \
+    \ }\n}\n\n// Usage in resolver\nconst resolvers = {\n  Mutation: {\n    createUser: async (_, { input }) => {\n      const\
+    \ existing = await db.getUserByEmail(input.email);\n      if (existing) {\n        throw new AppError('Email already registered',\
+    \ 'DUPLICATE_ENTRY', 'email');\n      }\n      return db.createUser(input);\n    },\n  },\n};\n\n// Response:\n// { \"\
+    errors\": [{ \"message\": \"Email already registered\",\n//   \"extensions\": { \"code\": \"DUPLICATE_ENTRY\", \"field\"\
+    : \"email\" } }] }\n"
+  example_bad: "const resolvers = {\n  Mutation: {\n    createUser: async (_, { input }) => {\n      try {\n        return\
+    \ await db.createUser(input);\n      } catch (err) {\n        throw new Error(err.message);\n        // Leaks: \"duplicate\
+    \ key value violates unique constraint users_email_key\"\n        // Exposes table name, column name, constraint name\
+    \ to client\n      }\n    },\n  },\n};\n"
+  when_applies: Projects using GraphQL API layers or Apollo
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps. projects not using GraphQL or Apollo
+  sources: ["https://spec.graphql.org/October2021/#sec-Errors"]
+- id: CR-GQL-007
+  text: Implement query complexity analysis and depth limiting — unbounded queries enable denial of service.
+  why: 'GraphQL lets clients write arbitrarily deep/wide queries: { users { posts { comments { author { posts { comments...
+    } } } } } }. Each level multiplies the resolver count exponentially. Without limits, one malicious query can trigger millions
+    of database queries.'
+  how_to_do_right: Set max depth (10-15 levels). Assign cost per field (list fields cost more). Set max complexity per query
+    (1000-5000). Use graphql-query-complexity or Apollo Server's built-in plugins. Log queries that approach limits.
+  severity: critical
+  technologies:
+    lang: [graphql]
+    library: [apollo]
+  domains:
+    domain: [architecture, api, security]
+  example_good: "import depthLimit from 'graphql-depth-limit';\nimport { createComplexityLimitRule } from 'graphql-validation-complexity';\n\
+    \nconst server = new ApolloServer({\n  typeDefs,\n  resolvers,\n  validationRules: [\n    depthLimit(10),  // Max 10 levels\
+    \ deep\n    createComplexityLimitRule(5000, {\n      scalarCost: 1,\n      objectCost: 2,\n      listFactor: 10,  // Lists\
+    \ multiply child cost by 10\n      onCost: (cost) => {\n        if (cost > 4000) logger.warn({ cost }, 'High complexity\
+    \ query');\n      },\n    }),\n  ],\n});\n\n// { users(first:100) { posts(first:50) { comments(first:100) } } }\n// Cost:\
+    \ 100 * (2 + 50 * (2 + 100 * 1)) = 100 * 5102 = 510,200 → REJECTED\n"
+  example_bad: 'const server = new ApolloServer({ typeDefs, resolvers });
+
+    // No depth limit, no complexity analysis
+
+    // Attacker: { a: users { b: posts { c: comments { d: author { e: posts { ... } } } } } }
+
+    // Exponential resolver explosion — server OOM or CPU exhaustion
+
+    '
+  when_applies: Any project using GraphQL API layers or Apollo
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps. projects not using GraphQL or Apollo
+  sources: ["https://www.apollographql.com/blog/securing-your-graphql-api-from-malicious-queries"]
+- id: CR-GQL-008
+  text: Disable introspection in production and use persisted queries — do not allow arbitrary queries from clients.
+  why: Introspection exposes your entire schema — every type, field, argument, and deprecated field. Attackers use this to
+    find sensitive fields and craft targeted queries. Persisted queries replace full query text with a hash — only pre-approved
+    queries execute.
+  how_to_do_right: 'Disable introspection via introspection: false in production. Use Automatic Persisted Queries (APQ): client
+    sends hash, server looks up query. Register queries at build time (relay-compiler, graphql-codegen). Allow introspection
+    only in development/staging.'
+  severity: high
+  technologies:
+    lang: [graphql]
+    library: [apollo, relay]
+  domains:
+    domain: [architecture, api, security]
+  example_good: "const server = new ApolloServer({\n  typeDefs,\n  resolvers,\n  introspection: process.env.NODE_ENV !== 'production',\n\
+    \  plugins: [\n    ApolloServerPluginLandingPageDisabled(),  // No playground in prod\n  ],\n  persistedQueries: {\n \
+    \   cache: new KeyValueCache(),  // APQ — clients send hash, not query\n    ttl: 900,\n  },\n});\n\n// Client sends: {\
+    \ \"extensions\": { \"persistedQuery\": { \"sha256Hash\": \"abc123...\" } } }\n// Server looks up query by hash — arbitrary\
+    \ queries rejected\n"
+  example_bad: "const server = new ApolloServer({\n  typeDefs,\n  resolvers,\n  introspection: true,  // Schema exposed in\
+    \ production\n  playground: true,      // Interactive query tool in production\n});\n// Attacker: { __schema { types {\
+    \ name fields { name type { name } } } } }\n// Full schema enumeration — finds adminDeleteUser, internalMetrics, etc.\n"
+  when_applies: Projects using GraphQL API layers, Apollo, or Relay
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps
+  sources: ["https://www.apollographql.com/docs/apollo-server/performance/apq"]
+- id: CR-GQL-009
+  text: Authenticate WebSocket connections at connection time (onConnect) — not per-message.
+  why: Once a WebSocket is established, the client can send any subscription query. If authentication is deferred to per-message,
+    an unauthenticated connection can subscribe to events it shouldn't see. Rejecting in onConnect prevents the connection
+    entirely.
+  how_to_do_right: Use graphql-ws protocol (not subscriptions-transport-ws which is deprecated). Validate auth token in onConnect
+    — return false/throw to reject. Store auth context in connection state. Check authorization per-subscription in subscribe
+    resolver.
+  severity: critical
+  technologies:
+    lang: [graphql]
+    platform: [websocket]
+  domains:
+    domain: [architecture, api, security]
+  example_good: "import { useServer } from 'graphql-ws/lib/use/ws';\nimport { WebSocketServer } from 'ws';\n\nconst wsServer\
+    \ = new WebSocketServer({ server: httpServer, path: '/graphql' });\n\nuseServer({\n  schema,\n  onConnect: async (ctx)\
+    \ => {\n    const token = ctx.connectionParams?.authToken;\n    if (!token) return false;  // Reject — no auth\n\n   \
+    \ const user = await verifyToken(token);\n    if (!user) return false;   // Reject — invalid token\n\n    // Store in\
+    \ context for resolvers\n    return { user };\n  },\n  onSubscribe: (ctx, msg) => {\n    // Per-subscription authorization\
+    \ check\n    if (msg.payload.query.includes('adminEvents') && ctx.extra.user.role !== 'admin') {\n      return [new GraphQLError('Forbidden')];\n\
+    \    }\n  },\n}, wsServer);\n"
+  example_bad: '// No auth on connection — anyone can subscribe
+
+    const wsServer = new WebSocketServer({ server: httpServer, path: ''/graphql'' });
+
+    useServer({ schema }, wsServer);  // No onConnect — all connections accepted
+
+    // Unauthenticated users receive adminEvents, privateMessages, etc.
+
+    '
+  when_applies: Any project using GraphQL API layers or real-time WebSocket connections
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps. projects not using GraphQL or WebSocket
+  sources: ["https://github.com/enisdenjo/graphql-ws"]
+- id: CR-GQL-010
+  text: Only resolve fields that the client requests — use info.fieldNodes to avoid unnecessary computation.
+  why: GraphQL's power is that clients request only what they need. But resolvers run regardless of whether their return value's
+    nested fields are requested. Checking the selection set lets you skip expensive joins, computations, or API calls for
+    unrequested fields.
+  how_to_do_right: 'Use graphql-fields or info.fieldNodes to inspect what the client requested. Skip expensive sub-queries
+    when their fields are not in the selection set. For SQL: only JOIN tables whose fields are selected. For APIs: skip calls
+    for unrequested data.'
+  severity: medium
+  technologies:
+    lang: [graphql]
+    library: [apollo]
+  domains:
+    domain: [architecture, api, performance]
+  example_good: "import graphqlFields from 'graphql-fields';\n\nconst resolvers = {\n  Query: {\n    users: async (_, args,\
+    \ ctx, info) => {\n      const requestedFields = graphqlFields(info);\n\n      let query = 'SELECT id, name, email FROM\
+    \ users';\n      const joins = [];\n\n      // Only JOIN if client asked for posts\n      if (requestedFields.posts) {\n\
+    \        joins.push('LEFT JOIN posts ON posts.user_id = users.id');\n      }\n      // Only JOIN if client asked for company\n\
+    \      if (requestedFields.company) {\n        joins.push('LEFT JOIN companies ON companies.id = users.company_id');\n\
+    \      }\n\n      return db.query(`${query} ${joins.join(' ')}`);\n    },\n  },\n};\n"
+  example_bad: "const resolvers = {\n  Query: {\n    users: async () => {\n      // Always fetches EVERYTHING — 3 JOINs regardless\
+    \ of what client asked\n      return db.query(`\n        SELECT * FROM users\n        JOIN posts ON posts.user_id = users.id\n\
+    \        JOIN companies ON companies.id = users.company_id\n        JOIN addresses ON addresses.user_id = users.id\n \
+    \     `);\n      // Client only asked for { users { name } } — 3 useless JOINs\n    },\n  },\n};\n"
+  when_applies: Projects using GraphQL API layers or Apollo
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps. projects not using GraphQL or Apollo
+  sources: ["https://graphql.org/learn/execution/#root-fields-resolvers"]
+- id: CR-GQL-011
+  text: Use @key directive to define entity identity in federated subgraphs — entities must be resolvable by reference.
+  why: Federation splits a monolithic schema across services. Each service owns types and must be able to resolve its types
+    from a minimal reference (usually ID). Without @key, the gateway cannot stitch types across services — a User defined
+    in auth-service cannot be extended with posts in posts-service.
+  how_to_do_right: 'Add @key(fields: ''id'') to entity types. Implement __resolveReference to fetch the entity from the key.
+    Use @external for fields owned by other services. Use @provides for fields you can resolve but are owned elsewhere.'
+  severity: high
+  technologies:
+    lang: [graphql]
+    library: [apollo federation]
+  domains:
+    domain: [architecture, api]
+  example_good: "# auth-service schema\ntype User @key(fields: \"id\") {\n  id: ID!\n  email: String!\n  name: String!\n}\n\
+    \n# posts-service schema — extends User from auth-service\ntype User @key(fields: \"id\") {\n  id: ID! @external\n  posts:\
+    \ [Post!]!\n}\n\ntype Post @key(fields: \"id\") {\n  id: ID!\n  title: String!\n  author: User!\n}\n\n# posts-service\
+    \ resolver\nconst resolvers = {\n  User: {\n    __resolveReference: (ref) => ({ id: ref.id }),  // Minimal — just forward\
+    \ ID\n    posts: (user) => db.getPostsByUserId(user.id),\n  },\n};\n"
+  example_bad: "# No @key — gateway cannot resolve cross-service references\ntype User {\n  id: ID!\n  email: String!\n}\n\
+    # posts-service cannot extend User — no entity resolution possible\n# Result: monolithic schema or duplicated types across\
+    \ services\n"
+  when_applies: Projects using GraphQL API layers or Apollo Federation
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps. projects not using GraphQL or Apollo Federation
+  sources: ["https://www.apollographql.com/docs/federation/entities"]
+- id: CR-GQL-012
+  text: Use the @cacheControl directive for response-level caching — set maxAge per field based on data volatility.
+  why: 'Without cache hints, every GraphQL request hits resolvers and databases. The @cacheControl directive tells CDNs and
+    Apollo Server''s response cache how long fields are safe to cache. A user''s name (maxAge: 3600) changes less often than
+    a live stock price (maxAge: 0).'
+  how_to_do_right: 'Add @cacheControl(maxAge: N) to types and fields. Set scope: PRIVATE for user-specific data. The response
+    maxAge is the minimum of all fields in the response. Use responseCachePlugin for server-side cache. Add cache-control
+    headers for CDN.'
+  severity: medium
+  technologies:
+    lang: [graphql]
+    library: [apollo]
+  domains:
+    domain: [architecture, api, performance]
+  example_good: "type User @cacheControl(maxAge: 3600) {    # User data — 1 hour cache\n  id: ID!\n  name: String!\n  email:\
+    \ String! @cacheControl(scope: PRIVATE)  # Private — per-user cache\n  lastLoginAt: DateTime @cacheControl(maxAge: 0)\
+    \  # No cache — real-time\n}\n\ntype Product @cacheControl(maxAge: 300) {   # Product data — 5 min cache\n  id: ID!\n\
+    \  name: String!\n  price: Float! @cacheControl(maxAge: 60)   # Price — 1 min cache\n  inventory: Int! @cacheControl(maxAge:\
+    \ 0)   # Inventory — no cache\n}\n\n# Apollo Server cache plugin\nconst server = new ApolloServer({\n  plugins: [responseCachePlugin()],\n\
+    });\n"
+  example_bad: "type User {\n  id: ID!\n  name: String!       # No cache hint — fetched from DB every time\n  email: String!\
+    \      # No scope — could be cached publicly with user data\n}\n# Every request hits the database — even for data that\
+    \ changes once a year\n"
+  when_applies: Projects using GraphQL API layers or Apollo
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps. projects not using GraphQL or Apollo
+  sources: ["https://www.apollographql.com/docs/apollo-server/performance/caching"]
+- id: CR-GQL-013
+  text: Validate mutation inputs with custom scalars and input validation — GraphQL type system is not enough.
+  why: 'GraphQL''s type system only validates shapes (String, Int, Boolean). It cannot enforce business rules: email format,
+    string length, numeric ranges, or cross-field validation. Without custom validation, invalid data reaches your business
+    logic and database.'
+  how_to_do_right: Define custom scalars (DateTime, Email, URL, PositiveInt) with validation. Validate input objects in resolvers
+    or with directive-based validation. Return structured validation errors with field paths. Validate early — before any
+    database calls.
+  severity: high
+  technologies:
+    lang: [graphql]
+  domains:
+    domain: [architecture, api, security]
+    concern: [backend]
+  example_good: "import { GraphQLScalarType } from 'graphql';\n\nconst EmailScalar = new GraphQLScalarType({\n  name: 'Email',\n\
+    \  parseValue(value) {\n    if (typeof value !== 'string' || !value.match(/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/)) {\n     \
+    \ throw new GraphQLError('Invalid email format');\n    }\n    return value.toLowerCase();\n  },\n});\n\n// Schema\nscalar\
+    \ Email\nscalar PositiveInt\n\ninput CreateUserInput {\n  email: Email!               # Validated by custom scalar\n \
+    \ name: String!\n  age: PositiveInt!           # Must be > 0\n}\n\n// Resolver with business validation\ncreateUser: async\
+    \ (_, { input }) => {\n  if (input.name.length > 100) {\n    throw new AppError('Name too long', 'VALIDATION_ERROR', 'name');\n\
+    \  }\n  // ...\n}\n"
+  example_bad: "input CreateUserInput {\n  email: String!    # Accepts \"not-an-email\" — no format validation\n  name: String!\
+    \     # Accepts 10MB string — no length limit\n  age: Int!         # Accepts -999 — no range validation\n}\n# Invalid\
+    \ data reaches database → constraint violation → ugly 500 error\n"
+  when_applies: Projects using GraphQL API layers
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps. projects not using GraphQL
+  sources: ["https://spec.graphql.org/October2021/#sec-Scalars"]
+- id: CR-GQL-014
+  text: Never remove or rename fields — deprecate them first with @deprecated directive and a migration timeline.
+  why: GraphQL clients may be mobile apps with cached versions or third-party integrations you don't control. Removing a field
+    breaks every client using it. Deprecation warns developers in tooling (GraphiQL, codegen) while keeping the field functional
+    during migration.
+  how_to_do_right: 'Add @deprecated(reason: ''Use newField instead'') to old fields. Log usage of deprecated fields. Set a
+    removal timeline (3-6 months). Add the replacement field before deprecating the old one. Remove only after usage drops
+    to zero.'
+  severity: high
+  technologies:
+    lang: [graphql]
+  domains:
+    domain: [architecture, api]
+  example_good: "type User {\n  id: ID!\n  name: String! @deprecated(reason: \"Use firstName and lastName instead — removal:\
+    \ 2026-06-01\")\n  firstName: String!\n  lastName: String!\n  fullName: String!           # Computed from firstName +\
+    \ lastName\n\n  avatarUrl: String @deprecated(reason: \"Use avatar { url } instead\")\n  avatar: Avatar\n}\n\n# Monitor\
+    \ deprecated field usage\n# const plugin = {\n#   requestDidStart() {\n#     return {\n#       didResolveOperation({ document\
+    \ }) {\n#         checkForDeprecatedFields(document);\n#       },\n#     };\n#   },\n# };\n"
+  example_bad: '# v1
+
+    type User { id: ID!, name: String!, avatarUrl: String }
+
+
+    # v2 — name removed, avatarUrl renamed
+
+    type User { id: ID!, firstName: String!, lastName: String!, avatar: Avatar }
+
+    # Every client using "name" or "avatarUrl" is instantly broken
+
+    # Mobile apps in the App Store still use v1 schema — can''t force update
+
+    '
+  when_applies: Projects using GraphQL API layers
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps. projects not using GraphQL
+  sources: ["https://spec.graphql.org/October2021/#sec--deprecated"]
+- id: CR-GQL-015
+  text: Test resolvers in isolation with mocked context — test the schema end-to-end with executeOperation.
+  why: Resolver unit tests verify business logic without network. Schema integration tests verify query parsing, type coercion,
+    error formatting, and middleware. Together they catch both logic bugs and schema/wiring bugs. Testing only at one level
+    leaves blind spots.
+  how_to_do_right: 'Unit: test resolver functions directly with mocked dataloaders/db. Integration: use ApolloServer.executeOperation()
+    with test queries. E2E: test actual HTTP requests (supertest). Assert both data AND errors in responses.'
+  severity: medium
+  technologies:
+    lang: [graphql]
+    framework: [testing, jest]
+    library: [apollo]
+  domains:
+    domain: [architecture, api, testing]
+  example_good: "// Unit test — resolver in isolation\ntest('getUser resolver returns user by ID', async () => {\n  const\
+    \ mockDb = { getUser: jest.fn().mockResolvedValue({ id: '1', name: 'Alice' }) };\n  const result = await resolvers.Query.user(null,\
+    \ { id: '1' }, { db: mockDb });\n  expect(result).toEqual({ id: '1', name: 'Alice' });\n  expect(mockDb.getUser).toHaveBeenCalledWith('1');\n\
+    });\n\n// Integration test — full query execution\ntest('user query returns correct shape', async () => {\n  const result\
+    \ = await server.executeOperation({\n    query: '{ user(id: \"1\") { id name email } }',\n  });\n  expect(result.body.singleResult.errors).toBeUndefined();\n\
+    \  expect(result.body.singleResult.data.user).toMatchObject({\n    id: '1',\n    name: expect.any(String),\n  });\n});\n"
+  example_bad: "// Only testing through HTTP — slow, flaky, hard to isolate\ntest('get user', async () => {\n  const res =\
+    \ await fetch('http://localhost:4000/graphql', {\n    method: 'POST',\n    body: JSON.stringify({ query: '{ user(id: \"\
+    1\") { name } }' }),\n  });\n  const data = await res.json();\n  expect(data.data.user.name).toBe('Alice');\n  // No resolver\
+    \ unit tests — can't test edge cases without full server\n});\n"
+  when_applies: Projects using GraphQL API layers, Apollo, or Jest
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps
+  sources: ["https://www.apollographql.com/docs/apollo-server/testing/testing"]
+- id: CR-GQL-016
+  text: Use Redis Pub/Sub as the subscription backend for multi-instance deployments — in-memory pub/sub only works on single
+    instance.
+  why: In-memory pub/sub (new PubSub()) only delivers events within the same process. In production with 3+ server instances
+    behind a load balancer, a user on instance A subscribes but the event is published on instance B — the user never receives
+    it. Redis Pub/Sub distributes events across all instances.
+  how_to_do_right: 'Use graphql-redis-subscriptions in production. Keep in-memory PubSub for development only. Use topic naming
+    conventions: ENTITY_ACTION (USER_CREATED, ORDER_UPDATED). Filter events in subscribe resolver to avoid over-broadcasting.'
+  severity: high
+  technologies:
+    lang: [graphql]
+    platform: [redis]
+  domains:
+    domain: [architecture, api]
+    concern: [backend]
+  example_good: "import { RedisPubSub } from 'graphql-redis-subscriptions';\nimport Redis from 'ioredis';\n\nconst pubsub\
+    \ = new RedisPubSub({\n  publisher: new Redis(process.env.REDIS_URL),\n  subscriber: new Redis(process.env.REDIS_URL),\n\
+    });\n\nconst resolvers = {\n  Subscription: {\n    orderUpdated: {\n      subscribe: (_, { orderId }) =>\n        pubsub.asyncIterableIterator(`ORDER_UPDATED:${orderId}`),\n\
+    \    },\n  },\n  Mutation: {\n    updateOrder: async (_, { id, input }) => {\n      const order = await db.updateOrder(id,\
+    \ input);\n      await pubsub.publish(`ORDER_UPDATED:${id}`, { orderUpdated: order });\n      return order;\n    },\n\
+    \  },\n};\n"
+  example_bad: 'import { PubSub } from ''graphql-subscriptions'';
+
+    const pubsub = new PubSub();  // In-memory only — single instance
+
+
+    // Works on one server. Behind a load balancer with 3 instances:
+
+    // - User subscribes on instance A
+
+    // - Mutation runs on instance B
+
+    // - Event published on instance B''s in-memory PubSub
+
+    // - User on instance A never receives the event
+
+    '
+  when_applies: Projects using GraphQL API layers or Redis cache/pub-sub systems
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps. projects not using GraphQL or Redis
+  sources: ["https://github.com/davidyaha/graphql-redis-subscriptions"]
+- id: CR-GQL-017
+  text: Document every type, field, and argument with description strings — they appear in GraphiQL and generated client docs.
+  why: GraphQL schema IS the API documentation. Descriptions appear in GraphiQL, Apollo Studio, and generated client code.
+    Without descriptions, consumers guess at field meanings — is 'status' a string enum? What values? What does 'score' represent?
+    Undocumented APIs generate support tickets.
+  how_to_do_right: 'Add description strings ("""multiline""" or "single line") to every type, field, enum value, and argument.
+    Document: units (cents vs dollars), format (ISO 8601), valid ranges, and business meaning. Use @deprecated with reason.'
+  severity: medium
+  technologies:
+    lang: [graphql]
+  domains:
+    domain: [architecture, api, quality]
+    concern: [documentation]
+  example_good: "\"\"\"\nA user account in the system.\nUsers can have multiple roles and belong to one organization.\n\"\"\
+    \"\ntype User {\n  \"Globally unique identifier (UUID v4)\"\n  id: ID!\n\n  \"Primary email address — must be verified\
+    \ before login\"\n  email: String!\n\n  \"\"\"\n  Account status. Transitions: PENDING → ACTIVE → SUSPENDED → DELETED.\n\
+    \  Only admins can transition to SUSPENDED.\n  \"\"\"\n  status: UserStatus!\n\n  \"Account creation timestamp (ISO 8601,\
+    \ UTC)\"\n  createdAt: DateTime!\n\n  \"Lifetime value in cents (not dollars) — updated daily\"\n  lifetimeValueCents:\
+    \ Int!\n}\n\nenum UserStatus {\n  \"Email sent, awaiting verification\"\n  PENDING\n  \"Verified and can log in\"\n  ACTIVE\n\
+    \  \"Admin-suspended — cannot log in\"\n  SUSPENDED\n}\n"
+  example_bad: "type User {\n  id: ID!\n  email: String!\n  status: String!        # What values? String or enum?\n  createdAt:\
+    \ String!     # What format? UTC or local?\n  value: Int!            # Value of what? In what unit? Cents? Dollars? Points?\n\
+    }\n"
+  when_applies: Projects using GraphQL API layers
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps. projects not using GraphQL
+  sources: ["https://spec.graphql.org/October2021/#sec-Descriptions"]
+- id: CR-GQL-018
+  text: Support query batching for clients that need multiple operations — but limit batch size to prevent abuse.
+  why: 'Mobile clients often need data from multiple queries on a single screen. Query batching sends them in one HTTP request,
+    saving round-trip latency. But unbounded batching is an abuse vector: an attacker sends 10,000 queries in one batch, exhausting
+    server resources.'
+  how_to_do_right: Enable batching with max size (10-20 queries). Reject batches exceeding the limit with 400. Consider using
+    @defer and @stream as alternatives to batching for progressive delivery. Monitor batch sizes in production.
+  severity: medium
+  technologies:
+    lang: [graphql]
+    library: [apollo]
+  domains:
+    domain: [architecture, api, performance, security]
+  example_good: "// Apollo Server — batching with limit\nconst server = new ApolloServer({\n  typeDefs,\n  resolvers,\n  allowBatchedHttpRequests:\
+    \ true,\n  plugins: [{\n    async requestDidStart() {\n      return {\n        async didResolveOperation(ctx) {\n    \
+    \      // Handled at HTTP level — reject oversized batches\n        },\n      };\n    },\n  }],\n});\n\n// Express middleware\
+    \ to limit batch size\napp.use('/graphql', (req, res, next) => {\n  if (Array.isArray(req.body) && req.body.length > 15)\
+    \ {\n    return res.status(400).json({ error: 'Batch size exceeds limit of 15' });\n  }\n  next();\n});\n"
+  example_bad: "// Unlimited batching — attacker sends 10,000 queries in one request\nconst server = new ApolloServer({\n\
+    \  typeDefs,\n  resolvers,\n  allowBatchedHttpRequests: true,  // No size limit\n});\n// POST /graphql with body: [query1,\
+    \ query2, ..., query10000]\n// Server processes all 10,000 — CPU/memory exhaustion\n"
+  when_applies: Projects using GraphQL API layers or Apollo
+  when_not_applies: internal modules with no exposed interface, monolithic single-process apps. projects not using GraphQL or Apollo
+  sources: ["https://www.apollographql.com/docs/apollo-server/requests"]

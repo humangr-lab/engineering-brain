@@ -1,0 +1,334 @@
+layer: rules
+technology: Python
+domain: reliability
+knowledge:
+- id: CR-SRE-PY-001
+  text: Python's GIL means CPU-bound work cannot be parallelized with threads — use multiprocessing or async. Threads in Python
+    only help with I/O-bound work (network calls, file I/O). A Flask app with 4 threads can handle 4 concurrent network requests
+    but only uses 1 CPU core for computation.
+  why: 'Google''s SRE teams using Python (for tooling, data pipelines, and some services) understand the GIL constraint. The
+    Global Interpreter Lock (GIL) prevents multiple threads from executing Python bytecode simultaneously. This means: threading
+    helps I/O (while one thread waits for a network response, another thread runs) but doesn''t help CPU (while one thread
+    computes, all other threads wait for the GIL). Common mistake: spawning 8 threads for CPU-heavy work on an 8-core machine
+    → only 1 core is used → no speedup. For web services: this limits single-process throughput. A Gunicorn worker with 4
+    threads handles 4 concurrent I/O-bound requests but only 1 CPU-bound request at a time. Solution: use multiple worker
+    processes (each has its own GIL) for CPU-bound work, or use asyncio for I/O-bound work.
+
+    '
+  how_to_do_right: '1. For I/O-bound work (HTTP requests, database queries): use asyncio (aiohttp, httpx) or threading. Both
+    work because the GIL is released during I/O.
+
+    2. For CPU-bound work (data processing, computation): use multiprocessing (ProcessPoolExecutor) or Celery workers. Each
+    process has its own GIL.
+
+    3. Gunicorn: use multiple workers (processes) for CPU-bound services. Workers = 2 × CPU_CORES + 1. Each worker is a separate
+    process.
+
+    4. For mixed workloads: use workers (for CPU) with async (for I/O). Gunicorn with uvicorn workers for async Python.
+
+    5. Profile before optimizing: use cProfile to determine if the bottleneck is CPU or I/O. Don''t assume.
+
+    6. Consider PyPy or Cython for CPU-critical sections. Or write the hot path in C/Rust with Python bindings.
+
+    '
+  example_good: "from concurrent.futures import ProcessPoolExecutor\nimport asyncio\n\n# CPU-bound: use processes (each gets its own GIL)\ndef cpu_heavy(data):\n    return sum(x**2 for x in data)\n\nwith ProcessPoolExecutor(max_workers=4) as pool:\n    results = list(pool.map(cpu_heavy, chunks))\n\n# I/O-bound: use async\nasync def fetch_all(urls):\n    async with aiohttp.ClientSession() as session:\n        tasks = [session.get(url) for url in urls]\n        return await asyncio.gather(*tasks)\n"
+  example_bad: "import threading\n\n# WRONG: threads for CPU-bound work — GIL prevents parallelism\ndef cpu_heavy(data):\n    return sum(x**2 for x in data)\n\nthreads = []\nfor chunk in chunks:\n    t = threading.Thread(target=cpu_heavy, args=(chunk,))\n    threads.append(t)\n    t.start()\nfor t in threads:\n    t.join()  # Only 1 core used despite 4 threads\n"
+  when_applies: "When choosing between threads, processes, or async for concurrent Python workloads."
+  severity: high
+  technologies:
+    lang: [general, python, asyncio]
+    framework: [web]
+  domains:
+    domain: [code_quality, performance, reliability]
+    concern: [concurrency]
+  sources:
+  - url: https://sre.google/sre-book/software-engineering-in-sre/
+    title: 'Google SRE Book — Chapter 18: Software Engineering in SRE'
+  validation_status: cross_checked
+- id: CR-SRE-PY-002
+  text: Python async context managers must be used for resource cleanup — database connections, HTTP sessions, file handles,
+    and locks. A bare `await session.get()` without `async with` leaks connections when exceptions occur.
+  why: 'Google''s reliability practices for Python code emphasize resource cleanup because connection leaks are the most common
+    source of "works fine, then mysteriously stops after running for hours." The pattern: code opens a connection, does work,
+    closes the connection. If an exception occurs between open and close, the connection is leaked. With 100 QPS and a 0.1%
+    exception rate, 0.1 connections leak per second = 360 per hour = connection pool exhausted in a few hours. Context managers
+    guarantee cleanup: `async with aiohttp.ClientSession() as session:` closes the session on exception AND on success. The
+    same applies to database transactions (`async with db.begin()`), locks (`async with lock:`), and file handles.
+
+    '
+  how_to_do_right: '1. ALWAYS use `async with` for: HTTP sessions, database connections, transactions, file handles, and locks.
+
+    2. Never use bare `await conn.execute()` without wrapping in `async with conn.begin()` (for transactions) or using a connection
+    pool.
+
+    3. For custom resources: implement `__aenter__` and `__aexit__` to ensure cleanup.
+
+    4. Use `contextlib.asynccontextmanager` for simple async cleanup patterns.
+
+    5. Set connection pool limits: max_connections=20 prevents unbounded connection creation when leaks occur.
+
+    6. Monitor connection pool usage: active connections, pool size, wait time. Growing active connections = leak.
+
+    '
+  example_good: "import aiohttp\n\nasync def fetch_data(url: str) -> dict:\n    async with aiohttp.ClientSession() as session:\n        async with session.get(url) as response:\n            return await response.json()\n    # session is guaranteed closed even on exception\n"
+  example_bad: "import aiohttp\n\nasync def fetch_data(url: str) -> dict:\n    session = aiohttp.ClientSession()\n    response = await session.get(url)  # if this raises, session leaks\n    data = await response.json()\n    await session.close()  # never reached on exception\n    return data\n"
+  when_applies: "When using async HTTP sessions, database connections, file handles, or locks in Python asyncio code."
+  severity: high
+  technologies:
+    lang: [general, python, asyncio]
+    framework: [orm, sqlalchemy]
+  domains:
+    domain: [code_quality, reliability]
+    concern: [concurrency, async, resource_management]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-PY-003
+  text: Python dependency pinning must include transitive dependencies — pinning `requests==2.31.0` but not `urllib3` (which
+    requests depends on) means a new urllib3 release can break your application even though you didn't change anything.
+  why: 'Google''s hermetic build principle (Chapter 8) extends to Python dependencies. The common setup: requirements.txt
+    pins direct dependencies but not transitive ones. Today: requests==2.31.0 installs urllib3==2.0.4 (works). Tomorrow: requests==2.31.0
+    installs urllib3==2.1.0 (a new release with a breaking change in how it handles redirects) → your application breaks.
+    You made zero changes — a transitive dependency update broke you. This is even worse in Docker: the same Dockerfile produces
+    different images on different days because pip resolves different transitive versions. Google''s solution: pin EVERY dependency
+    (direct and transitive) in a lock file. pip-compile (from pip-tools), poetry.lock, or pdm.lock capture the exact versions
+    of all dependencies.
+
+    '
+  how_to_do_right: '1. Use a lock file: pip-compile (pip-tools), poetry.lock, or pdm.lock. These pin ALL dependencies including
+    transitive ones.
+
+    2. requirements.in lists direct dependencies (unpinned or loosely pinned). requirements.txt (generated by pip-compile)
+    lists all dependencies with exact versions.
+
+    3. Update dependencies deliberately: run pip-compile --upgrade periodically, test, and commit the updated lock file.
+
+    4. Never run pip install without a lock file in production. Unresolved dependencies are non-deterministic.
+
+    5. Use hash verification: pip-compile --generate-hashes produces a lock file with cryptographic hashes. Pip verifies downloads
+    match.
+
+    6. Audit dependencies for security: use pip-audit or safety to check for known vulnerabilities in pinned versions.
+
+    '
+  example_good: "# requirements.in (direct dependencies)\nrequests>=2.31\nflask>=3.0\n\n# Generate lock file:\n# pip-compile --generate-hashes requirements.in -o requirements.txt\n\n# requirements.txt (generated, ALL deps pinned)\nrequests==2.31.0 \\\n    --hash=sha256:58cd2187...\nurllib3==2.0.7 \\\n    --hash=sha256:a1b2c3d4...\ncertifi==2024.2.2 \\\n    --hash=sha256:e5f6a7b8...\n"
+  example_bad: "# requirements.txt — only direct deps pinned\nrequests==2.31.0\nflask==3.0.0\n# urllib3, certifi, etc. NOT pinned\n# Tomorrow pip may install a different urllib3 version\n# and break your app without any code change\n"
+  when_applies: "When managing Python project dependencies for reproducible builds and deployments."
+  severity: high
+  technologies:
+    lang: [general, python, packaging]
+  domains:
+    domain: [quality, operations, deployment, reliability, security]
+    concern: [code, supply_chain, dependencies]
+  sources:
+  - url: https://sre.google/sre-book/release-engineering/
+    title: 'Google SRE Book — Chapter 8: Release Engineering'
+  validation_status: cross_checked
+- id: CR-SRE-PY-004
+  text: Pydantic models for API input validation eliminate an entire class of bugs — type errors, missing fields, invalid
+    values, and injection attacks are all caught before business logic runs. Raw dict access (request.json["field"]) is a
+    bug waiting to happen.
+  why: 'Google''s defense-in-depth (Chapter 27) approach to input validation applies to Python web services. The anti-pattern:
+    read request body as dict, access fields with ["key"], hope the types are correct, handle KeyError/TypeError/ValueError
+    deep in business logic. The Pydantic pattern: define a model with typed fields, constraints (min/max, regex, enum), and
+    defaults. FastAPI validates automatically on every request. Invalid input returns a 422 with detailed error messages.
+    Valid input is guaranteed to match the model — downstream code can trust the types without additional checking. This eliminates:
+    KeyError (required field missing), TypeError (string instead of int), ValueError (negative amount, invalid email), and
+    injection (fields are typed and constrained).
+
+    '
+  how_to_do_right: '1. Define Pydantic models for EVERY API endpoint: request body, query parameters, path parameters, and
+    response.
+
+    2. Use type annotations with constraints: `amount: float = Field(gt=0, le=1000000)`, `email: EmailStr`, `status: Literal["active",
+    "inactive"]`.
+
+    3. Use Optional[T] only for truly optional fields. Required fields should not have default values.
+
+    4. Custom validators for business rules: `@field_validator("end_date") def validate_end_after_start(...)`.
+
+    5. Use response models to prevent accidental data leakage: the response model defines exactly which fields are returned.
+    Internal fields (password_hash) are excluded.
+
+    6. Generate OpenAPI documentation automatically from Pydantic models (FastAPI does this by default).
+
+    '
+  example_good: "from pydantic import BaseModel, Field\nfrom fastapi import FastAPI\n\nclass CreateOrderRequest(BaseModel):\n    user_id: int = Field(gt=0)\n    amount: float = Field(gt=0, le=1_000_000)\n    currency: Literal[\"USD\", \"EUR\", \"GBP\"]\n    items: list[int] = Field(min_length=1)\n\napp = FastAPI()\n\n@app.post(\"/orders\")\nasync def create_order(req: CreateOrderRequest):\n    # req is guaranteed valid here\n    return {\"order_id\": process(req)}\n"
+  example_bad: "from fastapi import FastAPI, Request\n\napp = FastAPI()\n\n@app.post(\"/orders\")\nasync def create_order(request: Request):\n    body = await request.json()\n    user_id = body[\"user_id\"]    # KeyError if missing\n    amount = body[\"amount\"]      # Could be string, negative, etc.\n    currency = body[\"currency\"]  # No validation at all\n    return {\"order_id\": process(user_id, amount, currency)}\n"
+  when_applies: "When defining API endpoints that accept user input in Python web services."
+  severity: high
+  technologies:
+    lang: [general, python, pydantic]
+    framework: [web, fastapi]
+  domains:
+    domain: [architecture, quality, reliability]
+    concern: [api_design, validation, code]
+  sources:
+  - url: https://sre.google/sre-book/reliable-product-launches/
+    title: 'Google SRE Book — Chapter 27: Reliable Product Launches at Scale'
+  validation_status: cross_checked
+- id: CR-SRE-PY-005
+  text: Python logging must be structured (JSON) with consistent fields — not print() statements, not unstructured text. Structured
+    logs are searchable, parseable, and aggregatable. Unstructured logs are human-readable for one log entry and useless for
+    everything else.
+  why: 'Google''s monitoring chapter (Chapter 6) mandates machine-readable logs because at scale, logs are consumed by machines,
+    not humans. Unstructured log: "2024-01-15 14:32:01 ERROR Failed to process payment for user 123: timeout connecting to
+    stripe." Structured log: {"timestamp": "2024-01-15T14:32:01Z", "level": "error", "service": "payment", "user_id": 123,
+    "operation": "process_payment", "error": "timeout", "dependency": "stripe", "request_id": "req_abc123"}. The structured
+    version: can be filtered by user_id, can be aggregated by error type, can be correlated by request_id, can be alerted
+    on by dependency name, and can be parsed by any log aggregation tool. The unstructured version requires regex to extract
+    any of these fields.
+
+    '
+  how_to_do_right: '1. Use structlog or python-json-logger for JSON-formatted logging. Never use print() in production code.
+
+    2. Include standard fields in every log entry: timestamp, level, service, request_id, operation.
+
+    3. Add context fields for the specific operation: user_id, order_id, dependency, error_type.
+
+    4. Use log levels correctly: DEBUG (developer detail), INFO (normal operations), WARNING (recoverable issues), ERROR (failures),
+    CRITICAL (system-wide failures).
+
+    5. Configure log level via environment variable: LOG_LEVEL=INFO in production, LOG_LEVEL=DEBUG in development.
+
+    6. Bind context once per request: `logger = logger.bind(request_id=req_id, user_id=user_id)`. All subsequent log calls
+    include these fields automatically.
+
+    '
+  example_good: "import structlog\n\nlogger = structlog.get_logger()\n\nasync def process_payment(user_id: int, amount: float):\n    log = logger.bind(user_id=user_id, operation=\"process_payment\")\n    log.info(\"payment_started\", amount=amount)\n    try:\n        result = await stripe.charge(amount)\n        log.info(\"payment_completed\", charge_id=result.id)\n    except TimeoutError:\n        log.error(\"payment_timeout\", dependency=\"stripe\")\n        raise\n"
+  example_bad: "import logging\n\ndef process_payment(user_id, amount):\n    print(f\"Processing payment for user {user_id}\")\n    try:\n        result = stripe.charge(amount)\n        print(f\"Payment done: {result}\")\n    except Exception as e:\n        print(f\"ERROR: Payment failed: {e}\")\n        # Unstructured, no log level, no context fields\n        # Cannot be filtered, aggregated, or alerted on\n"
+  when_applies: "When adding logging to any Python production service or application."
+  severity: medium
+  technologies:
+    lang: [general, python, logging]
+  domains:
+    domain: [quality, observability, reliability]
+    concern: [code, logging]
+  sources:
+  - url: https://sre.google/sre-book/monitoring-distributed-systems/
+    title: 'Google SRE Book — Chapter 6: Monitoring Distributed Systems'
+  validation_status: cross_checked
+- id: CR-SRE-PY-006
+  text: Python mutable default arguments are a classic bug — def f(items=[]) shares the SAME list across all calls. Every
+    invocation that mutates the list affects all future invocations. Use None as default and create the mutable object inside
+    the function.
+  why: 'This is one of Python''s most well-known footguns, documented extensively and still causing production bugs. The mechanism:
+    default argument values are evaluated ONCE at function definition time, not at call time. For immutable types (int, str,
+    tuple) this is irrelevant. For mutable types (list, dict, set), the same object is shared across all calls. Example: `def
+    add_item(item, items=[])` → `items.append(item)` → first call: items = [1], second call: items = [1, 2], third call: items
+    = [1, 2, 3]. The list grows across calls. This causes: data leakage between requests in web servers, state corruption
+    in long-running services, and mysterious "works in tests but fails in production" bugs.
+
+    '
+  how_to_do_right: '1. NEVER use mutable defaults: def f(items=[]). Use: def f(items=None): items = items if items is not
+    None else [].
+
+    2. Static analysis tools catch this: ruff B006, pylint W0102, mypy can be configured to flag it.
+
+    3. This applies to: lists, dicts, sets, and ANY mutable object (including custom classes).
+
+    4. dataclass fields: use field(default_factory=list) instead of field(default=[]).
+
+    5. Pydantic models: use Field(default_factory=list) or define in model_post_init.
+
+    6. Review existing code: search for `def.*=\[\]` and `def.*=\{\}` patterns.
+
+    '
+  example_good: "from dataclasses import dataclass, field\n\ndef add_item(item: str, items: list[str] | None = None) -> list[str]:\n    if items is None:\n        items = []\n    items.append(item)\n    return items\n\n@dataclass\nclass Config:\n    tags: list[str] = field(default_factory=list)\n    metadata: dict = field(default_factory=dict)\n"
+  example_bad: "def add_item(item: str, items: list[str] = []) -> list[str]:\n    items.append(item)  # Mutates shared default!\n    return items\n\n# First call:  add_item(\"a\") -> [\"a\"]\n# Second call: add_item(\"b\") -> [\"a\", \"b\"]  # BUG!\n# The list persists across calls\n\nfrom dataclasses import dataclass\n\n@dataclass\nclass Config:\n    tags: list[str] = []  # ValueError: mutable default\n"
+  when_applies: "When defining Python functions or dataclasses with mutable default arguments (list, dict, set)."
+  severity: medium
+  technologies:
+    lang: [general, python]
+  domains:
+    domain: [quality, reliability]
+    concern: [code]
+  sources:
+  - url: https://sre.google/sre-book/simplicity/
+    title: 'Google SRE Book — Chapter 9: Simplicity'
+  validation_status: cross_checked
+- id: CR-SRE-PY-007
+  text: Python exception handling in async code requires special care — an unhandled exception in a Task is silently swallowed
+    unless the Task is awaited. Fire-and-forget async tasks with exceptions create silent failures that are nearly impossible
+    to debug.
+  why: 'Google''s async Python services encounter a specific class of bugs related to exception handling in asyncio Tasks.
+    The pattern: `asyncio.create_task(some_coroutine())` — if some_coroutine raises an exception, the exception is stored
+    in the Task object. If nobody awaits the Task, the exception is never raised. Python 3.8+ prints a warning ("Task exception
+    was never retrieved"), but the application continues as if nothing happened. The coroutine''s side effects don''t happen,
+    but no error is visible in normal logging. This creates "silent data loss" bugs: a background task that sends emails,
+    updates a cache, or records metrics fails silently, and nobody notices until users complain.
+
+    '
+  how_to_do_right: '1. ALWAYS await Tasks or store references and handle exceptions: `task = asyncio.create_task(coro())`
+    then later `await task` or `task.add_done_callback(handle_exception)`.
+
+    2. Use done_callback to catch exceptions from fire-and-forget tasks: `task.add_done_callback(lambda t: t.exception() and
+    logger.error(f"Task failed: {t.exception()}"))`
+
+    3. Use TaskGroup (Python 3.11+): `async with asyncio.TaskGroup() as tg: tg.create_task(coro())` — exceptions propagate
+    automatically.
+
+    4. Never use bare `asyncio.create_task()` without either awaiting or adding a done callback.
+
+    5. Monitor for "Task exception was never retrieved" warnings in logs: these indicate fire-and-forget tasks with unhandled
+    exceptions.
+
+    6. Use asyncio''s exception handler: `loop.set_exception_handler(handler)` to catch all unhandled async exceptions globally.
+
+    '
+  example_good: "import asyncio\nimport logging\n\nlogger = logging.getLogger(__name__)\n\n# Python 3.11+ TaskGroup (recommended)\nasync def process_all(items):\n    async with asyncio.TaskGroup() as tg:\n        for item in items:\n            tg.create_task(process(item))\n    # All exceptions propagate automatically\n\n# Pre-3.11: done callback\ndef _handle_task_exception(task: asyncio.Task):\n    if task.exception():\n        logger.error(\"Task failed: %s\", task.exception())\n\ntask = asyncio.create_task(send_email(user))\ntask.add_done_callback(_handle_task_exception)\n"
+  example_bad: "import asyncio\n\nasync def main():\n    # Fire-and-forget: exception is silently swallowed!\n    asyncio.create_task(send_email(user))\n    asyncio.create_task(update_cache(key))\n    # If send_email raises, nobody knows\n    # Python prints a warning but the app continues\n    # Email is never sent, no error in logs\n"
+  when_applies: "When using asyncio.create_task() for background or fire-and-forget async operations."
+  severity: high
+  technologies:
+    lang: [general, python, asyncio]
+  domains:
+    domain: [code_quality, reliability]
+    concern: [concurrency, async, error_handling]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-PY-008
+  text: Python startup time matters for serverless and container environments — a 30-second import time means 30 seconds of
+    cold start latency. Defer heavy imports (ML models, large libraries) to first use, not module load time.
+  why: 'Google''s container orchestration (Kubernetes, Chapter 8) and scaling practices (Chapter 21) care about startup time
+    because: new pods must be ready quickly for autoscaling, rolling deployments require new instances to start serving before
+    old ones are terminated, and failed instance replacement must be fast. Python''s import system executes module-level code
+    at import time. If `import tensorflow` loads a 500MB model into memory, every container start includes that 500MB load
+    time — even if most requests don''t use TensorFlow. In serverless (Lambda, Cloud Functions), cold start = import time
+    + initialization time. A 30-second cold start means the first request takes 30+ seconds.
+
+    '
+  how_to_do_right: '1. Defer heavy imports to first use: instead of top-level `import tensorflow`, use `def predict(): import
+    tensorflow as tf` (lazy import).
+
+    2. Use `importlib.import_module()` for conditional imports: only load modules that are actually needed for the current
+    request.
+
+    3. Separate startup-time config validation from runtime initialization: validate config at startup (fast), load ML models
+    on first request (deferred).
+
+    4. Measure import time: `python -X importtime -c "import myapp"` shows import tree with timing.
+
+    5. Reduce import chain depth: if importing your app triggers 200 transitive imports, refactor to reduce dependencies.
+
+    6. Pre-warm after startup: after the health check passes, trigger one request to load deferred resources before receiving
+    real traffic.
+
+    '
+  example_good: "# Lazy import pattern for heavy dependencies\ndef predict(data: dict) -> dict:\n    import tensorflow as tf  # Loaded on first call, not at startup\n    model = _get_cached_model()\n    return model.predict(data)\n\n_model_cache = None\ndef _get_cached_model():\n    global _model_cache\n    if _model_cache is None:\n        import tensorflow as tf\n        _model_cache = tf.saved_model.load(\"model/\")\n    return _model_cache\n"
+  example_bad: "import tensorflow as tf  # 30-second import at module load\nimport pandas as pd\nimport scipy\nimport sklearn\n\n# Every container start pays the full import cost\n# Cold start = 30+ seconds\n# Most requests may not even need TensorFlow\n\ndef health_check():\n    return {\"status\": \"ok\"}  # This simple endpoint takes 30s on cold start\n"
+  when_applies: "When deploying Python services in serverless, container, or autoscaling environments where startup time affects availability."
+  severity: medium
+  technologies:
+    lang: [general, python]
+    platform: [aws, lambda, kubernetes]
+  domains:
+    domain: [quality, operations, deployment, performance, reliability]
+    concern: [code]
+  sources:
+  - url: https://sre.google/sre-book/release-engineering/
+    title: 'Google SRE Book — Chapter 8: Release Engineering'
+  validation_status: cross_checked

@@ -1,0 +1,572 @@
+layer: rules
+technology: Airflow
+domain: orchestration
+knowledge:
+- id: CR-AIRFLOW-001
+  text: Make every Airflow task idempotent — rerunning a task with the same inputs must produce the same result without side
+    effects.
+  why: Airflow retries failed tasks automatically and operators frequently re-trigger manual reruns for debugging. A non-idempotent
+    task (e.g., appending to a table without deduplication) produces duplicate data on retry. An INSERT without ON CONFLICT
+    creates duplicate rows. An API call without idempotency keys charges a customer twice. Airflow's entire retry and backfill
+    model assumes tasks are safe to re-execute.
+  how_to_do_right: Use UPSERT (INSERT ON CONFLICT UPDATE) instead of INSERT for database writes. Use write-then-rename (atomic
+    file swap) for file outputs. Include the execution_date in all output paths and table partitions so reruns overwrite the
+    same partition. Use idempotency keys for external API calls. Verify idempotency by running the task twice in a row and
+    checking for identical output.
+  severity: critical
+  technologies:
+    lang: [python, sql]
+    platform: [airflow]
+  domains:
+    domain: [operations, architecture, reliability]
+    concern: [orchestration, data, engineering]
+  example_good: "from airflow.decorators import task\nfrom airflow.models import DagRun\n\n@task\ndef load_daily_sales(ds:\
+    \ str, **kwargs):\n    \"\"\"Idempotent: overwrites the partition for this execution date.\"\"\"\n    # 1. Write to temp\
+    \ location\n    tmp_path = f\"s3://data/tmp/sales_{ds}_{kwargs['run_id']}.parquet\"\n    df = extract_sales(date=ds)\n\
+    \    df.to_parquet(tmp_path)\n\n    # 2. Atomic overwrite of target partition\n    target = f\"s3://data/sales/date={ds}/data.parquet\"\
+    \n    s3_client.copy(tmp_path, target)\n    s3_client.delete(tmp_path)\n\n    # 3. Database upsert — rerun overwrites,\
+    \ never duplicates\n    engine.execute(f\"\"\"\n        INSERT INTO daily_sales (date, region, total)\n        SELECT\
+    \ date, region, SUM(amount)\n        FROM raw_sales WHERE date = '{ds}'\n        GROUP BY date, region\n        ON CONFLICT\
+    \ (date, region)\n        DO UPDATE SET total = EXCLUDED.total\n    \"\"\")\n"
+  example_bad: "@task\ndef load_daily_sales(ds: str, **kwargs):\n    \"\"\"Non-idempotent: duplicates data on every retry.\"\
+    \"\"\n    df = extract_sales(date=ds)\n    # Append mode — retry creates duplicate rows\n    df.to_sql('daily_sales',\
+    \ engine, if_exists='append')\n\n    # API call without idempotency key — charges customer twice on retry\n    payment_api.charge(customer_id,\
+    \ amount=99.99)\n"
+  when_applies: Any project using Apache Airflow DAG orchestration, Python codebases, or SQL
+  sources: ["https://airflow.apache.org/docs/apache-airflow/stable/best-practices.html"]
+- id: CR-AIRFLOW-002
+  text: Keep tasks atomic and short — each task should do one thing and complete in under 30 minutes.
+  why: A long monolithic task (extract + transform + load in one function) cannot be partially retried. If the load step fails
+    after 2 hours of extract+transform, the entire 2-hour task reruns from scratch. Airflow has no sub-task retry mechanism.
+    Short atomic tasks enable targeted retries (only retry the failed step), clearer dependency tracking in the UI, better
+    parallelism (independent steps run concurrently), and more useful SLA monitoring.
+  how_to_do_right: 'Split ETL into separate tasks: extract → transform → load. Each task writes its output to intermediate
+    storage (S3, temp table) that the next task reads. Use XCom only for metadata (file paths, row counts), not data. Target
+    task duration under 30 minutes. If a task consistently takes longer, consider splitting it further or moving to Spark/Flink
+    for the heavy computation.'
+  severity: high
+  technologies:
+    lang: [python]
+    platform: [airflow]
+  domains:
+    domain: [operations, architecture]
+    concern: [orchestration, data, engineering]
+  example_good: "from airflow.decorators import dag, task\nfrom datetime import datetime\n\n@dag(\n    schedule_interval=\"\
+    @daily\",\n    start_date=datetime(2026, 1, 1),\n    catchup=False,\n)\ndef sales_etl():\n    @task\n    def extract(ds:\
+    \ str) -> str:\n        \"\"\"Extract raw data to S3. ~5 minutes.\"\"\"\n        path = f\"s3://staging/raw_sales/{ds}.parquet\"\
+    \n        df = api_client.fetch_sales(date=ds)\n        df.to_parquet(path)\n        return path  # XCom: just the path,\
+    \ not the data\n\n    @task\n    def transform(raw_path: str, ds: str) -> str:\n        \"\"\"Clean and transform. ~10\
+    \ minutes.\"\"\"\n        path = f\"s3://staging/clean_sales/{ds}.parquet\"\n        df = pd.read_parquet(raw_path)\n\
+    \        clean_df = apply_business_rules(df)\n        clean_df.to_parquet(path)\n        return path\n\n    @task\n  \
+    \  def load(clean_path: str, ds: str):\n        \"\"\"Load to warehouse. ~5 minutes.\"\"\"\n        df = pd.read_parquet(clean_path)\n\
+    \        upsert_to_warehouse(df, table='daily_sales', partition_key=ds)\n\n    raw = extract()\n    clean = transform(raw)\n\
+    \    load(clean)\n\nsales_etl()\n"
+  example_bad: "@task\ndef etl_everything(ds: str):\n    \"\"\"Monolithic: 3 hours, unretrievable on failure.\"\"\"\n    #\
+    \ 1 hour: extract from 5 APIs\n    data = extract_from_all_sources(ds)\n    # 1.5 hours: heavy transformation\n    transformed\
+    \ = heavy_transform(data)\n    # 30 min: load to warehouse\n    load_to_warehouse(transformed, ds)\n    # If load fails\
+    \ at minute 150 → reruns from minute 0\n"
+  when_applies: Projects using Apache Airflow DAG orchestration or Python codebases
+  when_not_applies: projects not using Airflow or Python
+  sources: ["https://airflow.apache.org/docs/apache-airflow/stable/best-practices.html#writing-a-dag"]
+- id: CR-AIRFLOW-003
+  text: Never use top-level Python code in DAG files that performs I/O, imports heavy libraries, or makes network calls —
+    DAG files are parsed every scheduler heartbeat.
+  why: The Airflow scheduler parses every DAG file every 30 seconds (configurable) to detect changes. Any top-level code (outside
+    function definitions) executes on every parse cycle. A database query at the top level means 2 queries/minute per DAG
+    file. A heavy import (import pandas, import tensorflow) adds 1-2 seconds per parse. With 100 DAG files, top-level imports
+    add 100-200 seconds to every scheduler loop — the scheduler falls behind and tasks get delayed by minutes.
+  how_to_do_right: 'Move all I/O, heavy imports, and computation inside task callables (functions decorated with @task or
+    passed to operators). Use lazy imports: import pandas inside the function, not at the top of the file. DAG-level code
+    should only define DAG structure (operators, dependencies). Use Airflow Variables sparingly in DAG files — each access
+    is a database query. Cache variables if needed: Variable.get() in a top-level dict, not per-task.'
+  severity: high
+  technologies:
+    lang: [python]
+    platform: [airflow]
+  domains:
+    domain: [operations, performance]
+    concern: [orchestration]
+  example_good: "from airflow.decorators import dag, task\nfrom datetime import datetime\n\n@dag(schedule_interval=\"@hourly\"\
+    , start_date=datetime(2026, 1, 1))\ndef lightweight_dag():\n    \"\"\"DAG file: only structure, no I/O, no heavy imports.\"\
+    \"\"\n\n    @task\n    def process_data(ds: str):\n        # Heavy imports INSIDE the task — only loaded when task runs\n\
+    \        import pandas as pd\n        import numpy as np\n        from sklearn.preprocessing import StandardScaler\n\n\
+    \        df = pd.read_parquet(f\"s3://data/{ds}.parquet\")\n        scaler = StandardScaler()\n        scaled = scaler.fit_transform(df[['amount',\
+    \ 'quantity']])\n        # ...\n\n    process_data()\n\nlightweight_dag()\n"
+  example_bad: 'import pandas as pd            # 500ms import on every parse (every 30s)
+
+    import tensorflow as tf         # 3 seconds on every parse
+
+    from sqlalchemy import create_engine
+
+
+    engine = create_engine(DB_URL)  # Database connection on every parse
+
+    config = engine.execute("SELECT * FROM configs").fetchall()  # DB query every 30s
+
+
+    # 100 DAG files × 4 seconds per parse = 400 seconds per scheduler loop
+
+    # Scheduler can never keep up — tasks delayed by 5-10 minutes
+
+    '
+  when_applies: Projects using Apache Airflow DAG orchestration or Python codebases
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Airflow or Python
+  sources: ["https://airflow.apache.org/docs/apache-airflow/stable/best-practices.html#top-level-python-code"]
+- id: CR-AIRFLOW-004
+  text: Use XCom only for small metadata (file paths, row counts, status flags) — never for datasets or large payloads.
+  why: XCom stores values in Airflow's metadata database (typically PostgreSQL with a 1GB row limit, or MySQL with 64KB).
+    Pushing a 500MB DataFrame through XCom serializes it to the metadata DB, bloating the database, slowing down the UI (which
+    queries XCom for display), and eventually causing database performance issues. XCom serialization/deserialization adds
+    latency proportional to data size. Some XCom backends have hard size limits that cause silent truncation.
+  how_to_do_right: Store data in external storage (S3, GCS, temp tables) and pass the reference (path, table name, partition
+    key) through XCom. For structured metadata, return a small dict with paths and statistics. If you need large data passing
+    between tasks, use intermediate storage with the execution_date as a namespace. Consider custom XCom backends (S3XComBackend)
+    for larger metadata.
+  severity: high
+  technologies:
+    lang: [python]
+    platform: [airflow, aws, s3]
+  domains:
+    domain: [operations, architecture, performance]
+    concern: [orchestration, data, engineering]
+  example_good: "@task\ndef extract_orders(ds: str) -> dict:\n    \"\"\"Returns metadata, not data. Data lives in S3.\"\"\"\
+    \n    path = f\"s3://staging/orders/{ds}.parquet\"\n    df = fetch_orders(date=ds)\n    df.to_parquet(path)\n    return\
+    \ {\n        \"path\": path,             # Reference to data\n        \"row_count\": len(df),      # Small metadata\n\
+    \        \"schema_version\": \"v2\",    # Small metadata\n    }\n\n@task\ndef transform_orders(metadata: dict, ds: str)\
+    \ -> dict:\n    \"\"\"Reads from S3 path in metadata.\"\"\"\n    df = pd.read_parquet(metadata[\"path\"])\n    clean_df\
+    \ = transform(df)\n    output_path = f\"s3://staging/clean_orders/{ds}.parquet\"\n    clean_df.to_parquet(output_path)\n\
+    \    return {\"path\": output_path, \"row_count\": len(clean_df)}\n"
+  example_bad: "@task\ndef extract_orders(ds: str):\n    df = fetch_orders(date=ds)\n    return df.to_dict()  # 500MB dict\
+    \ serialized to metadata DB\n    # Airflow metadata DB grows by 500MB per DAG run\n    # UI queries slow down (loads XCom\
+    \ for display)\n    # MySQL: silent truncation at 64KB\n"
+  when_applies: Projects using Apache Airflow DAG orchestration, Python codebases, or AWS S3 object storage
+  sources: ["https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/xcoms.html"]
+- id: CR-AIRFLOW-005
+  text: Use sensors with mode='reschedule' instead of mode='poke' for long waits — poke mode wastes a worker slot.
+  why: In poke mode (default), the sensor occupies a worker slot for its entire duration, sleeping between pokes. A sensor
+    waiting 4 hours for a file to appear holds a worker slot for 4 hours — doing nothing but sleeping. With 16 worker slots
+    and 10 sensors poking, 62% of your capacity is occupied by sleeping tasks. In reschedule mode, the sensor releases the
+    worker slot between pokes, freeing it for other tasks.
+  how_to_do_right: Set mode='reschedule' on all sensors that wait for external conditions (file sensors, external task sensors,
+    HTTP sensors). Set poke_interval to match the expected wait granularity (60s for files that appear within minutes, 300s
+    for batch jobs that run hourly). Use soft_fail=True for optional dependencies. Set timeout to prevent infinite waiting.
+  severity: high
+  technologies:
+    lang: [python]
+    platform: [airflow]
+  domains:
+    domain: [operations, performance]
+    concern: [orchestration]
+  example_good: "from airflow.sensors.s3_key_sensor import S3KeySensor\n\n# Reschedule mode: releases worker slot between\
+    \ checks\nwait_for_upstream = S3KeySensor(\n    task_id='wait_for_upstream_data',\n    bucket_key='s3://data/upstream/{{\
+    \ ds }}/complete.flag',\n    mode='reschedule',        # Free worker slot between pokes\n    poke_interval=300,      \
+    \  # Check every 5 minutes\n    timeout=14400,            # Fail after 4 hours\n    soft_fail=True,           # Skip downstream\
+    \ if timeout, don't fail DAG\n)\n\n# External task sensor with reschedule\nfrom airflow.sensors.external_task import ExternalTaskSensor\n\
+    \nwait_for_etl = ExternalTaskSensor(\n    task_id='wait_for_upstream_etl',\n    external_dag_id='upstream_etl',\n    external_task_id='final_task',\n\
+    \    mode='reschedule',\n    poke_interval=120,\n    timeout=7200,\n)\n"
+  example_bad: "# Poke mode: occupies worker slot for entire wait duration\nwait_for_upstream = S3KeySensor(\n    task_id='wait_for_upstream_data',\n\
+    \    bucket_key='s3://data/upstream/{{ ds }}/complete.flag',\n    mode='poke',              # DEFAULT: holds worker slot\
+    \ while sleeping\n    poke_interval=60,\n    timeout=14400,            # 4 hours of holding a worker slot\n)\n# 10 sensors\
+    \ × 4 hours each = 40 worker-slot-hours wasted per day\n"
+  when_applies: Projects using Apache Airflow DAG orchestration or Python codebases
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Airflow or Python
+  sources: ["https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/sensors.html"]
+- id: CR-AIRFLOW-006
+  text: Use the TaskFlow API (@task decorator) instead of PythonOperator for Python-based tasks — it provides automatic XCom
+    handling and cleaner DAG code.
+  why: 'PythonOperator requires explicit XCom push/pull (ti.xcom_push, ti.xcom_pull) and manual function reference passing.
+    The TaskFlow API (@task decorator) automatically handles XCom: function return values are pushed, function parameters
+    are pulled from upstream task outputs. This eliminates boilerplate, makes data flow visible in the code, and prevents
+    common XCom key mismatch bugs.'
+  how_to_do_right: Decorate Python functions with @task. Return values to automatically push to XCom. Accept upstream task
+    outputs as function parameters. Use @task.branch for branching logic. Use @task.short_circuit for conditional skipping.
+    For non-Python tasks, continue using traditional operators (BashOperator, SparkSubmitOperator).
+  severity: medium
+  technologies:
+    lang: [python]
+    platform: [airflow]
+  domains:
+    domain: [operations, quality]
+    concern: [orchestration, code]
+  example_good: "from airflow.decorators import dag, task\nfrom datetime import datetime\n\n@dag(schedule_interval=\"@daily\"\
+    , start_date=datetime(2026, 1, 1))\ndef modern_etl():\n\n    @task\n    def extract(ds: str) -> str:\n        path = f\"\
+    s3://staging/{ds}.parquet\"\n        fetch_data(ds, path)\n        return path                  # Auto-pushed to XCom\n\
+    \n    @task\n    def transform(input_path: str) -> str:  # Auto-pulled from extract's output\n        output_path = input_path.replace(\"\
+    staging\", \"clean\")\n        clean_data(input_path, output_path)\n        return output_path\n\n    @task\n    def load(clean_path:\
+    \ str):              # Auto-pulled from transform's output\n        upsert_to_warehouse(clean_path)\n\n    # Data flow\
+    \ is explicit and type-safe\n    raw = extract()\n    clean = transform(raw)\n    load(clean)\n\nmodern_etl()\n"
+  example_bad: "from airflow.operators.python import PythonOperator\n\ndef extract_fn(**kwargs):\n    path = f\"s3://staging/{kwargs['ds']}.parquet\"\
+    \n    fetch_data(kwargs['ds'], path)\n    kwargs['ti'].xcom_push(key='raw_path', value=path)  # Manual push\n\ndef transform_fn(**kwargs):\n\
+    \    input_path = kwargs['ti'].xcom_pull(task_ids='extract', key='raw_path')  # Manual pull\n    output_path = input_path.replace(\"\
+    staging\", \"clean\")\n    clean_data(input_path, output_path)\n    kwargs['ti'].xcom_push(key='clean_path', value=output_path)\n\
+    \nextract = PythonOperator(task_id='extract', python_callable=extract_fn)\ntransform = PythonOperator(task_id='transform',\
+    \ python_callable=transform_fn)\nextract >> transform\n# Verbose, error-prone XCom key strings, data flow not visible\
+    \ in code\n"
+  when_applies: Projects using Apache Airflow DAG orchestration or Python codebases
+  when_not_applies: projects not using Airflow or Python
+  sources: ["https://airflow.apache.org/docs/apache-airflow/stable/tutorial/taskflow.html"]
+- id: CR-AIRFLOW-007
+  text: Store credentials in a secrets backend (AWS Secrets Manager, HashiCorp Vault, GCP Secret Manager) — never in Airflow
+    Variables or environment variables.
+  why: Airflow Variables are stored in the metadata database in plaintext (or with Fernet encryption that is only as secure
+    as the Fernet key). Anyone with Airflow UI access can read Variables. Environment variables are visible in process listings
+    and container inspection. A secrets backend provides centralized credential management, automatic rotation, access audit
+    logging, and fine-grained access control. Hardcoded credentials in DAG files are the worst option — they end up in version
+    control.
+  how_to_do_right: 'Configure a secrets backend in airflow.cfg: backend = airflow.providers.amazon.aws.secrets.secrets_manager.SecretsManagerBackend.
+    Store credentials as Airflow Connections in the secrets backend (conn_id naming convention). Access via BaseHook.get_connection(conn_id).
+    Never log connection details. Use conn_id references in operators, not raw credentials. Rotate credentials in the secrets
+    backend without code changes.'
+  severity: critical
+  technologies:
+    lang: [python]
+    platform: [airflow, aws, vault]
+  domains:
+    domain: [operations, security]
+    concern: [orchestration]
+  example_good: "# airflow.cfg\n# [secrets]\n# backend = airflow.providers.amazon.aws.secrets.secrets_manager.SecretsManagerBackend\n\
+    # backend_kwargs = {\"connections_prefix\": \"airflow/connections\", \"variables_prefix\": \"airflow/variables\"}\n\n\
+    # DAG uses conn_id — never sees credentials\nfrom airflow.providers.postgres.operators.postgres import PostgresOperator\n\
+    \nload_data = PostgresOperator(\n    task_id='load_data',\n    postgres_conn_id='warehouse_prod',  # Resolved from Secrets\
+    \ Manager\n    sql='sql/load_daily_sales.sql',\n)\n\n# Custom hook usage — credentials from connection\nfrom airflow.hooks.base\
+    \ import BaseHook\n\n@task\ndef call_api():\n    conn = BaseHook.get_connection('payment_api')\n    api_client = PaymentClient(\n\
+    \        base_url=conn.host,\n        api_key=conn.password,  # From secrets backend, never hardcoded\n    )\n    return\
+    \ api_client.get_transactions()\n"
+  example_bad: '# Credentials in DAG file — ends up in git
+
+    API_KEY = "sk-live-abc123def456"
+
+
+    # Credentials in Airflow Variable — plaintext in metadata DB
+
+    from airflow.models import Variable
+
+    api_key = Variable.get("payment_api_key")  # Anyone with UI access can read this
+
+
+    # Credentials in environment variable — visible in container/process info
+
+    import os
+
+    api_key = os.environ["PAYMENT_API_KEY"]
+
+    '
+  when_applies: Any project using Apache Airflow DAG orchestration, AWS cloud infrastructure, HashiCorp Vault secrets management,
+    or Python codebases
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities
+  sources: ["https://airflow.apache.org/docs/apache-airflow/stable/security/secrets/secrets-backend/index.html"]
+- id: CR-AIRFLOW-008
+  text: Use the factory pattern for dynamic DAGs — generate DAG objects in a loop from configuration, not by duplicating DAG
+    files.
+  why: When you need 50 similar DAGs (one per customer, one per data source, one per region), copy-pasting DAG files creates
+    maintenance nightmares. A change to the pipeline logic requires editing 50 files. A new customer requires creating a new
+    file. The factory pattern generates DAG objects programmatically from a configuration list, so all 50 DAGs share the same
+    code and a new customer is just a new entry in the config.
+  how_to_do_right: Create a factory function that returns a DAG object given parameters (customer_id, config). Call it in
+    a loop to generate multiple DAGs. Store the DAG configuration in a YAML/JSON file, database, or Airflow Variable (cached).
+    Each generated DAG must have a unique dag_id. Keep the factory function in a separate Python module imported by the DAG
+    file. Test the factory with different configurations in unit tests.
+  severity: medium
+  technologies:
+    lang: [python]
+    platform: [airflow]
+  domains:
+    domain: [operations, quality]
+    concern: [orchestration, code]
+  example_good: "# dags/customer_etl_factory.py\nfrom airflow.decorators import dag, task\nfrom datetime import datetime\n\
+    import yaml\n\n# Load config once at module level (small YAML, fast parse)\nwith open(\"/opt/airflow/config/customers.yaml\"\
+    ) as f:\n    CUSTOMERS = yaml.safe_load(f)  # [{id: \"acme\", db: \"acme_prod\", schedule: \"@daily\"}, ...]\n\ndef create_customer_dag(customer_config:\
+    \ dict):\n    customer_id = customer_config[\"id\"]\n    schedule = customer_config.get(\"schedule\", \"@daily\")\n\n\
+    \    @dag(\n        dag_id=f\"etl_{customer_id}\",\n        schedule_interval=schedule,\n        start_date=datetime(2026,\
+    \ 1, 1),\n        tags=[\"customer_etl\", customer_id],\n    )\n    def customer_etl():\n        @task\n        def extract(ds:\
+    \ str) -> str:\n            conn_id = customer_config[\"connection_id\"]\n            return extract_from_source(conn_id,\
+    \ ds)\n\n        @task\n        def transform(raw_path: str) -> str:\n            return apply_transforms(raw_path, customer_config.get(\"\
+    transforms\", []))\n\n        @task\n        def load(clean_path: str, ds: str):\n            load_to_warehouse(clean_path,\
+    \ schema=customer_id, partition=ds)\n\n        raw = extract()\n        clean = transform(raw)\n        load(clean)\n\n\
+    \    return customer_etl()\n\n# Generate one DAG per customer\nfor config in CUSTOMERS:\n    globals()[f\"etl_{config['id']}\"\
+    ] = create_customer_dag(config)\n"
+  example_bad: '# 50 nearly identical DAG files:
+
+    # dags/etl_acme.py
+
+    # dags/etl_globex.py
+
+    # dags/etl_initech.py
+
+    # ... 47 more files with copy-pasted logic
+
+    # Change to transform step = edit 50 files
+
+    # New customer = copy file, change 3 variables, hope you didn''t miss one
+
+    '
+  when_applies: Projects using Apache Airflow DAG orchestration or Python codebases
+  when_not_applies: projects not using Airflow or Python
+  sources: ["https://airflow.apache.org/docs/apache-airflow/stable/howto/dynamic-dag-generation.html"]
+- id: CR-AIRFLOW-009
+  text: Choose KubernetesExecutor for heterogeneous resource requirements and CeleryExecutor for low-latency homogeneous workloads.
+  why: LocalExecutor runs tasks as subprocesses on the scheduler machine — single point of failure, no isolation, limited
+    to one machine's resources. CeleryExecutor distributes tasks across a fixed pool of workers — fast scheduling (~1s), but
+    all workers have the same resources (memory, CPU, installed libraries). KubernetesExecutor launches each task in a separate
+    pod — per-task resource requests, custom Docker images, true isolation, but 10-30s pod startup overhead. The wrong executor
+    choice means either wasted resources or task failures.
+  how_to_do_right: 'CeleryExecutor: best for 50+ DAGs with similar resource needs, low-latency scheduling, and predictable
+    workloads. Configure worker autoscaling (KEDA or Celery Flower). KubernetesExecutor: best for diverse resource needs (some
+    tasks need 32GB RAM, others need GPU), multi-tenant environments, or when tasks need different Python dependencies. Use
+    pod_template_file for custom resources. Consider CeleryKubernetesExecutor (hybrid) for the best of both.'
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [celery]
+    platform: [airflow, kubernetes]
+  domains:
+    domain: [operations, infrastructure, performance]
+    concern: [orchestration]
+  example_good: "# KubernetesExecutor with per-task resource requests\nfrom airflow.decorators import task\nfrom kubernetes.client\
+    \ import models as k8s\n\n@task(\n    executor_config={\n        \"pod_override\": k8s.V1Pod(\n            spec=k8s.V1PodSpec(\n\
+    \                containers=[\n                    k8s.V1Container(\n                        name=\"base\",\n        \
+    \                resources=k8s.V1ResourceRequirements(\n                            requests={\"memory\": \"8Gi\", \"\
+    cpu\": \"4\"},\n                            limits={\"memory\": \"16Gi\", \"cpu\": \"8\"},\n                        ),\n\
+    \                        image=\"my-registry/spark-tasks:v2.3\",  # Custom image\n                    )\n            \
+    \    ]\n            )\n        )\n    }\n)\ndef heavy_transform(ds: str):\n    \"\"\"Runs in a pod with 8GB RAM and 4\
+    \ CPUs.\"\"\"\n    import pyspark  # Available only in this custom image\n    # ...\n\n@task  # Default resources for\
+    \ lightweight tasks\ndef send_notification(ds: str):\n    \"\"\"Runs in a default pod with minimal resources.\"\"\"\n\
+    \    notify_slack(f\"ETL for {ds} complete\")\n"
+  example_bad: '# LocalExecutor for production — single machine, no isolation
+
+    # airflow.cfg: executor = LocalExecutor
+
+    # 100 concurrent tasks on one machine → OOM, CPU starvation
+
+    # Machine failure → all tasks fail, no failover
+
+
+    # CeleryExecutor with uniform workers for heterogeneous tasks
+
+    # Worker has 4GB RAM — but ML task needs 32GB
+
+    # Task OOMs and retries forever, blocking the queue
+
+    '
+  when_applies: Projects using Apache Airflow DAG orchestration, Kubernetes-orchestrated deployments, or Celery distributed
+    task queue
+  sources: ["https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/executor/index.html"]
+- id: CR-AIRFLOW-010
+  text: Write unit tests for DAGs that validate structure, task dependencies, and individual task logic — do not rely only
+    on manual trigger-and-watch.
+  why: 'DAGs can have subtle structural bugs: circular dependencies, missing upstream tasks, wrong trigger rules, incorrect
+    schedule intervals. These are only discovered at runtime — often in production, hours after deployment. A DAG structure
+    test catches these instantly in CI. Task logic tests (testing the Python function independent of Airflow) catch data transformation
+    bugs before deployment. Without automated tests, every DAG change is a manual QA process.'
+  how_to_do_right: 'Test DAG structure: verify DAG loads without errors, check task count, verify dependency graph. Test task
+    logic: import and call the Python function directly with test inputs. Use DagBag to validate all DAGs in the dags/ directory.
+    Test XCom data flow by mocking ti.xcom_pull. Run DAG tests in CI before deployment. Use Airflow''s built-in DAG test command:
+    airflow dags test dag_id execution_date.'
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pytest]
+    platform: [airflow]
+  domains:
+    domain: [operations, testing]
+    concern: [orchestration]
+  example_good: "# tests/test_sales_etl_dag.py\nimport pytest\nfrom airflow.models import DagBag\n\n@pytest.fixture(scope=\"\
+    session\")\ndef dagbag():\n    return DagBag(dag_folder=\"dags/\", include_examples=False)\n\ndef test_dag_loads_without_errors(dagbag):\n\
+    \    \"\"\"Verify no import errors in any DAG file.\"\"\"\n    assert len(dagbag.import_errors) == 0, f\"DAG import errors:\
+    \ {dagbag.import_errors}\"\n\ndef test_sales_etl_structure(dagbag):\n    \"\"\"Verify DAG structure: tasks, dependencies,\
+    \ schedule.\"\"\"\n    dag = dagbag.get_dag(\"sales_etl\")\n    assert dag is not None, \"DAG 'sales_etl' not found\"\n\
+    \    assert dag.schedule_interval == \"@daily\"\n\n    # Verify expected tasks exist\n    task_ids = [t.task_id for t\
+    \ in dag.tasks]\n    assert \"extract\" in task_ids\n    assert \"transform\" in task_ids\n    assert \"load\" in task_ids\n\
+    \n    # Verify dependency chain\n    transform_task = dag.get_task(\"transform\")\n    upstream_ids = [t.task_id for t\
+    \ in transform_task.upstream_list]\n    assert \"extract\" in upstream_ids\n\ndef test_transform_logic():\n    \"\"\"\
+    Test task logic independent of Airflow.\"\"\"\n    from dags.sales_etl import apply_business_rules\n    import pandas\
+    \ as pd\n\n    input_df = pd.DataFrame({\"amount\": [100, -50, 0], \"status\": [\"ok\", \"ok\", \"cancelled\"]})\n   \
+    \ result = apply_business_rules(input_df)\n    assert len(result) == 2  # Cancelled row filtered\n    assert (result[\"\
+    amount\"] >= 0).all()  # Negative amounts corrected\n"
+  example_bad: '# No tests — deploy and pray
+
+    # "It worked when I triggered it manually on staging"
+
+    # Production: circular dependency detected at 3am → all downstream DAGs blocked
+
+    # No one notices for 8 hours
+
+    '
+  when_applies: Projects using Apache Airflow DAG orchestration, Python codebases, or pytest
+  when_not_applies: exploratory prototypes, one-off scripts, or spike investigations
+  sources: ["https://airflow.apache.org/docs/apache-airflow/stable/best-practices.html#unit-tests"]
+- id: CR-AIRFLOW-011
+  text: Set up SLA monitoring and alerting for critical DAGs — rely on SLA callbacks and task-level notifications, not manual
+    UI checking.
+  why: Without automated alerting, a failed critical DAG is discovered only when a stakeholder asks 'where is my report?'
+    hours later. A DAG that succeeds but takes 3x longer than expected (data source degradation) goes unnoticed until downstream
+    consumers complain. SLA misses indicate systemic issues (resource contention, upstream delays, data quality problems)
+    that get worse if not addressed. Manual UI monitoring does not scale beyond 10 DAGs.
+  how_to_do_right: 'Set sla on tasks for expected completion time. Configure sla_miss_callback for automated alerting (Slack,
+    PagerDuty, email). Use on_failure_callback and on_retry_callback on the DAG for task-level alerts. Monitor in Grafana:
+    task duration (p50, p95, p99), DAG run duration, scheduler heartbeat, task queue depth. Set up heartbeat monitoring for
+    the scheduler itself.'
+  severity: high
+  technologies:
+    lang: [python]
+    library: [slack]
+    platform: [airflow, pagerduty]
+  domains:
+    domain: [operations, observability, reliability]
+    concern: [orchestration, monitoring]
+  example_good: "from airflow.decorators import dag, task\nfrom datetime import datetime, timedelta\n\ndef alert_on_failure(context):\n\
+    \    \"\"\"Send Slack alert on task failure.\"\"\"\n    task_instance = context['task_instance']\n    slack_webhook.send(\n\
+    \        text=f\":red_circle: Task FAILED: {task_instance.dag_id}.{task_instance.task_id}\\n\"\n             f\"Execution\
+    \ date: {context['ds']}\\n\"\n             f\"Log URL: {task_instance.log_url}\"\n    )\n\ndef alert_on_sla_miss(dag,\
+    \ task_list, blocking_task_list, slas, blocking_tis):\n    \"\"\"Alert when task exceeds SLA.\"\"\"\n    for sla in slas:\n\
+    \        slack_webhook.send(\n            text=f\":warning: SLA MISS: {sla.dag_id}.{sla.task_id} \"\n                \
+    \ f\"exceeded {sla.timedelta}\"\n        )\n\n@dag(\n    schedule_interval=\"@daily\",\n    start_date=datetime(2026,\
+    \ 1, 1),\n    sla_miss_callback=alert_on_sla_miss,\n    default_args={\n        'on_failure_callback': alert_on_failure,\n\
+    \        'retries': 2,\n        'retry_delay': timedelta(minutes=5),\n        'sla': timedelta(hours=2),  # All tasks\
+    \ must complete within 2 hours\n    },\n)\ndef critical_etl():\n    @task(sla=timedelta(minutes=30))  # Extract must finish\
+    \ in 30 min\n    def extract(ds: str) -> str:\n        return fetch_data(ds)\n\n    @task(sla=timedelta(hours=1))    \
+    \ # Transform must finish in 1 hour\n    def transform(data: str) -> str:\n        return process_data(data)\n\n    transform(extract())\n\
+    \ncritical_etl()\n"
+  example_bad: "@dag(schedule_interval=\"@daily\", start_date=datetime(2026, 1, 1))\ndef critical_etl():\n    # No SLA, no\
+    \ failure callback, no monitoring\n    # Fails silently at 3am, discovered at 10am when CFO asks for report\n    @task\n\
+    \    def extract(ds: str):\n        return fetch_data(ds)\n"
+  when_applies: Projects using Apache Airflow DAG orchestration, Python codebases, Slack, or PagerDuty
+  sources: ["https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dag-run.html#sla-miss"]
+- id: CR-AIRFLOW-012
+  text: Use Airflow Connections for service credentials and Variables for configuration — but access Variables inside tasks,
+    not at DAG parse time.
+  why: Airflow Variables are stored in the metadata database. Accessing Variable.get() at the top level of a DAG file (outside
+    a task) queries the database on every scheduler heartbeat (every 30 seconds). With 100 DAGs each reading 3 variables,
+    the scheduler makes 300 DB queries every 30 seconds (600/minute) just for variable lookups. This degrades scheduler performance
+    and can cause task scheduling delays.
+  how_to_do_right: Access Variables inside task callables, not at DAG parse time. For DAG-level configuration that must be
+    available at parse time (schedule intervals, start dates), use a YAML config file or environment variables instead. If
+    you must use Variables at parse time, use Variable.get() with deserialize_json=True and fetch one JSON variable containing
+    all config, not multiple scalar variables.
+  severity: medium
+  technologies:
+    lang: [python]
+    platform: [airflow]
+  domains:
+    domain: [operations, performance]
+    concern: [orchestration]
+  example_good: "from airflow.decorators import dag, task\nfrom airflow.models import Variable\nfrom datetime import datetime\n\
+    \n# DAG-level config from file (parsed once, no DB query)\nimport yaml\nwith open(\"/opt/airflow/config/pipeline.yaml\"\
+    ) as f:\n    PIPELINE_CONFIG = yaml.safe_load(f)\n\n@dag(\n    schedule_interval=PIPELINE_CONFIG[\"schedule\"],  # From\
+    \ file, not Variable\n    start_date=datetime(2026, 1, 1),\n)\ndef configurable_etl():\n\n    @task\n    def extract(ds:\
+    \ str) -> str:\n        # Variable accessed INSIDE task — only queried when task runs\n        config = Variable.get(\"\
+    extract_config\", deserialize_json=True)\n        source_url = config[\"source_url\"]\n        batch_size = config[\"\
+    batch_size\"]\n        return fetch_data(source_url, batch_size, ds)\n\n    extract()\n\nconfigurable_etl()\n"
+  example_bad: 'from airflow.models import Variable
+
+
+    # Variables at parse time — DB query every 30 seconds
+
+    SOURCE_URL = Variable.get("source_url")        # DB query per parse
+
+    BATCH_SIZE = Variable.get("batch_size")         # DB query per parse
+
+    API_KEY = Variable.get("api_key")               # DB query per parse (credentials in Variable!)
+
+    TARGET_TABLE = Variable.get("target_table")     # DB query per parse
+
+    # 4 queries × every 30 seconds = 480 queries/hour just from this DAG
+
+    '
+  when_applies: Projects using Apache Airflow DAG orchestration or Python codebases
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Airflow or Python
+  sources: ["https://airflow.apache.org/docs/apache-airflow/stable/howto/variable.html"]
+- id: CR-AIRFLOW-013
+  text: Set catchup=False on DAGs unless you explicitly need historical backfill — catchup=True creates a run for every missed
+    interval.
+  why: With catchup=True (default), when a DAG is first enabled or after a pause, Airflow creates one DAG run for every missed
+    schedule interval. A daily DAG with start_date=2025-01-01 enabled in February 2026 creates 400+ DAG runs simultaneously.
+    This floods the scheduler, overwhelms worker pools, and can crash external APIs or databases with sudden load. Most production
+    DAGs only need to process the latest interval.
+  how_to_do_right: 'Set catchup=False on all DAGs that should only process the current/latest interval. When you need historical
+    backfill, use the CLI: airflow dags backfill --start-date 2026-01-01 --end-date 2026-02-01 dag_id — this gives you explicit
+    control over the date range and parallelism. Set max_active_runs=1 or 2 to prevent concurrent runs from overwhelming resources
+    during backfill.'
+  severity: high
+  technologies:
+    lang: [python]
+    platform: [airflow]
+  domains:
+    domain: [operations]
+    concern: [orchestration]
+  example_good: "@dag(\n    schedule_interval=\"@daily\",\n    start_date=datetime(2026, 1, 1),\n    catchup=False,      \
+    \  # Only run for the latest interval\n    max_active_runs=2,    # At most 2 concurrent runs\n)\ndef production_etl():\n\
+    \    # Runs once per day, no historical backfill on deploy\n    pass\n\n# For explicit backfill (when needed):\n# airflow\
+    \ dags backfill \\\n#   --start-date 2026-01-15 \\\n#   --end-date 2026-02-01 \\\n#   --reset-dagruns \\\n#   production_etl\n"
+  example_bad: "@dag(\n    schedule_interval=\"@hourly\",\n    start_date=datetime(2025, 1, 1),  # 14 months ago\n    # catchup\
+    \ defaults to True\n    # max_active_runs defaults to 16\n)\ndef production_etl():\n    pass\n\n# On first enable: 10,000+\
+    \ DAG runs created simultaneously\n# Scheduler overwhelmed, workers saturated, external APIs rate-limited\n# \"Why is\
+    \ my database getting 10,000 simultaneous connections?\"\n"
+  when_applies: Projects using Apache Airflow DAG orchestration or Python codebases
+  when_not_applies: projects not using Airflow or Python
+  sources: ["https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dag-run.html#catchup"]
+- id: CR-AIRFLOW-014
+  text: Use trigger rules to control task execution in branching DAGs — the default all_success skips tasks after branches.
+  why: When a BranchPythonOperator selects one branch, tasks in the other branch are marked as 'skipped'. The default trigger
+    rule (all_success) requires all upstream tasks to succeed. A downstream join task with all_success trigger rule will be
+    skipped because some upstream tasks were skipped (not succeeded). This silently prevents the rest of the DAG from running.
+    The none_failed_min_one_success trigger rule handles this correctly by running if at least one upstream succeeded and
+    none failed.
+  how_to_do_right: Set trigger_rule='none_failed_min_one_success' on join tasks after branches. Use 'all_done' when the task
+    should run regardless of upstream status (cleanup tasks). Use 'one_success' when any one upstream success is sufficient.
+    Test branching DAGs with both branch paths to verify join tasks execute correctly. Visualize the DAG in the Airflow UI
+    and trace the execution path.
+  severity: medium
+  technologies:
+    lang: [python]
+    platform: [airflow]
+  domains:
+    domain: [operations]
+    concern: [orchestration, correctness]
+  example_good: "from airflow.decorators import dag, task\nfrom airflow.operators.python import BranchPythonOperator\nfrom\
+    \ airflow.utils.trigger_rule import TriggerRule\n\n@dag(schedule_interval=\"@daily\", start_date=datetime(2026, 1, 1))\n\
+    def branching_dag():\n\n    @task.branch\n    def choose_path(ds: str) -> str:\n        if is_weekend(ds):\n         \
+    \   return 'light_processing'\n        return 'full_processing'\n\n    @task\n    def light_processing(): ...\n\n    @task\n\
+    \    def full_processing(): ...\n\n    @task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)\n    def send_report():\n\
+    \        \"\"\"Runs after whichever branch completed — not skipped.\"\"\"\n        notify_stakeholders()\n\n    branch\
+    \ = choose_path()\n    [light_processing(), full_processing()] >> send_report()\n"
+  example_bad: "@task  # Default trigger_rule='all_success'\ndef send_report():\n    \"\"\"SKIPPED when one branch is skipped\
+    \ — DAG appears to succeed but report never sent.\"\"\"\n    notify_stakeholders()\n\n# BranchOperator → light_processing\
+    \ (runs) + full_processing (skipped)\n# send_report trigger_rule=all_success → skipped (full_processing was skipped)\n\
+    # No report sent, no error, no alert\n"
+  when_applies: Projects using Apache Airflow DAG orchestration or Python codebases
+  when_not_applies: projects not using Airflow or Python
+  sources: ["https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dags.html#trigger-rules"]
+- id: CR-AIRFLOW-015
+  text: Use pool slots to limit concurrent access to shared resources — prevent resource exhaustion from parallel task execution.
+  why: Airflow schedules tasks in parallel based on parallelism and concurrency settings. Without resource limits, 50 tasks
+    can simultaneously open database connections, hit API rate limits, or overwhelm shared file systems. A production database
+    with a 100-connection pool gets 50 connections from Airflow ETL + 50 connections from the application = connection exhaustion.
+    Pools provide fine-grained concurrency control per shared resource.
+  how_to_do_right: 'Create pools in the Airflow UI or CLI: airflow pools set database_pool 10 ''Max 10 concurrent DB tasks''.
+    Assign tasks to pools: task.pool = ''database_pool''. Set priority_weight to control task ordering within the pool. Use
+    pool_slots to consume multiple slots for heavy tasks. Create separate pools for each external resource (database_pool,
+    api_pool, spark_cluster_pool). Monitor pool usage in the Airflow UI''s Pools page.'
+  severity: medium
+  technologies:
+    lang: [python]
+    platform: [airflow]
+  domains:
+    domain: [operations, performance, reliability]
+    concern: [orchestration]
+  example_good: "# Create pool via CLI (or UI)\n# airflow pools set warehouse_db 10 \"Max 10 concurrent warehouse queries\"\
+    \n# airflow pools set payment_api 5 \"Max 5 concurrent API calls\"\n\n@task(pool='warehouse_db', pool_slots=1)\ndef load_to_warehouse(ds:\
+    \ str):\n    \"\"\"Limited to 10 concurrent tasks across all DAGs.\"\"\"\n    upsert_data(ds)\n\n@task(pool='warehouse_db',\
+    \ pool_slots=3)\ndef heavy_aggregation(ds: str):\n    \"\"\"Heavy query: consumes 3 pool slots (30% of pool capacity).\"\
+    \"\"\n    run_heavy_aggregation(ds)\n\n@task(pool='payment_api', pool_slots=1, priority_weight=10)\ndef process_refund(ds:\
+    \ str):\n    \"\"\"High priority: processed before lower-priority tasks in same pool.\"\"\"\n    refund_api.process(ds)\n"
+  example_bad: "# No pools — 50 DAGs all query the warehouse simultaneously\n@task\ndef load_to_warehouse(ds: str):\n    upsert_data(ds)\n\
+    # 50 concurrent connections → warehouse connection pool exhausted\n# Application users get \"too many connections\" errors\n\
+    # All 50 tasks slow down due to resource contention\n"
+  when_applies: Projects using Apache Airflow DAG orchestration or Python codebases
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Airflow or Python
+  sources: ["https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/pools.html"]

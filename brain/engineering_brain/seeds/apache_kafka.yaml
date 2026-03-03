@@ -1,0 +1,541 @@
+layer: rules
+technology: Kafka
+domain: streaming
+knowledge:
+- id: CR-KAFKA-001
+  text: Kafka producers must set acks=all for durable writes in any system where message loss is unacceptable.
+  why: With acks=0 or acks=1, messages can be acknowledged before all in-sync replicas confirm the write. If the leader broker
+    crashes immediately after acknowledging, the message is permanently lost. In financial systems, order pipelines, or audit
+    logs, a single lost message can mean lost revenue, compliance violations, or silent data corruption that surfaces weeks
+    later.
+  how_to_do_right: Set acks=all (or acks=-1) in producer config. Pair with min.insync.replicas=2 on the topic/broker to ensure
+    at least 2 replicas confirm. Accept the ~2-5ms latency increase per produce call. For high-throughput paths, combine with
+    batching (linger.ms) to amortize the latency cost across many messages.
+  severity: critical
+  technologies:
+    lang: [java, python]
+    library: [confluent-kafka]
+    platform: [kafka]
+  domains:
+    domain: [architecture, reliability]
+    concern: [streaming, data, engineering]
+  example_good: "# Python confluent-kafka producer\nfrom confluent_kafka import Producer\n\nproducer = Producer({\n    'bootstrap.servers':\
+    \ 'broker1:9092,broker2:9092,broker3:9092',\n    'acks': 'all',                  # Wait for all ISR replicas\n    'retries':\
+    \ 2147483647,          # Retry indefinitely on transient errors\n    'enable.idempotence': True,     # Prevent duplicates\
+    \ on retry\n    'max.in.flight.requests.per.connection': 5,  # Safe with idempotence\n    'linger.ms': 20,           \
+    \    # Batch for 20ms to amortize acks=all latency\n})\n"
+  example_bad: "# Dangerous: message loss on broker failure\nproducer = Producer({\n    'bootstrap.servers': 'broker1:9092',\n\
+    \    'acks': '1',       # Only leader confirms — data lost if leader crashes\n    'retries': 0,      # No retry on transient\
+    \ errors\n})\n"
+  when_applies: Any project using Apache Kafka event streaming, Java/JVM applications, Python codebases, or confluent-kafka
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://kafka.apache.org/documentation/#producerconfigs_acks"]
+- id: CR-KAFKA-002
+  text: Enable idempotent producer to guarantee exactly-once delivery semantics at the partition level.
+  why: Without idempotence, a network timeout during produce can cause the producer to retry, resulting in duplicate messages
+    in the partition. The broker has no way to detect the duplicate because each produce request looks like a new message.
+    Idempotent producers assign a Producer ID (PID) and sequence number to each message, allowing the broker to deduplicate
+    retries transparently.
+  how_to_do_right: Set enable.idempotence=true. This automatically enforces acks=all, retries=MAX_INT, and max.in.flight.requests.per.connection<=5.
+    Do not override these settings when idempotence is enabled — Kafka will reject conflicting configurations. For cross-partition
+    atomicity, use transactional producers instead.
+  severity: high
+  technologies:
+    library: [confluent-kafka, kafka-python]
+    platform: [kafka]
+  domains:
+    domain: [architecture, reliability]
+    concern: [streaming, exactly_once]
+  example_good: "producer = Producer({\n    'bootstrap.servers': 'broker1:9092,broker2:9092',\n    'enable.idempotence': True,\
+    \   # Dedup retries via PID+sequence\n    'acks': 'all',                # Required by idempotence\n})\n"
+  example_bad: "producer = Producer({\n    'bootstrap.servers': 'broker1:9092',\n    'enable.idempotence': False,\n    'retries':\
+    \ 3,\n    'acks': '1',\n    # Retry after timeout = duplicate messages in partition\n})\n"
+  when_applies: Projects using Apache Kafka event streaming, confluent-kafka, or kafka-python
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://kafka.apache.org/documentation/#producerconfigs_enable.idempotence"]
+- id: CR-KAFKA-003
+  text: Tune linger.ms and batch.size together to balance latency and throughput.
+  why: By default linger.ms=0, meaning the producer sends each message immediately in its own request. This wastes network
+    round-trips and reduces throughput by 10-50x compared to batched sends. However, setting linger.ms too high (>100ms) adds
+    unacceptable latency for real-time use cases. The optimal setting depends on your latency SLA and message rate.
+  how_to_do_right: 'For high-throughput pipelines (ETL, log shipping): set linger.ms=50-100 and batch.size=256KB-1MB. For
+    low-latency applications (user-facing events): set linger.ms=5-20 and batch.size=64KB. Always measure end-to-end latency
+    (p99) after tuning. Enable compression (lz4 or zstd) alongside batching for maximum throughput gain.'
+  severity: medium
+  technologies:
+    library: [confluent-kafka]
+    platform: [kafka]
+  domains:
+    domain: [architecture, performance]
+    concern: [streaming]
+  example_good: "# High-throughput ETL producer\nproducer = Producer({\n    'bootstrap.servers': 'broker1:9092,broker2:9092',\n\
+    \    'linger.ms': 50,                # Wait up to 50ms to fill batch\n    'batch.size': 262144,           # 256KB batch\
+    \ size\n    'compression.type': 'lz4',     # Fast compression, ~4x size reduction\n    'enable.idempotence': True,\n \
+    \   'acks': 'all',\n})\n"
+  example_bad: "# Default settings: one message per request, no compression\nproducer = Producer({\n    'bootstrap.servers':\
+    \ 'broker1:9092',\n    'linger.ms': 0,        # Send immediately — low throughput\n    'batch.size': 16384,   # 16KB default\
+    \ — too small for ETL\n    # No compression — wastes bandwidth\n})\n"
+  when_applies: Projects using Apache Kafka event streaming or confluent-kafka
+  when_not_applies: batch-only workloads, simple request-response systems. projects not using Kafka or confluent-kafka
+  sources: ["https://kafka.apache.org/documentation/#producerconfigs_linger.ms"]
+- id: CR-KAFKA-004
+  text: Always commit offsets AFTER processing, never before — to prevent data loss on consumer crash.
+  why: If you commit the offset before processing the message and the consumer crashes mid-processing, the message is marked
+    as consumed but was never actually processed. On restart, the consumer picks up from the committed offset and the unprocessed
+    message is permanently skipped. This is silent data loss — no error, no retry, no trace.
+  how_to_do_right: Disable auto-commit (enable.auto.commit=false). Process the message fully — including any database writes,
+    API calls, or downstream publishes. Only then call consumer.commit() or commitSync(). For exactly-once with external systems,
+    use the transactional outbox pattern or Kafka transactions.
+  severity: critical
+  technologies:
+    library: [confluent-kafka, kafka-python]
+    platform: [kafka]
+  domains:
+    domain: [architecture, reliability]
+    concern: [streaming, data, engineering]
+  example_good: "from confluent_kafka import Consumer\n\nconsumer = Consumer({\n    'bootstrap.servers': 'broker1:9092',\n\
+    \    'group.id': 'order-processor',\n    'enable.auto.commit': False,    # Manual commit only\n    'auto.offset.reset':\
+    \ 'earliest',\n})\nconsumer.subscribe(['orders'])\n\nwhile True:\n    msg = consumer.poll(1.0)\n    if msg is None:\n\
+    \        continue\n    if msg.error():\n        handle_error(msg.error())\n        continue\n\n    # Process FIRST\n \
+    \   process_order(msg.value())\n    save_to_database(msg.value())\n\n    # Commit AFTER successful processing\n    consumer.commit(message=msg)\n"
+  example_bad: "consumer = Consumer({\n    'bootstrap.servers': 'broker1:9092',\n    'group.id': 'order-processor',\n    'enable.auto.commit':\
+    \ True,     # Commits every 5s regardless of processing\n    'auto.commit.interval.ms': 5000,\n})\n# If consumer crashes\
+    \ after auto-commit but before process_order(),\n# the order is permanently lost — no error, no retry\n"
+  when_applies: Any project using Apache Kafka event streaming, confluent-kafka, or kafka-python
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://kafka.apache.org/documentation/#consumerconfigs_enable.auto.commit"]
+- id: CR-KAFKA-005
+  text: Set auto.offset.reset to 'earliest' for new consumer groups to avoid silently missing historical data.
+  why: The default auto.offset.reset is 'latest', meaning a new consumer group (or one whose offsets expired) starts reading
+    only new messages. All existing messages in the topic are silently skipped. For data pipelines, analytics, or any system
+    that needs to process the full topic history, this means permanent data loss on first deployment or after extended downtime.
+  how_to_do_right: Set auto.offset.reset=earliest for data pipelines, ETL jobs, and any consumer that must process historical
+    data. Use 'latest' only for real-time alerting or monitoring where historical data is irrelevant. Always test consumer
+    group behavior by deleting the group and restarting — verify it processes from the expected offset.
+  severity: high
+  technologies:
+    library: [confluent-kafka]
+    platform: [kafka]
+  domains:
+    domain: [architecture, reliability]
+    concern: [streaming]
+  example_good: "consumer = Consumer({\n    'bootstrap.servers': 'broker1:9092',\n    'group.id': 'analytics-pipeline',\n\
+    \    'auto.offset.reset': 'earliest',  # Process from beginning if no committed offset\n    'enable.auto.commit': False,\n\
+    })\n"
+  example_bad: "consumer = Consumer({\n    'bootstrap.servers': 'broker1:9092',\n    'group.id': 'analytics-pipeline',\n \
+    \   # auto.offset.reset defaults to 'latest'\n    # New deployment skips all existing data — silent data loss\n})\n"
+  when_applies: Projects using Apache Kafka event streaming or confluent-kafka
+  when_not_applies: batch-only workloads, simple request-response systems. projects not using Kafka or confluent-kafka
+  sources: ["https://kafka.apache.org/documentation/#consumerconfigs_auto.offset.reset"]
+- id: CR-KAFKA-006
+  text: Handle consumer rebalances explicitly using a ConsumerRebalanceListener to avoid duplicate processing.
+  why: During a rebalance (new consumer joins/leaves, partition reassignment), Kafka revokes partitions from one consumer
+    and assigns them to another. If the old consumer has processed messages but not yet committed offsets, the new consumer
+    will re-process those messages. Without a rebalance listener, you cannot flush pending work or commit offsets before partition
+    revocation, leading to duplicates or lost progress.
+  how_to_do_right: Implement on_revoke to commit offsets and flush any buffered data before partitions are revoked. Implement
+    on_assign to initialize any per-partition state. Use cooperative-sticky partition assignment strategy (partition.assignment.strategy=cooperative-sticky)
+    to minimize stop-the-world rebalances in Kafka 2.4+.
+  severity: high
+  technologies:
+    library: [confluent-kafka, kafka-python]
+    platform: [kafka]
+  domains:
+    domain: [architecture, reliability]
+    concern: [streaming]
+  example_good: "from confluent_kafka import Consumer\n\ndef on_revoke(consumer, partitions):\n    \"\"\"Flush pending work\
+    \ before losing partitions.\"\"\"\n    flush_buffered_writes()\n    consumer.commit(asynchronous=False)  # Synchronous\
+    \ commit on revoke\n\ndef on_assign(consumer, partitions):\n    \"\"\"Initialize per-partition state.\"\"\"\n    for p\
+    \ in partitions:\n        init_partition_buffer(p.partition)\n\nconsumer = Consumer({\n    'bootstrap.servers': 'broker1:9092',\n\
+    \    'group.id': 'order-processor',\n    'partition.assignment.strategy': 'cooperative-sticky',\n    'enable.auto.commit':\
+    \ False,\n})\nconsumer.subscribe(['orders'], on_revoke=on_revoke, on_assign=on_assign)\n"
+  example_bad: "consumer = Consumer({\n    'bootstrap.servers': 'broker1:9092',\n    'group.id': 'order-processor',\n})\n\
+    consumer.subscribe(['orders'])\n# No rebalance handling — buffered data lost on revoke,\n# duplicates on assign when offsets\
+    \ not committed\n"
+  when_applies: Projects using Apache Kafka event streaming, confluent-kafka, or kafka-python
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://kafka.apache.org/documentation/#consumerconfigs_partition.assignment.strategy"]
+- id: CR-KAFKA-007
+  text: Choose partition keys that distribute load evenly — avoid hot partitions from skewed key distributions.
+  why: 'Kafka hashes the message key to determine the partition. If your key has a skewed distribution (e.g., tenant_id where
+    one tenant generates 80% of traffic), one partition receives most of the load while others sit idle. This creates a hot
+    partition bottleneck: one broker is overloaded, consumer lag grows on that partition only, and you cannot scale by adding
+    partitions because the hot key is pinned to one partition.'
+  how_to_do_right: Analyze your key distribution before choosing. For skewed keys, use a composite key (tenant_id + sub_shard)
+    or random suffix for high-volume keys. For ordered-per-entity use cases (orders per customer), use the entity ID as key.
+    Monitor partition-level metrics (bytes-in, messages-in per partition) to detect skew early. Consider custom partitioners
+    for complex routing.
+  severity: high
+  technologies:
+    platform: [kafka]
+  domains:
+    domain: [architecture, performance]
+    concern: [streaming, data, engineering]
+  example_good: "# Composite key to spread high-volume tenants across partitions\nimport hashlib\n\ndef produce_event(producer,\
+    \ tenant_id: str, event: dict, num_sub_shards: int = 8):\n    if is_high_volume_tenant(tenant_id):\n        # Sub-shard\
+    \ to avoid hot partition\n        shard = int(hashlib.md5(event['event_id'].encode()).hexdigest(), 16) % num_sub_shards\n\
+    \        key = f\"{tenant_id}:{shard}\"\n    else:\n        key = tenant_id\n\n    producer.produce('events', key=key.encode(),\
+    \ value=serialize(event))\n"
+  example_bad: '# tenant_id as key — one tenant = 80% traffic = one hot partition
+
+    producer.produce(''events'', key=tenant_id.encode(), value=serialize(event))
+
+    # Cannot fix by adding partitions — hot key always maps to ONE partition
+
+    '
+  when_applies: Projects using Apache Kafka event streaming
+  when_not_applies: batch-only workloads, simple request-response systems. projects not using Kafka
+  sources: ["https://kafka.apache.org/documentation/#design_partitioningstrategy"]
+- id: CR-KAFKA-008
+  text: Use compacted topics for state/lookup data and delete-retention topics for event streams.
+  why: Delete-retention topics discard entire segments after retention.ms expires — suitable for event streams where old events
+    lose relevance. Compacted topics retain only the latest value per key forever — suitable for CDC, configuration, and lookup
+    tables where you need the current state. Using the wrong cleanup policy means either losing current state (delete on lookup
+    data) or unbounded growth (compact on event streams).
+  how_to_do_right: Set cleanup.policy=compact for entity state topics (user profiles, product catalog, config). Set cleanup.policy=delete
+    for event streams (clicks, logs, transactions). For CDC topics that need both latest state and time-bounded history, use
+    cleanup.policy=compact,delete with appropriate retention. Set min.compaction.lag.ms to ensure consumers have time to read
+    updates before compaction removes them.
+  severity: medium
+  technologies:
+    platform: [kafka]
+  domains:
+    domain: [architecture]
+    concern: [streaming, data, engineering]
+  example_good: "# Compacted topic for user profile state\nkafka-topics.sh --create --topic user-profiles \\\n  --partitions\
+    \ 12 \\\n  --replication-factor 3 \\\n  --config cleanup.policy=compact \\\n  --config min.compaction.lag.ms=3600000 \\\
+    \n  --config delete.retention.ms=86400000\n\n# Delete-retention topic for click events\nkafka-topics.sh --create --topic\
+    \ click-events \\\n  --partitions 24 \\\n  --replication-factor 3 \\\n  --config cleanup.policy=delete \\\n  --config\
+    \ retention.ms=604800000  # 7 days\n"
+  example_bad: "# Delete retention on state topic — lose current user profiles after 7 days\nkafka-topics.sh --create --topic\
+    \ user-profiles \\\n  --config cleanup.policy=delete \\\n  --config retention.ms=604800000\n\n# Compact on event stream\
+    \ — unbounded topic growth, never deletes old events\nkafka-topics.sh --create --topic click-events \\\n  --config cleanup.policy=compact\n"
+  when_applies: Projects using Apache Kafka event streaming
+  when_not_applies: batch-only workloads, simple request-response systems. projects not using Kafka
+  sources: ["https://kafka.apache.org/documentation/#compaction"]
+- id: CR-KAFKA-009
+  text: Use Schema Registry with Avro or Protobuf for all production Kafka topics — never use raw JSON without schema validation.
+  why: Without schema enforcement, any producer can send arbitrarily-shaped JSON to a topic. A single malformed message (missing
+    field, wrong type, extra nesting) poisons every downstream consumer. Debugging requires reading raw bytes from the topic.
+    Schema Registry enforces contracts between producers and consumers, catches breaking changes before they reach production,
+    and provides automatic serialization/deserialization.
+  how_to_do_right: Deploy Confluent Schema Registry (or Apicurio). Register Avro or Protobuf schemas for every topic. Configure
+    producers with AvroSerializer/ProtobufSerializer. Set compatibility mode to BACKWARD (default) to allow adding optional
+    fields without breaking consumers. Test schema evolution in CI by registering the new schema against the compatibility
+    checker before deploying.
+  severity: high
+  technologies:
+    lang: [protobuf]
+    library: [schema registry]
+    platform: [kafka, avro]
+  domains:
+    domain: [architecture, reliability]
+    concern: [streaming, data, engineering]
+  example_good: "from confluent_kafka import SerializingProducer\nfrom confluent_kafka.schema_registry import SchemaRegistryClient\n\
+    from confluent_kafka.schema_registry.avro import AvroSerializer\n\nschema_registry = SchemaRegistryClient({'url': 'http://schema-registry:8081'})\n\
+    \norder_schema = \"\"\"{\n  \"type\": \"record\",\n  \"name\": \"Order\",\n  \"fields\": [\n    {\"name\": \"order_id\"\
+    , \"type\": \"string\"},\n    {\"name\": \"amount\", \"type\": \"double\"},\n    {\"name\": \"currency\", \"type\": \"\
+    string\", \"default\": \"USD\"},\n    {\"name\": \"created_at\", \"type\": \"long\", \"logicalType\": \"timestamp-millis\"\
+    }\n  ]\n}\"\"\"\n\nproducer = SerializingProducer({\n    'bootstrap.servers': 'broker1:9092',\n    'key.serializer': StringSerializer('utf_8'),\n\
+    \    'value.serializer': AvroSerializer(schema_registry, order_schema),\n})\n"
+  example_bad: "import json\n# Raw JSON — no schema validation, no evolution guarantees\nproducer.produce('orders', value=json.dumps({\n\
+    \    'order_id': '123',\n    'amount': '49.99',   # String instead of number — silent corruption\n    # Missing 'currency'\
+    \ field — consumer crashes with KeyError\n}).encode())\n"
+  when_applies: Projects using Apache Kafka event streaming, Avro, Protobuf, or Schema Registry
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://docs.confluent.io/platform/current/schema-registry/index.html"]
+- id: CR-KAFKA-010
+  text: Set schema compatibility mode to BACKWARD for consumer-first evolution, FORWARD for producer-first evolution.
+  why: BACKWARD compatibility (default) means new schemas can read data written by old schemas — safe for rolling consumer
+    upgrades. FORWARD compatibility means old schemas can read data written by new schemas — safe for rolling producer upgrades.
+    FULL compatibility is both. Using NONE disables compatibility checks entirely, allowing any schema change to break consumers
+    silently at runtime instead of failing at registration time.
+  how_to_do_right: 'Use BACKWARD (default) for most cases — it allows adding fields with defaults and removing optional fields.
+    Use FORWARD when producers are deployed before consumers. Use FULL for strict contract enforcement. Never use NONE in
+    production. Test compatibility in CI: curl -X POST schema-registry/compatibility/subjects/{topic}-value/versions/latest.'
+  severity: medium
+  technologies:
+    lang: [protobuf]
+    library: [schema registry]
+    platform: [kafka, avro]
+  domains:
+    domain: [architecture]
+    concern: [streaming, data, engineering]
+  example_good: "# Set BACKWARD compatibility (consumers can read old + new data)\ncurl -X PUT http://schema-registry:8081/config/orders-value\
+    \ \\\n  -H \"Content-Type: application/vnd.schemaregistry.v1+json\" \\\n  -d '{\"compatibility\": \"BACKWARD\"}'\n\n#\
+    \ CI check: verify new schema is compatible before deploy\ncurl -X POST http://schema-registry:8081/compatibility/subjects/orders-value/versions/latest\
+    \ \\\n  -H \"Content-Type: application/vnd.schemaregistry.v1+json\" \\\n  -d '{\"schema\": \"{...new_schema_json...}\"\
+    }'\n# Returns {\"is_compatible\": true} or fails deployment\n"
+  example_bad: "# NONE compatibility — any producer can break all consumers\ncurl -X PUT http://schema-registry:8081/config/orders-value\
+    \ \\\n  -d '{\"compatibility\": \"NONE\"}'\n\n# Removing a required field now silently breaks all consumers\n# No validation,\
+    \ no warning, discovered only at runtime\n"
+  when_applies: Projects using Apache Kafka event streaming, Schema Registry, Avro, or Protobuf
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html"]
+- id: CR-KAFKA-011
+  text: Implement a Dead Letter Topic (DLT) for messages that fail processing after retries — never silently drop or block
+    on poison pills.
+  why: A poison pill is a message that causes the consumer to crash or fail repeatedly (malformed data, schema mismatch, business
+    rule violation). Without a DLT, the consumer either blocks forever on the bad message (stalling the entire partition)
+    or skips it silently (data loss). A DLT captures failed messages with error context for later investigation and reprocessing,
+    keeping the main pipeline flowing.
+  how_to_do_right: 'Create a DLT topic (e.g., orders.DLT) with the same partition count as the source topic. After N retries
+    (typically 3-5), produce the failed message to the DLT with headers containing: original topic, partition, offset, error
+    message, retry count, timestamp. Monitor DLT lag as an alert. Build a reprocessing tool that reads from DLT and replays
+    to the source topic after the bug is fixed.'
+  severity: high
+  technologies:
+    library: [confluent-kafka]
+    platform: [kafka]
+  domains:
+    domain: [architecture, reliability]
+    concern: [streaming, data, engineering]
+  example_good: "MAX_RETRIES = 3\nDLT_TOPIC = 'orders.DLT'\n\ndef process_with_dlt(consumer, producer, msg):\n    retries\
+    \ = 0\n    while retries < MAX_RETRIES:\n        try:\n            process_order(msg.value())\n            consumer.commit(message=msg)\n\
+    \            return\n        except TransientError:\n            retries += 1\n            time.sleep(2 ** retries)  #\
+    \ Exponential backoff\n        except Exception as e:\n            # Non-retryable error — send to DLT immediately\n \
+    \           break\n\n    # All retries exhausted or non-retryable — send to DLT\n    headers = [\n        ('original_topic',\
+    \ msg.topic().encode()),\n        ('original_partition', str(msg.partition()).encode()),\n        ('original_offset',\
+    \ str(msg.offset()).encode()),\n        ('error', str(e).encode()),\n        ('retry_count', str(retries).encode()),\n\
+    \    ]\n    producer.produce(DLT_TOPIC, key=msg.key(), value=msg.value(), headers=headers)\n    consumer.commit(message=msg)\
+    \  # Skip poison pill in source topic\n"
+  example_bad: "# Silently skip failed messages — data loss\ntry:\n    process_order(msg.value())\nexcept Exception:\n   \
+    \ pass  # Message vanishes, no trace, no recovery\n\n# Or: retry forever — blocks entire partition\nwhile True:\n    try:\n\
+    \        process_order(msg.value())\n        break\n    except Exception:\n        time.sleep(1)  # Infinite loop on poison\
+    \ pill\n"
+  when_applies: Projects using Apache Kafka event streaming or confluent-kafka
+  when_not_applies: batch-only workloads, simple request-response systems. projects not using Kafka or confluent-kafka
+  sources: ["https://kafka.apache.org/documentation/#design_consumerposition"]
+- id: CR-KAFKA-012
+  text: Use Kafka transactions for exactly-once semantics when consuming from one topic and producing to another.
+  why: 'The consume-transform-produce pattern without transactions has a gap: if the consumer commits the source offset but
+    the downstream produce fails (or vice versa), you get data loss or duplicates. Kafka transactions atomically commit the
+    consumed offsets and the produced messages in a single transaction, guaranteeing exactly-once processing across topics.'
+  how_to_do_right: Set transactional.id on the producer (unique per instance, stable across restarts). Call init_transactions()
+    once at startup. Wrap consume-produce cycles in begin_transaction/commit_transaction. Set isolation.level=read_committed
+    on downstream consumers to avoid reading uncommitted messages. Use a unique transactional.id per consumer partition assignment
+    to avoid fencing conflicts.
+  severity: high
+  technologies:
+    library: [confluent-kafka]
+    platform: [kafka]
+  domains:
+    domain: [architecture, reliability]
+    concern: [streaming, exactly_once]
+  example_good: "from confluent_kafka import Consumer, Producer\n\nproducer = Producer({\n    'bootstrap.servers': 'broker1:9092',\n\
+    \    'transactional.id': 'order-enricher-0',  # Unique, stable per instance\n    'enable.idempotence': True,\n})\nproducer.init_transactions()\n\
+    \nconsumer = Consumer({\n    'bootstrap.servers': 'broker1:9092',\n    'group.id': 'order-enricher',\n    'enable.auto.commit':\
+    \ False,\n    'isolation.level': 'read_committed',\n})\nconsumer.subscribe(['raw-orders'])\n\nwhile True:\n    msg = consumer.poll(1.0)\n\
+    \    if msg is None or msg.error():\n        continue\n\n    producer.begin_transaction()\n    try:\n        enriched\
+    \ = enrich_order(msg.value())\n        producer.produce('enriched-orders', key=msg.key(), value=enriched)\n        producer.send_offsets_to_transaction(\n\
+    \            consumer.position(consumer.assignment()),\n            consumer.consumer_group_metadata()\n        )\n  \
+    \      producer.commit_transaction()\n    except Exception:\n        producer.abort_transaction()\n"
+  example_bad: '# Non-transactional consume-produce — duplicates or loss on failure
+
+    msg = consumer.poll(1.0)
+
+    enriched = enrich_order(msg.value())
+
+    producer.produce(''enriched-orders'', value=enriched)
+
+    consumer.commit()  # If produce failed, offset committed but message lost
+
+    # If commit fails after produce, message duplicated on re-process
+
+    '
+  when_applies: Projects using Apache Kafka event streaming or confluent-kafka
+  when_not_applies: batch-only workloads, simple request-response systems. projects not using Kafka or confluent-kafka
+  sources: ["https://kafka.apache.org/documentation/#semantics"]
+- id: CR-KAFKA-013
+  text: Monitor consumer lag per partition and alert when lag exceeds your SLA threshold.
+  why: Consumer lag (the difference between the latest produced offset and the last committed consumer offset) is the primary
+    health metric for Kafka consumers. Growing lag means the consumer cannot keep up with the production rate. If lag exceeds
+    topic retention, messages are deleted before being consumed — permanent data loss. Lag is also the first indicator of
+    downstream processing issues, resource starvation, or rebalance storms.
+  how_to_do_right: 'Export consumer lag metrics via JMX (records-lag-max) or use kafka-consumer-groups.sh --describe. Integrate
+    with Prometheus + Grafana using kafka-exporter or Burrow. Set alerts: WARNING at 10,000 messages lag, CRITICAL at 100,000
+    or when lag growth rate is positive for >5 minutes. Monitor per-partition lag, not just total — a single hot partition
+    lag is invisible in aggregate.'
+  severity: high
+  technologies:
+    library: [burrow]
+    platform: [kafka, prometheus, grafana]
+  domains:
+    domain: [architecture, observability]
+    concern: [streaming, monitoring]
+  example_good: "# Prometheus alert rule for consumer lag\n# prometheus/rules/kafka_consumer.yml\ngroups:\n  - name: kafka_consumer_lag\n\
+    \    rules:\n      - alert: KafkaConsumerLagHigh\n        expr: kafka_consumergroup_lag > 100000\n        for: 5m\n  \
+    \      labels:\n          severity: critical\n        annotations:\n          summary: \"Consumer {{ $labels.consumergroup\
+    \ }} lag is {{ $value }} on {{ $labels.topic }}/{{ $labels.partition }}\"\n\n      - alert: KafkaConsumerLagGrowing\n\
+    \        expr: rate(kafka_consumergroup_lag[5m]) > 0\n        for: 15m\n        labels:\n          severity: warning\n\
+    \        annotations:\n          summary: \"Consumer {{ $labels.consumergroup }} lag growing steadily\"\n"
+  example_bad: '# Only monitoring broker-level metrics — consumer lag invisible
+
+    # "Broker CPU is fine" while consumer is 2 million messages behind
+
+    # No per-partition monitoring — one hot partition lagging undetected
+
+    '
+  when_applies: Projects using Apache Kafka event streaming, Prometheus metrics collection, Grafana dashboards and alerting,
+    or Burrow
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://kafka.apache.org/documentation/#design_consumerposition"]
+- id: CR-KAFKA-014
+  text: Monitor under-replicated partitions (URP) as a critical cluster health indicator.
+  why: Under-replicated partitions mean at least one replica is not caught up with the leader. This indicates broker failure,
+    disk issues, network problems, or resource exhaustion. If the leader crashes while replicas are behind, committed data
+    can be lost (even with acks=all if min.insync.replicas is degraded). URP > 0 for more than a few minutes is a cluster
+    emergency.
+  how_to_do_right: 'Export kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions via JMX. Alert immediately when
+    URP > 0 persists for >2 minutes. Investigate: check broker logs for disk errors, network timeouts, GC pauses. Use kafka-reassign-partitions.sh
+    to move replicas off unhealthy brokers. Maintain min.insync.replicas=2 with replication.factor=3 so one URP does not block
+    producers.'
+  severity: critical
+  technologies:
+    library: [jmx]
+    platform: [kafka, prometheus]
+  domains:
+    domain: [architecture, observability, reliability]
+    concern: [streaming, monitoring]
+  example_good: "# JMX exporter config for under-replicated partitions\n# jmx_exporter.yml\nrules:\n  - pattern: \"kafka.server<type=ReplicaManager,\
+    \ name=UnderReplicatedPartitions><Value>\"\n    name: kafka_server_under_replicated_partitions\n    type: GAUGE\n\n# Prometheus\
+    \ alert\n- alert: KafkaUnderReplicatedPartitions\n  expr: kafka_server_under_replicated_partitions > 0\n  for: 2m\n  labels:\n\
+    \    severity: critical\n  annotations:\n    summary: \"Broker {{ $labels.instance }} has {{ $value }} under-replicated\
+    \ partitions\"\n"
+  example_bad: '# No URP monitoring — silent data durability degradation
+
+    # Broker disk fills up, replicas fall behind, min.insync.replicas drops to 1
+
+    # Leader crashes — committed messages permanently lost
+
+    # Discovered only when consumer reports missing data days later
+
+    '
+  when_applies: Any project using Apache Kafka event streaming, JMX, or Prometheus metrics collection
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://kafka.apache.org/documentation/#monitoring"]
+- id: CR-KAFKA-015
+  text: Use compression (lz4 or zstd) on producers to reduce network bandwidth and broker disk usage.
+  why: Kafka messages are typically JSON or Avro with high compressibility (60-80% reduction). Without compression, you are
+    sending 3-5x more data over the network and storing 3-5x more on broker disks. For high-throughput topics (>100MB/s),
+    compression is the difference between needing 3 brokers and needing 10. Compression happens in the producer batch, so
+    larger batches yield better compression ratios.
+  how_to_do_right: Set compression.type=lz4 for lowest CPU overhead with good compression (best for latency-sensitive workloads).
+    Use zstd for best compression ratio (best for bandwidth-constrained or storage-heavy workloads). Never use gzip — it has
+    3-5x the CPU cost of lz4 for marginally better compression. Pair with linger.ms > 0 and large batch.size for optimal compression
+    ratios. Brokers decompress for validation and recompress only if broker compression differs from producer.
+  severity: medium
+  technologies:
+    library: [confluent-kafka]
+    platform: [kafka]
+  domains:
+    domain: [architecture, performance]
+    concern: [streaming]
+  example_good: "# High-throughput pipeline — lz4 for low CPU overhead\nproducer = Producer({\n    'bootstrap.servers': 'broker1:9092,broker2:9092',\n\
+    \    'compression.type': 'lz4',   # ~70% size reduction, minimal CPU\n    'linger.ms': 50,             # Batch for better\
+    \ compression ratio\n    'batch.size': 524288,        # 512KB batches\n})\n\n# Bandwidth-constrained environment — zstd\
+    \ for max compression\nproducer_zstd = Producer({\n    'bootstrap.servers': 'broker1:9092',\n    'compression.type': 'zstd',\
+    \  # ~80% size reduction, moderate CPU\n    'compression.level': 3,      # Balance compression/CPU (1-22)\n})\n"
+  example_bad: "# No compression — 3-5x wasted bandwidth and disk\nproducer = Producer({\n    'bootstrap.servers': 'broker1:9092',\n\
+    \    # compression.type defaults to 'none'\n})\n\n# gzip — highest CPU cost, marginal compression improvement over lz4\n\
+    producer = Producer({\n    'compression.type': 'gzip',  # 3-5x more CPU than lz4\n})\n"
+  when_applies: Projects using Apache Kafka event streaming or confluent-kafka
+  when_not_applies: batch-only workloads, simple request-response systems. projects not using Kafka or confluent-kafka
+  sources: ["https://kafka.apache.org/documentation/#producerconfigs_compression.type"]
+- id: CR-KAFKA-016
+  text: Enable SASL authentication and TLS encryption for all Kafka client connections in production.
+  why: Without authentication, any application that can reach the Kafka port can produce to or consume from any topic — including
+    injecting malicious messages, reading sensitive data, or deleting topics. Without TLS, all data (including credentials)
+    is transmitted in plaintext, vulnerable to network sniffing and man-in-the-middle attacks. This is not theoretical — misconfigured
+    Kafka clusters exposed to the internet have been used to inject ransomware messages and exfiltrate data.
+  how_to_do_right: Configure SASL/SCRAM-SHA-512 or SASL/OAUTHBEARER for authentication. Enable TLS (ssl.endpoint.identification.algorithm=https)
+    for encryption in transit. Use Kafka ACLs to restrict topic-level access per service principal. Rotate credentials via
+    SCRAM or OAUTHBEARER token refresh. For inter-broker communication, use SASL_SSL on the inter-broker listener. Never expose
+    Kafka ports (9092, 9093) to the public internet.
+  severity: critical
+  technologies:
+    library: [sasl]
+    platform: [kafka, tls]
+  domains:
+    domain: [architecture, security]
+    concern: [streaming]
+  example_good: "# Producer with SASL/SCRAM + TLS\nproducer = Producer({\n    'bootstrap.servers': 'broker1:9093,broker2:9093',\n\
+    \    'security.protocol': 'SASL_SSL',\n    'sasl.mechanism': 'SCRAM-SHA-512',\n    'sasl.username': os.getenv('KAFKA_USERNAME'),\n\
+    \    'sasl.password': os.getenv('KAFKA_PASSWORD'),\n    'ssl.ca.location': '/etc/kafka/certs/ca.pem',\n    'ssl.endpoint.identification.algorithm':\
+    \ 'https',\n})\n\n# Kafka ACL: order-service can only produce to 'orders' topic\n# kafka-acls.sh --add --allow-principal\
+    \ User:order-service \\\n#   --producer --topic orders --cluster-name production\n"
+  example_bad: "# PLAINTEXT — no auth, no encryption\nproducer = Producer({\n    'bootstrap.servers': 'broker1:9092',\n  \
+    \  'security.protocol': 'PLAINTEXT',  # Anyone can connect\n})\n# Credentials in plaintext, topics open to all, data sniffable\n"
+  when_applies: Any project using Apache Kafka event streaming, TLS, or SASL
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://kafka.apache.org/documentation/#security"]
+- id: CR-KAFKA-017
+  text: Use Kafka ACLs to enforce least-privilege access — each service should only access its own topics.
+  why: 'Without ACLs, every authenticated client has full access to every topic in the cluster. A compromised service can
+    read sensitive topics (PII, financial data), produce garbage to critical topics, or delete topics entirely. ACLs enforce
+    the principle of least privilege: each service identity can only produce to specific topics and consume from specific
+    consumer groups.'
+  how_to_do_right: Enable authorizer (authorizer.class.name=kafka.security.authorizer.AclAuthorizer). Create per-service principals.
+    Grant PRODUCE on specific topics for producers. Grant READ on topics and consumer groups for consumers. Deny all by default
+    (super.users only for admin). Audit ACLs quarterly. Use PrefixedResource for topic patterns (e.g., team-prefix-*).
+  severity: high
+  technologies:
+    library: [sasl, acls]
+    platform: [kafka]
+  domains:
+    domain: [architecture, security]
+    concern: [streaming]
+  example_good: "# Grant order-service PRODUCE to 'orders' topic only\nkafka-acls.sh --bootstrap-server broker1:9093 \\\n\
+    \  --command-config admin.properties \\\n  --add \\\n  --allow-principal User:order-service \\\n  --operation Write \\\
+    \n  --topic orders\n\n# Grant analytics-consumer READ on 'orders' topic + its consumer group\nkafka-acls.sh --bootstrap-server\
+    \ broker1:9093 \\\n  --command-config admin.properties \\\n  --add \\\n  --allow-principal User:analytics-consumer \\\n\
+    \  --operation Read \\\n  --topic orders \\\n  --group analytics-order-processor\n\n# List all ACLs for audit\nkafka-acls.sh\
+    \ --bootstrap-server broker1:9093 \\\n  --command-config admin.properties \\\n  --list\n"
+  example_bad: '# No ACLs — every service can read/write every topic
+
+    # order-service can read payment-events (PII exposure)
+
+    # analytics can produce to orders (data corruption)
+
+    # Any compromised service = full cluster compromise
+
+    '
+  when_applies: Projects using Apache Kafka event streaming, SASL, or ACLs
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://kafka.apache.org/documentation/#security_authz"]
+- id: CR-KAFKA-018
+  text: Size partitions based on throughput requirements and consumer parallelism — not arbitrarily.
+  why: Each partition is the unit of parallelism in Kafka. Too few partitions limits consumer throughput (you cannot have
+    more consumers than partitions in a group). Too many partitions increases end-to-end latency (more leader elections on
+    broker failure), uses more file handles and memory on brokers, and makes rebalances slower. The right number depends on
+    target throughput, consumer processing speed, and retention.
+  how_to_do_right: 'Calculate: partitions = max(target_throughput_MB_s / per_partition_throughput_MB_s, max_consumers_in_group).
+    For most workloads, each partition sustains 10-30 MB/s. Start with 6-12 partitions for moderate topics, 24-48 for high-throughput
+    topics. You can increase partitions later but cannot decrease them. Over-partition by 2x expected need for growth. Use
+    kafka.server:type=BrokerTopicMetrics to measure actual per-partition throughput.'
+  severity: medium
+  technologies:
+    platform: [kafka]
+  domains:
+    domain: [architecture, performance]
+    concern: [streaming, data, engineering]
+  example_good: "# Sizing calculation:\n# Target: 100 MB/s ingestion, 10 consumers in group\n# Per-partition throughput: ~20\
+    \ MB/s\n# Partitions needed: max(100/20, 10) = 10, round up to 12 for growth\n\nkafka-topics.sh --create --topic high-volume-events\
+    \ \\\n  --partitions 12 \\\n  --replication-factor 3 \\\n  --config retention.ms=604800000 \\\n  --config min.insync.replicas=2\n\
+    \n# Low-volume config topic — 3 partitions is enough\nkafka-topics.sh --create --topic service-config \\\n  --partitions\
+    \ 3 \\\n  --replication-factor 3 \\\n  --config cleanup.policy=compact\n"
+  example_bad: '# 1 partition — cannot scale consumers, single point of bottleneck
+
+    kafka-topics.sh --create --topic orders --partitions 1
+
+
+    # 1000 partitions on a 3-broker cluster — broker metadata overhead,
+
+    # slow rebalances, 1000 open file handles per broker
+
+    kafka-topics.sh --create --topic logs --partitions 1000
+
+    '
+  when_applies: Projects using Apache Kafka event streaming
+  when_not_applies: batch-only workloads, simple request-response systems. projects not using Kafka
+  sources: ["https://kafka.apache.org/documentation/#design_partitioningstrategy"]

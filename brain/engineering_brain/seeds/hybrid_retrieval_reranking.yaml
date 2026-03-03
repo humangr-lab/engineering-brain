@@ -1,0 +1,1020 @@
+layer: rules
+domain: architecture
+knowledge:
+- id: HRR-001
+  text: >
+    Implement Reciprocal Rank Fusion (RRF) with k=60 as the default score constant
+    to merge ranked lists from multiple retrieval modalities. Score formula:
+    RRF(d) = sum(1 / (k + rank_i(d))) across all retrieval lists i.
+  why: >
+    RRF with k=60 is not arbitrary — Cormack et al. (SIGIR 2009) demonstrated it
+    outperforms Condorcet, individual rank learning methods, and simple score
+    combination on TREC data. k=60 dampens the advantage of very high ranks relative
+    to middling ranks, preventing any single retrieval system from dominating the
+    fusion. Teams that use k=1 or k=10 see the dense retriever dominate entirely,
+    making the BM25 contribution near-zero. The formula is rank-based, not score-based,
+    so it handles heterogeneous score distributions (BM25 vs cosine similarity)
+    without normalization.
+  how_to_do_right: |
+    1. Collect ranked results from each retrieval system as [(doc_id, score)] lists
+    2. Assign rank 1, 2, 3... (rank 1 = best) per system — ignore original scores
+    3. For each document: RRF_score = sum(1.0 / (60 + rank)) across all systems
+       where it appears
+    4. Documents not appearing in a list get rank = infinity (score contribution = 0)
+    5. Sort by RRF_score descending — return top-K
+    6. Tune k only with NDCG@10 measurements on held-out eval set; default k=60
+    7. Validate: documents appearing in top-5 of multiple lists must rank higher
+       than documents appearing in top-5 of only one list
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [qdrant, opensearch, llamaindex]
+  domains:
+    domain: [architecture, information_retrieval]
+    concern: [hybrid_search, ranking, fusion]
+  example_good: |
+    from collections import defaultdict
+
+    def reciprocal_rank_fusion(
+        ranked_lists: list[list[str]],
+        k: int = 60,
+    ) -> list[tuple[str, float]]:
+        """
+        Args:
+            ranked_lists: Each list is doc_ids in rank order (index 0 = rank 1 = best)
+            k: Constant; default 60 per Cormack et al. (SIGIR 2009)
+        Returns:
+            List of (doc_id, rrf_score) sorted by score descending
+        """
+        scores: dict[str, float] = defaultdict(float)
+        for ranked_list in ranked_lists:
+            for rank, doc_id in enumerate(ranked_list, start=1):
+                scores[doc_id] += 1.0 / (k + rank)
+        return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+    # Usage: fuse dense + BM25 results
+    dense_results = ["doc_A", "doc_C", "doc_B"]   # dense retriever ranking
+    bm25_results  = ["doc_B", "doc_A", "doc_D"]   # BM25 ranking
+
+    fused = reciprocal_rank_fusion([dense_results, bm25_results], k=60)
+    # doc_A: 1/61 + 1/62 = 0.0328
+    # doc_B: 1/63 + 1/61 = 0.0321  ← appears in both, ranked 3rd and 1st
+    # doc_C: 1/62          = 0.0161
+    # doc_D: 1/62          = 0.0161
+  example_bad: |
+    # Naive score averaging — fails with heterogeneous score scales
+    def bad_fusion(dense: list[tuple[str, float]], bm25: list[tuple[str, float]]):
+        combined = defaultdict(float)
+        for doc_id, score in dense:
+            combined[doc_id] += score  # Dense cosine: 0.0 to 1.0
+        for doc_id, score in bm25:
+            combined[doc_id] += score  # BM25: 0.0 to 25.0+ — dominates unfairly
+        return sorted(combined.items(), key=lambda x: x[1], reverse=True)
+    # BM25 scores are ~10-25x larger than cosine scores — BM25 wins every time
+  when_applies: >
+    Any system combining two or more retrieval methods with different score scales:
+    BM25 + dense embeddings, dense + sparse (SPLADE), graph traversal + semantic.
+  sources:
+    - "Cormack, G.V., Clarke, C.L.A., Buettcher, S. (2009). Reciprocal Rank Fusion outperforms Condorcet and Individual Rank Learning Methods. SIGIR 2009."
+    - "https://opensearch.org/blog/introducing-reciprocal-rank-fusion-hybrid-search/"
+    - "https://learn.microsoft.com/en-us/azure/search/hybrid-search-ranking"
+
+- id: HRR-002
+  text: >
+    Use Personalized PageRank (PPR) for graph-based retrieval in knowledge graphs:
+    seed the PPR walk from query-matched nodes and retrieve top-K nodes by stationary
+    distribution. Use teleportation probability alpha=0.85 (damping=0.15) for local
+    relevance vs global authority balance.
+  why: >
+    Standard vector search retrieves semantically similar nodes but misses structural
+    context — a concept two hops away that causally explains the seed node. PPR
+    propagates relevance through graph edges, surfacing related concepts that share
+    no vocabulary with the query. In a knowledge graph with 2,000 nodes and 15,000
+    edges, PPR identifies multi-hop reasoning chains that BM25 + dense search
+    completely miss. Alpha=0.85 (the Google PageRank default) balances local
+    exploration (low alpha → stays near seeds) vs global authority (high alpha →
+    wanders too far from query context).
+  how_to_do_right: |
+    1. Seed set: run BM25 + vector search first; top-K results become PPR seed nodes
+    2. Initialize: scores[seed] = 1/|seeds| for each seed, 0 elsewhere
+    3. Iterate: scores = alpha * (A_normalized @ scores) + (1-alpha) * seed_distribution
+       where A_normalized is column-stochastic adjacency matrix
+    4. Converge when max(|scores_new - scores_old|) < 1e-6 (typically 20-50 iterations)
+    5. Return nodes with highest stationary probability scores
+    6. Limit graph to 2-3 hop neighborhood of seeds for efficiency (sparse PPR)
+    7. Combine PPR scores with RRF: treat PPR ranking as one more retrieval list
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [networkx, scipy, falkordb, neo4j]
+  domains:
+    domain: [architecture, information_retrieval]
+    concern: [graph_retrieval, knowledge_graph, personalized_pagerank]
+  example_good: |
+    import numpy as np
+    from scipy.sparse import csr_matrix
+
+    def personalized_pagerank(
+        adjacency: csr_matrix,      # Sparse N x N adjacency matrix
+        seed_nodes: list[int],      # Node indices from initial retrieval
+        alpha: float = 0.85,        # Damping factor
+        max_iter: int = 100,
+        tol: float = 1e-6,
+    ) -> np.ndarray:
+        """
+        Returns stationary distribution (PPR scores) over all N nodes.
+        Higher score = more relevant to seed set.
+        """
+        n = adjacency.shape[0]
+        # Column-normalize adjacency (dangling nodes → uniform)
+        col_sums = np.array(adjacency.sum(axis=0)).flatten()
+        col_sums[col_sums == 0] = 1.0  # Avoid divide-by-zero
+        A_norm = adjacency / col_sums  # Column-stochastic
+
+        # Personalization vector: uniform over seeds
+        personalization = np.zeros(n)
+        for node in seed_nodes:
+            personalization[node] = 1.0 / len(seed_nodes)
+
+        scores = personalization.copy()
+        for _ in range(max_iter):
+            new_scores = alpha * (A_norm @ scores) + (1 - alpha) * personalization
+            if np.max(np.abs(new_scores - scores)) < tol:
+                break
+            scores = new_scores
+        return scores
+
+    # Usage: combine with vector search results
+    vector_hits = ["node_42", "node_17", "node_89"]  # From dense retrieval
+    seed_indices = [42, 17, 89]
+    ppr_scores = personalized_pagerank(graph_adj, seed_indices, alpha=0.85)
+    top_ppr = np.argsort(ppr_scores)[::-1][:20]  # Top 20 by PPR
+  example_bad: |
+    # BFS from seed nodes — retrieves all neighbors uniformly, no relevance weighting
+    from collections import deque
+    def bfs_retrieval(graph, seeds, max_hops=2):
+        visited = set(seeds)
+        queue = deque([(s, 0) for s in seeds])
+        while queue:
+            node, depth = queue.popleft()
+            if depth < max_hops:
+                for neighbor in graph.neighbors(node):
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append((neighbor, depth + 1))
+        return list(visited)  # No ranking — returns hundreds of unranked nodes
+  when_applies: >
+    Knowledge graph retrieval where multi-hop reasoning is required,
+    and query-matched nodes alone are insufficient to answer the question.
+  sources:
+    - "Page, L., Brin, S., Motwani, R., Winograd, T. (1999). The PageRank Citation Ranking. Stanford InfoLab."
+    - "https://arxiv.org/html/2601.15518v2"
+
+- id: HRR-003
+  text: >
+    Tune BM25 + dense vector hybrid search using a single alpha parameter:
+    final_score = alpha * dense_score + (1 - alpha) * bm25_normalized_score.
+    Start with alpha=0.7 (favor dense) and tune on held-out NDCG@10.
+    For terminology-heavy domains (code, legal, medical), shift toward alpha=0.4.
+  why: >
+    Dense embeddings excel at semantic similarity but fail on exact keyword matches —
+    a query for "BERT tokenizer overflow" may return conceptually related but
+    irrelevant documents while missing the exact bug report. BM25 excels at exact
+    keyword matching but fails at semantic paraphrase. Alpha tuning requires
+    domain-specific measurement: a legal document retrieval system measured NDCG@10
+    of 0.71 at alpha=0.4 vs 0.62 at alpha=0.7 because legal queries heavily use
+    exact terminology. Code retrieval similarly benefits from lower alpha (BM25
+    dominates for exact API names). General-purpose queries favor higher alpha.
+  how_to_do_right: |
+    1. Normalize BM25 scores to [0, 1]: bm25_norm = (bm25 - min) / (max - min + 1e-9)
+    2. Dense scores are cosine similarity, already in [-1, 1]; clip to [0, 1]
+    3. Weighted combination: score = alpha * dense + (1 - alpha) * bm25_norm
+    4. Tune alpha using NDCG@10 on 50+ eval queries with known relevant docs
+    5. Starting points: general text=0.7, technical/code=0.4, entity lookups=0.3
+    6. Prefer RRF over weighted scores when score calibration is uncertain (HRR-001)
+    7. Log alpha value in all retrieval traces for debugging relevance regressions
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [qdrant, opensearch, rank_bm25]
+  domains:
+    domain: [architecture, information_retrieval]
+    concern: [hybrid_search, bm25, alpha_tuning]
+  example_good: |
+    from rank_bm25 import BM25Okapi
+    import numpy as np
+
+    class HybridRetriever:
+        def __init__(self, alpha: float = 0.7):
+            self.alpha = alpha  # Tunable; log in traces
+
+        def search(
+            self,
+            query: str,
+            bm25: BM25Okapi,
+            dense_scores: np.ndarray,    # Cosine similarities from vector store
+            bm25_scores: np.ndarray,     # Raw BM25 scores
+            top_k: int = 10,
+        ) -> list[int]:
+            # Normalize BM25 to [0, 1]
+            bm25_min, bm25_max = bm25_scores.min(), bm25_scores.max()
+            bm25_norm = (bm25_scores - bm25_min) / (bm25_max - bm25_min + 1e-9)
+
+            # Clip dense to [0, 1] (cosine can be negative)
+            dense_norm = np.clip(dense_scores, 0, 1)
+
+            # Weighted fusion
+            combined = self.alpha * dense_norm + (1 - self.alpha) * bm25_norm
+            return np.argsort(combined)[::-1][:top_k].tolist()
+
+    # Evaluate alpha with NDCG@10
+    def tune_alpha(retriever, eval_queries, relevant_docs):
+        best_alpha, best_ndcg = 0.7, 0.0
+        for alpha in np.arange(0.2, 0.9, 0.1):
+            retriever.alpha = alpha
+            ndcg = compute_ndcg_at_10(retriever, eval_queries, relevant_docs)
+            if ndcg > best_ndcg:
+                best_alpha, best_ndcg = alpha, ndcg
+        return best_alpha
+  example_bad: |
+    # Simple concatenation without normalization
+    def bad_hybrid(dense_scores, bm25_scores):
+        # BM25 range: [0, 25]. Dense cosine range: [0.0, 1.0]
+        # BM25 dominates entirely — dense contributes <5% to combined score
+        return dense_scores + bm25_scores  # Broken: scale mismatch
+  when_applies: >
+    Any retrieval system combining dense embeddings with sparse/BM25 retrieval.
+    Mandatory when queries include both conceptual questions and exact keyword lookups.
+  sources:
+    - "https://qdrant.tech/documentation/advanced-tutorials/reranking-hybrid-search/"
+    - "Robertson, S., Zaragoza, H. (2009). The Probabilistic Relevance Framework: BM25 and Beyond. Foundations and Trends in Information Retrieval."
+
+- id: HRR-004
+  text: >
+    Normalize all retrieval scores to [0.0, 1.0] before fusion using
+    min-max normalization per retrieval system, not globally. Apply per-query
+    normalization (not per-corpus), and use additive smoothing (epsilon=1e-9)
+    to prevent division by zero when all scores are identical.
+  why: >
+    Global corpus-level normalization fails at query time: the min/max of the corpus
+    differs from the min/max of the current query's result set. A query returning
+    very similar documents may have BM25 scores in [23.1, 23.4] — corpus-normalized
+    to [0.91, 0.92], which looks high; but query-normalized to [0.0, 1.0], the
+    ranking remains meaningful within the query's context. Cross-system score
+    combination without per-query normalization causes the modality with higher
+    absolute scores to dominate silently — a common bug that shows up as "BM25
+    always wins" or "dense always wins" regardless of alpha setting.
+  how_to_do_right: |
+    1. After each retrieval system returns scores, normalize immediately:
+       scores_norm = (scores - scores.min()) / (scores.max() - scores.min() + 1e-9)
+    2. Apply normalization independently per retrieval system
+    3. Apply AFTER filtering (top-K first, then normalize the top-K)
+    4. Clip result to [0.0, 1.0] to handle floating point edge cases
+    5. Log: log pre-normalization min/max per system for debugging
+    6. When only one result returned: normalized score = 1.0 by definition
+  severity: high
+  technologies:
+    lang: [python]
+  domains:
+    domain: [architecture, information_retrieval]
+    concern: [score_normalization, fusion, hybrid_search]
+  example_good: |
+    import numpy as np
+    from typing import NamedTuple
+
+    class RetrievalResult(NamedTuple):
+        doc_ids: list[str]
+        scores: np.ndarray  # Raw scores from retrieval system
+
+    def normalize_scores(result: RetrievalResult) -> RetrievalResult:
+        """Per-query min-max normalization to [0, 1]."""
+        s = result.scores
+        s_min, s_max = s.min(), s.max()
+        normalized = (s - s_min) / (s_max - s_min + 1e-9)
+        normalized = np.clip(normalized, 0.0, 1.0)
+        return RetrievalResult(doc_ids=result.doc_ids, scores=normalized)
+
+    def fuse(dense: RetrievalResult, bm25: RetrievalResult, alpha=0.7):
+        dense_norm = normalize_scores(dense)
+        bm25_norm = normalize_scores(bm25)
+        # Merge by doc_id, combine normalized scores
+        all_docs = set(dense_norm.doc_ids) | set(bm25_norm.doc_ids)
+        combined = {}
+        d_map = dict(zip(dense_norm.doc_ids, dense_norm.scores))
+        b_map = dict(zip(bm25_norm.doc_ids, bm25_norm.scores))
+        for doc in all_docs:
+            combined[doc] = alpha * d_map.get(doc, 0.0) + (1-alpha) * b_map.get(doc, 0.0)
+        return sorted(combined.items(), key=lambda x: x[1], reverse=True)
+  example_bad: |
+    # Corpus-level normalization computed offline — wrong at query time
+    CORPUS_BM25_MAX = 24.7  # Precomputed — stale and wrong for any specific query
+    CORPUS_BM25_MIN = 0.0
+
+    def bad_normalize(bm25_scores):
+        return (bm25_scores - CORPUS_BM25_MIN) / (CORPUS_BM25_MAX - CORPUS_BM25_MIN)
+    # Query returning [23.1, 23.2, 23.3] normalizes to [0.935, 0.939, 0.944]
+    # Tiny differences become meaningless — ranking is essentially random within tight cluster
+  when_applies: >
+    Always when combining scores from heterogeneous retrieval systems.
+  sources:
+    - "https://learn.microsoft.com/en-us/azure/search/hybrid-search-ranking"
+    - "Cormack, G.V., Clarke, C.L.A., Buettcher, S. (2009). Reciprocal Rank Fusion outperforms Condorcet and Individual Rank Learning Methods. SIGIR 2009."
+
+- id: HRR-005
+  text: >
+    Apply two-stage retrieval: Stage 1 (fast recall) retrieves 100-200 candidates
+    from the full corpus in <50ms using approximate nearest neighbors + BM25.
+    Stage 2 (precise reranking) applies a cross-encoder or ColBERT on the 100-200
+    candidates in <250ms. Never run cross-encoders on the full corpus.
+  why: >
+    Cross-encoders (BERT-based bi-directional attention over query+document jointly)
+    are 100-1000x more accurate than bi-encoders for relevance scoring but cannot
+    scale to full corpus search — latency would be O(corpus_size * inference_time).
+    A 1M-document corpus with 10ms cross-encoder latency = 10,000 seconds per query.
+    Two-stage recall+rerank brings this to: 50ms (ANN recall of 150 candidates) +
+    150ms (cross-encoder on 150 docs) = 200ms total, with near-oracle relevance
+    quality on the candidates set. The first stage's recall@150 must be >95%
+    (virtually all relevant documents in top 150) for the pipeline to work.
+  how_to_do_right: |
+    1. Stage 1: BM25 union dense ANN → top-150 candidates, target recall@150 > 0.95
+    2. Stage 2: cross-encoder (BAAI/bge-reranker-v2-m3 or ms-marco-MiniLM-L-6-v2)
+       scores each (query, candidate) pair independently
+    3. Total budget: Stage 1 < 50ms, Stage 2 < 250ms (use batch inference)
+    4. Use sentence-transformers CrossEncoder for Stage 2:
+       CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2').predict(pairs)
+    5. If Stage 2 > 250ms: reduce candidates from 150 to 50, or use ColBERT (HRR-006)
+    6. Monitor recall@K in stage 1: if < 0.90, increase candidates or improve stage 1
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [sentence-transformers, qdrant, rank_bm25]
+  domains:
+    domain: [architecture, information_retrieval]
+    concern: [reranking, two_stage, latency, recall]
+  example_good: |
+    from sentence_transformers import CrossEncoder
+    from typing import List, Tuple
+
+    # Stage 1: Fast recall (ANN + BM25 via RRF)
+    def recall_stage(query: str, corpus_size: int = 1_000_000) -> list[str]:
+        dense_hits = qdrant_client.search(collection="docs",
+                                          query_vector=embed(query), limit=100)
+        bm25_hits  = bm25_index.get_top_n(query.split(), corpus, n=100)
+        # RRF fusion → top 150 candidates
+        return rrf_merge(dense_hits, bm25_hits, k=60, top_k=150)
+
+    # Stage 2: Precise reranking (cross-encoder on 150 candidates only)
+    reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+    def rerank_stage(query: str, candidates: list[str]) -> list[str]:
+        pairs = [(query, doc_store[doc_id]) for doc_id in candidates]
+        scores = reranker.predict(pairs, batch_size=32, show_progress_bar=False)
+        ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
+        return [doc_id for doc_id, _ in ranked[:10]]
+
+    # Total pipeline
+    def retrieve(query: str) -> list[str]:
+        candidates = recall_stage(query)    # <50ms
+        return rerank_stage(query, candidates)  # <250ms on 150 candidates
+  example_bad: |
+    # Cross-encoder on full corpus — completely unscalable
+    reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    def retrieve_bad(query: str) -> list[str]:
+        all_docs = corpus.get_all()  # 1M documents
+        pairs = [(query, doc) for doc in all_docs]
+        scores = reranker.predict(pairs)  # 1M cross-encoder calls: ~10,000 seconds
+        return sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:10]
+  when_applies: >
+    Any retrieval pipeline where final result quality matters more than the absolute
+    minimum latency, and corpus size exceeds ~5,000 documents.
+  sources:
+    - "https://www.sbert.net/examples/applications/retrieve_rerank/README.html"
+    - "https://qdrant.tech/documentation/tutorials-search-engineering/reranking-hybrid-search/"
+
+- id: HRR-006
+  text: >
+    Use ColBERT late interaction for token-level matching when cross-encoder
+    latency is too high. Precompute document token embeddings offline; at query
+    time compute MaxSim (maximum similarity per query token over all document tokens)
+    and sum across query tokens for the final score.
+  why: >
+    ColBERT (Khattab & Zaharia, 2020) achieves cross-encoder-level quality at
+    near-bi-encoder latency by precomputing document representations offline and
+    using a lightweight MaxSim operator at query time. For a 10M-document corpus,
+    ColBERT retrieves top-10 at ~30-50ms vs cross-encoder's 1,000+ seconds on full
+    corpus. The key insight: each query token gets to "attend" to the document token
+    that best matches it, capturing phrase-level and entity-level matching that
+    single-vector bi-encoders miss. This makes ColBERT ideal for technical corpora
+    (code, medical literature) where specific terms matter.
+  how_to_do_right: |
+    1. Offline: encode all documents token-by-token with ColBERT encoder,
+       store compressed token matrices (128-dim float16)
+    2. Query: encode query tokens, compute MaxSim:
+       score(q, d) = sum_t( max_j( q_t · d_j ) )  for each query token t, doc token j
+    3. Use ragatouille (Python) or Qdrant's ColBERT support for managed implementation
+    4. Storage overhead: ~128 bytes per token, 10M docs * 100 tokens avg = ~128GB
+       Use int8 quantization to reduce to ~32GB
+    5. PLAID indexing: use centroid pruning for fast approximate MaxSim
+    6. Fallback: if ColBERT storage exceeds budget, use cross-encoder on top-50 only
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [ragatouille, qdrant, sentence-transformers]
+  domains:
+    domain: [architecture, information_retrieval]
+    concern: [colbert, late_interaction, token_matching, reranking]
+  example_good: |
+    # Using ragatouille for managed ColBERT
+    from ragatouille import RAGPretrainedModel
+
+    # Offline: index documents with ColBERT
+    RAG = RAGPretrainedModel.from_pretrained("colbert-ir/colbertv2.0")
+    RAG.index(
+        collection=documents,          # list of strings
+        index_name="my_knowledge_base",
+        max_document_length=180,       # tokens per document
+        split_documents=True,          # split long docs
+    )
+
+    # Query time: MaxSim computed automatically
+    results = RAG.search(query="Python circular import resolution", k=10)
+    # Returns: [{"content": "...", "score": 23.45, "rank": 1}, ...]
+    # Score = sum of MaxSim across query tokens — higher = better match
+
+    # Alternative: Qdrant native ColBERT support
+    from fastembed import LateInteractionTextEmbedding
+    model = LateInteractionTextEmbedding("colbert-ir/colbertv2.0")
+    query_embeddings = list(model.query_embed("Python circular import"))
+    # qdrant_client.query_points with multivector = query_embeddings
+  example_bad: |
+    # Using single-vector bi-encoder for technical query — misses term-level matching
+    from sentence_transformers import SentenceTransformer
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    query_embedding = model.encode("ImportError circular import mymodule line 42")
+    # Single 384-dim vector — loses individual token signals for "ImportError",
+    # "circular", "mymodule" — semantic similarity of paragraph, not terms
+  when_applies: >
+    Technical corpora (code, legal, medical) where query-document term overlap matters.
+    When cross-encoder latency exceeds 200ms on the candidate set from Stage 1.
+  sources:
+    - "Khattab, O., Zaharia, M. (2020). ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT. SIGIR 2020. arxiv.org/abs/2004.12832"
+    - "https://qdrant.tech/documentation/fastembed/fastembed-colbert/"
+
+- id: HRR-007
+  text: >
+    Implement per-modality timeout with fallback: each retrieval modality (dense,
+    BM25, graph PPR) has an individual timeout (100ms), and the fusion step has
+    a global deadline (300ms). If a modality times out, exclude it from fusion
+    and emit a metric. Never block on a slow modality if fast modalities already
+    have results.
+  why: >
+    In production, individual retrieval modalities fail independently — Qdrant may
+    be overloaded during a spike while BM25 is healthy, or graph traversal deadlocks
+    on a pathological query. Synchronous blocking on all modalities causes total
+    retrieval failure when any one modality fails. With per-modality timeout + fallback,
+    the system degrades gracefully: a dense-only result in 100ms is dramatically
+    better than a timeout error after 30 seconds. Teams without this pattern report
+    cascading failures during traffic spikes because graph PPR's P99 latency is 5x
+    its median.
+  how_to_do_right: |
+    1. Run all modalities as concurrent asyncio tasks or threads
+    2. Per-modality timeout: asyncio.wait_for(task, timeout=0.1)  # 100ms
+    3. Global deadline: asyncio.wait(tasks, timeout=0.3)  # 300ms total
+    4. Modalities that complete within deadline: include in RRF fusion
+    5. Modalities that timeout: log warning + metric (retrieval.modality.timeout), exclude
+    6. If ALL modalities timeout: return empty list + error metric (retrieval.total.timeout)
+    7. Never expose timeout errors to callers as retrieval failures — empty set is valid
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [asyncio, qdrant]
+  domains:
+    domain: [architecture, information_retrieval]
+    concern: [latency, timeout, fault_tolerance, hybrid_search]
+  example_good: |
+    import asyncio
+    import logging
+    from dataclasses import dataclass, field
+
+    logger = logging.getLogger(__name__)
+
+    @dataclass
+    class RetrievalResults:
+        dense: list[str] = field(default_factory=list)
+        bm25: list[str] = field(default_factory=list)
+        graph: list[str] = field(default_factory=list)
+        timedout_modalities: list[str] = field(default_factory=list)
+
+    async def hybrid_retrieve(query: str) -> RetrievalResults:
+        results = RetrievalResults()
+        MODALITY_TIMEOUT = 0.100  # 100ms per modality
+        GLOBAL_TIMEOUT = 0.300    # 300ms total
+
+        async def run_dense():
+            return await dense_retriever.search(query, top_k=100)
+
+        async def run_bm25():
+            return await bm25_retriever.search(query, top_k=100)
+
+        async def run_graph():
+            return await ppr_retriever.search(query, top_k=50)
+
+        async def with_timeout(coro, name: str) -> list[str]:
+            try:
+                return await asyncio.wait_for(coro, timeout=MODALITY_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning(f"Modality {name} timed out after {MODALITY_TIMEOUT}s")
+                results.timedout_modalities.append(name)
+                return []  # Graceful degradation
+
+        results.dense, results.bm25, results.graph = await asyncio.gather(
+            with_timeout(run_dense(), "dense"),
+            with_timeout(run_bm25(), "bm25"),
+            with_timeout(run_graph(), "graph"),
+        )
+        return results
+  example_bad: |
+    async def bad_hybrid_retrieve(query: str):
+        # Sequential — first timeout kills entire retrieval
+        dense = await dense_retriever.search(query)     # If this takes 400ms...
+        bm25 = await bm25_retriever.search(query)       # ...these never execute
+        graph = await ppr_retriever.search(query)
+        return rrf_merge(dense, bm25, graph)
+
+        # Also bad: parallel but no timeout
+        dense, bm25, graph = await asyncio.gather(
+            dense_retriever.search(query),
+            bm25_retriever.search(query),
+            ppr_retriever.search(query),  # Hangs 30s if graph PPR deadlocks
+        )
+  when_applies: >
+    Any production hybrid retrieval system with 2+ modalities and SLA requirements
+    (user-facing search, agent knowledge retrieval with latency budgets).
+  sources:
+    - "https://sre.google/sre-book/handling-overload/"
+    - "https://docs.python.org/3/library/asyncio-task.html#asyncio.wait_for"
+
+- id: HRR-008
+  text: >
+    Compare RRF, CombMNZ, and Borda Count fusion strategies empirically on your
+    dataset. Default to RRF (k=60) until NDCG@10 measurements justify switching.
+    CombMNZ is superior when retrieval systems have calibrated, comparable scores.
+    Borda Count is best for 5+ retrieval systems with unstable score distributions.
+  why: >
+    No fusion strategy universally dominates. Cormack et al. showed RRF outperforms
+    Condorcet and individual rank learning on TREC, but this is TREC data — your
+    domain may differ. CombMNZ (sum of scores * count of systems where doc appears)
+    rewards documents that appear across multiple systems more aggressively than RRF,
+    which is better when all retrieval systems are calibrated. Borda Count is
+    rank-based like RRF but uses linear rank scores instead of reciprocal, distributing
+    score weight more evenly — beneficial when one strong system would dominate RRF
+    due to consistently high rank positions.
+  how_to_do_right: |
+    1. Run all three strategies on 50+ eval queries with NDCG@10 ground truth
+    2. RRF formula: sum(1 / (60 + rank_i))
+    3. CombMNZ formula: sum(normalized_scores) * count(systems_where_doc_appears)
+    4. Borda formula: sum(N - rank_i) where N = total candidates in list
+    5. Select strategy with highest NDCG@10; run statistical significance test
+    6. Re-evaluate quarterly as retrieval systems evolve
+    7. If strategies tie: prefer RRF (no score normalization required, more robust)
+  severity: medium
+  technologies:
+    lang: [python]
+  domains:
+    domain: [architecture, information_retrieval]
+    concern: [fusion_strategy, ranking, evaluation]
+  example_good: |
+    import numpy as np
+    from collections import defaultdict
+
+    def combmnz(ranked_lists: list[list[tuple[str, float]]]) -> list[tuple[str, float]]:
+        """CombMNZ: reward docs appearing across multiple systems."""
+        scores: dict[str, float] = defaultdict(float)
+        appearances: dict[str, int] = defaultdict(int)
+        for system_results in ranked_lists:
+            doc_ids = [d for d, _ in system_results]
+            doc_scores = np.array([s for _, s in system_results])
+            # Normalize per system
+            doc_scores = (doc_scores - doc_scores.min()) / (doc_scores.ptp() + 1e-9)
+            for doc_id, score in zip(doc_ids, doc_scores):
+                scores[doc_id] += score
+                appearances[doc_id] += 1
+        # CombMNZ: sum * number of contributing systems
+        combined = {doc: scores[doc] * appearances[doc] for doc in scores}
+        return sorted(combined.items(), key=lambda x: x[1], reverse=True)
+
+    def borda_count(ranked_lists: list[list[str]]) -> list[tuple[str, float]]:
+        """Borda Count: linear rank score (N - rank)."""
+        scores: dict[str, float] = defaultdict(float)
+        for ranked_list in ranked_lists:
+            n = len(ranked_list)
+            for rank, doc_id in enumerate(ranked_list):
+                scores[doc_id] += (n - rank)  # Rank 1 gets N-1, last gets 0
+        return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+  example_bad: |
+    # Picking fusion strategy without measurement — gut feeling wins
+    def retrieve(query):
+        dense = dense_search(query)
+        bm25  = bm25_search(query)
+        # "RRF is popular on Twitter so we use it"
+        return rrf_merge(dense, bm25)
+    # No NDCG@10 measurement. CombMNZ might be +12% NDCG on this domain.
+  when_applies: >
+    When initial RRF deployment is stable and NDCG@10 measurement infrastructure
+    exists. Evaluate at project start and after any major retrieval system change.
+  sources:
+    - "Cormack, G.V., Clarke, C.L.A., Buettcher, S. (2009). Reciprocal Rank Fusion outperforms Condorcet and Individual Rank Learning Methods. SIGIR 2009."
+    - "Fox, E.A., Shaw, J.A. (1994). Combination of Multiple Searches. NIST TREC-2."
+
+- id: HRR-009
+  text: >
+    Decompose multi-aspect queries into sub-queries before retrieval: identify
+    distinct information needs within a single query, run separate retrievals,
+    then merge results with RRF. A query with 3+ distinct aspects benefits from
+    decomposition; single-aspect queries should NOT be decomposed.
+  why: >
+    A query like "Python circular imports in FastAPI dependency injection with
+    Protocol-based interfaces" has three distinct aspects: (1) circular imports
+    in Python, (2) FastAPI dependency injection, (3) Protocol-based interface design.
+    A single embedding for this query averages the three aspects — the retrieved
+    documents will partially match each but fully match none. Decomposition retrieves
+    top-10 per sub-query, then RRF fusion promotes documents that match multiple
+    aspects. In practice on multi-hop QA benchmarks, query decomposition improves
+    recall@10 by 15-30% for complex questions.
+  how_to_do_right: |
+    1. Detect multi-aspect queries: heuristics include AND/OR keywords, comma lists,
+       question words repeated, or via LLM classification
+    2. Decompose with LLM: "List the distinct information needs in this query as a
+       JSON array of strings" (max 3-4 sub-queries to avoid noise)
+    3. Run retrieval independently for each sub-query
+    4. RRF fusion with original query as additional retrieval source
+    5. Do NOT decompose: factual single-entity queries, short queries (<5 words)
+    6. Latency budget: decomposition adds 1 LLM call (~50ms) + N retrieval calls
+       Total must remain under 500ms for user-facing search
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [llamaindex, langchain, openai]
+  domains:
+    domain: [architecture, information_retrieval]
+    concern: [query_decomposition, multi_hop, recall]
+  example_good: |
+    from openai import AsyncOpenAI
+    import json
+
+    client = AsyncOpenAI()
+
+    async def decompose_query(query: str) -> list[str]:
+        """LLM-based query decomposition for multi-aspect queries."""
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{
+                "role": "user",
+                "content": f"""Decompose this query into at most 3 distinct information needs.
+                Return JSON array of strings. If query has a single focus, return ["<original query>"].
+
+                Query: {query}"""
+            }],
+            response_format={"type": "json_object"},
+            max_tokens=200,
+        )
+        data = json.loads(response.choices[0].message.content)
+        sub_queries = data.get("queries", [query])
+        return sub_queries[:3]  # Hard cap: never more than 3
+
+    async def multi_aspect_retrieve(query: str, top_k: int = 10) -> list[str]:
+        sub_queries = await decompose_query(query)
+        ranked_lists = []
+        for sq in sub_queries:
+            hits = await retriever.search(sq, top_k=20)
+            ranked_lists.append([h["id"] for h in hits])
+        return [doc_id for doc_id, _ in reciprocal_rank_fusion(ranked_lists, k=60)][:top_k]
+  example_bad: |
+    # Single embedding for multi-aspect query — averages all aspects
+    async def bad_retrieve(query: str):
+        query_embedding = embed_model.encode(query)  # Averaged across 3 aspects
+        # Returns documents that partially match all aspects but fully match none
+        return await qdrant.search(collection="docs",
+                                   query_vector=query_embedding, limit=10)
+  when_applies: >
+    Complex queries with 3+ distinct information needs, multi-hop reasoning questions,
+    and compound questions. Not for single-entity lookups or short factual queries.
+  sources:
+    - "https://glaforge.dev/posts/2026/02/10/advanced-rag-understanding-reciprocal-rank-fusion-in-hybrid-search/"
+    - "Press, O., et al. (2023). Measuring and Narrowing the Compositionality Gap in Language Models. EMNLP 2023."
+
+- id: HRR-010
+  text: >
+    Evaluate retrieval quality using MRR@10, NDCG@10, and Recall@K as complementary
+    metrics. MRR measures first-relevant-result quality; NDCG measures graded
+    relevance across top-K; Recall@K measures coverage. Require all three before
+    claiming retrieval improvement.
+  why: >
+    Optimizing a single metric misleads. MRR@10 can increase while NDCG@10 drops
+    if the first relevant result moves to rank 1 but other relevant results move to
+    rank 15 (beyond K). Recall@K can be perfect while NDCG@10 is poor if the system
+    retrieves all relevant documents but buries them at ranks 9-10. All three
+    together capture: did we find the right answer fast (MRR), did we rank all
+    relevant results well (NDCG), and did we miss any relevant documents (Recall)?
+    Teams reporting only Recall@10 routinely ship retrieval systems that bury the
+    best answer at rank 8 — it counts as a "hit" but users don't read that far.
+  how_to_do_right: |
+    1. Build eval dataset: 50+ queries with manually annotated relevant doc IDs
+       (binary for MRR/Recall, graded 0-3 for NDCG)
+    2. MRR@10 = mean(1/rank of first relevant result) across queries, rank <= 10
+    3. NDCG@10 = mean(DCG@10 / IDCG@10) where DCG = sum(rel_i / log2(i+1))
+    4. Recall@K = mean(|retrieved_relevant| / |all_relevant|) at K=10, 20, 50
+    5. Report all three; require: MRR@10 > 0.7, NDCG@10 > 0.65, Recall@50 > 0.90
+    6. Run evaluation after every retrieval system change (CI integration)
+    7. Use ranx or ir-measures Python library for standard implementations
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [ranx, ir-measures, beir]
+  domains:
+    domain: [architecture, information_retrieval]
+    concern: [evaluation, mrr, ndcg, recall, metrics]
+  example_good: |
+    from ranx import Qrels, Run, evaluate
+
+    # Evaluation setup
+    qrels_dict = {
+        "q1": {"doc_A": 3, "doc_B": 1, "doc_D": 2},  # Graded relevance 0-3
+        "q2": {"doc_C": 2, "doc_E": 3},
+    }
+    run_dict = {
+        "q1": {"doc_A": 0.95, "doc_C": 0.80, "doc_B": 0.75, "doc_D": 0.60},
+        "q2": {"doc_E": 0.90, "doc_C": 0.85, "doc_F": 0.70},
+    }
+
+    qrels = Qrels(qrels_dict)
+    run = Run(run_dict)
+
+    results = evaluate(qrels, run, ["mrr@10", "ndcg@10", "recall@50"])
+    # results: {"mrr@10": 0.875, "ndcg@10": 0.812, "recall@50": 0.933}
+
+    # CI gate: fail if any metric below threshold
+    assert results["mrr@10"] >= 0.70, f"MRR@10 regression: {results['mrr@10']}"
+    assert results["ndcg@10"] >= 0.65, f"NDCG@10 regression: {results['ndcg@10']}"
+    assert results["recall@50"] >= 0.90, f"Recall@50 regression: {results['recall@50']}"
+  example_bad: |
+    # Only reporting accuracy (binary hit/miss at top-1) — hides ranking quality
+    def evaluate_retrieval_bad(retriever, queries, ground_truth):
+        correct = 0
+        for q, relevant_docs in zip(queries, ground_truth):
+            top1 = retriever.search(q, top_k=1)[0]["id"]
+            if top1 in relevant_docs:
+                correct += 1
+        accuracy = correct / len(queries)
+        print(f"Accuracy@1: {accuracy:.2f}")  # Says nothing about recall or ranking
+  when_applies: >
+    Before deploying any retrieval system change to production. Required for A/B
+    test decision-making between retrieval architectures.
+  sources:
+    - "https://github.com/AmenRa/ranx"
+    - "Manning, C.D., Raghavan, P., Schütze, H. (2008). Introduction to Information Retrieval. Cambridge University Press."
+
+- id: HRR-011
+  text: >
+    Implement a semantic cache for retrieval results using embedding similarity:
+    cache lookup hashes the query embedding against stored queries at threshold > 0.97
+    cosine similarity, returns cached results, and bypasses the retrieval pipeline.
+    TTL: 1 hour for factual queries, 5 minutes for time-sensitive queries.
+  why: >
+    Production retrieval systems receive many semantically identical queries
+    ("what is X?" vs "explain X" vs "how does X work?") that share the same
+    relevant documents. Without semantic caching, each incurs the full 200-300ms
+    retrieval cost. At 1,000 QPS, a 30% cache hit rate saves 300ms * 300 hits/sec
+    = 90,000ms of retrieval load per second. Exact-string caching misses all
+    paraphrase variants; semantic caching at threshold 0.97 catches them safely.
+    Threshold below 0.95 risks false cache hits (semantically similar but retrievably
+    different queries, e.g., "Python 2 imports" vs "Python 3 imports").
+  how_to_do_right: |
+    1. On query: compute query embedding (reuse from retrieval pipeline, no extra cost)
+    2. Search cache index for nearest cached query: similarity >= 0.97 → cache hit
+    3. Cache key: query embedding vector; cache value: retrieved doc_ids + scores
+    4. Store cache in Redis (fast) with TTL per query category
+    5. Cache miss: run full retrieval, store result with TTL
+    6. Cache invalidation: when document corpus changes significantly (>5% update),
+       clear cache for affected topic clusters
+    7. Monitor: cache.hit_rate, cache.similarity_distribution, cache.ttl_distribution
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [redis, qdrant, numpy]
+  domains:
+    domain: [architecture, information_retrieval]
+    concern: [caching, performance, semantic_cache]
+  example_good: |
+    import json
+    import hashlib
+    import numpy as np
+    from redis.asyncio import Redis
+
+    class SemanticCache:
+        SIMILARITY_THRESHOLD = 0.97
+        DEFAULT_TTL = 3600  # 1 hour
+
+        def __init__(self, redis: Redis, vector_store):
+            self._redis = redis
+            self._vector_store = vector_store  # For fast similarity lookup
+
+        async def get(self, query_embedding: list[float]) -> list[str] | None:
+            # Search cache for similar past queries
+            cached_queries = await self._vector_store.search(
+                collection="query_cache",
+                query_vector=query_embedding,
+                limit=1,
+                score_threshold=self.SIMILARITY_THRESHOLD,
+            )
+            if not cached_queries:
+                return None  # Cache miss
+            cache_key = f"retrieval:{cached_queries[0].id}"
+            raw = await self._redis.get(cache_key)
+            return json.loads(raw) if raw else None
+
+        async def set(
+            self, query_embedding: list[float], results: list[str], ttl: int = DEFAULT_TTL
+        ) -> None:
+            query_id = hashlib.sha256(str(query_embedding[:5]).encode()).hexdigest()[:16]
+            await self._vector_store.upsert("query_cache",
+                                            [(query_id, query_embedding)])
+            await self._redis.setex(f"retrieval:{query_id}", ttl, json.dumps(results))
+  example_bad: |
+    # Exact string cache — misses all paraphrase variants
+    import hashlib
+    cache = {}
+    def retrieve_with_cache(query: str) -> list[str]:
+        key = hashlib.md5(query.encode()).hexdigest()
+        if key in cache:
+            return cache[key]  # Only hits on exact same string
+        results = retriever.search(query)
+        cache[key] = results
+        return results
+    # "how does dependency injection work" and "explain dependency injection"
+    # are different cache keys despite returning identical results
+  when_applies: >
+    Production retrieval systems with >100 QPS and repetitive query patterns,
+    especially user-facing search or agent knowledge retrieval with repeated queries.
+  sources:
+    - "https://www.llamaindex.ai/blog/new-llamaindex-caching-module"
+    - "https://redis.io/docs/manual/keyspace-notifications/"
+
+- id: HRR-012
+  text: >
+    Implement Sparse + Dense hybrid search using SPLADE (or BM42) for sparse
+    embeddings instead of raw BM25 when learned term weighting outperforms
+    statistical BM25 on your domain. SPLADE generates sparse vectors where each
+    dimension corresponds to a vocabulary term with a learned relevance weight.
+  why: >
+    Classical BM25 uses statistical term frequency and IDF — it cannot learn that
+    "ML" and "machine learning" are related, or that "BERT" is more relevant than
+    "bird" for NLP queries. SPLADE (Formal et al., 2021) trains a transformer to
+    produce sparse representations that encode learned term expansions and weights.
+    On MS MARCO, SPLADE outperforms BM25 by ~15% MRR@10 while remaining sparse
+    (compatible with inverted index infrastructure). For general English text with
+    synonym-heavy queries, SPLADE's learned expansion significantly improves recall.
+    For code or highly technical domains, BM25 sometimes outperforms SPLADE
+    (tokenization artifacts) — measure before switching.
+  how_to_do_right: |
+    1. Use Qdrant's sparse vector support with SPLADE model:
+       pip install fastembed → from fastembed import SparseTextEmbedding
+    2. Create Qdrant collection with both dense and sparse vector configs
+    3. Upsert documents with both dense (1536-dim float32) and sparse vectors
+    4. Query: compute both embeddings, use sparse_vectors + dense_vectors
+    5. Fuse with RRF: sparse_results + dense_results → RRF(k=60)
+    6. Evaluate: compare NDCG@10 of BM25 vs SPLADE on 50 domain queries
+    7. Deploy SPLADE only if NDCG@10 >= BM25 + 3% (statistical significance margin)
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [qdrant, fastembed]
+  domains:
+    domain: [architecture, information_retrieval]
+    concern: [sparse_retrieval, splade, learned_weighting]
+  example_good: |
+    from qdrant_client import QdrantClient, models
+    from fastembed import SparseTextEmbedding, TextEmbedding
+
+    # Initialize models
+    dense_model = TextEmbedding("BAAI/bge-base-en-v1.5")
+    sparse_model = SparseTextEmbedding("prithivida/Splade_PP_en_v1")
+
+    client = QdrantClient("localhost", port=6333)
+
+    # Create collection with both vector types
+    client.create_collection(
+        collection_name="hybrid_docs",
+        vectors_config={"dense": models.VectorParams(size=768, distance=models.Distance.COSINE)},
+        sparse_vectors_config={"sparse": models.SparseVectorParams()},
+    )
+
+    # Upsert with both embeddings
+    def index_document(doc_id: str, text: str):
+        dense_vec = list(next(dense_model.embed([text])))
+        sparse_vec = next(sparse_model.embed([text]))
+        client.upsert("hybrid_docs", points=[
+            models.PointStruct(
+                id=doc_id,
+                vector={"dense": dense_vec,
+                        "sparse": models.SparseVector(
+                            indices=sparse_vec.indices.tolist(),
+                            values=sparse_vec.values.tolist()
+                        )},
+            )
+        ])
+  example_bad: |
+    # Using raw BM25 without evaluating SPLADE — may be leaving 15% MRR on the table
+    from rank_bm25 import BM25Okapi
+    corpus = [doc.split() for doc in documents]
+    bm25 = BM25Okapi(corpus)
+    # "ML model training" won't match docs containing "machine learning model training"
+    # BM25 has no term expansion — exact token match only
+  when_applies: >
+    General English text retrieval with synonym-heavy queries. Evaluate vs BM25
+    on your specific domain before deploying — SPLADE is not always superior.
+  sources:
+    - "Formal, T., et al. (2021). SPLADE: Sparse Lexical and Expansion Model for First Stage Ranking. SIGIR 2021."
+    - "https://qdrant.tech/articles/hybrid-search/"
+
+- id: HRR-013
+  text: >
+    Implement retrieval with diversity injection: after RRF fusion, apply Maximal
+    Marginal Relevance (MMR) to select a top-K result set that balances relevance
+    with diversity. Use lambda=0.5 (equal weight) for general retrieval,
+    lambda=0.8 (favor relevance) for question answering.
+  why: >
+    Pure relevance ranking returns 10 documents that all say the same thing from
+    different angles — redundant for the user or downstream LLM. MMR (Carbonell &
+    Goldstein, 1998) iteratively selects the next document that maximizes:
+    lambda * relevance_score - (1 - lambda) * max_similarity_to_already_selected
+    This guarantees the top-K set covers multiple aspects of the query rather than
+    10 nearly-identical high-relevance documents. In RAG pipelines, diverse context
+    documents improve LLM answer quality by 8-15% on complex questions (measured
+    by RAGAS faithfulness score) because the LLM sees multiple perspectives.
+  how_to_do_right: |
+    1. Obtain relevance scores from fusion stage (RRF scores normalized to [0,1])
+    2. Compute pairwise cosine similarity between candidate document embeddings
+    3. Iteratively select: greedy MMR selection from remaining candidates
+    4. lambda=0.5: general knowledge retrieval (balance relevance and diversity)
+    5. lambda=0.8: single-answer factual QA (favor relevance, minimal diversity)
+    6. lambda=0.3: exploratory search (maximize coverage of topic)
+    7. Apply MMR after fusion, before returning to caller — adds ~5ms for 100 candidates
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [numpy, llamaindex]
+  domains:
+    domain: [architecture, information_retrieval]
+    concern: [diversity, mmr, reranking]
+  example_good: |
+    import numpy as np
+
+    def maximal_marginal_relevance(
+        query_embedding: np.ndarray,
+        candidate_embeddings: np.ndarray,  # shape: (N, D)
+        candidate_ids: list[str],
+        relevance_scores: np.ndarray,       # from RRF fusion, normalized [0,1]
+        top_k: int = 10,
+        lambda_param: float = 0.5,
+    ) -> list[str]:
+        """
+        MMR selection: balance relevance with diversity.
+        lambda=0.5: equal weight. lambda=1.0: pure relevance.
+        """
+        selected_indices: list[int] = []
+        remaining = list(range(len(candidate_ids)))
+
+        for _ in range(min(top_k, len(remaining))):
+            if not selected_indices:
+                # First: pick most relevant
+                best = max(remaining, key=lambda i: relevance_scores[i])
+            else:
+                # Subsequent: maximize MMR objective
+                selected_embs = candidate_embeddings[selected_indices]
+                best, best_score = None, -np.inf
+                for i in remaining:
+                    relevance = relevance_scores[i]
+                    # Max similarity to any already-selected document
+                    sims = candidate_embeddings[i] @ selected_embs.T
+                    max_sim = sims.max()
+                    mmr_score = lambda_param * relevance - (1 - lambda_param) * max_sim
+                    if mmr_score > best_score:
+                        best, best_score = i, mmr_score
+            selected_indices.append(best)
+            remaining.remove(best)
+
+        return [candidate_ids[i] for i in selected_indices]
+  example_bad: |
+    # Pure relevance: top-10 all say "use pip install" in different words
+    def retrieve_no_diversity(query: str) -> list[str]:
+        results = rrf_fusion(dense_search(query), bm25_search(query))
+        return [doc_id for doc_id, _ in results[:10]]
+    # For query "how to install Python packages": 10 documents about pip install
+    # MMR would surface: pip, conda, poetry, venv, virtualenv, pyenv — actual coverage
+  when_applies: >
+    RAG context window filling (avoid redundant context for LLM), exploratory search,
+    and knowledge graph exploration where topic coverage matters over rank-1 quality.
+  sources:
+    - "Carbonell, J., Goldstein, J. (1998). The Use of MMR, Diversity-Based Reranking for Reordering Documents and Producing Summaries. SIGIR 1998."
+    - "https://www.llamaindex.ai/blog/llamaindex-enhancing-retrieval-performance-with-alpha-tuning-and-reranking-in-a-rag-pipeline-b4c030966ebf"

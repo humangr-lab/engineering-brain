@@ -1,0 +1,262 @@
+layer: rules
+technology: SRE
+domain: architecture
+knowledge:
+- id: CR-SRE-MICRO-001
+  text: Service boundaries should follow domain boundaries, not technical layers. A "database service" or "auth service" is
+    a shared infrastructure component, not a proper microservice. A "payment service" or "inventory service" is a bounded
+    context that owns its data and logic independently.
+  why: 'Google''s experience with large-scale distributed systems (referenced across Chapters 18, 20, 22) shows that technical-layer
+    decomposition ("frontend service," "API service," "database service") creates distributed monoliths: every feature change
+    requires coordinating across all layers, and the "database service" becomes a bottleneck that every other service depends
+    on. Domain-driven decomposition ("order service," "payment service," "inventory service") creates independent services:
+    each service owns its data, has its own database, and can be developed, deployed, and scaled independently. Domain boundaries
+    reduce cross-team coordination, limit blast radius (payment bugs don''t affect inventory), and enable team autonomy.
+
+    '
+  how_to_do_right: '1. Each microservice owns ONE bounded context: orders, payments, inventory, user management. Not "database
+    queries" or "API gateway logic."
+
+    2. Each service owns its data store. The payment service has its own database. The inventory service has its own database.
+    No shared databases.
+
+    3. Services communicate through APIs (REST, gRPC, events), not through shared databases or shared file systems.
+
+    4. If two services need to change together for most features, they should be one service. Independent deployment is the
+    test of a proper service boundary.
+
+    5. Start monolithic and extract services when domain boundaries become clear. Premature microservice extraction creates
+    unnecessary complexity.
+
+    6. Use the "two pizza team" heuristic: each service should be owned by a team small enough to be fed by two pizzas. If
+    it needs a larger team, it might be too big.
+
+    '
+  example_good: "# Domain-driven service boundaries — each service owns its data\n# payment_service/\n#   models.py    -> Payment, Refund, Transaction\n#   db.py        -> payments_db (own database)\n#   api.py       -> POST /payments, GET /payments/{id}\n#\n# inventory_service/\n#   models.py    -> Product, Stock, Warehouse\n#   db.py        -> inventory_db (own database)\n#   api.py       -> GET /stock/{sku}, POST /reserve\n#\n# Services communicate via API, not shared database\n"
+  example_bad: "# Technical-layer decomposition — distributed monolith\n# database_service/   -> ALL tables, ALL queries (bottleneck)\n# api_service/        -> ALL endpoints, thin proxy\n# frontend_service/   -> ALL pages\n#\n# Every feature change requires coordinating across all 3 services\n# database_service is a single point of failure for everything\n"
+  when_applies: "When designing service boundaries for a new microservice architecture or decomposing a monolith."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kubernetes]
+  domains:
+    domain: [architecture, reliability]
+    concern: [microservices, boundaries]
+  sources:
+  - url: https://sre.google/sre-book/software-engineering-in-sre/
+    title: 'Google SRE Book — Chapter 18: Software Engineering in SRE'
+  validation_status: cross_checked
+- id: CR-SRE-MICRO-002
+  text: Synchronous service-to-service calls create temporal coupling — if service B is slow, service A is slow. Use asynchronous
+    communication (events, queues) for operations where the caller does not need an immediate response. Reserve synchronous
+    calls for read operations and operations requiring immediate confirmation.
+  why: 'Google''s cascading failure analysis (Chapter 22) identifies synchronous call chains as the primary coupling mechanism.
+    In a synchronous chain: user → A → B → C → database. If C takes 5 seconds instead of 50ms, A and B each wait 5 seconds
+    → their thread pools fill → new requests to A queue → A''s callers timeout → cascade. The fundamental problem: synchronous
+    calls make the caller''s latency dependent on the callee''s latency. With asynchronous communication: A publishes "order
+    created" event → B processes payment asynchronously → C updates inventory asynchronously. A''s response time is independent
+    of B and C. If C is slow, only C''s processing is delayed — A and its users are unaffected. Google''s rule: use async
+    for commands (create, update, delete) and sync for queries (read, search) where the user needs an immediate response.
+
+    '
+  how_to_do_right: '1. Classify operations: queries (need immediate response → synchronous) vs commands (fire-and-forget →
+    asynchronous).
+
+    2. Use events for cross-service state changes: "order created" → payment service subscribes and processes. The order service
+    doesn''t wait.
+
+    3. Use request-reply for queries: "get user profile" → synchronous HTTP/gRPC call. The caller needs the data now.
+
+    4. Limit synchronous call depth: A→B is ok, A→B→C is acceptable, A→B→C→D→E is a distributed monolith. If depth > 3, redesign.
+
+    5. Set timeouts on all synchronous calls: prevents the caller from waiting indefinitely when the callee is slow.
+
+    6. Consider CQRS: separate read models (synchronous, optimized for queries) from write models (asynchronous, eventual
+    consistency).
+
+    '
+  example_good: "import asyncio\nfrom kafka import KafkaProducer\n\nasync def create_order(order: Order) -> dict:\n    # Save order (essential, synchronous)\n    saved = await db.save(order)\n    # Publish event (async, non-blocking for caller)\n    producer.send(\"order_created\", value=order.to_dict())\n    return {\"order_id\": saved.id, \"status\": \"processing\"}\n    # Payment and inventory process asynchronously via event\n    # If payment service is slow, create_order is NOT affected\n"
+  example_bad: "async def create_order(order: Order) -> dict:\n    saved = await db.save(order)\n    # Synchronous chain: A -> B -> C\n    payment = await payment_service.charge(order)  # 2s if slow\n    inventory = await inventory_service.reserve(order)  # 1s if slow\n    notification = await email_service.send(order)  # 3s if slow\n    return {\"order_id\": saved.id}  # Total: 6s if all slow, cascading\n"
+  when_applies: "When designing communication patterns between services, especially for write operations and cross-service state changes."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kafka, rabbitmq, grpc]
+  domains:
+    domain: [architecture, messaging, reliability]
+    concern: [microservices]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-MICRO-003
+  text: API gateways must handle cross-cutting concerns (authentication, rate limiting, logging, tracing) so that individual
+    services don't have to. If every service implements its own auth validation, you have N implementations to audit, test,
+    and patch when a vulnerability is found.
+  why: 'Google''s defense-in-depth approach (reflected across multiple chapters) centralizes cross-cutting concerns at the
+    edge for efficiency and security. Without an API gateway: each service implements JWT validation → each has slightly different
+    validation logic → one service forgets to check token expiration → security vulnerability. Each service implements rate
+    limiting → different algorithms, different limits, different behaviors → no consistent user experience. Each service implements
+    logging → different formats, different fields → impossible to correlate. With an API gateway: authentication is implemented
+    ONCE, rate limiting is configured centrally, logging is standardized, and tracing is automatic. Individual services trust
+    the gateway''s authentication and focus on business logic.
+
+    '
+  how_to_do_right: '1. API gateway handles: authentication (validate JWT/API key), authorization (check permissions), rate
+    limiting, request logging, distributed tracing (inject trace headers), and TLS termination.
+
+    2. Services trust the gateway: if a request reaches the service, it''s already authenticated. The service reads the user
+    identity from a header (X-User-ID), not from the JWT.
+
+    3. Don''t put business logic in the gateway: it handles cross-cutting infrastructure concerns, not order processing or
+    payment validation.
+
+    4. Use standard gateway solutions (Kong, Envoy, AWS API Gateway, Nginx) rather than building your own.
+
+    5. The gateway itself must be highly available: it''s on the critical path for all requests. Deploy multiple instances
+    with load balancing.
+
+    6. Monitor gateway-specific metrics: request rate per route, authentication failure rate, rate limit hit rate, gateway
+    latency added.
+
+    '
+  example_good: "# API Gateway handles cross-cutting concerns centrally\n# Kong/Envoy config:\n# routes:\n#   /api/orders/*:\n#     plugins:\n#       - jwt-auth          # Auth validated ONCE at gateway\n#       - rate-limiting:     # Rate limit enforced ONCE\n#           second: 100\n#       - correlation-id     # Trace ID injected automatically\n#     upstream: order-service\n#\n# order-service trusts gateway auth, reads X-User-ID header\n# No JWT validation in order-service code\n"
+  example_bad: "# Each service implements its own auth — N implementations to audit\n# order_service/auth.py   -> validates JWT (checks expiry? maybe)\n# payment_service/auth.py -> validates JWT (different library, different bugs)\n# user_service/auth.py    -> validates JWT (forgot to check token expiry!)\n# inventory_service/      -> no auth at all (forgot to add it)\n#\n# Security vulnerability found -> must patch N services independently\n"
+  when_applies: "When building a microservice architecture where multiple services need authentication, rate limiting, logging, or tracing."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [aws, load_balancer]
+  domains:
+    domain: [architecture, reliability, security]
+    concern: [microservices]
+  sources:
+  - url: https://sre.google/sre-book/load-balancing-frontend/
+    title: 'Google SRE Book — Chapter 19: Load Balancing at the Frontend'
+  validation_status: cross_checked
+- id: CR-SRE-MICRO-004
+  text: The strangler fig pattern is the safe way to migrate from monolith to microservices — extract one service at a time,
+    routing traffic through a facade that sends requests to either the monolith or the new service. Never attempt a big-bang
+    rewrite.
+  why: 'Google''s engineering practices (Chapter 18) and release engineering (Chapter 8) both advise incremental migration
+    over rewrites. The big-bang rewrite trap: rewrite the entire monolith as microservices over 6-18 months → the monolith
+    continues to evolve during the rewrite → the new system doesn''t match the current monolith → launch the new system →
+    discover dozens of edge cases that were handled in the monolith but missed in the rewrite → spend months fixing → meanwhile
+    the old monolith is rotting because investment shifted. The strangler fig pattern: identify one bounded context in the
+    monolith → build a microservice for it → route traffic for that context to the new service → verify it works → repeat.
+    At each step, the system works. If the migration stalls, you have a partially migrated system that still functions — not
+    a half-finished rewrite.
+
+    '
+  how_to_do_right: '1. Start with the least complex, most independent bounded context. Don''t start with the most critical
+    module.
+
+    2. Build a facade/router that intercepts requests and routes to either monolith or new service based on the path/context.
+
+    3. First, route traffic to the new service AND the monolith (parallel run). Compare responses. Fix discrepancies.
+
+    4. Then, route traffic to the new service only. The monolith no longer handles that context.
+
+    5. One service at a time: don''t try to extract 5 services simultaneously. Each extraction is a project with testing and
+    validation.
+
+    6. The migration may take months or years. That''s fine — each step delivers value and reduces the monolith''s scope.
+
+    '
+  example_good: "# Strangler fig: route traffic through facade, migrate one context at a time\n# nginx.conf (facade/router)\nlocation /api/payments/ {\n    proxy_pass http://new-payment-service;  # Migrated!\n}\nlocation /api/ {\n    proxy_pass http://legacy-monolith;      # Everything else stays\n}\n# Step 1: Extract payments (simplest bounded context)\n# Step 2: Verify payments service works (parallel run + compare)\n# Step 3: Route payments to new service\n# Step 4: Extract next context (inventory)\n"
+  example_bad: "# Big-bang rewrite — 12 months, then discover edge cases\n# Month 1-12: Rewrite entire monolith as 15 microservices\n# Month 12: Launch new system\n# Month 12-15: Discover dozens of edge cases the monolith handled\n# Month 15: Old monolith is rotting, new system is incomplete\n# Result: Two broken systems instead of one working one\n"
+  when_applies: "When migrating from a monolith to microservices, or extracting a bounded context from an existing system."
+  severity: medium
+  technologies:
+    lang: [general]
+  domains:
+    domain: [architecture, reliability]
+    concern: [microservices, migration]
+  sources:
+  - url: https://sre.google/sre-book/software-engineering-in-sre/
+    title: 'Google SRE Book — Chapter 18: Software Engineering in SRE'
+  validation_status: cross_checked
+- id: CR-SRE-MICRO-005
+  text: Service-to-service communication must be authenticated and encrypted — even within the internal network. Zero-trust
+    networking assumes the internal network is hostile. If an attacker compromises one service, they should not be able to
+    impersonate other services or read their traffic.
+  why: 'Google''s BeyondCorp model (referenced in their security practices and SRE chapters) treats the internal network as
+    untrusted. The traditional model ("trust the internal network") fails when: an attacker gains access to one internal service
+    (through a vulnerability, supply chain attack, or stolen credential) and can then: call any other internal service (no
+    authentication), read traffic between services (no encryption), and impersonate any service (no identity verification).
+    Google''s zero-trust approach: every service has a cryptographic identity (mTLS certificate), every service-to-service
+    call is authenticated and encrypted, and every service enforces authorization (service A can only call specific endpoints
+    on service B). This limits the blast radius of any single compromise.
+
+    '
+  how_to_do_right: '1. Use mTLS for all service-to-service communication: both client and server present certificates. This
+    provides authentication and encryption.
+
+    2. Use a service mesh (Istio, Linkerd) to manage mTLS automatically. Don''t implement mTLS in application code.
+
+    3. Define authorization policies: service A can call service B''s /process-payment endpoint but not its /admin endpoint.
+
+    4. Rotate service certificates automatically (every 24-72 hours). Short-lived certificates limit the window of compromise.
+
+    5. Monitor authentication failures: a service receiving many unauthenticated requests may indicate an attacker or misconfiguration.
+
+    6. Encrypt ALL internal traffic, even for "non-sensitive" data. Classification can change, and encrypting everything is
+    simpler than deciding what to encrypt.
+
+    '
+  example_good: "# Istio mTLS: every service-to-service call is authenticated + encrypted\n# PeerAuthentication — require mTLS for all services\napiVersion: security.istio.io/v1beta1\nkind: PeerAuthentication\nmetadata:\n  name: default\n  namespace: production\nspec:\n  mtls:\n    mode: STRICT  # All traffic MUST be mTLS\n---\n# AuthorizationPolicy — payment-service can only be called by order-service\napiVersion: security.istio.io/v1beta1\nkind: AuthorizationPolicy\nmetadata:\n  name: payment-allow-orders\nspec:\n  selector:\n    matchLabels:\n      app: payment-service\n  rules:\n  - from:\n    - source:\n        principals: [\"cluster.local/ns/production/sa/order-service\"]\n"
+  example_bad: "# No mTLS, no auth between services — trust the network\n# Any service can call any other service\n# If attacker compromises frontend-service, they can:\n#   curl http://payment-service/admin/refund-all  # No auth!\n#   curl http://user-service/dump-database         # No auth!\n#   curl http://internal-api/secrets               # No auth!\n# Internal network = trusted = catastrophic if breached\n"
+  when_applies: "When deploying services in a microservice architecture where multiple services communicate over the internal network."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kubernetes, tls, istio]
+  domains:
+    domain: [architecture, reliability, security]
+    concern: [microservices, network, zero_trust]
+  sources:
+  - url: https://sre.google/sre-book/reliable-product-launches/
+    title: 'Google SRE Book — Chapter 27: Reliable Product Launches at Scale'
+  validation_status: cross_checked
+- id: CR-SRE-MICRO-006
+  text: Distributed tracing must be sampling-aware — tracing 100% of requests in production is prohibitively expensive. Use
+    head-based sampling (decide at the edge) or tail-based sampling (keep interesting traces). A 1-5% sampling rate captures
+    enough signal for debugging while keeping costs manageable.
+  why: 'Google''s monitoring chapter (Chapter 6) and troubleshooting practices (Chapter 12) use distributed tracing extensively
+    but with sampling. The cost calculation: if a service processes 10,000 QPS and each request generates 10 spans across
+    5 services = 100,000 spans/second = 8.6 billion spans/day. At $0.001 per span for storage and indexing, that''s $8,600/day.
+    At 1% sampling: 86 million spans/day = $86/day. Sampling trades completeness for cost-effectiveness. Head-based sampling
+    (decide at the edge, propagate the decision): simple, but may miss interesting traces. Tail-based sampling (collect all
+    traces, discard boring ones): keeps error traces, slow traces, and specific user traces, but requires a collector that
+    can buffer and decide.
+
+    '
+  how_to_do_right: '1. Default sampling rate: 1-5% for high-traffic services, 100% for low-traffic services (<100 QPS).
+
+    2. Always trace errors: if any span in a trace has an error, keep the entire trace regardless of sampling rate.
+
+    3. Always trace slow requests: if any span exceeds P99 latency, keep the trace.
+
+    4. Use trace context propagation (W3C Trace Context, B3): the sampling decision propagates through all services in the
+    chain.
+
+    5. Head-based sampling: decide at the edge, simple to implement, may miss interesting traces. Use for most services.
+
+    6. Tail-based sampling: collect everything, filter at the collector. Expensive (requires buffer) but keeps all interesting
+    traces. Use for critical services.
+
+    '
+  example_good: "from opentelemetry.sdk.trace.sampling import TraceIdRatioBased, ParentBased\n\n# Head-based sampling: 5% of normal requests, 100% of errors\nsampler = ParentBased(\n    root=TraceIdRatioBased(0.05),  # 5% sampling for normal traffic\n)\n\n# Custom sampler: always keep error traces and slow traces\nclass TailBiasedSampler:\n    def should_sample(self, span):\n        if span.status.is_error:\n            return RECORD_AND_SAMPLE  # Always keep errors\n        if span.duration_ms > p99_threshold:\n            return RECORD_AND_SAMPLE  # Always keep slow requests\n        return self.base_sampler.should_sample(span)\n"
+  example_bad: "# Trace 100% of requests — $8,600/day in storage costs\nsampler = TraceIdRatioBased(1.0)  # 100% sampling\n# 10K QPS * 10 spans * 86400s = 8.6 billion spans/day\n# OR: No tracing at all — zero visibility into distributed issues\n"
+  when_applies: "When implementing distributed tracing in a microservice architecture with more than a few hundred QPS."
+  severity: medium
+  technologies:
+    lang: [general]
+    platform: [jaeger, opentelemetry]
+  domains:
+    domain: [architecture, observability, reliability]
+    concern: [microservices, tracing, distributed]
+  sources:
+  - url: https://sre.google/sre-book/monitoring-distributed-systems/
+    title: 'Google SRE Book — Chapter 6: Monitoring Distributed Systems'
+  validation_status: cross_checked

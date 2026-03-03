@@ -1,0 +1,1158 @@
+layer: patterns
+technology: General
+domain: reliability
+knowledge:
+- id: CR-ARCH-RCB-001
+  text: Circuit Breaker Pattern — Protect services from cascade failures by detecting repeated failures in a dependency and
+    short-circuiting calls with an immediate fallback response.
+  why: When a downstream service becomes slow or unresponsive, callers accumulate blocked threads/connections waiting for
+    timeouts. If the caller has 100 connection pool slots and each waits 30 seconds, the caller is effectively down after
+    100 requests (pool exhaustion). The circuit breaker detects the failure pattern and stops making calls entirely (OPEN
+    state), returning a fallback immediately. This prevents the caller from wasting resources on a known-failing dependency
+    and gives the dependency time to recover. Netflix coined the pattern after experiencing cascade failures across 100+ microservices.
+  how_to_do_right: '1. CLOSED state: normal operation. Track failure count in a rolling window.
+
+    2. OPEN state: triggered when failure threshold exceeded. All calls return fallback immediately.
+
+    3. HALF-OPEN state: after recovery timeout, allow ONE probe call through.
+
+    4. If probe succeeds → CLOSED. If probe fails → OPEN again.
+
+    5. Configure per-dependency: aggressive for non-critical (3 failures → OPEN), lenient for critical (10 failures → OPEN).
+
+    6. Meaningful fallback: cached data, default value, degraded feature — not just an error.
+
+    7. Monitor: dashboard showing circuit state per dependency. OPEN = degraded system.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python, java, go, typescript]
+  domains:
+    domain: [reliability, architecture]
+    concern: [microservices, resilience]
+  example_good: "# Circuit breaker with meaningful fallback and monitoring\nfrom circuitbreaker import circuit\n\nclass RecommendationClient:\n\
+    \    @circuit(\n        failure_threshold=5,        # 5 failures in window → OPEN\n        recovery_timeout=30,      \
+    \   # Try again after 30 seconds\n        expected_exception=(httpx.TimeoutException, httpx.HTTPStatusError),\n    )\n\
+    \    def get_recommendations(self, user_id: str) -> list[Product]:\n        response = httpx.get(\n            f\"{self.base_url}/recommendations/{user_id}\"\
+    ,\n            timeout=httpx.Timeout(connect=1.0, read=3.0),\n        )\n        response.raise_for_status()\n       \
+    \ return [Product(**p) for p in response.json()]\n\n    def get_recommendations_safe(self, user_id: str) -> list[Product]:\n\
+    \        try:\n            return self.get_recommendations(user_id)\n        except CircuitBreakerError:\n           \
+    \ # Circuit OPEN — return cached recommendations (not an error page)\n            cached = self.cache.get(f\"recs:{user_id}\"\
+    )\n            if cached:\n                return cached\n            # No cache — return popular items (generic fallback)\n\
+    \            return self.get_popular_items()\n\n    def health_status(self) -> dict:\n        state = self.get_recommendations._circuit_breaker.state\n\
+    \        return {\"recommendation_service\": state.name}\n        # Dashboard shows: CLOSED (green), HALF_OPEN (yellow),\
+    \ OPEN (red)\n"
+  example_bad: "# No circuit breaker — caller blocks until timeout, cascades failure\nclass RecommendationClient:\n    def\
+    \ get_recommendations(self, user_id: str) -> list[Product]:\n        # No circuit breaker, no timeout configuration\n\
+    \        response = requests.get(f\"{self.base_url}/recommendations/{user_id}\")\n        return response.json()\n\n#\
+    \ Scenario: recommendation service is slow (30s response time)\n# Request 1: blocks for 30 seconds (timeout)\n# Request\
+    \ 2-100: all block for 30 seconds each\n# Connection pool exhausted → THIS service is now down\n# Services calling THIS\
+    \ service also start blocking\n# Within 5 minutes: entire system cascade failure\n"
+  sources: ["https://martinfowler.com/bliki/CircuitBreaker.html"]
+  when_applies: "When protecting services from cascade failures caused by slow or unresponsive downstream dependencies"
+- id: CR-ARCH-RCB-002
+  text: Bulkhead Isolation — Partition resources (thread pools, connection pools, memory) by dependency or criticality so
+    that a failure in one partition does not exhaust resources shared by others.
+  why: 'Without bulkheads, all service calls share the same connection pool. If the Payment Service becomes slow and consumes
+    all 100 connections from the shared pool, the Inventory Service (which is perfectly healthy) cannot be reached because
+    no connections are available. Bulkhead isolation gives each dependency its own resource pool: 30 connections for Payment,
+    30 for Inventory, 30 for Notifications, 10 reserve. Payment can exhaust its 30 connections without affecting Inventory
+    at all. Named after ship bulkheads that contain flooding to one compartment.'
+  how_to_do_right: '1. Thread pool isolation: each dependency gets its own thread pool (Hystrix-style).
+
+    2. Semaphore isolation: lighter weight — limits concurrent calls per dependency.
+
+    3. Connection pool isolation: separate HTTP client per dependency with its own pool size.
+
+    4. Partition by criticality: critical path (checkout) gets more resources than non-critical (recommendations).
+
+    5. Queue-based bulkhead: bounded queue per partition — reject when full (shed load).
+
+    6. Monitor: track pool utilization per partition. >80% utilization = capacity alert.
+
+    '
+  severity: high
+  technologies:
+    lang: [python, java, go]
+  domains:
+    domain: [reliability, architecture]
+    concern: [microservices, resilience]
+  example_good: "# Bulkhead: separate HTTP clients with dedicated connection pools\nclass ServiceClients:\n    def __init__(self):\n\
+    \        # Critical path — larger pool, longer timeouts\n        self.payment_client = httpx.AsyncClient(\n          \
+    \  base_url=\"http://payment-service\",\n            limits=httpx.Limits(max_connections=30, max_keepalive_connections=10),\n\
+    \            timeout=httpx.Timeout(connect=2.0, read=10.0),\n        )\n        # Critical path — medium pool\n      \
+    \  self.inventory_client = httpx.AsyncClient(\n            base_url=\"http://inventory-service\",\n            limits=httpx.Limits(max_connections=20,\
+    \ max_keepalive_connections=5),\n            timeout=httpx.Timeout(connect=1.0, read=5.0),\n        )\n        # Non-critical\
+    \ — small pool, short timeouts\n        self.recommendation_client = httpx.AsyncClient(\n            base_url=\"http://recommendation-service\"\
+    ,\n            limits=httpx.Limits(max_connections=5, max_keepalive_connections=2),\n            timeout=httpx.Timeout(connect=0.5,\
+    \ read=2.0),\n        )\n        # If recommendation service exhausts its 5 connections,\n        # payment and inventory\
+    \ are completely unaffected\n\n    async def close(self):\n        await self.payment_client.aclose()\n        await self.inventory_client.aclose()\n\
+    \        await self.recommendation_client.aclose()\n"
+  example_bad: "# Shared connection pool — one slow service affects all\n# Single HTTP client for everything\nclient = httpx.AsyncClient(\n\
+    \    limits=httpx.Limits(max_connections=50),\n)\n\nasync def checkout(order):\n    # All calls share the same 50-connection\
+    \ pool\n    payment = await client.post(\"http://payment-service/charge\", ...)   # 40 connections (slow)\n    inventory\
+    \ = await client.post(\"http://inventory-service/reserve\", ...)  # Blocked — pool exhausted!\n    notification = await\
+    \ client.post(\"http://notification-service/send\", ...)  # Blocked!\n    # Payment service is slow → consumes all 50\
+    \ connections\n    # Inventory and Notification are healthy but unreachable\n    # Checkout is completely broken even\
+    \ though only Payment is degraded\n"
+  sources: ["https://learn.microsoft.com/en-us/azure/architecture/patterns/circuit-breaker"]
+  when_applies: "When configuring circuit breaker thresholds and monitoring across multiple service dependencies"
+- id: CR-ARCH-RTO-001
+  text: Timeout Budget (Deadline Propagation) — Propagate a total request deadline across the call chain, subtracting elapsed
+    time at each hop. Inner calls cannot exceed the remaining budget.
+  why: 'Without deadline propagation, each service sets its own timeout independently. Gateway: 30s, Service A: 10s, Service
+    B: 10s, Service C: 10s. If Service B takes 9.9 seconds, Service C gets the full 10 seconds — total: 29.8 seconds. The
+    user waited almost 30 seconds. With deadline propagation, the gateway sets a 5-second total deadline. Service A receives
+    5s, uses 1s, propagates 4s to B. B uses 2s, propagates 2s to C. If C cannot complete in 2s, it fails fast. Total maximum:
+    5 seconds. The user gets a response or an error quickly.'
+  how_to_do_right: '1. Set a total deadline at the entry point (API Gateway or first service in chain).
+
+    2. Propagate deadline via headers: `X-Request-Deadline: 2026-02-17T12:00:05Z` or `grpc-timeout`.
+
+    3. Each service: remaining = deadline - now(). If remaining <= 0, return error immediately.
+
+    4. Each service: set downstream timeout = min(own_timeout, remaining_budget).
+
+    5. Use context.WithDeadline (Go), CancellationToken (.NET), or custom middleware (Python).
+
+    6. Separate connect timeout (1s) from read timeout (varies by budget).
+
+    '
+  severity: high
+  technologies:
+    lang: [python, go, java]
+    platform: [grpc]
+  domains:
+    domain: [reliability, architecture, performance]
+    concern: [microservices]
+  example_good: "# Deadline propagation middleware\nfrom datetime import datetime, timedelta\n\nclass DeadlinePropagation:\n\
+    \    \"\"\"Middleware that propagates request deadlines across services.\"\"\"\n\n    async def __call__(self, request,\
+    \ call_next):\n        # Read deadline from upstream\n        deadline_header = request.headers.get(\"X-Request-Deadline\"\
+    )\n        if deadline_header:\n            deadline = datetime.fromisoformat(deadline_header)\n        else:\n      \
+    \      # Entry point: set initial deadline (5 seconds from now)\n            deadline = datetime.utcnow() + timedelta(seconds=5)\n\
+    \n        remaining = (deadline - datetime.utcnow()).total_seconds()\n        if remaining <= 0:\n            return JSONResponse({\"\
+    error\": \"deadline exceeded\"}, status_code=504)\n\n        # Store in request context for downstream calls\n       \
+    \ request.state.deadline = deadline\n        request.state.remaining_budget = remaining\n\n        return await call_next(request)\n\
+    \n# Downstream call respects remaining budget\nasync def call_inventory(request, sku: str):\n    remaining = request.state.remaining_budget\n\
+    \    response = await httpx.get(\n        f\"http://inventory/{sku}\",\n        timeout=httpx.Timeout(connect=1.0, read=min(5.0,\
+    \ remaining - 0.5)),\n        headers={\"X-Request-Deadline\": request.state.deadline.isoformat()},\n    )\n    return\
+    \ response.json()\n"
+  example_bad: '# Independent timeouts — no deadline propagation
+
+    # Gateway: timeout = 30s
+
+    # Service A: timeout to B = 10s
+
+    # Service B: timeout to C = 10s
+
+    # Service C: timeout to D = 10s
+
+    #
+
+    # Worst case: A waits 10s for B, B waits 10s for C, C waits 10s for D
+
+    # Total: 30 seconds — user sees spinning wheel for 30 seconds
+
+    # Each service thinks "10 seconds is reasonable" in isolation
+
+    # But the CHAIN of 10s + 10s + 10s is not reasonable for the user
+
+    #
+
+    # With deadline propagation: total budget = 5s
+
+    # A uses 1s, propagates 4s → B uses 2s, propagates 2s → C must finish in 2s
+
+    '
+  sources: ["https://learn.microsoft.com/en-us/azure/architecture/patterns/retry"]
+  when_applies: "When designing timeout strategies for services that call multiple external dependencies"
+- id: CR-ARCH-RRL-001
+  text: Rate Limiting — Protect services from traffic spikes by limiting the number of requests per time window. Use token
+    bucket for smooth rate with burst capacity, sliding window for strict rate enforcement.
+  why: Without rate limiting, a single misbehaving client (or DDoS attack) can overwhelm a service, causing latency spikes
+    and outages for all clients. Rate limiting ensures fair resource allocation and protects backend services from overload.
+    At the API Gateway level, it prevents abuse. At the service level, it prevents cascade failures. Distributed rate limiting
+    (via Redis) ensures consistent limits across multiple service instances. The 429 (Too Many Requests) response with Retry-After
+    header tells clients exactly when to retry.
+  how_to_do_right: '1. Token bucket: allows bursts up to bucket size, refills at steady rate. Best for APIs with variable
+    traffic.
+
+    2. Sliding window: strict count per time window. Best for fixed-rate quotas.
+
+    3. Distributed rate limiting: use Redis INCR with TTL for consistent limits across instances.
+
+    4. Tiered limits: free tier (100/hour), paid tier (10000/hour), enterprise (unlimited).
+
+    5. Return 429 with Retry-After header — tell clients when to retry.
+
+    6. Client-side: implement exponential backoff with jitter (do not retry immediately).
+
+    7. Distinguish rate types: per-user, per-API-key, per-IP, global.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python, go]
+    platform: [redis, nginx]
+  domains:
+    domain: [reliability, security, architecture, api]
+  example_good: "# Distributed rate limiter using Redis sliding window\nimport redis\nimport time\n\nclass SlidingWindowRateLimiter:\n\
+    \    def __init__(self, redis_client: redis.Redis, limit: int, window_seconds: int):\n        self.redis = redis_client\n\
+    \        self.limit = limit\n        self.window = window_seconds\n\n    def is_allowed(self, key: str) -> tuple[bool,\
+    \ dict]:\n        now = time.time()\n        window_start = now - self.window\n        pipe = self.redis.pipeline()\n\
+    \        # Remove expired entries\n        pipe.zremrangebyscore(key, 0, window_start)\n        # Count requests in current\
+    \ window\n        pipe.zcard(key)\n        # Add current request\n        pipe.zadd(key, {str(now): now})\n        # Set\
+    \ TTL for cleanup\n        pipe.expire(key, self.window)\n        _, count, _, _ = pipe.execute()\n\n        if count\
+    \ >= self.limit:\n            retry_after = self.window - (now - window_start)\n            return False, {\"Retry-After\"\
+    : str(int(retry_after))}\n        return True, {\"X-RateLimit-Remaining\": str(self.limit - count - 1)}\n\n# Usage in\
+    \ middleware\n@app.middleware(\"http\")\nasync def rate_limit_middleware(request, call_next):\n    key = f\"ratelimit:{request.client.host}\"\
+    \n    allowed, headers = limiter.is_allowed(key)\n    if not allowed:\n        return JSONResponse({\"error\": \"Too many\
+    \ requests\"}, status_code=429, headers=headers)\n    response = await call_next(request)\n    response.headers.update(headers)\n\
+    \    return response\n"
+  example_bad: "# No rate limiting — one client can bring down the entire service\n@app.route(\"/api/search\")\ndef search(query:\
+    \ str):\n    # No rate limit — a bot can send 10,000 requests/second\n    results = expensive_search(query)  # Each query\
+    \ takes 500ms of CPU\n    return results\n    # 10,000 * 500ms = 5,000 seconds of CPU per second\n    # Service overwhelmed\
+    \ → all users see 503 errors\n    # Cascades to database → database connection pool exhausted\n    # Cascades to dependent\
+    \ services → full system outage\n"
+  sources: ["https://learn.microsoft.com/en-us/azure/architecture/patterns/rate-limiting-pattern"]
+  when_applies: "When protecting services from traffic spikes, abuse, or resource exhaustion with rate limiting"
+- id: CR-ARCH-RGD-001
+  text: Graceful Degradation — When a dependency fails, reduce functionality rather than failing completely. Disable non-critical
+    features, return cached data, and maintain core user experience.
+  why: Users prefer a degraded experience over no experience. When the Recommendation Service is down, showing an empty recommendation
+    section is better than returning a 500 error for the entire product page. When the Payment Service is slow, allowing users
+    to browse and add to cart (while showing 'checkout temporarily unavailable') retains users who would otherwise leave.
+    Netflix's graceful degradation strategy keeps streaming running even when personalization, ratings, and social features
+    are down — because the core value is watching content, not browsing recommendations.
+  how_to_do_right: '1. Classify features by criticality: critical (checkout), important (search), nice-to-have (recommendations).
+
+    2. Feature flags: toggle non-critical features off when their dependencies fail.
+
+    3. Cached fallbacks: return last-known-good data when fresh data is unavailable.
+
+    4. Static defaults: show popular items when personalization is down.
+
+    5. Partial responses: return what you have, mark missing sections as unavailable.
+
+    6. Priority queuing: under load, serve critical requests first, shed non-critical.
+
+    7. Communicate degradation: show banners like "Some features are temporarily limited."
+
+    '
+  severity: critical
+  technologies:
+    lang: [python, java, typescript, go]
+  domains:
+    domain: [reliability, architecture]
+    concern: [frontend, ux, resilience]
+  example_good: "# Product page with graceful degradation\nasync def get_product_page(product_id: str) -> ProductPage:\n \
+    \   # Critical: product details (fail = return 404)\n    product = await product_service.get(product_id)  # No fallback\
+    \ — critical\n\n    # Important: pricing (fallback = show \"contact for price\")\n    try:\n        price = await pricing_service.get_price(product_id)\n\
+    \    except (CircuitBreakerError, TimeoutError):\n        price = PriceFallback(display=\"Contact for price\", available=False)\n\
+    \n    # Nice-to-have: recommendations (fallback = popular items)\n    try:\n        recommendations = await recommendation_service.get(product_id)\n\
+    \    except (CircuitBreakerError, TimeoutError):\n        recommendations = await cache.get(f\"popular_items\")  # Cached\
+    \ fallback\n\n    # Nice-to-have: reviews (fallback = hide section)\n    try:\n        reviews = await review_service.get(product_id)\n\
+    \    except (CircuitBreakerError, TimeoutError):\n        reviews = None  # Section not shown — degraded but functional\n\
+    \n    return ProductPage(\n        product=product,\n        price=price,\n        recommendations=recommendations or\
+    \ [],\n        reviews=reviews,\n        degraded_features=_list_degraded(price, recommendations, reviews),\n    )\n"
+  example_bad: "# All-or-nothing — one failure kills the entire page\nasync def get_product_page(product_id: str) -> ProductPage:\n\
+    \    # If ANY of these fail, the entire product page returns 500\n    product = await product_service.get(product_id)\n\
+    \    price = await pricing_service.get_price(product_id)\n    recommendations = await recommendation_service.get(product_id)\n\
+    \    reviews = await review_service.get(product_id)\n    related = await related_products_service.get(product_id)\n\n\
+    \    # Recommendation service is down for maintenance (15 minutes)\n    # → Every product page returns 500 for 15 minutes\n\
+    \    # → Users cannot even SEE the product, let alone buy it\n    # → Revenue loss during the outage\n    return ProductPage(product,\
+    \ price, recommendations, reviews, related)\n"
+  sources: ["https://learn.microsoft.com/en-us/azure/architecture/patterns/bulkhead"]
+  when_applies: "When designing services that must continue operating with reduced functionality during partial outages"
+- id: CR-ARCH-RCE-001
+  text: Chaos Engineering — Proactively inject failures into production-like environments to discover weaknesses before they
+    cause real outages. Start with a steady-state hypothesis, introduce failures, observe results.
+  why: Resilience patterns (circuit breakers, retries, fallbacks) are only as good as their configuration and testing. A circuit
+    breaker configured with the wrong threshold does not protect you. A fallback that returns stale data from 6 months ago
+    is worse than an error. Chaos engineering validates that resilience mechanisms actually work under realistic conditions.
+    Netflix's Chaos Monkey randomly terminates production instances — their services must handle it gracefully. Google's DiRT
+    (Disaster Recovery Testing) tests entire datacenter failures. The alternative is finding out your resilience is broken
+    during a real outage at 3 AM.
+  how_to_do_right: '1. Define steady state: ''order success rate > 99.5%, p99 latency < 2s''.
+
+    2. Hypothesize: ''if we kill 1 inventory service instance, steady state is maintained''.
+
+    3. Run experiment: kill the instance (Chaos Monkey, Litmus, Gremlin).
+
+    4. Observe: did steady state hold? If not, what broke?
+
+    5. Fix: improve resilience, add circuit breakers, fix configuration.
+
+    6. Start small: single instance termination → network partition → entire AZ failure.
+
+    7. Blast radius: start in staging, graduate to production with kill switch.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    library: [litmus, gremlin]
+    platform: [kubernetes]
+  domains:
+    domain: [reliability, testing, operations]
+    concern: [sre]
+  example_good: "# Chaos experiment definition (Litmus ChaosEngine)\n# experiment: kill one pod of order-service, verify steady\
+    \ state\napiVersion: litmuschaos.io/v1alpha1\nkind: ChaosEngine\nmetadata:\n  name: order-service-pod-kill\nspec:\n  appinfo:\n\
+    \    appns: production\n    applabel: \"app=order-service\"\n  chaosServiceAccount: litmus-admin\n  experiments:\n   \
+    \ - name: pod-delete\n      spec:\n        components:\n          env:\n            - name: TOTAL_CHAOS_DURATION\n   \
+    \           value: \"60\"        # Kill pod for 60 seconds\n            - name: PODS_AFFECTED_PERC\n              value:\
+    \ \"33\"        # Kill 1 of 3 pods\n        probe:\n          - name: order-success-rate\n            type: promProbe\n\
+    \            promProbe/inputs:\n              query: \"rate(orders_success_total[5m]) / rate(orders_total[5m])\"\n   \
+    \           comparator:\n                criteria: \">=\"\n                value: \"0.995\"   # Steady state: >99.5% success\
+    \ rate\n            mode: Continuous\n            runProperties:\n              probeTimeout: 5\n              interval:\
+    \ 10\n\n# Expected: pod killed, traffic shifts to remaining 2 pods, success rate maintained\n# If fails: circuit breaker\
+    \ misconfigured, load balancer slow to detect failure, etc.\n"
+  example_bad: '# "We have resilience" — never tested in practice
+
+    #
+
+    # Team: "We have circuit breakers on all external calls"
+
+    # Reality: threshold set to 100 failures (default) — never triggers
+
+    #
+
+    # Team: "We have fallback responses"
+
+    # Reality: fallback returns data from a cache that expired 6 months ago
+
+    #
+
+    # Team: "We handle pod failures gracefully"
+
+    # Reality: health check endpoint returns 200 even when DB is disconnected
+
+    #
+
+    # First real outage: 3 AM, inventory service OOM-killed
+
+    # Circuit breaker: threshold never reached (only 50 errors before total failure)
+
+    # Fallback: returned 6-month-old inventory data (showed in-stock items that are discontinued)
+
+    # Health check: reported "healthy" → no automatic remediation
+
+    # Duration: 4 hours (manual intervention required)
+
+    # Cost: $200K in lost orders + customer trust damage
+
+    '
+  sources: ["https://learn.microsoft.com/en-us/azure/architecture/patterns/compensating-transaction"]
+  when_applies: "When handling failed operations in distributed systems that lack native transaction rollback"
+- id: CR-ARCH-RSR-001
+  text: SLI/SLO/SLA — Define Service Level Indicators (what to measure), Service Level Objectives (target percentages), and
+    Service Level Agreements (customer commitments). Use error budgets to balance reliability and velocity.
+  why: Without SLOs, reliability is either 'good enough' (subjective) or '100%' (impossible and expensive). SLOs make reliability
+    a measurable, achievable target. A 99.9% availability SLO means 43 minutes of downtime per month is acceptable. The error
+    budget (0.1% = 43 minutes) is the amount of unreliability you can 'spend' on risky deployments, experiments, and maintenance.
+    When the error budget is full, ship features fast. When the error budget is depleted, stop features and focus on reliability.
+    This creates a data-driven conversation between product (features) and engineering (reliability).
+  how_to_do_right: '1. SLI (indicator): what you measure. Availability: successful requests / total requests. Latency: p99
+    < 500ms.
+
+    2. SLO (objective): target percentage. 99.9% availability over 30-day rolling window.
+
+    3. SLA (agreement): customer-facing commitment with consequences. 99.5% uptime or credits.
+
+    4. SLO > SLA: internal target is stricter than customer promise (99.9% vs 99.5%).
+
+    5. Error budget: 100% - SLO = budget. 99.9% SLO → 0.1% error budget → 43 min/month.
+
+    6. Error budget policy: when depleted → freeze features, postmortems for every incident.
+
+    7. When budget is healthy → ship faster, take more risks, run chaos experiments.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python]
+    platform: [prometheus, grafana, datadog]
+  domains:
+    domain: [reliability, operations, management]
+    concern: [sre]
+  example_good: "# SLI/SLO definitions in code (for automated alerting)\n# sre/slo_config.py\nSLOS = {\n    \"order_api_availability\"\
+    : {\n        \"sli\": \"rate(http_requests_total{job='order-api',code!~'5..'}[5m]) / rate(http_requests_total{job='order-api'}[5m])\"\
+    ,\n        \"target\": 0.999,        # 99.9%\n        \"window\": \"30d\",\n        \"error_budget_minutes\": 43.2,  #\
+    \ 30 days * 24h * 60m * 0.001\n        \"alert_burn_rate\": 14.4, # Alert when burning 14.4x budget (1h = 1 day of budget)\n\
+    \    },\n    \"order_api_latency_p99\": {\n        \"sli\": \"histogram_quantile(0.99, rate(http_request_duration_seconds_bucket{job='order-api'}[5m]))\"\
+    ,\n        \"target_seconds\": 0.5,   # p99 < 500ms\n        \"window\": \"30d\",\n    },\n    \"checkout_success_rate\"\
+    : {\n        \"sli\": \"rate(checkout_success_total[5m]) / rate(checkout_attempts_total[5m])\",\n        \"target\": 0.995,\
+    \         # 99.5% of checkout attempts succeed\n        \"window\": \"7d\",\n    },\n}\n\n# Error budget calculation\n\
+    def get_error_budget_remaining(slo_name: str) -> float:\n    \"\"\"Returns remaining error budget as percentage (0-100).\"\
+    \"\"\n    slo = SLOS[slo_name]\n    actual = query_prometheus(slo[\"sli\"], slo[\"window\"])\n    budget_total = 1 - slo[\"\
+    target\"]       # e.g., 0.001\n    budget_consumed = 1 - actual            # e.g., 0.0003\n    return ((budget_total -\
+    \ budget_consumed) / budget_total) * 100  # e.g., 70%\n"
+  example_bad: '# No SLOs — reliability is subjective
+
+    #
+
+    # Product manager: "The service feels slow"
+
+    # Engineer: "It''s fine, I tested it locally"
+
+    # VP: "I got an error yesterday, fix it"
+
+    # Engineer: "That was a one-time thing"
+
+    #
+
+    # Without SLOs:
+
+    # - No agreed-upon target (is 99% OK? 99.9%? 99.99%?)
+
+    # - No error budget (always pressure for both features AND reliability)
+
+    # - No data (anecdotes drive decisions)
+
+    # - Reliability work is reactive (fix after outage) not proactive
+
+    # - No way to answer: "should we ship this risky feature?"
+
+    #   (Answer with SLO: "yes, we have 35 minutes of error budget remaining")
+
+    '
+  sources: ["https://sre.google/sre-book/handling-overload/"]
+  when_applies: "When designing load shedding strategies to protect critical services during overload conditions"
+- id: CR-ARCH-RSR-002
+  text: Incident Management — Structured response to production incidents with clear roles (Incident Commander, Communication
+    Lead, Subject Matter Experts) and mandatory blameless postmortems.
+  why: 'Without structured incident management, production incidents are chaotic: 15 engineers troubleshooting in parallel,
+    nobody coordinating, conflicting fixes applied, customers getting no updates. A structured process with clear roles reduces
+    mean time to resolution (MTTR) and prevents panic-driven mistakes. Blameless postmortems prevent the same incident from
+    recurring: the root cause is a system failure, not a person failure. Google''s incident management playbook reduced their
+    MTTR by 40% after standardization.'
+  how_to_do_right: '1. Incident Commander (IC): makes decisions, coordinates response, NOT debugging.
+
+    2. Communication Lead: updates status page, stakeholders, and customers at regular intervals.
+
+    3. Subject Matter Experts (SMEs): debug the issue, propose and implement fixes.
+
+    4. Scribe: documents timeline, actions taken, and decisions in real-time.
+
+    5. Severity levels: SEV1 (system down, revenue impact), SEV2 (degraded), SEV3 (minor, no impact).
+
+    6. Postmortem within 48 hours: timeline, root cause, contributing factors, action items.
+
+    7. Blameless: "the deploy process allowed a bad config" not "John pushed a bad config."
+
+    '
+  severity: high
+  technologies:
+    lang: [general]
+    library: [statuspage, slack]
+    platform: [pagerduty]
+  domains:
+    domain: [reliability, operations]
+    concern: [sre]
+  example_good: '# Blameless postmortem template
+
+    # Title: Order Service Latency Spike — 2026-02-15
+
+    # Severity: SEV2 (degraded — checkout latency >5s for 23 minutes)
+
+    # Duration: 14:32 - 14:55 UTC (23 minutes)
+
+    # Impact: 12% of checkout attempts failed, $8,200 estimated revenue impact
+
+    #
+
+    # Timeline:
+
+    # 14:32 — Alert: order_api_latency_p99 > 5s (burn rate 20x)
+
+    # 14:34 — IC assigned: Sarah. Comm lead: Mike.
+
+    # 14:36 — SME identified: recent deploy at 14:25 added new DB query
+
+    # 14:40 — Root cause: missing index on orders.customer_id (new query full-scans)
+
+    # 14:45 — Mitigation: CREATE INDEX CONCURRENTLY on orders.customer_id
+
+    # 14:50 — Index created. Latency dropping.
+
+    # 14:55 — Steady state restored. All clear declared.
+
+    #
+
+    # Root Cause: New endpoint (GET /orders/by-customer) performed sequential scan
+
+    # on 10M-row orders table. Missing index on customer_id column.
+
+    #
+
+    # Contributing Factors:
+
+    # - No query plan review in PR process
+
+    # - Staging DB has 1000 rows (fast even without index)
+
+    # - No slow query alerting threshold
+
+    #
+
+    # Action Items:
+
+    # - [P1] Add slow query log alerting (threshold: 100ms) — DRI: Sarah, ETA: Feb 17
+
+    # - [P2] Add DB migration review checklist to PR template — DRI: Mike, ETA: Feb 20
+
+    # - [P3] Seed staging DB with production-scale data — DRI: Alex, ETA: Mar 1
+
+    '
+  example_bad: '# Unstructured incident response — chaos
+
+    #
+
+    # 14:32 — Alert fires. Nobody responds (no on-call rotation defined).
+
+    # 14:40 — Customer tweets: "your site is broken"
+
+    # 14:42 — VP pings Slack: "What''s going on??"
+
+    # 14:45 — 8 engineers start debugging simultaneously
+
+    # 14:50 — Engineer A rolls back deploy. Engineer B applies hotfix. Both collide.
+
+    # 14:55 — Rollback partially applied. Hotfix conflicts. Service now fully down.
+
+    # 15:00 — VP: "Who broke it?" (blame culture kicks in)
+
+    # 15:30 — Service restored after manual intervention.
+
+    # 15:31 — "We should do a postmortem." Never scheduled.
+
+    # 16:00 — Same issue occurs next week. Same response. Same outcome.
+
+    '
+  sources: ["https://sre.google/sre-book/addressing-cascading-failures/"]
+  when_applies: "When managing cascading failures across a mesh of interdependent microservices"
+- id: CR-ARCH-RBP-001
+  text: Backpressure — Signal to upstream producers that the downstream consumer cannot keep up. Use bounded queues, flow
+    control, and load shedding to prevent memory exhaustion and cascade failures.
+  why: 'When a producer generates messages faster than the consumer can process them, unbounded queues grow until memory is
+    exhausted and the process is OOM-killed. This is the most common cause of overnight production crashes: a traffic spike
+    at midnight fills a queue, consumer falls behind, memory grows linearly, OOM at 3 AM, on-call woken up. Backpressure signals
+    the producer to slow down BEFORE memory is exhausted. The two strategies: push-back (reject new messages) or shed load
+    (drop lowest priority messages). Both are better than crashing.'
+  how_to_do_right: '1. Bounded queues: set a maximum queue size. When full, reject new items (block or return error).
+
+    2. Flow control: producer adapts rate based on consumer acknowledgment speed (TCP-style).
+
+    3. Load shedding: when overloaded, drop lowest-priority work to protect highest-priority.
+
+    4. Admission control: reject requests at the gateway when backend capacity is reached.
+
+    5. Rate limiting upstream: limit producer rate to consumer''s sustainable throughput.
+
+    6. Monitor queue depth: growing queue = consumer falling behind = capacity problem.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python, go]
+    platform: [kafka, rabbitmq]
+  domains:
+    domain: [reliability, performance, architecture]
+    concern: [distributed_systems]
+  example_good: "# Bounded queue with backpressure — rejects when full\nimport asyncio\n\nclass BoundedTaskQueue:\n    def\
+    \ __init__(self, max_size: int = 1000):\n        self.queue: asyncio.Queue = asyncio.Queue(maxsize=max_size)\n       \
+    \ self.metrics = QueueMetrics()\n\n    async def enqueue(self, task: Task) -> bool:\n        \"\"\"Returns False if queue\
+    \ is full — caller must handle.\"\"\"\n        try:\n            self.queue.put_nowait(task)\n            self.metrics.record_enqueue(self.queue.qsize())\n\
+    \            return True\n        except asyncio.QueueFull:\n            self.metrics.record_rejection()\n           \
+    \ return False  # Backpressure signal — caller should retry or shed\n\n    async def process(self):\n        while True:\n\
+    \            task = await self.queue.get()\n            await self._execute(task)\n\n# API handler with backpressure\n\
+    @router.post(\"/tasks\")\nasync def submit_task(body: TaskRequest):\n    accepted = await task_queue.enqueue(Task.from_request(body))\n\
+    \    if not accepted:\n        # Backpressure: tell client to slow down\n        return JSONResponse(\n            {\"\
+    error\": \"Service at capacity\", \"retry_after\": 5},\n            status_code=503,\n            headers={\"Retry-After\"\
+    : \"5\"},\n        )\n    return {\"status\": \"accepted\"}\n"
+  example_bad: "# Unbounded queue — grows until OOM crash\nimport queue\n\ntask_queue = []  # Unbounded list used as queue\n\
+    \n@router.post(\"/tasks\")\nasync def submit_task(body: TaskRequest):\n    # Always accepts — no backpressure\n    task_queue.append(Task.from_request(body))\n\
+    \    return {\"status\": \"accepted\"}\n    # Traffic spike: 10,000 tasks/second\n    # Consumer processes: 100 tasks/second\n\
+    \    # Queue grows: 9,900 tasks/second net\n    # After 1 hour: 35,640,000 tasks in memory\n    # OOM-kill at 3 AM. All\
+    \ 35M tasks lost (not persisted).\n"
+  sources: ["https://learn.microsoft.com/en-us/azure/architecture/patterns/bulkhead"]
+  when_applies: "When isolating service components to prevent failure in one from affecting others"
+- id: CR-ARCH-RRT-001
+  text: Exponential Backoff with Jitter — When retrying failed operations, increase the wait time exponentially with randomized
+    jitter to prevent thundering herd synchronization.
+  why: When a service goes down and comes back up, all waiting clients retry simultaneously — a thundering herd that immediately
+    brings the recovering service back down. Fixed-interval retries create synchronized waves of traffic at exact intervals
+    (every 1s, every 2s). Exponential backoff spaces retries out (1s, 2s, 4s, 8s), reducing pressure. Adding random jitter
+    (1.2s, 2.7s, 3.1s, 9.4s) desynchronizes clients so they do not retry at the same time. Without jitter, exponential backoff
+    still creates synchronized waves — jitter is essential.
+  how_to_do_right: '1. Exponential backoff: delay = base * (2 ^ attempt). Base = 1s, attempt 1-2-4-8-16s.
+
+    2. Full jitter: delay = random(0, base * 2^attempt). Most effective desynchronization.
+
+    3. Decorrelated jitter: delay = random(base, previous_delay * 3). Good middle ground.
+
+    4. Maximum delay cap: do not exceed 60s (user gives up after minutes of waiting).
+
+    5. Maximum attempts: stop after 5-10 retries. Escalate to fallback or error.
+
+    6. Idempotent operations only: retrying a non-idempotent operation (transfer money) is dangerous.
+
+    7. Budget-aware: respect the deadline propagation budget (do not retry if budget exhausted).
+
+    '
+  severity: high
+  technologies:
+    lang: [python, java, go, typescript]
+  domains:
+    domain: [reliability, architecture, infrastructure]
+    concern: [distributed_systems, networking]
+  example_good: "# Exponential backoff with full jitter\nimport random\nimport asyncio\n\nasync def retry_with_backoff(\n\
+    \    func,\n    max_attempts: int = 5,\n    base_delay: float = 1.0,\n    max_delay: float = 60.0,\n    retryable_exceptions:\
+    \ tuple = (TimeoutError, ConnectionError),\n):\n    for attempt in range(max_attempts):\n        try:\n            return\
+    \ await func()\n        except retryable_exceptions as e:\n            if attempt == max_attempts - 1:\n             \
+    \   raise  # Last attempt — propagate error\n            # Full jitter: random between 0 and exponential ceiling\n   \
+    \         ceiling = min(base_delay * (2 ** attempt), max_delay)\n            delay = random.uniform(0, ceiling)\n    \
+    \        logger.warning(\n                f\"Attempt {attempt + 1}/{max_attempts} failed: {e}. \"\n                f\"\
+    Retrying in {delay:.1f}s\"\n            )\n            await asyncio.sleep(delay)\n\n# Usage\nresult = await retry_with_backoff(\n\
+    \    lambda: inventory_client.check_stock(\"SKU-123\"),\n    max_attempts=3,\n    base_delay=0.5,\n)\n# Attempt 1: immediate\n\
+    # Attempt 2: random(0, 0.5) = 0.3s delay (each client different)\n# Attempt 3: random(0, 1.0) = 0.7s delay (each client\
+    \ different)\n"
+  example_bad: "# Fixed interval retry — thundering herd\nasync def retry_fixed(func, max_attempts=5):\n    for attempt in\
+    \ range(max_attempts):\n        try:\n            return await func()\n        except Exception:\n            await asyncio.sleep(1)\
+    \  # Fixed 1-second delay\n    raise RetryExhausted()\n\n# Service goes down. 1000 clients waiting.\n# Second 0: service\
+    \ comes back up\n# Second 1: ALL 1000 clients retry simultaneously → service crashes again\n# Second 2: ALL 1000 clients\
+    \ retry again → service crashes again\n# Infinite crash loop — synchronized retries prevent recovery\n"
+  sources: ["https://learn.microsoft.com/en-us/azure/architecture/patterns/retry"]
+  when_applies: "When implementing retry policies for transient failures in distributed systems"
+- id: CR-ARCH-RHC-001
+  text: Health Check Types — Implement liveness (am I running?), readiness (can I serve traffic?), and startup (am I initialized?)
+    probes separately. Each serves a different purpose in container orchestration.
+  why: 'A service can be running (process alive) but not ready (database connection pool not initialized). A service can be
+    ready but temporarily unhealthy (memory pressure, long GC pause). Conflating these states causes either premature traffic
+    routing (requests fail because DB is not connected) or unnecessary pod restarts (pod is just slow starting, not dead).
+    Kubernetes uses three probe types: liveness (restart if failing), readiness (remove from load balancer if failing), and
+    startup (give time for slow initialization). Each probe must check the right thing.'
+  how_to_do_right: '1. Startup probe: checks initialization (DB migrations complete, cache warmed). Runs once at start.
+
+    2. Readiness probe: checks if the service can handle requests (DB connected, dependent services reachable).
+
+    3. Liveness probe: checks if the process is alive and not deadlocked. Simple: return 200 if main loop is running.
+
+    4. Readiness probe should check dependencies (DB, Redis, downstream services).
+
+    5. Liveness probe should NOT check dependencies — a DB failure should not restart your pod.
+
+    6. Startup probe timeout should be generous (slow DB migrations, large caches).
+
+    '
+  severity: high
+  technologies:
+    lang: [python, go]
+    framework: [fastapi]
+    platform: [kubernetes]
+  domains:
+    domain: [reliability, operations, deployment, infrastructure]
+  example_good: "# Three separate health check endpoints\n@router.get(\"/health/live\")\nasync def liveness():\n    \"\"\"\
+    Liveness: is the process alive and not deadlocked?\n    DO NOT check external dependencies here — a DB failure\n    should\
+    \ not cause pod restart (circuit breakers handle that).\"\"\"\n    return {\"status\": \"alive\"}\n\n@router.get(\"/health/ready\"\
+    )\nasync def readiness():\n    \"\"\"Readiness: can this instance serve traffic?\n    Check ALL dependencies required\
+    \ to handle requests.\"\"\"\n    checks = {}\n    checks[\"database\"] = await check_db_connection()\n    checks[\"redis\"\
+    ] = await check_redis_connection()\n    checks[\"kafka\"] = await check_kafka_connection()\n\n    all_healthy = all(c[\"\
+    healthy\"] for c in checks.values())\n    status_code = 200 if all_healthy else 503\n    return JSONResponse(\n      \
+    \  {\"status\": \"ready\" if all_healthy else \"not_ready\", \"checks\": checks},\n        status_code=status_code,\n\
+    \    )\n\n@router.get(\"/health/startup\")\nasync def startup():\n    \"\"\"Startup: has initialization completed?\"\"\
+    \"\n    if not app.state.initialized:\n        return JSONResponse({\"status\": \"starting\"}, status_code=503)\n    return\
+    \ {\"status\": \"started\"}\n\n# Kubernetes pod spec\n# livenessProbe:\n#   httpGet: { path: /health/live, port: 8080\
+    \ }\n#   periodSeconds: 10\n#   failureThreshold: 3  # Restart after 3 failures (30s)\n# readinessProbe:\n#   httpGet:\
+    \ { path: /health/ready, port: 8080 }\n#   periodSeconds: 5\n#   failureThreshold: 2  # Remove from LB after 2 failures\
+    \ (10s)\n# startupProbe:\n#   httpGet: { path: /health/startup, port: 8080 }\n#   periodSeconds: 5\n#   failureThreshold:\
+    \ 30  # Allow 150s for slow startup\n"
+  example_bad: "# Single health check that does too much\n@router.get(\"/health\")\nasync def health():\n    # Liveness AND\
+    \ readiness AND startup in one endpoint\n    db_ok = await check_db()         # DB down → pod restarted (wrong!)\n   \
+    \ redis_ok = await check_redis()   # Redis down → pod restarted (wrong!)\n    kafka_ok = await check_kafka()   # Kafka\
+    \ down → pod restarted (wrong!)\n    if not (db_ok and redis_ok and kafka_ok):\n        return {\"status\": \"unhealthy\"\
+    }, 503\n    return {\"status\": \"healthy\"}\n\n# Kubernetes uses this for BOTH liveness AND readiness\n# Problem: DB\
+    \ goes down for 30 seconds (maintenance)\n# → Health check returns 503\n# → Kubernetes restarts ALL pods (liveness failure)\n\
+    # → Pods restart, try to connect to DB (still down)\n# → Health check returns 503 again\n# → Restart loop until DB comes\
+    \ back\n# → All traffic lost during restart thrashing\n# Correct: liveness should NOT check DB. Only readiness should.\n"
+  sources: ["https://learn.microsoft.com/en-us/azure/architecture/patterns/health-endpoint-monitoring"]
+  when_applies: "When implementing health checks for services behind load balancers or container orchestrators"
+- id: CR-ARCH-RLS-001
+  text: Load Shedding — Under overload, proactively reject low-priority work to protect capacity for high-priority work. Drop
+    the least important requests rather than degrading everything equally.
+  why: 'When a service is overloaded, serving ALL requests slowly is worse than serving IMPORTANT requests fast and rejecting
+    the rest. A checkout request that times out is a lost sale. A recommendation request that times out is invisible to the
+    user. Load shedding prioritizes: checkout gets served (revenue-critical), recommendations get dropped (nice-to-have).
+    Without load shedding, all requests compete equally for the same resources, and the most important requests fail alongside
+    the least important ones.'
+  how_to_do_right: '1. Classify requests by priority: P0 (checkout, payment), P1 (search, browse), P2 (recommendations, analytics).
+
+    2. Measure current load: request queue depth, CPU utilization, active connections.
+
+    3. Shedding thresholds: at 80% capacity, shed P2. At 90%, shed P1. At 95%, shed P0 (circuit breaker).
+
+    4. Return 503 with Retry-After for shed requests — client knows it is load-related.
+
+    5. Admission control at the gateway: reject before the request consumes backend resources.
+
+    6. Monitor shedding rate: sustained shedding = capacity planning needed.
+
+    '
+  severity: high
+  technologies:
+    lang: [python, go]
+    platform: [nginx, envoy]
+  domains:
+    domain: [reliability, performance]
+    concern: [scalability]
+  example_good: "# Priority-based load shedding\nfrom enum import IntEnum\n\nclass Priority(IntEnum):\n    CRITICAL = 0  \
+    \ # Checkout, payment — never shed (until extreme)\n    HIGH = 1        # Search, product pages\n    MEDIUM = 2      #\
+    \ Recommendations, reviews\n    LOW = 3         # Analytics, tracking, prefetch\n\nclass LoadShedder:\n    def __init__(self,\
+    \ max_concurrent: int = 1000):\n        self.max_concurrent = max_concurrent\n        self.current_load = 0\n        self.shed_threshold\
+    \ = {\n            Priority.LOW: 0.7,       # Shed at 70% capacity\n            Priority.MEDIUM: 0.85,   # Shed at 85%\
+    \ capacity\n            Priority.HIGH: 0.95,     # Shed at 95% capacity\n            Priority.CRITICAL: 1.0,  # Shed only\
+    \ at 100% (last resort)\n        }\n\n    def should_admit(self, priority: Priority) -> bool:\n        utilization = self.current_load\
+    \ / self.max_concurrent\n        return utilization < self.shed_threshold[priority]\n\n# Middleware\n@app.middleware(\"\
+    http\")\nasync def load_shed_middleware(request, call_next):\n    priority = classify_request_priority(request)\n    if\
+    \ not load_shedder.should_admit(priority):\n        return JSONResponse(\n            {\"error\": \"Service at capacity\"\
+    , \"priority\": priority.name},\n            status_code=503,\n            headers={\"Retry-After\": \"5\"},\n       \
+    \ )\n    load_shedder.current_load += 1\n    try:\n        return await call_next(request)\n    finally:\n        load_shedder.current_load\
+    \ -= 1\n"
+  example_bad: "# No load shedding — all requests treated equally\n@app.middleware(\"http\")\nasync def no_shedding(request,\
+    \ call_next):\n    # Every request is accepted, regardless of current load\n    return await call_next(request)\n\n# Under\
+    \ 2x capacity:\n# - Checkout requests: 4 second response time (was 200ms) → user abandons\n# - Analytics events: 4 second\
+    \ response time (was 200ms) → nobody notices\n# - Recommendation calls: 4 second response time → nobody cares\n#\n# Result:\
+    \ ALL users get a bad experience equally\n# Revenue-critical checkout is as slow as non-critical analytics\n# $50K/hour\
+    \ in lost revenue because we treated analytics equally with checkout\n"
+  sources: ["https://sre.google/sre-book/load-balancing-frontend/"]
+  when_applies: "When designing load shedding to protect critical paths under extreme traffic conditions"
+- id: CR-ARCH-ROB-001
+  text: Three Pillars of Observability — Metrics (quantitative trends), Logs (qualitative events), and Traces (request journey).
+    Each serves a different debugging purpose. Use all three, correlated by request ID.
+  why: 'Metrics tell you WHAT is wrong (error rate increased to 5%). Logs tell you WHY it is wrong (NullPointerException in
+    PaymentService.charge()). Traces tell you WHERE in the call chain it is wrong (Payment Service → Stripe adapter, 14 seconds).
+    Using only one pillar leaves blind spots: metrics without logs means ''something is wrong but I do not know what.'' Logs
+    without traces means ''I found the error but I do not know which request triggered it.'' Correlating all three via a shared
+    request_id enables: alert (metric) → investigate (trace) → root cause (log) in minutes.'
+  how_to_do_right: '1. Metrics: counters (requests_total), gauges (connections_active), histograms (latency_seconds).
+
+    2. Logs: structured JSON with request_id, timestamp, level, service, message. Never unstructured strings.
+
+    3. Traces: OpenTelemetry spans with trace_id propagated across services.
+
+    4. Correlation: request_id in all three — click from alert to trace to log.
+
+    5. RED method for services: Rate (requests/sec), Errors (error rate), Duration (latency).
+
+    6. USE method for resources: Utilization (CPU%), Saturation (queue depth), Errors.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python]
+    platform: [prometheus, grafana, jaeger, opentelemetry]
+  domains:
+    domain: [reliability, observability, operations]
+    concern: [sre]
+  example_good: "# All three pillars, correlated by request_id\nimport structlog\nfrom opentelemetry import trace\nfrom prometheus_client\
+    \ import Counter, Histogram\n\n# Metrics\nREQUEST_COUNT = Counter(\"http_requests_total\", \"Total requests\", [\"method\"\
+    , \"endpoint\", \"status\"])\nREQUEST_DURATION = Histogram(\"http_request_duration_seconds\", \"Request latency\", [\"\
+    endpoint\"])\n\n# Structured logging with request context\nlogger = structlog.get_logger()\n\n@router.post(\"/orders\"\
+    )\nasync def create_order(body: CreateOrderRequest):\n    span = trace.get_current_span()\n    request_id = span.get_span_context().trace_id\n\
+    \n    # Log (structured, with request_id)\n    logger.info(\"order.create.started\",\n        request_id=request_id,\n\
+    \        customer_id=body.customer_id,\n        item_count=len(body.items),\n    )\n\n    with REQUEST_DURATION.labels(endpoint=\"\
+    /orders\").time():\n        order = await order_service.create(body)\n\n    # Metric\n    REQUEST_COUNT.labels(method=\"\
+    POST\", endpoint=\"/orders\", status=\"201\").inc()\n\n    # Debugging flow:\n    # 1. Alert: error_rate > 5% (Grafana\
+    \ alert from metric)\n    # 2. Trace: trace_id shows Order → Payment → timeout at Stripe\n    # 3. Log: structlog shows\
+    \ \"stripe.timeout after 30s\" with full context\n"
+  example_bad: "# Unstructured logging, no metrics, no tracing\n@router.post(\"/orders\")\nasync def create_order(body: dict):\n\
+    \    print(f\"Creating order for {body}\")  # Unstructured print — cannot query\n    order = await order_service.create(body)\n\
+    \    print(f\"Order created: {order}\")\n\n# Debugging:\n# \"Error rate seems high\" — how do you know? No metrics.\n\
+    # \"Let me check the logs\" — grep through gigabytes of print() output\n# \"Found an error\" — which request caused it?\
+    \ No request_id.\n# \"Which service was slow?\" — no tracing, cannot see the call chain.\n"
+  sources: ["https://learn.microsoft.com/en-us/azure/architecture/patterns/priority-queue"]
+  when_applies: "When load balancing requests across backend instances that may have different capacities"
+- id: CR-ARCH-RFF-001
+  text: Feature Flags for Safe Releases — Decouple deployment from release using feature flags. Deploy code anytime; enable
+    features gradually via configuration, not code deployment.
+  why: Without feature flags, deploying code IS releasing it to all users simultaneously. A bug in a new feature requires
+    an emergency rollback of the entire deployment. With feature flags, code is deployed but disabled by default. The product
+    manager enables it for 1% of users, monitors metrics, and gradually increases to 100%. If a problem is found at 5%, the
+    flag is turned off in seconds — no deployment, no rollback, no downtime. Feature flags also enable A/B testing, beta programs,
+    and kill switches for expensive features during load spikes.
+  how_to_do_right: '1. Deployment: code goes to production, feature flag is OFF by default.
+
+    2. Release: flag enabled for internal users → beta users → 10% → 50% → 100%.
+
+    3. Kill switch: critical features have emergency OFF switch (shed feature under load).
+
+    4. Flag types: boolean (on/off), percentage (rollout %), user segment (beta users only).
+
+    5. Flag lifecycle: create → test → enable → promote → clean up (remove flag and dead code).
+
+    6. Technical debt: flags left in code forever become confusing. Review and clean up quarterly.
+
+    '
+  severity: high
+  technologies:
+    lang: [python, typescript]
+    library: [launchdarkly, unleash]
+  domains:
+    domain: [reliability, operations, deployment]
+    concern: [product]
+  example_good: "# Feature flag for gradual rollout\nfrom feature_flags import is_enabled\n\n@router.get(\"/checkout\")\n\
+    async def checkout(user: AuthUser = Depends()):\n    # New checkout flow — deployed but disabled by default\n    if is_enabled(\"\
+    new_checkout_flow\", user_id=user.id, default=False):\n        return await new_checkout_handler(user)\n    else:\n  \
+    \      return await legacy_checkout_handler(user)\n\n# Rollout plan (no deployments needed):\n# Day 1: Enable for internal\
+    \ team (user segment: \"employees\")\n# Day 2: Enable for 1% of users (percentage rollout: 1%)\n# Day 3: Monitor metrics\
+    \ — error rate OK → increase to 10%\n# Day 5: 10% healthy → increase to 50%\n# Day 7: 50% healthy → enable for 100%\n\
+    # Day 14: Remove flag + legacy code (cleanup)\n\n# Emergency: bug found at 10% rollout\n# → Turn OFF flag (1 click, <5\
+    \ seconds)\n# → 100% of users back on legacy checkout\n# → No deployment, no rollback, no downtime\n"
+  example_bad: "# No feature flags — deployment IS release\n@router.get(\"/checkout\")\nasync def checkout(user: AuthUser\
+    \ = Depends()):\n    return await new_checkout_handler(user)\n    # Deployed to 100% of users instantly\n    # Bug found\
+    \ at 2 AM: 15% of checkouts fail\n    # Emergency rollback: git revert → build → deploy (30 minutes)\n    # 30 minutes\
+    \ of broken checkout = $45K in lost revenue\n    # With feature flag: 5 seconds to disable\n"
+  sources: ["https://martinfowler.com/articles/feature-toggles.html"]
+  when_applies: "When using feature flags to control graceful degradation during incidents"
+- id: CR-ARCH-RCP-001
+  text: Connection Pool Management — Size database connection pools based on measured concurrency, not guesses. Monitor pool
+    exhaustion, wait time, and connection lifetime.
+  why: 'Each database connection consumes memory on both the application server (~5MB) and the database server (~10MB). A
+    pool of 100 connections across 10 pods = 1000 connections to PostgreSQL. PostgreSQL performs poorly above 200-300 connections
+    (context switching overhead). An oversized pool wastes memory and degrades database performance. An undersized pool causes
+    request queuing — requests wait for an available connection, increasing latency. The optimal pool size follows the formula:
+    connections = (2 * CPU_cores) + effective_disk_spindles for database workloads.'
+  how_to_do_right: '1. Formula: pool_size = (2 * CPU_cores) + disk_spindles. For SSD: pool_size = 2 * CPU_cores + 1.
+
+    2. Per-pod pool: if max_connections=200 and 10 pods, each pod gets pool_size=20.
+
+    3. Connection proxy (PgBouncer): multiplexes many application connections to fewer database connections.
+
+    4. Monitor: pool_active (connections in use), pool_waiting (requests queuing), pool_idle (wasted connections).
+
+    5. Timeout: max_wait = 5 seconds. If no connection available in 5s, fail fast (not block forever).
+
+    6. Connection lifetime: max_lifetime = 30 minutes. Recycle connections to prevent stale state.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy]
+    library: [pgbouncer]
+    platform: [postgresql]
+  domains:
+    domain: [reliability, performance, databases]
+  example_good: "# SQLAlchemy connection pool with proper configuration\nfrom sqlalchemy import create_engine\n\nengine =\
+    \ create_engine(\n    DATABASE_URL,\n    pool_size=10,            # Steady-state connections per pod\n    max_overflow=5,\
+    \          # Burst capacity (temporary extra connections)\n    pool_timeout=5,          # Max wait for connection (fail\
+    \ fast)\n    pool_recycle=1800,       # Recycle connections every 30 minutes\n    pool_pre_ping=True,      # Test connection\
+    \ before using (handles DB restarts)\n    echo_pool=\"debug\",       # Log pool events for monitoring\n)\n\n# With PgBouncer\
+    \ in front of PostgreSQL:\n# 10 pods * 15 connections each = 150 connections to PgBouncer\n# PgBouncer multiplexes to\
+    \ 30 real PostgreSQL connections\n# PostgreSQL sees 30 connections (well within optimal range)\n\n# Monitoring queries:\n\
+    # SELECT count(*) FROM pg_stat_activity;  -- Current connections\n# PgBouncer: SHOW POOLS;  -- Active, waiting, idle per\
+    \ pool\n"
+  example_bad: "# Oversized pool — kills database performance\nengine = create_engine(\n    DATABASE_URL,\n    pool_size=100,\
+    \     # 100 connections per pod!\n    max_overflow=50,   # Burst to 150 per pod!\n    pool_timeout=30,   # Wait 30 seconds\
+    \ (user gives up at 5s)\n    # No pool_recycle — stale connections accumulate\n    # No pool_pre_ping — uses dead connections,\
+    \ gets errors\n)\n# 10 pods * 150 connections = 1500 connections to PostgreSQL\n# PostgreSQL max_connections=200 (default)\
+    \ → connection refused!\n# Even if raised to 1500: context switching overhead kills performance\n# DB CPU at 100% just\
+    \ managing connections, not executing queries\n"
+  sources: ["https://learn.microsoft.com/en-us/azure/architecture/patterns/cache-aside"]
+  when_applies: "When adding caching layers to reduce load on downstream services and databases"
+- id: CR-ARCH-RCA-001
+  text: Capacity Planning — Measure current resource utilization, project growth, and provision headroom BEFORE you hit limits.
+    Use load testing to find breaking points and plan scaling triggers.
+  why: 'Reactive scaling (scale when the system crashes) means outages. Proactive capacity planning (scale before you hit
+    limits) means continuous availability. Black Friday traffic is 10x normal — if you plan for 2x, you will have a 5-hour
+    outage during your highest revenue period. Capacity planning requires: knowing your current baseline (CPU, memory, connections
+    at normal load), knowing your ceiling (load test to find the breaking point), and knowing your growth rate (traffic doubles
+    every 6 months). The buffer is the gap between current usage and the ceiling — when the buffer shrinks below 20%, it is
+    time to scale.'
+  how_to_do_right: '1. Baseline: measure current resource utilization at peak (not average — peaks cause outages).
+
+    2. Ceiling: load test to find the breaking point (what traffic level causes p99 > SLO?).
+
+    3. Buffer: ceiling - baseline = available headroom. Target: >30% buffer at peak.
+
+    4. Growth projection: plot utilization over time, project when buffer reaches 20%.
+
+    5. Scaling triggers: autoscale at 70% CPU (reactive). Plan capacity increases at 50% trend (proactive).
+
+    6. Load test regularly: the ceiling changes as code changes. Re-test after major releases.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    library: [k6]
+    platform: [kubernetes, prometheus, grafana]
+  domains:
+    domain: [reliability, performance, operations]
+    concern: [sre]
+  example_good: '# Capacity planning dashboard (Grafana)
+
+    #
+
+    # Panel 1: Current vs Ceiling
+
+    #   CPU: 45% used / 100% ceiling = 55% buffer (GREEN)
+
+    #   Memory: 60% used / 100% ceiling = 40% buffer (GREEN)
+
+    #   DB connections: 150 used / 200 ceiling = 25% buffer (YELLOW)
+
+    #   Request rate: 800 rps / 1200 rps ceiling = 33% buffer (GREEN)
+
+    #
+
+    # Panel 2: Growth Projection
+
+    #   At current growth rate (15% month-over-month):
+
+    #   DB connections will hit ceiling in 3 months → ACTION: add PgBouncer
+
+    #   CPU will hit 70% in 5 months → ACTION: plan horizontal scaling
+
+    #
+
+    # Panel 3: Load Test Results (last run: 2026-02-10)
+
+    #   Breaking point: 1,200 rps (p99 > 2s SLO at 1,200 rps)
+
+    #   Current peak: 800 rps
+
+    #   Buffer: 400 rps (33%)
+
+    #
+
+    # Autoscale config:
+
+    # apiVersion: autoscaling/v2
+
+    # kind: HorizontalPodAutoscaler
+
+    # spec:
+
+    #   minReplicas: 3
+
+    #   maxReplicas: 20
+
+    #   metrics:
+
+    #     - type: Resource
+
+    #       resource:
+
+    #         name: cpu
+
+    #         target:
+
+    #           type: Utilization
+
+    #           averageUtilization: 70  # Scale at 70% CPU
+
+    '
+  example_bad: '# No capacity planning — reactive scaling (scale after crash)
+
+    #
+
+    # Month 1: 100 rps, 2 pods, everything fine
+
+    # Month 3: 200 rps, 2 pods, "still fine, a little slow"
+
+    # Month 5: 400 rps, 2 pods, "latency is high but acceptable"
+
+    # Month 6: 600 rps, 2 pods, "we should probably scale soon"
+
+    # Month 7: 800 rps, 2 pods, OUTAGE — connection pool exhausted
+
+    #   3 hours of downtime while scrambling to add pods
+
+    #   Database connections maxed out — adding pods makes it WORSE
+
+    #   Need PgBouncer, but installing it takes 2 days
+
+    #   Revenue loss: $150K
+
+    #   Root cause: nobody was watching the trend line
+
+    '
+  sources: ["https://sre.google/sre-book/postmortem-culture/"]
+  when_applies: "When conducting post-incident analysis and building resilience improvement plans"
+- id: CR-ARCH-RTR-001
+  text: Toil Elimination — Automate repetitive, manual operational work that scales linearly with service size. If humans
+    do it more than twice, automate it.
+  why: 'Toil is manual, repetitive, automatable work that grows linearly with service size: restarting crashed pods, rotating
+    certificates, responding to the same alert with the same fix, manually running database migrations, copying logs to S3.
+    Every hour spent on toil is an hour NOT spent on improving reliability, building features, or reducing future toil. Google''s
+    SRE model caps toil at 50% of an engineer''s time — the other 50% goes to engineering work that permanently reduces toil.
+    Without this discipline, toil grows until 100% of engineering time is spent firefighting.'
+  how_to_do_right: '1. Identify toil: any manual work that is repetitive, automatable, and grows with service size.
+
+    2. Measure toil: track hours per week spent on manual operational tasks.
+
+    3. Prioritize automation: automate the highest-frequency toil first (biggest time savings).
+
+    4. Self-healing: automated remediation for known issues (restart on OOM, scale on high CPU).
+
+    5. Runbooks → code: every runbook step should eventually become an automated script.
+
+    6. Target: <50% toil. If toil exceeds 50%, stop feature work and automate.
+
+    '
+  severity: medium
+  technologies:
+    lang: [python]
+    platform: [kubernetes, ansible, terraform]
+  domains:
+    domain: [reliability, operations]
+    concern: [sre, automation]
+  example_good: "# Self-healing automation — replaces manual runbook\n# BEFORE (manual toil — 15 min per incident, 3x/week):\n\
+    # 1. Alert fires: \"order-service high memory\"\n# 2. On-call SSH into pod, check memory usage\n# 3. Identify the leak\
+    \ (always the same cache growing unbounded)\n# 4. Restart the pod\n# 5. Monitor for 5 minutes\n# 6. Close the alert\n\
+    # Time: 15 min * 3/week = 45 min/week = 39 hours/year\n\n# AFTER (automated — 0 min per incident):\n# Kubernetes handles\
+    \ it automatically:\napiVersion: v1\nkind: Pod\nspec:\n  containers:\n    - name: order-service\n      resources:\n  \
+    \      limits:\n          memory: \"512Mi\"  # OOM-kill at 512Mi → Kubernetes restarts automatically\n      livenessProbe:\n\
+    \        httpGet: { path: /health/live, port: 8080 }\n        periodSeconds: 10\n        failureThreshold: 3  # 3 failures\
+    \ → automatic restart\n\n# Plus: fix the root cause (unbounded cache)\nfrom cachetools import TTLCache\ncache = TTLCache(maxsize=10000,\
+    \ ttl=300)  # Bounded + TTL\n# Now: zero incidents per week, zero toil\n"
+  example_bad: '# Manual toil consuming engineering time
+
+    #
+
+    # Every Monday:
+
+    # - Manually check disk usage on 15 servers (30 min)
+
+    # - Manually rotate 3 API keys (45 min — generate, update, verify)
+
+    # - Manually run database vacuum (20 min)
+
+    # - Manually review and acknowledge 50 alerts (60 min)
+
+    #
+
+    # Every incident:
+
+    # - SSH into server, check logs, restart service (15 min)
+
+    # - Same fix every time — nobody automates it
+
+    #
+
+    # Weekly toil: 3+ hours
+
+    # Annual toil: 156 hours = 4 full work weeks
+
+    # With 5 engineers: 780 hours/year = 20 work weeks on autopilot tasks
+
+    # That is 5 months of engineering capacity wasted on work a script could do
+
+    '
+  sources: ["https://opentelemetry.io/docs/concepts/signals/traces/"]
+  when_applies: "When instrumenting distributed systems with tracing for latency diagnosis and bottleneck detection"
+- id: CR-ARCH-RDR-001
+  text: Disaster Recovery Planning — Define RPO (how much data can you lose?) and RTO (how long can you be down?), then design
+    backup/replication strategies to meet these targets. Test recovery regularly.
+  why: 'A disaster (datacenter fire, ransomware, catastrophic bug that corrupts data) will happen — the question is when.
+    Without a tested DR plan, recovery time is measured in days or weeks. Gitlab''s 2017 database incident took 18 hours to
+    recover because backup restoration had never been tested (one backup method had been silently failing for months). RPO
+    and RTO define the business requirement: RPO=1 hour means you can lose up to 1 hour of data (hourly backups). RTO=4 hours
+    means the system must be operational within 4 hours. These targets drive the technical solution: real-time replication
+    for RPO=0, hot standby for RTO=minutes.'
+  how_to_do_right: '1. RPO (Recovery Point Objective): maximum acceptable data loss. RPO=0 requires synchronous replication.
+
+    2. RTO (Recovery Time Objective): maximum acceptable downtime. RTO=minutes requires hot standby.
+
+    3. Backup strategy: full + incremental, stored in a DIFFERENT region/provider than production.
+
+    4. Test recovery: restore from backup monthly. If you have not tested it, it does not work.
+
+    5. Runbook: step-by-step recovery procedure, tested by the person who will execute it at 3 AM.
+
+    6. Multi-region: active-passive (failover) or active-active (both serve traffic). Cost increases with lower RTO.
+
+    '
+  severity: critical
+  technologies:
+    platform: [postgresql, aws, kubernetes, terraform]
+  domains:
+    domain: [reliability, operations]
+    concern: [sre]
+  example_good: '# DR strategy matching business requirements
+
+    # RPO = 1 hour (can lose up to 1 hour of data)
+
+    # RTO = 4 hours (must be operational within 4 hours)
+
+
+    # Backup strategy:
+
+    # 1. PostgreSQL WAL archiving to S3 (continuous, RPO ≈ minutes)
+
+    # 2. Daily full backup to S3 in different region (belt + suspenders)
+
+    # 3. S3 cross-region replication (backup survives regional outage)
+
+    # 4. Application state is stateless (only DB needs recovery)
+
+
+    # Recovery runbook (tested quarterly):
+
+    # 1. Provision new infrastructure in DR region (Terraform, 15 min)
+
+    # 2. Restore PostgreSQL from WAL archive (pg_basebackup + WAL replay, 2 hours)
+
+    # 3. Update DNS to point to DR region (5 min)
+
+    # 4. Verify application health checks pass (10 min)
+
+    # 5. Total: ~2.5 hours (within 4-hour RTO)
+
+
+    # Quarterly DR test:
+
+    # - Actually restore from backup to a test environment
+
+    # - Verify data integrity (row counts, checksums)
+
+    # - Time the recovery process (must be < RTO)
+
+    # - Document any issues and update runbook
+
+    '
+  example_bad: '# "We have backups" — never tested
+
+    #
+
+    # Backup config (set up 2 years ago):
+
+    # pg_dump --format=custom mydb > /backups/daily.dump  (cron, daily)
+
+    #
+
+    # Disaster: ransomware encrypts all servers
+
+    # Recovery attempt:
+
+    # 1. Find backup: /backups/daily.dump — encrypted by ransomware
+
+    # 2. Find off-site backup: none (backups on same server as DB)
+
+    # 3. Find S3 backup: bucket exists but empty (cron job failed 8 months ago, nobody noticed)
+
+    # 4. Find WAL archive: not configured
+
+    # 5. Last viable backup: 8 months old
+
+    # 6. 8 months of customer data, orders, and transactions: GONE
+
+    #
+
+    # Root cause: backup existed on paper, never tested in practice
+
+    '
+  sources: ["https://learn.microsoft.com/en-us/azure/architecture/patterns/throttling"]
+  when_applies: "When designing request throttling to prevent resource exhaustion under heavy load"

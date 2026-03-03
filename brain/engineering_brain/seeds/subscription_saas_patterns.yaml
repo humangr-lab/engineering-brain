@@ -1,0 +1,1133 @@
+layer: rules
+domain: fintech
+knowledge:
+- id: SAAS-001
+  text: >
+    Use Stripe SetupIntent (not PaymentIntent) when saving a payment method for future
+    off-session charges (subscriptions). Use PaymentIntent only for immediate one-time
+    charges. Confusing these two flows causes: cards saved without 3DS authentication
+    (rejected by European banks under PSD2), or 3DS prompts appearing on subscription
+    renewals (user not present, charge fails). Validate the resulting PaymentMethod with
+    stripe.payment_methods.attach() before creating the subscription.
+  why: >
+    PSD2 Strong Customer Authentication requires 3DS for card-not-present transactions
+    above €30. SetupIntent explicitly requests 3DS at setup time — the user authenticates
+    once, and subsequent subscription charges are classified as merchant-initiated transactions
+    (exempt from 3DS). Skipping SetupIntent causes European subscription renewals to fail
+    at 30-50% rates. Stripe reports that SCA-compliant flows have 15% better authorization
+    rates in EU markets than non-compliant flows.
+  how_to_do_right: |
+    1. Create SetupIntent server-side:
+       setup_intent = stripe.SetupIntent.create(
+           customer=customer_id,
+           payment_method_types=["card"],
+           usage="off_session",  # Critical: tells Stripe this is for future charges
+       )
+    2. Send client_secret to frontend → confirm with Stripe.js:
+       stripe.confirmCardSetup(setup_intent.client_secret, {
+           payment_method: { card: cardElement }
+       })
+    3. On webhook payment_method.attached: create the subscription:
+       stripe.Subscription.create(
+           customer=customer_id,
+           items=[{"price": price_id}],
+           default_payment_method=payment_method_id,
+       )
+    4. Handle setup_intent.setup_failed webhook: notify user to retry with different card
+    5. For trial subscriptions: SetupIntent still required — first charge (after trial) is off-session
+    6. Test EU cards: use Stripe test card 4000002500003155 (3DS2 required)
+  severity: critical
+  technologies:
+    lang: [python, javascript]
+    framework: [stripe, fastapi, react]
+  domains:
+    domain: [fintech, saas, payments]
+    concern: [stripe, psd2, 3ds, subscription_setup]
+  example_good: |
+    import stripe
+
+    # Server: create SetupIntent for subscription enrollment
+    def create_setup_intent(customer_id: str) -> dict:
+        intent = stripe.SetupIntent.create(
+            customer=customer_id,
+            payment_method_types=["card"],
+            usage="off_session",          # Critical for PSD2 exemption
+            metadata={"flow": "subscription_enrollment"},
+        )
+        return {"client_secret": intent.client_secret}
+
+    # Server: webhook handler — payment_method attached → create subscription
+    def handle_payment_method_attached(event: dict):
+        pm = event["data"]["object"]
+        customer_id = pm["customer"]
+        pm_id = pm["id"]
+
+        subscription = stripe.Subscription.create(
+            customer=customer_id,
+            items=[{"price": "price_pro_monthly"}],
+            default_payment_method=pm_id,
+            expand=["latest_invoice.payment_intent"],
+        )
+        db.update_user_subscription(customer_id, subscription.id, subscription.status)
+
+    # Client-side (JavaScript):
+    # const result = await stripe.confirmCardSetup(clientSecret, {
+    #   payment_method: { card: cardElement, billing_details: { name: userName } }
+    # });
+  example_bad: |
+    # WRONG: using PaymentIntent for subscription enrollment
+    intent = stripe.PaymentIntent.create(
+        amount=0,                      # Nonsensical zero-amount PaymentIntent
+        currency="eur",
+        customer=customer_id,
+        setup_future_usage="off_session",
+    )
+    # Problem: amount=0 PaymentIntent is not a real SetupIntent.
+    # The card is saved but subsequent off-session charges fail 3DS in EU.
+    # Subscription renewal failure rate in Germany/France: ~40%.
+  when_applies: Implementing subscription enrollment or saving cards for future charges
+  sources:
+    - "https://stripe.com/docs/payments/setup-intents"
+    - "https://stripe.com/docs/payments/3d-secure"
+    - "https://stripe.com/resources/more/best-practices-for-saas-billing"
+    - "https://stripe.com/docs/billing/subscriptions/overview"
+
+- id: SAAS-002
+  text: >
+    Implement feature gating by subscription tier using a centralized FeatureGate service
+    that reads the user's current tier from cache (Redis, TTL 60s). Never check the Stripe
+    API in hot paths — Stripe API latency is 100-300ms and has rate limits. Cache the
+    entitlements: {tier, features, quota_limits} in Redis keyed by user_id. Invalidate
+    the cache on subscription.updated webhook.
+  why: >
+    If your feature gate calls Stripe's API on every API request: at 1000 req/s, you're
+    making 1000 Stripe API calls/second. Stripe's rate limit is 100 req/s (live mode).
+    You'll hit rate limits and start returning 429, which translates to random feature
+    lockouts for paying customers. Even without rate limits: 200ms added to every request
+    × 1000 req/s = 200ms median latency increase. Redis at localhost is 0.1ms.
+  how_to_do_right: |
+    1. Schema: tier ∈ {FREE, BASIC, PRO, ENTERPRISE}
+       Feature matrix stored in code (not DB) — changing features requires a deploy,
+       which is intentional (audit trail for feature changes)
+    2. Cache structure (Redis Hash):
+       HSET user:U-123:entitlements tier PRO api_calls_limit 10000 team_members_limit 20 ...
+       EXPIRE user:U-123:entitlements 60  (60s TTL)
+    3. Gate check path: Redis hit → return. Miss → fetch from DB (subscription table) → write cache.
+    4. On subscription.updated webhook: DEL user:{user_id}:entitlements (immediate invalidation)
+    5. Tier downgrade: grace period 24 hours before removing features (user confusion mitigation)
+    6. Enforcement: return HTTP 402 Payment Required with JSON body including upgrade_url
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, redis, stripe, sqlalchemy]
+  domains:
+    domain: [fintech, saas]
+    concern: [feature_gating, entitlements, caching]
+  example_good: |
+    from enum import Enum
+    from dataclasses import dataclass
+    import redis.asyncio as redis
+
+    class Tier(str, Enum):
+        FREE = "FREE"
+        BASIC = "BASIC"
+        PRO = "PRO"
+        ENTERPRISE = "ENTERPRISE"
+
+    FEATURE_MATRIX = {
+        Tier.FREE:       {"api_calls": 100,    "team_members": 1,   "export": False, "webhooks": False},
+        Tier.BASIC:      {"api_calls": 1_000,  "team_members": 3,   "export": True,  "webhooks": False},
+        Tier.PRO:        {"api_calls": 10_000, "team_members": 20,  "export": True,  "webhooks": True},
+        Tier.ENTERPRISE: {"api_calls": -1,     "team_members": -1,  "export": True,  "webhooks": True},
+    }
+
+    async def get_entitlements(redis_client: redis.Redis, db, user_id: str) -> dict:
+        cache_key = f"user:{user_id}:entitlements"
+        cached = await redis_client.hgetall(cache_key)
+        if cached:
+            return {k.decode(): v.decode() for k, v in cached.items()}
+
+        # Cache miss: fetch from DB
+        sub = await db.get_active_subscription(user_id)
+        tier = Tier(sub.tier) if sub else Tier.FREE
+        features = FEATURE_MATRIX[tier]
+        await redis_client.hset(cache_key, mapping={"tier": tier.value, **{k: str(v) for k, v in features.items()}})
+        await redis_client.expire(cache_key, 60)
+        return features
+
+    async def require_feature(feature: str, user_id: str, redis_client, db):
+        entitlements = await get_entitlements(redis_client, db, user_id)
+        if entitlements.get(feature) in ("False", "0"):
+            raise HTTPException(status_code=402, detail={"error": "feature_not_available", "upgrade_url": "/billing/upgrade"})
+  example_bad: |
+    # WRONG: calling Stripe on every request to check subscription
+    async def check_feature(user_id: str, feature: str):
+        customer = stripe.Customer.retrieve(user_id, expand=["subscriptions"])
+        sub = customer.subscriptions.data[0] if customer.subscriptions.data else None
+        tier = sub.metadata.get("tier", "FREE") if sub else "FREE"
+        # 200ms latency per request. 1000 req/s → hits Stripe rate limit in seconds.
+  when_applies: Any SaaS product with multiple subscription tiers and feature differentiation
+  sources:
+    - "https://stripe.com/docs/billing/subscriptions/overview"
+    - "https://stripe.com/resources/more/best-practices-for-saas-billing"
+    - "https://redis.io/docs/data-types/hashes/"
+
+- id: SAAS-003
+  text: >
+    Track quota usage with atomic Redis counters (INCR + EXPIRE) for daily/monthly reset.
+    Use a Lua script or Redis pipeline for check-and-increment to avoid TOCTOU race
+    conditions. Never check quota in application code then increment separately — two
+    concurrent requests can both pass the check and both increment, exceeding the limit
+    by 2× under load.
+  why: >
+    TOCTOU (time-of-check-time-of-use) race on quota: at 100 req/s, two concurrent
+    requests both read api_calls_count = 99, both see 99 < 100, both increment to 100.
+    User has now made 101 calls against a 100-call limit. At 1000 req/s on a heavily
+    loaded PRO plan: user can exceed quota by hundreds of calls before the counter
+    stabilizes. This enables abuse and revenue leakage. Atomic check-and-increment via
+    Redis Lua eliminates the race entirely.
+  how_to_do_right: |
+    1. Redis key structure: quota:{user_id}:{metric}:{YYYY-MM} (monthly reset)
+       or: quota:{user_id}:{metric}:{YYYY-MM-DD} (daily reset)
+    2. Atomic check-and-increment Lua script (runs atomically in Redis):
+       -- Returns 1 if allowed, 0 if limit exceeded
+       local current = redis.call('GET', KEYS[1])
+       if current and tonumber(current) >= tonumber(ARGV[1]) then return 0 end
+       local new_val = redis.call('INCR', KEYS[1])
+       if new_val == 1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end
+       return 1
+    3. On application startup: preload the Lua script with SCRIPT LOAD
+    4. Monthly reset: key expires automatically (EXPIRE = seconds until end of month)
+    5. Soft limit: at 90% usage → send email warning "You've used 90% of your API quota"
+    6. Hard limit: at 100% → return HTTP 429 with Retry-After header (time until reset)
+    7. Usage dashboard: expose current/limit/reset_at via API for transparency
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [redis, fastapi, celery]
+  domains:
+    domain: [fintech, saas, rate_limiting]
+    concern: [quota_tracking, race_conditions, atomicity]
+  example_good: |
+    import redis
+    from datetime import datetime, timezone
+    import calendar
+
+    # Lua script: atomic check-and-increment
+    QUOTA_CHECK_SCRIPT = """
+    local current = redis.call('GET', KEYS[1])
+    if current and tonumber(current) >= tonumber(ARGV[1]) then
+        return {0, tonumber(current)}
+    end
+    local new_val = redis.call('INCR', KEYS[1])
+    if new_val == 1 then
+        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+    end
+    return {1, new_val}
+    """
+
+    class QuotaService:
+        def __init__(self, redis_client: redis.Redis):
+            self.redis = redis_client
+            self._script_sha = redis_client.script_load(QUOTA_CHECK_SCRIPT)
+
+        def check_and_increment(self, user_id: str, metric: str, limit: int) -> tuple[bool, int]:
+            now = datetime.now(timezone.utc)
+            # Key expires at end of current month
+            days_remaining = calendar.monthrange(now.year, now.month)[1] - now.day
+            ttl_seconds = days_remaining * 86400 + (86400 - now.hour * 3600)
+
+            key = f"quota:{user_id}:{metric}:{now.strftime('%Y-%m')}"
+            allowed, count = self.redis.evalsha(
+                self._script_sha, 1, key, str(limit), str(ttl_seconds)
+            )
+            return bool(allowed), int(count)
+
+    # Usage in FastAPI middleware
+    allowed, count = quota_service.check_and_increment(user_id, "api_calls", limit=10_000)
+    if not allowed:
+        raise HTTPException(status_code=429, detail={"quota_used": count, "quota_limit": 10_000})
+  example_bad: |
+    # WRONG: non-atomic check-then-increment (TOCTOU race)
+    async def check_quota(user_id: str, limit: int) -> bool:
+        current = int(await redis.get(f"quota:{user_id}") or 0)
+        if current >= limit:
+            return False  # Denied
+        # RACE CONDITION: another request reads 'current' here simultaneously
+        await redis.incr(f"quota:{user_id}")
+        return True  # Both requests pass and both increment → exceeds limit
+  when_applies: Any SaaS product with per-user or per-tenant usage limits and metered features
+  sources:
+    - "https://redis.io/docs/manual/programmability/eval-intro/"
+    - "https://stripe.com/docs/billing/subscriptions/metered-billing"
+    - "https://stripe.com/resources/more/usage-based-pricing-for-saas-how-to-make-this-pricing-model-work"
+
+- id: SAAS-004
+  text: >
+    Implement Stripe metered billing by reporting usage records to Stripe at the END of
+    the billing period (or incrementally throughout). Use stripe.SubscriptionItem.create_usage_record()
+    with action="increment" for incremental reporting. Never use action="set" for high-frequency
+    events — it replaces the total, causing race conditions. Buffer events in Redis and flush
+    to Stripe hourly (not per-event) to avoid API rate limits.
+  why: >
+    Reporting a usage record to Stripe per API call at 10K calls/day = 10K Stripe API
+    calls/day per customer. At 1000 customers: 10M Stripe API calls/day. Stripe's limit:
+    100 req/s in live mode = 8.6M req/day. You'll hit rate limits. The production-grade
+    pattern: buffer events in Redis (INCR per event), flush hourly with a single
+    stripe.SubscriptionItem.create_usage_record() per customer. At 1000 customers:
+    1000 Stripe API calls/hour = 24K/day. 400× more efficient.
+  how_to_do_right: |
+    1. Per-event: increment Redis counter (atomic, no Stripe call)
+       INCR usage:{customer_id}:{metric}:{YYYY-MM-DD-HH}
+
+    2. Hourly Celery task: flush to Stripe
+       a. GETDEL usage:{customer_id}:{metric}:{prev_hour_key}  → quantity
+       b. If quantity > 0: stripe.SubscriptionItem.create_usage_record(
+              si_id, quantity=quantity, timestamp=hour_start_unix,
+              action="increment"
+          )
+       c. Store in local DB: usage_records(customer_id, metric, quantity, hour, stripe_recorded_at)
+
+    3. End-of-period reconciliation: compare DB total vs Stripe invoice line items
+       Any discrepancy > 1% → alert + manual correction via usage record adjustment
+
+    4. Idempotency key for Stripe calls: f"usage-{customer_id}-{metric}-{hour}"
+       Prevents double-reporting on retry
+
+    5. Test: use Stripe test mode subscription, verify invoice shows correct usage quantity
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [stripe, redis, celery, fastapi]
+  domains:
+    domain: [fintech, saas, billing]
+    concern: [metered_billing, usage_tracking, stripe_api]
+  example_good: |
+    import stripe
+    import redis
+    from celery import shared_task
+    from datetime import datetime, timezone
+
+    redis_client = redis.Redis()
+
+    def record_usage_event(customer_id: str, metric: str, quantity: int = 1):
+        """Fast path: atomic Redis increment. No Stripe API call."""
+        now = datetime.now(timezone.utc)
+        hour_key = f"usage:{customer_id}:{metric}:{now.strftime('%Y-%m-%d-%H')}"
+        redis_client.incrby(hour_key, quantity)
+        redis_client.expire(hour_key, 86400 * 3)  # 3-day safety TTL
+
+    @shared_task
+    def flush_usage_to_stripe():
+        """Hourly task: flush buffered usage to Stripe."""
+        from datetime import timedelta
+        prev_hour = datetime.now(timezone.utc) - timedelta(hours=1)
+        hour_key_pattern = f"usage:*:*:{prev_hour.strftime('%Y-%m-%d-%H')}"
+
+        for key in redis_client.scan_iter(hour_key_pattern):
+            quantity = redis_client.getdel(key)
+            if not quantity or int(quantity) == 0:
+                continue
+
+            parts = key.decode().split(":")
+            customer_id, metric = parts[1], parts[2]
+
+            sub_item = db.get_stripe_subscription_item(customer_id, metric)
+            if not sub_item:
+                continue
+
+            stripe.SubscriptionItem.create_usage_record(
+                sub_item.stripe_id,
+                quantity=int(quantity),
+                timestamp=int(prev_hour.replace(minute=0, second=0).timestamp()),
+                action="increment",
+                idempotency_key=f"usage-{customer_id}-{metric}-{prev_hour.strftime('%Y%m%d%H')}",
+            )
+  example_bad: |
+    # WRONG: calling Stripe on every event
+    def record_api_call(customer_id: str):
+        sub_item_id = db.get_subscription_item(customer_id)
+        stripe.SubscriptionItem.create_usage_record(
+            sub_item_id,
+            quantity=1,
+            action="increment",
+        )
+        # At 10K events/day × 1000 customers = 10M Stripe calls/day
+        # Stripe limit: 8.6M/day. Rate limit errors. Missed revenue.
+  when_applies: Implementing usage-based or metered billing with Stripe
+  sources:
+    - "https://stripe.com/docs/billing/subscriptions/metered-billing"
+    - "https://stripe.com/docs/api/usage_records/create"
+    - "https://colorwhistle.com/stripe-saas-credits-billing/"
+
+- id: SAAS-005
+  text: >
+    Process Stripe webhooks idempotently by storing each processed stripe_event_id in
+    a database table before processing. Stripe delivers events at-least-once and out-of-order.
+    Handle out-of-order delivery by comparing event.created timestamp before updating state.
+    Never trust the webhook payload alone for financial state — always re-fetch from Stripe
+    API to get the authoritative state.
+  why: >
+    Stripe's webhook delivery guarantees at-least-once delivery with up to 3-day retry window.
+    Common scenario: your server returns HTTP 500 → Stripe retries the webhook 23 hours later
+    → your handler fires again → customer subscription is created twice → duplicate charge.
+    Out-of-order example: invoice.payment_succeeded arrives before invoice.created (Stripe
+    does not guarantee ordering). Naive handlers that don't check timestamps set subscription
+    to "active" and then a delayed event sets it to "past_due" — subscription appears to
+    downgrade randomly.
+  how_to_do_right: |
+    1. Webhook table:
+       CREATE TABLE stripe_events (
+           stripe_event_id VARCHAR(64) PRIMARY KEY,
+           event_type VARCHAR(100) NOT NULL,
+           processed_at TIMESTAMP NOT NULL DEFAULT NOW(),
+           status VARCHAR(20) NOT NULL DEFAULT 'processing'
+       );
+
+    2. Idempotency check at start of handler:
+       a. INSERT INTO stripe_events (stripe_event_id, event_type, status) VALUES (event.id, event.type, 'processing')
+          ON CONFLICT (stripe_event_id) DO NOTHING RETURNING stripe_event_id
+       b. If no row returned → already processed, return HTTP 200 immediately
+
+    3. Re-fetch from Stripe (never trust payload alone):
+       subscription = stripe.Subscription.retrieve(event.data.object.id)
+
+    4. Out-of-order guard: check event.created > db_subscription.last_event_at before updating
+
+    5. After processing: UPDATE stripe_events SET status = 'completed' WHERE stripe_event_id = event.id
+
+    6. Verify webhook signature: stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
+       — prevents fake webhooks
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [stripe, fastapi, postgresql, sqlalchemy]
+  domains:
+    domain: [fintech, saas, payments]
+    concern: [webhook_idempotency, stripe, event_processing]
+  example_good: |
+    import stripe
+    from fastapi import Request, HTTPException
+
+    @router.post("/webhooks/stripe")
+    async def stripe_webhook(request: Request, db: AsyncSession):
+        payload = await request.body()
+        sig_header = request.headers.get("stripe-signature")
+
+        # Step 1: Verify signature (reject fake webhooks)
+        try:
+            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        except stripe.error.SignatureVerificationError:
+            raise HTTPException(status_code=400, detail="Invalid signature")
+
+        # Step 2: Idempotency check (insert-or-skip)
+        result = await db.execute(
+            text("""
+                INSERT INTO stripe_events (stripe_event_id, event_type, status)
+                VALUES (:event_id, :event_type, 'processing')
+                ON CONFLICT (stripe_event_id) DO NOTHING
+                RETURNING stripe_event_id
+            """),
+            {"event_id": event["id"], "event_type": event["type"]}
+        )
+        if result.rowcount == 0:
+            return {"status": "already_processed"}  # idempotent skip
+
+        # Step 3: Re-fetch authoritative state from Stripe
+        if event["type"] == "customer.subscription.updated":
+            sub_id = event["data"]["object"]["id"]
+            subscription = stripe.Subscription.retrieve(sub_id)  # authoritative state
+            await handle_subscription_updated(db, subscription, event["created"])
+
+        await db.execute(
+            text("UPDATE stripe_events SET status = 'completed' WHERE stripe_event_id = :id"),
+            {"id": event["id"]}
+        )
+        await db.commit()
+        return {"status": "processed"}
+  example_bad: |
+    @router.post("/webhooks/stripe")
+    async def stripe_webhook(request: Request, db):
+        payload = await request.json()
+        # WRONG: no signature verification, no idempotency check, trusting payload
+        if payload["type"] == "customer.subscription.updated":
+            sub = payload["data"]["object"]  # stale snapshot, not authoritative
+            await db.update_subscription(sub["customer"], sub["status"])
+            # Stripe retries → handler fires twice → two DB updates with possibly different state
+            # Malicious actor sends fake webhook → fraudulent subscription activation
+  when_applies: Any Stripe webhook endpoint processing subscription or payment events
+  sources:
+    - "https://stripe.com/docs/webhooks"
+    - "https://stripe.com/docs/api/idempotent_requests"
+    - "https://www.stigg.io/blog-posts/best-practices-i-wish-we-knew-when-integrating-stripe-webhooks"
+    - "https://dev.to/aniefon_umanah_ac5f21311c/building-reliable-stripe-subscriptions-in-nestjs-webhook-idempotency-and-optimistic-locking-3o91"
+
+- id: SAAS-006
+  text: >
+    Implement the subscription state machine explicitly: TRIALING → ACTIVE → PAST_DUE →
+    CANCELED → EXPIRED. Enforce valid transitions only. CANCELED subscriptions cannot
+    go back to ACTIVE without a new subscription creation. PAST_DUE suspends features
+    after a configurable grace period (default: 7 days). Store state transition history
+    for audit and customer support.
+  why: >
+    Without an explicit state machine, subscription state becomes inconsistent under edge
+    cases: webhook fires subscription.deleted while customer is in a trial, handler sets
+    status to CANCELED — customer loses trial access they paid setup fee for. Or: dunning
+    retry succeeds, subscription goes ACTIVE, but app still shows PAST_DUE because the
+    active check reads cached stale state. Explicit state machine with valid transition
+    enforcement catches these bugs at the state transition layer, not in production support tickets.
+  how_to_do_right: |
+    1. Subscription states and Stripe event → state mapping:
+       TRIALING: subscription.created with trial_end set
+       ACTIVE: subscription.updated (status=active) OR payment_intent.succeeded after PAST_DUE
+       PAST_DUE: invoice.payment_failed (first failure)
+       CANCELED: customer.subscription.deleted
+       EXPIRED: custom state after grace period exhausted
+
+    2. Valid transitions:
+       TRIALING  → ACTIVE    (trial ends, first payment succeeds)
+       TRIALING  → CANCELED  (user cancels during trial)
+       ACTIVE    → PAST_DUE  (payment fails)
+       ACTIVE    → CANCELED  (user cancels or admin action)
+       PAST_DUE  → ACTIVE    (payment retry succeeds)
+       PAST_DUE  → CANCELED  (max retries exhausted)
+       PAST_DUE  → EXPIRED   (grace period + no payment)
+
+    3. Store transition history:
+       CREATE TABLE subscription_transitions (
+           id BIGSERIAL PRIMARY KEY,
+           subscription_id VARCHAR(64) NOT NULL,
+           from_state VARCHAR(20),
+           to_state VARCHAR(20) NOT NULL,
+           reason VARCHAR(100),
+           stripe_event_id VARCHAR(64),
+           transitioned_at TIMESTAMP DEFAULT NOW()
+       );
+
+    4. Feature suspension: on PAST_DUE → schedule Celery task to set is_suspended=TRUE at grace_period_end
+    5. Re-activation: on ACTIVE (from PAST_DUE) → cancel suspension task, clear is_suspended
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [stripe, fastapi, postgresql, celery]
+  domains:
+    domain: [fintech, saas, billing]
+    concern: [state_machine, subscription_lifecycle, dunning]
+  example_good: |
+    from enum import Enum
+    from typing import Optional
+
+    class SubscriptionState(str, Enum):
+        TRIALING = "TRIALING"
+        ACTIVE = "ACTIVE"
+        PAST_DUE = "PAST_DUE"
+        CANCELED = "CANCELED"
+        EXPIRED = "EXPIRED"
+
+    VALID_TRANSITIONS = {
+        SubscriptionState.TRIALING:  {SubscriptionState.ACTIVE, SubscriptionState.CANCELED},
+        SubscriptionState.ACTIVE:    {SubscriptionState.PAST_DUE, SubscriptionState.CANCELED},
+        SubscriptionState.PAST_DUE:  {SubscriptionState.ACTIVE, SubscriptionState.CANCELED, SubscriptionState.EXPIRED},
+        SubscriptionState.CANCELED:  set(),   # terminal — no transitions out
+        SubscriptionState.EXPIRED:   set(),   # terminal
+    }
+
+    async def transition_subscription(db, sub_id: str, to_state: SubscriptionState,
+                                       reason: str, stripe_event_id: Optional[str] = None):
+        subscription = await db.get_subscription(sub_id)
+        from_state = SubscriptionState(subscription.state)
+
+        if to_state not in VALID_TRANSITIONS[from_state]:
+            raise ValueError(f"Invalid transition: {from_state} → {to_state}")
+
+        async with db.begin():
+            await db.update_subscription_state(sub_id, to_state)
+            await db.insert_transition_history(sub_id, from_state, to_state, reason, stripe_event_id)
+
+            if to_state == SubscriptionState.PAST_DUE:
+                # Schedule suspension after grace period
+                suspend_subscription.apply_async(args=[sub_id], countdown=7 * 86400)
+
+            elif to_state == SubscriptionState.ACTIVE and from_state == SubscriptionState.PAST_DUE:
+                # Cancel pending suspension
+                revoke_suspension_task(sub_id)
+                await db.clear_suspension(sub_id)
+  example_bad: |
+    # WRONG: no state machine, ad-hoc status updates
+    async def handle_payment_failed(stripe_event):
+        customer_id = stripe_event["data"]["object"]["customer"]
+        # Direct status overwrite with no transition validation
+        await db.execute("UPDATE subscriptions SET status = 'past_due' WHERE customer_id = $1", customer_id)
+        # No history. No grace period logic. CANCELED → PAST_DUE transition possible (invalid).
+        # Support ticket: "I canceled my subscription but my card is still being charged"
+  when_applies: Implementing subscription management in any SaaS product with Stripe Billing
+  sources:
+    - "https://stripe.com/docs/billing/subscriptions/overview#subscription-states"
+    - "https://stripe.com/docs/billing/subscriptions/webhooks"
+    - "https://www.getlago.com/blog/subscription-management-best-practices-and-strategies"
+
+- id: SAAS-007
+  text: >
+    Configure Stripe's Smart Retries (dunning) with a custom retry schedule: attempt 1
+    at 3 days, attempt 2 at 7 days, attempt 3 at 14 days, attempt 4 at 28 days. Send
+    in-app notification + email at each failed attempt. Suspend account access after
+    attempt 2 (day 7) — not immediately on first failure. Cancel and stop attempting
+    after attempt 4. Never retry more than 4 times — card declinations after 4 attempts
+    signal a definitively invalid card, not a transient issue.
+  why: >
+    Stripe reports that 41% of failed recurring payments are recovered through automated
+    retries. However: retrying too aggressively (same day, multiple times) triggers bank
+    fraud detection and permanently blocks the card for your merchant ID. The 3-7-14-28
+    schedule aligns with when users typically notice bank notifications and update cards.
+    Suspending on attempt 2 (not 1) gives users one "grace" failure for legitimate transient
+    issues (insufficient funds on payday) while still creating urgency to update their card.
+  how_to_do_right: |
+    1. In Stripe Dashboard: Billing → Settings → Retry schedule:
+       - Attempt 1: 3 days after failure
+       - Attempt 2: 7 days after failure
+       - Attempt 3: 14 days after failure
+       - Attempt 4: 28 days after failure
+       - After last attempt: cancel subscription
+
+    2. Webhook handlers:
+       invoice.payment_failed → failed_count += 1
+         If failed_count == 1: send "Payment failed" email, no suspension yet
+         If failed_count == 2: send "Action required" email + suspend account
+         If failed_count >= 3: send "Account suspended" email
+
+    3. Stripe Smart Retries: enable in Billing settings — ML-based optimal retry timing
+       (better than fixed schedule for card-not-present recovery)
+
+    4. Customer portal: stripe.billing_portal.Session.create() — let customers
+       self-service update payment method without contacting support
+
+    5. Invoice.payment_succeeded after PAST_DUE: reactivate + send "Welcome back" email
+
+    6. Metric: track recovery rate by attempt number — optimize schedule quarterly
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [stripe, fastapi, celery]
+  domains:
+    domain: [fintech, saas, billing, dunning]
+    concern: [dunning, payment_recovery, subscription_retention]
+  example_good: |
+    import stripe
+    from datetime import timedelta
+
+    DUNNING_ACTIONS = {
+        1: {"suspend": False, "email_template": "payment_failed_first"},
+        2: {"suspend": True,  "email_template": "payment_failed_action_required"},
+        3: {"suspend": True,  "email_template": "payment_failed_final_warning"},
+        4: {"suspend": True,  "email_template": "subscription_canceled"},
+    }
+
+    async def handle_invoice_payment_failed(event: dict, db, email_service):
+        invoice = stripe.Invoice.retrieve(event["data"]["object"]["id"])
+        customer_id = invoice["customer"]
+        subscription_id = invoice["subscription"]
+
+        # Increment failure count
+        sub = await db.get_subscription_by_stripe_id(subscription_id)
+        new_count = sub.dunning_attempt_count + 1
+        await db.update_dunning_count(sub.id, new_count)
+
+        action = DUNNING_ACTIONS.get(new_count, DUNNING_ACTIONS[4])
+
+        # Send dunning email
+        await email_service.send(
+            template=action["email_template"],
+            to=sub.user_email,
+            data={
+                "portal_url": stripe.billing_portal.Session.create(
+                    customer=customer_id,
+                    return_url="https://app.example.com/billing"
+                ).url
+            }
+        )
+
+        # Suspend if configured
+        if action["suspend"]:
+            await db.suspend_subscription(sub.id, reason=f"dunning_attempt_{new_count}")
+            await invalidate_entitlement_cache(customer_id)
+  example_bad: |
+    # WRONG: suspend on first failure, no graduated response
+    async def handle_payment_failed(event: dict, db):
+        customer_id = event["data"]["object"]["customer"]
+        # Immediate account lockout on first failure
+        await db.deactivate_account(customer_id)
+        # Customer's card declined due to bank maintenance window.
+        # They wake up locked out. Churn. Could have been retained with 3-day retry.
+  when_applies: Configuring payment recovery and dunning for subscription billing
+  sources:
+    - "https://stripe.com/docs/billing/revenue-recovery/smart-retries"
+    - "https://stripe.com/docs/billing/revenue-recovery/dunning"
+    - "https://docs.stripe.com/billing/subscriptions/overview#subscription-states"
+
+- id: SAAS-008
+  text: >
+    Handle proration correctly on mid-cycle plan changes. Stripe computes proration
+    automatically when subscription_proration_behavior = 'create_prorations'. Verify
+    the upcoming invoice preview before applying the change. For immediate upgrades:
+    charge the proration difference immediately (payment_behavior = 'default_incomplete').
+    For downgrades: credit the difference on the next invoice. Never set proration_behavior
+    = 'none' for upgrades — users will be charged full price for a plan they only used
+    partially.
+  why: >
+    Incorrect proration is a billing compliance issue and a churn driver. If a user
+    upgrades from BASIC ($29) to PRO ($99) on day 15 of a 30-day cycle, they owe
+    $35 for the remaining 15 days of PRO minus the $14.50 unused BASIC credit = $20.50.
+    Without proration: you charge them $99 on day 30 for a month that included 15 days
+    of BASIC and 15 days of PRO — effectively double-charging for 15 days. Users notice,
+    dispute via credit card chargeback, and churn.
+  how_to_do_right: |
+    1. Preview upcoming invoice before applying change:
+       preview = stripe.Invoice.upcoming(
+           customer=customer_id,
+           subscription=subscription_id,
+           subscription_items=[{"id": current_item_id, "price": new_price_id}],
+           subscription_proration_behavior="create_prorations",
+       )
+       Show preview to user in UI: "You'll be charged $20.50 now for the upgrade"
+
+    2. Apply the change with immediate charge for upgrades:
+       stripe.Subscription.modify(
+           subscription_id,
+           items=[{"id": current_item_id, "price": new_price_id}],
+           proration_behavior="create_prorations",
+           payment_behavior="default_incomplete",   # charge proration immediately
+           expand=["latest_invoice.payment_intent"],
+       )
+
+    3. If latest_invoice.payment_intent.status == "requires_action":
+          → Send client_secret to frontend for 3DS confirmation
+       If status == "succeeded": → upgrade complete
+
+    4. For downgrades (to lower tier):
+       proration_behavior="create_prorations"  # credit applied to next invoice
+       payment_behavior="pending_if_incomplete"  # no immediate charge
+
+    5. Log: subscription_change(user_id, from_price, to_price, proration_amount, stripe_invoice_id)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [stripe, fastapi]
+  domains:
+    domain: [fintech, saas, billing]
+    concern: [proration, plan_change, billing_accuracy]
+  example_good: |
+    import stripe
+
+    def upgrade_subscription(subscription_id: str, new_price_id: str, current_item_id: str) -> dict:
+        # Step 1: Preview the proration charge
+        preview = stripe.Invoice.upcoming(
+            subscription=subscription_id,
+            subscription_items=[{"id": current_item_id, "price": new_price_id}],
+            subscription_proration_behavior="create_prorations",
+        )
+        proration_amount = sum(
+            line.amount for line in preview.lines.data if line.proration
+        )
+
+        # Step 2: Apply upgrade with immediate charge
+        subscription = stripe.Subscription.modify(
+            subscription_id,
+            items=[{"id": current_item_id, "price": new_price_id}],
+            proration_behavior="create_prorations",
+            payment_behavior="default_incomplete",
+            expand=["latest_invoice.payment_intent"],
+        )
+
+        pi = subscription.latest_invoice.payment_intent
+        if pi and pi.status == "requires_payment_method":
+            raise ValueError("Payment failed — card declined")
+        if pi and pi.status == "requires_action":
+            return {"requires_action": True, "client_secret": pi.client_secret}
+
+        return {"success": True, "amount_charged": proration_amount}
+  example_bad: |
+    # WRONG: no proration on upgrade
+    stripe.Subscription.modify(
+        subscription_id,
+        items=[{"id": current_item_id, "price": new_price_id}],
+        proration_behavior="none",   # user charged full PRO price next cycle
+    )
+    # User upgraded on day 15. Next invoice: full $99 for PRO.
+    # They already paid $29 for BASIC this cycle. Net: paid for 45 days in a 30-day month.
+    # Chargeback: $29 (the BASIC payment they feel was wasted).
+  when_applies: Implementing plan upgrade or downgrade flows in subscription billing
+  sources:
+    - "https://stripe.com/docs/billing/subscriptions/upgrade-downgrade"
+    - "https://stripe.com/docs/api/invoices/upcoming"
+    - "https://stripe.com/docs/billing/subscriptions/pending-updates"
+
+- id: SAAS-009
+  text: >
+    Instrument freemium-to-paid conversion with a full funnel: free_signup → feature_limit_hit
+    → upgrade_modal_shown → plan_selected → checkout_started → payment_completed. Track
+    drop-off at each step in your analytics system. The most impactful optimization is
+    always at the highest-drop-off step. Without funnel instrumentation, you are guessing
+    about conversion optimization.
+  why: >
+    Typical freemium conversion rates: 2-5% (median), 8-15% (top quartile). The difference
+    between 3% and 8% conversion on 10,000 free users = 500 additional paid users. At
+    $29/month = $14,500 MRR difference. Without funnel data, engineering teams optimize
+    the wrong step. Common finding: 60% of users who see the upgrade modal immediately
+    close it — the problem is the modal content, not the payment flow. Instrumentation
+    reveals this in a week; guessing takes quarters.
+  how_to_do_right: |
+    1. Fire analytics events at every step (use a wrapper to ensure consistency):
+       track_funnel_event(user_id, "upgrade_funnel", "feature_limit_hit",
+                          {"feature": "api_calls", "used": 100, "limit": 100, "tier": "FREE"})
+
+    2. Key events and properties:
+       free_signup: source, referrer, initial_intent
+       feature_limit_hit: feature, limit, plan_that_unlocks
+       upgrade_modal_shown: trigger (limit_hit | proactive | admin)
+       plan_selected: plan, billing_period (monthly|annual), amount
+       checkout_started: plan, stripe_session_id
+       checkout_abandoned: plan, time_on_page_seconds
+       payment_completed: plan, amount, coupon, trial_used
+
+    3. Weekly funnel report:
+       For each consecutive step pair: conversion_rate = step_n+1_users / step_n_users
+       Rank by lowest conversion — that is your next A/B test target
+
+    4. Identify "almost converted" users: opened modal + selected plan + abandoned at checkout
+       → targeted email within 24 hours with support offer
+
+    5. Avoid PII in analytics events — use pseudonymized user_id only (see DWH-011)
+  severity: medium
+  technologies:
+    lang: [python, javascript]
+    framework: [mixpanel, segment, amplitude, fastapi, react]
+  domains:
+    domain: [saas, product_analytics, growth]
+    concern: [conversion_funnel, instrumentation, growth_metrics]
+  example_good: |
+    # Centralized funnel event wrapper (Python)
+    from typing import Optional
+    import time
+
+    class FunnelTracker:
+        UPGRADE_FUNNEL = "upgrade_funnel"
+
+        def __init__(self, analytics_client):
+            self.client = analytics_client
+
+        def track(self, user_id: str, funnel: str, step: str, properties: dict):
+            """Pseudonymized tracking — no raw PII."""
+            self.client.track(
+                anonymous_id=pseudonymize(user_id),  # never raw email
+                event=f"{funnel}.{step}",
+                properties={
+                    **properties,
+                    "timestamp": int(time.time()),
+                    "server_side": True,
+                }
+            )
+
+        def feature_limit_hit(self, user_id: str, feature: str, limit: int, current_tier: str):
+            self.track(user_id, self.UPGRADE_FUNNEL, "feature_limit_hit", {
+                "feature": feature, "limit": limit, "current_tier": current_tier,
+                "plan_that_unlocks": FEATURE_TO_MIN_PLAN[feature],
+            })
+
+        def payment_completed(self, user_id: str, plan: str, amount_cents: int,
+                              annual: bool, coupon: Optional[str] = None):
+            self.track(user_id, self.UPGRADE_FUNNEL, "payment_completed", {
+                "plan": plan, "amount_cents": amount_cents,
+                "billing_period": "annual" if annual else "monthly",
+                "coupon_used": coupon is not None,
+            })
+  example_bad: |
+    # WRONG: no funnel instrumentation
+    @router.post("/upgrade")
+    async def upgrade(user_id: str, plan: str):
+        # Creates Stripe checkout session but tracks nothing
+        session = stripe.checkout.Session.create(...)
+        return {"url": session.url}
+    # After 6 months: "Why is conversion rate 1.8%? Nobody knows."
+    # Engineering team rebuilds the checkout flow (wrong fix).
+    # Actual issue: upgrade modal shows PRO before BASIC — users confused by price jump.
+  when_applies: Any freemium SaaS product with a free-to-paid conversion goal
+  sources:
+    - "https://stripe.com/docs/payments/checkout/custom-success-page"
+    - "https://segment.com/docs/connections/spec/track/"
+    - "https://www.getlago.com/blog/subscription-management-best-practices-and-strategies"
+
+- id: SAAS-010
+  text: >
+    Handle trial expiration with a 3-step sequence: (1) email at T-7 days "trial ending soon"
+    with upgrade CTA, (2) email at T-1 day "last chance" with one-click upgrade, (3) at
+    trial end, downgrade to FREE tier (not suspend/cancel) and show in-app banner.
+    Suspension at trial end causes 40% more churn than graceful downgrade to free tier.
+    Give users a 7-day post-trial window to convert before removing any trial-exclusive features.
+  why: >
+    Stripe's default trial_end behavior sends the user to PAST_DUE if no payment method
+    is on file. PAST_DUE with no payment method on file → Stripe immediately cancels
+    (no retry possible). User experience: working trial → account gone overnight. 85%
+    of users who experience this do not return. Graceful downgrade to FREE tier keeps the
+    user engaged — they can still use the product and convert later. SaaS studies show
+    that 23% of "expired trial" users convert within 30 days when given a graceful downgrade.
+  how_to_do_right: |
+    1. Configure Stripe subscription with trial: trial_end = now + 14 days
+       payment_settings.save_default_payment_method = "on_subscription"
+
+    2. Proactive email sequence (Celery tasks scheduled at trial creation):
+       T-7: task("trial_ending_7_days", user_id, eta=trial_end - 7 days)
+       T-1: task("trial_ending_1_day",  user_id, eta=trial_end - 1 day)
+       T=0: task("trial_expired",       user_id, eta=trial_end)
+
+    3. At T=0 with no payment method: call stripe.Subscription.cancel()
+       then set local subscription state to FREE (not CANCELED/SUSPENDED)
+       Keep user's data, show upgrade banner
+
+    4. At T=0 with payment method: Stripe auto-charges. Handle invoice.payment_succeeded
+       → ACTIVE state. Handle invoice.payment_failed → dunning flow (SAAS-007)
+
+    5. 7-day post-trial window: restore trial-exclusive feature access for 7 days
+       (database flag: trial_grace_expires_at = trial_end + 7 days)
+
+    6. Metric: trial_conversion_rate = users_converted / (users_expired + users_converted)
+       Baseline: 15-25%. Alert if drops below 12%.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [stripe, celery, fastapi]
+  domains:
+    domain: [fintech, saas, billing, retention]
+    concern: [trial_management, churn, conversion]
+  example_good: |
+    from celery import shared_task
+    from datetime import timedelta
+    import stripe
+
+    def create_trial_subscription(user_id: str, customer_id: str, trial_days: int = 14):
+        trial_end = int((datetime.utcnow() + timedelta(days=trial_days)).timestamp())
+
+        subscription = stripe.Subscription.create(
+            customer=customer_id,
+            items=[{"price": "price_pro_monthly"}],
+            trial_end=trial_end,
+            payment_settings={"save_default_payment_method": "on_subscription"},
+        )
+
+        # Schedule trial lifecycle tasks
+        trial_end_dt = datetime.utcfromtimestamp(trial_end)
+        send_trial_ending_7_days.apply_async(args=[user_id], eta=trial_end_dt - timedelta(days=7))
+        send_trial_ending_1_day.apply_async(args=[user_id], eta=trial_end_dt - timedelta(days=1))
+        handle_trial_end.apply_async(args=[user_id, subscription.id], eta=trial_end_dt)
+        return subscription
+
+    @shared_task
+    async def handle_trial_end(user_id: str, stripe_subscription_id: str):
+        sub = await db.get_subscription_by_stripe_id(stripe_subscription_id)
+        if sub.state == "TRIALING":
+            # No payment method collected → graceful downgrade
+            stripe.Subscription.cancel(stripe_subscription_id)
+            await db.set_tier(user_id, "FREE")
+            await db.set_trial_grace_expires_at(user_id, datetime.utcnow() + timedelta(days=7))
+            await email_service.send("trial_expired_downgraded", user_id)
+  example_bad: |
+    # WRONG: rely on Stripe default trial_end behavior with no payment method
+    # Stripe behavior: subscription moves to incomplete_expired → canceled
+    # No email sent (unless you configure Stripe email — not customizable)
+    # User wakes up to "Your account has been canceled"
+    # No graceful downgrade. All data access gone. 85% churn rate.
+    stripe.Subscription.create(
+        customer=customer_id,
+        items=[{"price": "price_pro_monthly"}],
+        trial_end=trial_end,
+        # No tasks scheduled, no grace period, no email sequence
+    )
+  when_applies: Any SaaS product with free trials converting to paid subscriptions
+  sources:
+    - "https://stripe.com/docs/billing/subscriptions/trials"
+    - "https://stripe.com/docs/billing/subscriptions/overview#trial"
+    - "https://www.getlago.com/blog/subscription-management-best-practices-and-strategies"
+
+- id: SAAS-011
+  text: >
+    Implement cancellation flow with a retention offer (pause subscription or 1-month discount)
+    before completing cancellation. Show the offer only once per 6 months per user — offering
+    it every time trains users to cancel expecting a discount. Measure retention_offer_acceptance_rate.
+    If > 30%: offer is effective. If < 5%: offer is wrong (wrong incentive or wrong timing).
+    Store cancellation reason for product intelligence.
+  why: >
+    Stripe research shows that 15-30% of users who initiate cancellation can be retained
+    with a pause or discount offer. At $1000 MRR and 5% monthly churn: 50 cancellations/month.
+    If 20% accept a pause: 10 users retained × $29/month = $290 MRR saved/month.
+    Cancellation reason data is the highest-signal product feedback you can collect —
+    "too expensive" vs "missing feature X" vs "switching to competitor Y" drives completely
+    different roadmap decisions. Without it, you are flying blind on churn.
+  how_to_do_right: |
+    1. Cancellation flow steps:
+       a. Show: "Before you go — here's why customers stay" (social proof)
+       b. Ask: cancellation_reason (radio: too_expensive | missing_feature | switching | not_using | other)
+       c. If too_expensive + last_offer_shown > 6 months ago: show discount offer (1 month 50% off)
+       d. If not_using: offer subscription pause (1-3 months) instead of cancel
+       e. Final confirmation: "Your plan will remain active until {period_end}"
+          (never cancel immediately — cancel at period end)
+
+    2. Cancel at period end, not immediately:
+       stripe.Subscription.modify(subscription_id, cancel_at_period_end=True)
+       Show "Cancels on {period_end}" banner — user has until then to reconsider
+
+    3. Post-cancel email at T-7 days before period end: "We hate to see you go" + re-subscribe CTA
+
+    4. Store: cancellation_reasons table (subscription_id, reason, offered_discount, accepted_discount,
+       offered_pause, accepted_pause, canceled_at)
+
+    5. Weekly report: churn_reasons distribution → feed into product backlog
+  severity: medium
+  technologies:
+    lang: [python, javascript]
+    framework: [stripe, fastapi, react]
+  domains:
+    domain: [fintech, saas, retention, product]
+    concern: [churn, cancellation_flow, retention_offers]
+  example_good: |
+    import stripe
+
+    async def process_cancellation(user_id: str, subscription_id: str,
+                                    reason: str, accept_offer: bool) -> dict:
+        sub = await db.get_subscription(user_id)
+        result = {}
+
+        # Check if retention offer applies
+        offer_eligible = (
+            reason in ("too_expensive", "not_using") and
+            (sub.last_offer_shown_at is None or
+             (datetime.utcnow() - sub.last_offer_shown_at).days > 180)
+        )
+
+        if offer_eligible and not accept_offer:
+            # Show offer — don't cancel yet
+            await db.update_last_offer_shown(user_id)
+            if reason == "too_expensive":
+                return {"show_offer": True, "offer_type": "discount",
+                        "offer_description": "50% off your next 2 months"}
+            else:
+                return {"show_offer": True, "offer_type": "pause",
+                        "offer_description": "Pause your subscription for up to 3 months"}
+
+        if accept_offer:
+            if reason == "too_expensive":
+                stripe.Subscription.modify(subscription_id,
+                    coupon="50PCT_2MONTHS", proration_behavior="none")
+            else:  # pause
+                stripe.Subscription.modify(subscription_id,
+                    pause_collection={"behavior": "mark_uncollectible"})
+            result["retained"] = True
+        else:
+            # Cancel at period end (not immediately)
+            stripe.Subscription.modify(subscription_id, cancel_at_period_end=True)
+            result["cancels_at"] = sub.current_period_end.isoformat()
+
+        await db.store_cancellation_reason(subscription_id, reason, accept_offer)
+        return result
+  example_bad: |
+    # WRONG: immediate cancellation, no retention, no reason capture
+    @router.delete("/subscription")
+    async def cancel_subscription(user_id: str, db):
+        sub = await db.get_subscription(user_id)
+        stripe.Subscription.delete(sub.stripe_id)   # immediate cancel, no period_end respect
+        await db.delete_subscription(user_id)
+        # User loses access immediately even though they paid for 20 more days
+        # No reason captured. No retention offered. Churn data: zero.
+  when_applies: Any subscription SaaS with user-initiated cancellation flow
+  sources:
+    - "https://stripe.com/docs/billing/subscriptions/cancel"
+    - "https://stripe.com/docs/billing/subscriptions/pause-payment"
+    - "https://wise.com/us/blog/saas-billing-best-practices"
+
+- id: SAAS-012
+  text: >
+    Track MRR, churn rate, LTV, and ARPU in a dedicated subscription analytics model
+    updated nightly. MRR = sum of all active subscription monthly amounts. Churn rate =
+    churned_MRR / MRR_at_period_start. LTV = ARPU / churn_rate. Alert if weekly MRR
+    growth < 5% for 3 consecutive weeks (growth stall) or if weekly churn > 3% (churn spike).
+    Never compute these metrics on-the-fly in dashboards from the raw subscriptions table.
+  why: >
+    Computing MRR on-the-fly requires joining 6 tables and applying complex proration logic
+    on every dashboard load. At 100K subscribers, this query takes 45 seconds. Materializing
+    nightly gives sub-second dashboard loads. More importantly: churn rate computed from
+    the live subscriptions table is wrong because it doesn't account for reactivations,
+    plan changes, and trial-to-paid conversions correctly. The nightly materialization
+    applies the correct business logic once, consistently.
+  how_to_do_right: |
+    1. subscription_daily_metrics table:
+       date, active_subscriptions, new_subscriptions, churned_subscriptions,
+       mrr_usd, new_mrr_usd, churned_mrr_usd, expansion_mrr_usd, contraction_mrr_usd
+
+    2. MRR calculation (correct, handles annual subscriptions):
+       monthly_amount = IF billing_period == 'year': amount / 12 ELSE amount
+       MRR = SUM(monthly_amount) WHERE status = 'active' AND NOT cancel_at_period_end
+              AND trial_end IS NULL (trials don't count)
+
+    3. Churned MRR = SUM(monthly_amount) of subscriptions that went ACTIVE→CANCELED this day
+    4. Expansion MRR = MRR from existing customers who upgraded (plan change increase)
+    5. Contraction MRR = MRR lost from existing customers who downgraded
+
+    6. LTV calculation:
+       ARPU = MRR / active_customer_count
+       churn_rate_monthly = churned_subscriptions / active_subscriptions_at_month_start
+       LTV = ARPU / churn_rate_monthly   (assumes constant churn)
+
+    7. Nightly dbt model: materialized='table', runs at 03:00 UTC after Stripe sync
+  severity: medium
+  technologies:
+    lang: [sql, python]
+    framework: [dbt, stripe, postgresql, snowflake]
+  domains:
+    domain: [saas, analytics, billing, product]
+    concern: [mrr, churn, ltv, subscription_metrics]
+  example_good: |
+    -- dbt model: gold/subscription_mrr_daily.sql
+    -- GRAIN: one row per day per active subscription
+    {{ config(materialized='table') }}
+
+    WITH active_subs AS (
+        SELECT
+            s.id                                           AS subscription_id,
+            s.customer_id,
+            s.status,
+            s.current_period_start::DATE                   AS period_date,
+            p.currency,
+            CASE
+                WHEN p.billing_interval = 'year'
+                THEN (p.unit_amount::NUMERIC / 100) / 12
+                ELSE p.unit_amount::NUMERIC / 100
+            END                                            AS monthly_amount_usd,
+            s.canceled_at::DATE                            AS canceled_date,
+            s.trial_end::DATE                              AS trial_end_date
+        FROM {{ ref('stg_stripe__subscriptions') }} s
+        JOIN {{ ref('stg_stripe__prices') }} p ON s.price_id = p.id
+        WHERE s.status IN ('active', 'past_due')
+          AND s.trial_end IS NULL  -- exclude trials
+    )
+    SELECT
+        CURRENT_DATE                                       AS metric_date,
+        COUNT(*)                                           AS active_subscriptions,
+        SUM(monthly_amount_usd)                            AS mrr_usd,
+        AVG(monthly_amount_usd)                            AS arpu_usd
+    FROM active_subs
+    WHERE canceled_date IS NULL OR canceled_date > CURRENT_DATE
+  example_bad: |
+    # WRONG: computing MRR on-the-fly per dashboard request
+    @router.get("/admin/mrr")
+    async def get_mrr(db):
+        # 45-second query on 100K subscriptions at 3 AM when CEO checks mobile
+        result = await db.execute("""
+            SELECT SUM(
+                CASE WHEN billing_interval = 'year' THEN amount / 12.0 ELSE amount END
+            ) FROM subscriptions s JOIN prices p ON s.price_id = p.id
+            WHERE s.status = 'active'
+        """)
+        return {"mrr": result.scalar()}
+  when_applies: Any SaaS product tracking subscription revenue metrics for business decisions
+  sources:
+    - "https://stripe.com/docs/billing/revenue-recognition"
+    - "https://stripe.com/resources/more/best-practices-for-saas-billing"
+    - "https://www.getlago.com/blog/subscription-management-best-practices-and-strategies"

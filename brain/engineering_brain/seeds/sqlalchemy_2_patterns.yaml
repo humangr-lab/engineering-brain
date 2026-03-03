@@ -1,0 +1,1006 @@
+layer: rules
+domain: databases
+knowledge:
+- id: SQLA-001
+  text: >
+    In SQLAlchemy 2.0, NEVER use the legacy Query API (session.query(Model)). Always use
+    select() statements with session.execute(). The Query API is a legacy interface that was
+    removed conceptually in 2.0 — it still exists for compatibility but produces inferior
+    type-checking, worse async support, and confusing semantics. Any new code must use
+    select(Model).where(...) passed to session.execute() or session.scalars().
+  why: >
+    The legacy Query API was designed before Python's type system matured. It returns opaque
+    Query objects that do not compose well with type checkers. In async contexts, session.query()
+    triggers implicit I/O that is forbidden in async sessions and causes greenlet errors at
+    runtime. Teams that mixed old and new styles in migration had silent bugs where async code
+    called legacy synchronous methods. The new style unifies sync and async paths.
+  how_to_do_right: |
+    1. Replace session.query(User) with select(User).
+    2. Replace .filter() with .where().
+    3. Replace .first() with session.scalars(stmt).first().
+    4. Replace .all() with list(session.scalars(stmt)).
+    5. Replace .one() with session.scalars(stmt).one().
+    6. For scalar results: session.execute(select(User.id)).scalars().all().
+    7. Set future=True in create_engine() during migration to catch all old-style usage.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy, fastapi, flask]
+  domains:
+    domain: [databases, backend]
+    concern: [orm, migration, type_safety]
+  example_good: |
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    def get_active_users(session: Session) -> list[User]:
+        stmt = select(User).where(User.is_active == True).order_by(User.created_at.desc())
+        return list(session.scalars(stmt))
+
+    def get_user_by_email(session: Session, email: str) -> User | None:
+        stmt = select(User).where(User.email == email)
+        return session.scalars(stmt).first()
+  example_bad: |
+    # Legacy Query API — NEVER use in new code or after migration
+    def get_active_users(session: Session) -> list[User]:
+        return session.query(User).filter(User.is_active == True).all()
+        # Problems:
+        # 1. Returns Query object, not typed result
+        # 2. .filter() vs .where() confusion
+        # 3. Fails silently in async sessions with greenlet errors
+        # 4. Type checkers cannot infer return type accurately
+  when_applies: "All SQLAlchemy ORM queries in codebases using SQLAlchemy 1.4+ or 2.0."
+  sources:
+    - "https://docs.sqlalchemy.org/en/20/changelog/whatsnew_20.html#orm-query-is-internally-unified-with-select-update-delete"
+    - "https://docs.sqlalchemy.org/en/20/orm/queryguide/select.html"
+
+- id: SQLA-002
+  text: >
+    Declare all ORM columns using Mapped[T] = mapped_column() syntax in SQLAlchemy 2.0.
+    The annotated declarative form provides compile-time type safety, eliminates Column() noise,
+    and makes Optional vs required fields explicit via Mapped[T] vs Mapped[Optional[T]]. Never
+    mix old-style Column() declarations with new-style Mapped[] in the same model.
+  why: >
+    Without Mapped[] annotations, mypy and pyright treat all ORM attributes as Any, making
+    type-unsafe code that causes runtime AttributeError bugs. A field declared as Column(String)
+    without Optional could silently store NULL in the database while the type checker approves
+    downstream code that assumes str. The annotated form catches this at static analysis time,
+    before the code runs. Production bugs from None propagation are eliminated by making
+    nullability explicit at the model level.
+  how_to_do_right: |
+    1. Declare non-nullable fields as: name: Mapped[str] = mapped_column(String(255))
+    2. Declare nullable fields as: bio: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    3. Primary keys: id: Mapped[int] = mapped_column(primary_key=True)
+    4. Auto-incrementing UUID: id: Mapped[uuid.UUID] = mapped_column(default=uuid.uuid4, primary_key=True)
+    5. Default values: created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    6. Server defaults: updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    7. Add __tablename__ = "users" as class variable, NOT in Mapped[].
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy]
+  domains:
+    domain: [databases, code_quality]
+    concern: [type_safety, orm, schema]
+  example_good: |
+    from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+    from sqlalchemy import String, Text, DateTime, func
+    from typing import Optional
+    import uuid, datetime
+
+    class Base(DeclarativeBase):
+        pass
+
+    class User(Base):
+        __tablename__ = "users"
+        id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+        email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+        name: Mapped[str] = mapped_column(String(100), nullable=False)
+        bio: Mapped[Optional[str]] = mapped_column(Text)
+        created_at: Mapped[datetime.datetime] = mapped_column(server_default=func.now())
+        is_active: Mapped[bool] = mapped_column(default=True)
+  example_bad: |
+    from sqlalchemy import Column, Integer, String, Text, Boolean
+    from sqlalchemy.ext.declarative import declarative_base
+    Base = declarative_base()  # Old-style base
+
+    class User(Base):
+        __tablename__ = "users"
+        id = Column(Integer, primary_key=True)        # No type info
+        email = Column(String(255), unique=True)       # Nullable? Unknown
+        name = Column(String(100))                     # Could be None — type checker won't warn
+        bio = Column(Text)                             # Optional? Cannot tell
+        # mypy sees all attributes as Any — bugs hide until runtime
+  when_applies: "All new SQLAlchemy 2.0 models and any model being migrated from 1.x."
+  sources:
+    - "https://docs.sqlalchemy.org/en/20/orm/declarative_tables.html#mapped-column-derives-the-datatype-and-nullability-from-the-mapped-annotation"
+    - "https://docs.sqlalchemy.org/en/20/changelog/whatsnew_20.html#new-type-annotation-map"
+
+- id: SQLA-003
+  text: >
+    Use async_sessionmaker (not AsyncSession directly) to create async sessions in SQLAlchemy 2.0.
+    Pair it with async with for lifecycle management. Never create one engine per request.
+    The engine and sessionmaker are expensive to create and must be module-level singletons.
+    Sessions are cheap and must be request-scoped, created fresh for each request and closed
+    when the request completes.
+  why: >
+    Creating a new engine per request burns 50-200ms per request on connection establishment
+    and TLS handshakes. In a FastAPI service handling 1,000 req/s, this adds 50-200 seconds
+    of total wasted latency per second. async_sessionmaker (introduced in SQLAlchemy 2.0)
+    improves over sessionmaker for async by ensuring proper async context propagation. Using
+    raw AsyncSession without sessionmaker leads to sessions being shared across requests,
+    causing intermittent concurrent access errors and data corruption under load.
+  how_to_do_right: |
+    1. Create engine once at module level: engine = create_async_engine(DATABASE_URL, pool_size=10)
+    2. Create sessionmaker once: AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+    3. expire_on_commit=False prevents lazy loads AFTER commit in async context (which would error)
+    4. In FastAPI, use a dependency: async def get_session() -> AsyncGenerator[AsyncSession, None]
+    5. Wrap in async with AsyncSessionLocal() as session: yield session
+    6. Use try/finally or async context manager to guarantee session.close()
+    7. For unit of work: async with session.begin(): ... (auto commits on exit, rolls back on exception)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy, fastapi]
+  domains:
+    domain: [databases, backend, performance]
+    concern: [async, session_lifecycle, connection_pool]
+  example_good: |
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+    from typing import AsyncGenerator
+
+    # Module-level singletons (created once)
+    engine = create_async_engine(
+        "postgresql+asyncpg://user:pass@localhost/db",
+        pool_size=10,
+        max_overflow=20,
+        echo=False,
+    )
+    AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+    # FastAPI dependency — session is request-scoped
+    async def get_session() -> AsyncGenerator[AsyncSession, None]:
+        async with AsyncSessionLocal() as session:
+            try:
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+
+    # Usage in route
+    async def create_user(data: UserCreate, session: AsyncSession = Depends(get_session)):
+        async with session.begin():
+            user = User(email=data.email, name=data.name)
+            session.add(user)
+        return user
+  example_bad: |
+    # WRONG: Creating engine per request
+    async def get_session():
+        engine = create_async_engine(DATABASE_URL)  # 50-200ms wasted per request!
+        session = AsyncSession(engine)
+        yield session
+        await session.close()
+        await engine.dispose()  # Destroys connection pool
+
+    # WRONG: Using expire_on_commit=True (default) in async
+    AsyncSessionLocal = async_sessionmaker(engine)  # expire_on_commit=True by default
+    # After commit, accessing user.name triggers lazy load — MissingGreenlet error in async!
+  when_applies: "Any async SQLAlchemy application, especially FastAPI, Starlette, or Litestar backends."
+  sources:
+    - "https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html#sqlalchemy.ext.asyncio.async_sessionmaker"
+    - "https://leapcell.io/blog/building-high-performance-async-apis-with-fastapi-sqlalchemy-2-0-and-asyncpg"
+
+- id: SQLA-004
+  text: >
+    Choose relationship loading strategy based on access pattern: use selectin for collections
+    (one-to-many), joined for single scalar relationships where the parent is always needed
+    alongside the child, and lazy=raise for anything you don't intend to load eagerly.
+    Never rely on the default lazy loading in production code — it causes N+1 queries silently.
+  why: >
+    Default lazy loading (lazy="select") fires one SQL query per object when you access a
+    relationship attribute. Loading 100 users and accessing user.orders for each fires 101
+    queries instead of 2. In a list endpoint returning 50 items with 3 relationships each,
+    this is 151 queries vs 4 queries — a 37x difference. lazy=raise forces you to explicitly
+    declare loading strategy at query time, making N+1 impossible to hide. Teams that set
+    lazy=raise on all relationships eliminated N+1 bugs from production permanently.
+  how_to_do_right: |
+    1. Set lazy="raise" on all relationships by default in model definitions.
+    2. Override per-query with options(selectinload(User.orders)) when you need the relationship.
+    3. Use selectinload() for collections (one-to-many, many-to-many) — fires 1 extra query total.
+    4. Use joinedload() for scalar/single-object relationships (many-to-one) — adds a JOIN.
+    5. Use subqueryload() only when JOIN would cause row multiplication (avoid for large collections).
+    6. Use contains_eager() when you already JOIN manually in the query.
+    7. Chain loading: options(selectinload(User.orders).selectinload(Order.items)).
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy]
+  domains:
+    domain: [databases, performance]
+    concern: [n_plus_one, query_optimization, orm]
+  example_good: |
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload, joinedload, relationship
+
+    class User(Base):
+        __tablename__ = "users"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        orders: Mapped[list["Order"]] = relationship("Order", lazy="raise")  # Explicit intent
+        address: Mapped[Optional["Address"]] = relationship("Address", lazy="raise")
+
+    # Explicit eager loading per query — N+1 impossible
+    async def get_users_with_orders(session: AsyncSession) -> list[User]:
+        stmt = (
+            select(User)
+            .options(
+                selectinload(User.orders),          # One IN query for all orders
+                joinedload(User.address),           # JOIN for scalar relationship
+            )
+            .where(User.is_active == True)
+        )
+        return list(await session.scalars(stmt))
+  example_bad: |
+    class User(Base):
+        __tablename__ = "users"
+        id = Column(Integer, primary_key=True)
+        orders = relationship("Order")  # Default lazy="select" — silent N+1
+
+    # This fires 1 + N queries:
+    users = session.execute(select(User)).scalars().all()
+    for user in users:
+        print(user.orders)  # NEW QUERY PER USER! 100 users = 101 queries
+  when_applies: >
+    All ORM relationship definitions. Mandatory before any endpoint that returns a list of
+    objects with nested relationships.
+  sources:
+    - "https://docs.sqlalchemy.org/en/20/orm/queryguide/relationships.html"
+    - "https://sgoel.dev/posts/handling-the-n-1-selects-problem-in-sqlalchemy/"
+
+- id: SQLA-005
+  text: >
+    For bulk inserts of 100+ rows, use session.execute(insert(Model).values([...])) instead of
+    session.add_all(objects). For 10,000+ rows, use Core insert() with returning() for IDs.
+    session.add() and add_all() have per-object Python overhead that makes them 10-50x slower
+    than bulk insert for large datasets.
+  why: >
+    session.add_all() iterates each object through the ORM instrumentation layer, fires
+    before_flush/after_flush events per object, and builds individual INSERT statements. For
+    1,000 rows, this means 1,000 individual INSERTs or a very large VALUES clause with
+    significant Python-side overhead. Measured benchmarks show: add_all(1000) = ~2.1s,
+    insert().values(1000) = ~0.12s on PostgreSQL. For ETL jobs or data migration, this 17x
+    difference is the difference between a 2-minute job and a 34-minute job.
+  how_to_do_right: |
+    1. For <100 rows with event hooks needed: session.add_all(objects)
+    2. For 100-10,000 rows: session.execute(insert(Model), [{"col": val, ...}, ...])
+    3. For >10,000 rows with IDs needed: stmt = insert(Model).values(rows).returning(Model.id)
+    4. For >10,000 rows without ORM: use psycopg3 copy_records_to_table() for maximum speed
+    5. Never call session.flush() inside a loop — batch all adds then flush once
+    6. Use session.bulk_insert_mappings() (deprecated in 2.0 — use insert() instead)
+    7. Chunk large inserts: for chunk in batched(rows, 1000): session.execute(insert(Model), chunk)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy, postgresql]
+  domains:
+    domain: [databases, performance]
+    concern: [bulk_operations, throughput, etl]
+  example_good: |
+    from sqlalchemy import insert
+    from itertools import batched  # Python 3.12+, or use custom chunker
+
+    async def bulk_create_events(session: AsyncSession, events: list[dict]) -> None:
+        # Bulk insert using Core INSERT — no per-object overhead
+        # Processes 10,000 rows in ~200ms vs ~4 seconds with add_all
+        CHUNK_SIZE = 1000
+        for i in range(0, len(events), CHUNK_SIZE):
+            chunk = events[i:i + CHUNK_SIZE]
+            await session.execute(insert(Event), chunk)
+        await session.commit()
+
+    # With RETURNING to get generated IDs
+    async def bulk_create_returning_ids(session: AsyncSession, rows: list[dict]) -> list[int]:
+        result = await session.execute(
+            insert(User).returning(User.id),
+            rows,
+        )
+        return list(result.scalars())
+  example_bad: |
+    # WRONG: add_all for bulk insert — 10-50x slower
+    async def import_events(session: AsyncSession, events: list[EventData]) -> None:
+        objects = [Event(**e.model_dump()) for e in events]
+        session.add_all(objects)      # Python overhead per object
+        await session.flush()          # Fires per-object events
+        await session.commit()
+        # For 10,000 events: ~4 seconds. Bulk insert: ~200ms.
+  when_applies: "Any batch import, ETL pipeline, seed script, or endpoint inserting 100+ rows at once."
+  sources:
+    - "https://docs.sqlalchemy.org/en/20/orm/persistence_techniques.html#bulk-operations"
+    - "https://docs.sqlalchemy.org/en/20/core/dml.html#sqlalchemy.sql.expression.insert"
+
+- id: SQLA-006
+  text: >
+    Configure the connection pool for production with explicit pool_size, max_overflow,
+    pool_recycle, and pool_pre_ping. Never use the default pool settings in production —
+    they will cause connection exhaustion under load or dead connections from firewalls that
+    silently close idle connections after 1-30 minutes.
+  why: >
+    AWS RDS and most cloud databases kill idle connections after 5-30 minutes. Without
+    pool_recycle, SQLAlchemy reuses a stale connection that was silently killed by the
+    firewall, and the next query fails with "SSL connection has been closed unexpectedly"
+    or "server closed the connection unexpectedly". Without pool_pre_ping, these errors
+    propagate to users. Without proper pool_size, a FastAPI app with 8 workers will open
+    8 × max_connections simultaneous connections, exhausting PostgreSQL's default limit of
+    100 connections. A pool of size=5, max_overflow=10 per worker means 8 workers × 15 = 120
+    connections — already over the PostgreSQL default.
+  how_to_do_right: |
+    1. pool_size = desired_baseline_connections (usually 5-10 per process)
+    2. max_overflow = burst_capacity (usually 2x pool_size, never > db max_connections / workers)
+    3. pool_recycle = 1800 (30 min) — recycle before cloud firewall kills at ~60 min
+    4. pool_pre_ping = True — test connection health before use (adds ~1ms overhead but prevents errors)
+    5. pool_timeout = 30 — wait up to 30s for a free connection before raising
+    6. Calculate: total_connections = (pool_size + max_overflow) × num_workers
+    7. Ensure total_connections < db_max_connections × 0.8 (leave headroom)
+    8. For PgBouncer: use NullPool (no connection pool needed, PgBouncer does it)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy, postgresql]
+  domains:
+    domain: [databases, infrastructure, reliability]
+    concern: [connection_pool, production, configuration]
+  example_good: |
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    # Production: 4 FastAPI workers, PostgreSQL max_connections=100
+    # Budget: 100 * 0.8 = 80 connections / 4 workers = 20 per worker
+    engine = create_async_engine(
+        DATABASE_URL,
+        pool_size=5,           # Baseline connections per process
+        max_overflow=10,       # Burst: up to 15 total per process
+        pool_recycle=1800,     # Recycle every 30 min (before cloud firewall kills)
+        pool_pre_ping=True,    # Test health before use — prevents stale connection errors
+        pool_timeout=30,       # Fail fast if pool exhausted
+        echo=False,
+    )
+    # Total: 4 workers × 15 max = 60 connections — well under 80 budget
+  example_bad: |
+    # Default pool settings — production timebomb
+    engine = create_async_engine(DATABASE_URL)
+    # Defaults: pool_size=5, max_overflow=10, pool_recycle=-1 (never), pool_pre_ping=False
+    # With 8 workers: up to 8 × 15 = 120 connections > PostgreSQL default 100
+    # After 30 minutes: stale connections cause "server closed the connection unexpectedly"
+    # Users see 500 errors until pool recycles
+  when_applies: "Any production SQLAlchemy deployment connecting to PostgreSQL, MySQL, or cloud-managed databases."
+  sources:
+    - "https://docs.sqlalchemy.org/en/20/core/pooling.html#connection-pool-configuration"
+    - "https://docs.sqlalchemy.org/en/20/core/pooling.html#disconnect-handling-pessimistic"
+
+- id: SQLA-007
+  text: >
+    Use Alembic for all database schema changes with autogenerate disabled for critical tables.
+    Every migration must be reviewed before applying — autogenerated migrations often miss
+    enum changes, index changes, and can generate destructive DROP TABLE statements if model
+    names are renamed. Never apply alembic upgrade head in CI without a review step.
+  why: >
+    Alembic autogenerate compares models to database schema metadata. If a developer renames
+    a model class, autogenerate produces DROP TABLE old_table; CREATE TABLE new_table —
+    destroying production data. If an Enum type is extended, autogenerate may miss the ALTER
+    TYPE statement on PostgreSQL. At a fintech company, an unreviewed migration ran in prod
+    and dropped a table with 2.3M records because a model had been renamed. The autogenerated
+    migration was syntactically valid YAML but semantically catastrophic.
+  how_to_do_right: |
+    1. Use alembic revision --autogenerate -m "description" to generate migration draft
+    2. ALWAYS review the generated file before applying
+    3. Check for DROP TABLE / DROP COLUMN — treat as red flags requiring justification
+    4. For renames: use op.rename_table() not drop+create
+    5. For Enum additions: write manual op.execute("ALTER TYPE status ADD VALUE 'new_val'")
+    6. Test migration on a copy of production data before applying
+    7. For CI: run alembic upgrade head on test database, run tests, then promote to prod
+    8. Add alembic downgrade -1 test to CI to ensure rollback works
+    9. Never use alembic.run_migrations_online() with pool_pre_ping=False
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy, alembic, postgresql]
+  domains:
+    domain: [databases, devops, reliability]
+    concern: [migrations, schema_management, data_safety]
+  example_good: |
+    # env.py — configure autogenerate with import all models
+    from myapp.models import Base  # Imports ALL models (critical for autogenerate completeness)
+    target_metadata = Base.metadata
+
+    # alembic.ini — review generated migration before applying
+    # CI pipeline step:
+    # 1. alembic upgrade head  (apply on test DB)
+    # 2. pytest                (run tests against migrated DB)
+    # 3. alembic downgrade -1  (verify rollback works)
+    # 4. alembic upgrade head  (re-apply)
+    # ONLY THEN merge to main
+
+    # Example safe rename migration (manual, not autogenerated):
+    def upgrade() -> None:
+        op.rename_table('user_profiles', 'profiles')  # Safe rename, no data loss
+
+    def downgrade() -> None:
+        op.rename_table('profiles', 'user_profiles')
+  example_bad: |
+    # Autogenerated migration after model rename — DANGEROUS
+    def upgrade() -> None:
+        op.drop_table('user_profiles')     # DESTROYS DATA!
+        op.create_table('profiles', ...)   # Creates empty table
+
+    # Developer ran this in prod without reviewing:
+    # $ alembic upgrade head  →  2.3M user profiles deleted, no rollback
+  when_applies: "All schema migrations in any environment. Especially critical before any production deployment."
+  sources:
+    - "https://alembic.sqlalchemy.org/en/latest/autogenerate.html"
+    - "https://alembic.sqlalchemy.org/en/latest/ops.html#alembic.operations.Operations.rename_table"
+
+- id: SQLA-008
+  text: >
+    Use @event.listens_for with before_flush and after_commit hooks for cross-cutting concerns
+    like audit logging, cache invalidation, and soft-delete enforcement. Never implement these
+    in service layer code where they can be bypassed — ORM events fire for ALL session
+    operations including bulk operations.
+  why: >
+    When audit logging is implemented in service functions, direct ORM usage, admin tools,
+    migrations, and background jobs bypass it silently. A financial audit at a payments company
+    found 18% of account balance changes had no corresponding audit log because some service
+    functions called session.add() directly without going through the audited service layer.
+    ORM event hooks fire unconditionally, making audit coverage 100%. The before_flush hook
+    also allows injecting updated_at timestamps universally without per-model boilerplate.
+  how_to_do_right: |
+    1. Register hooks in a dedicated events.py module loaded at application startup
+    2. Use @event.listens_for(Session, "before_flush") for pre-commit mutations (timestamps)
+    3. Use @event.listens_for(Session, "after_commit") for post-commit side effects (cache invalidation)
+    4. Inspect session.new, session.dirty, session.deleted in before_flush
+    5. Filter by model class: isinstance(instance, AuditedModel)
+    6. Keep event handlers lightweight — heavy work in after_commit via async task queue
+    7. Test events: they fire during tests, so use a test session with rollback to avoid pollution
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy]
+  domains:
+    domain: [databases, code_quality, security]
+    concern: [audit_log, event_hooks, cross_cutting]
+  example_good: |
+    from sqlalchemy import event
+    from sqlalchemy.orm import Session
+    from datetime import datetime, timezone
+
+    # events.py — loaded at startup
+    @event.listens_for(Session, "before_flush")
+    def set_timestamps(session: Session, flush_context, instances) -> None:
+        now = datetime.now(timezone.utc)
+        for instance in session.new:
+            if hasattr(instance, "created_at"):
+                instance.created_at = now
+            if hasattr(instance, "updated_at"):
+                instance.updated_at = now
+        for instance in session.dirty:
+            if hasattr(instance, "updated_at"):
+                instance.updated_at = now
+
+    @event.listens_for(Session, "after_commit")
+    def invalidate_cache(session: Session) -> None:
+        # Collect invalidation keys BEFORE commit (dirty tracking cleared after)
+        for instance in session._new.values():
+            cache.delete(f"entity:{type(instance).__name__}:{instance.id}")
+  example_bad: |
+    # Timestamp management in every service function — bypassed everywhere
+    async def update_user(session: AsyncSession, user_id: int, data: dict) -> User:
+        user = await session.get(User, user_id)
+        for k, v in data.items():
+            setattr(user, k, v)
+        user.updated_at = datetime.now()  # Bypassed by any direct ORM usage
+        await session.commit()
+        cache.delete(f"user:{user_id}")   # Bypassed by migrations, admin, background jobs
+  when_applies: >
+    Applications with audit requirements, cache invalidation needs, or any cross-cutting
+    concern that must apply to ALL database writes regardless of code path.
+  sources:
+    - "https://docs.sqlalchemy.org/en/20/orm/events.html#sqlalchemy.orm.SessionEvents.before_flush"
+    - "https://docs.sqlalchemy.org/en/20/orm/events.html#sqlalchemy.orm.SessionEvents.after_commit"
+
+- id: SQLA-009
+  text: >
+    Use @hybrid_property for computed columns that need to work both as Python attributes
+    and SQL WHERE/ORDER BY clauses. Never add @property for anything that needs to be
+    filterable or sortable in queries — Python @property is invisible to SQLAlchemy and
+    forces Python-side filtering of full table scans.
+  why: >
+    A @property on an ORM model works in Python but cannot be used in .where() clauses.
+    Code that appears correct — select(User).where(User.full_name == "John Doe") —
+    raises AttributeError at runtime if full_name is a @property instead of @hybrid_property.
+    Even worse, developers work around this by loading all rows and filtering in Python,
+    causing full table scans. One team filtered 500K user records in Python because the
+    "is_premium" check combined two columns — switching to @hybrid_property eliminated a 4-second
+    query and replaced it with a 12ms indexed query.
+  how_to_do_right: |
+    1. Define @hybrid_property for Python behavior (instance-level)
+    2. Define @<property>.expression for SQL behavior (class-level, used in queries)
+    3. Use SQL functions in expression: func.lower(), func.concat(), case()
+    4. Test both: assert user.full_name == "John Doe" (Python) and
+       select(User).where(User.full_name == "John Doe") (SQL)
+    5. For writeable computed: add @<property>.setter
+    6. For computed columns stored in DB: use mapped_column(computed(...)) instead
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy]
+  domains:
+    domain: [databases, code_quality, performance]
+    concern: [hybrid_properties, query_optimization, orm]
+  example_good: |
+    from sqlalchemy.ext.hybrid import hybrid_property
+    from sqlalchemy import func
+
+    class User(Base):
+        __tablename__ = "users"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        first_name: Mapped[str] = mapped_column(String(100))
+        last_name: Mapped[str] = mapped_column(String(100))
+        subscription_end: Mapped[Optional[datetime]] = mapped_column()
+
+        @hybrid_property
+        def full_name(self) -> str:
+            return f"{self.first_name} {self.last_name}"
+
+        @full_name.expression  # type: ignore[override]
+        @classmethod
+        def full_name(cls):
+            return func.concat(cls.first_name, " ", cls.last_name)
+
+        @hybrid_property
+        def is_premium(self) -> bool:
+            return self.subscription_end is not None and self.subscription_end > datetime.now()
+
+        @is_premium.expression  # type: ignore[override]
+        @classmethod
+        def is_premium(cls):
+            from sqlalchemy import and_, func
+            return and_(cls.subscription_end != None, cls.subscription_end > func.now())
+
+    # Usable in queries:
+    stmt = select(User).where(User.is_premium == True).order_by(User.full_name)
+  example_bad: |
+    class User(Base):
+        __tablename__ = "users"
+        first_name = Column(String)
+        last_name = Column(String)
+
+        @property                    # Python-only — cannot use in SQL
+        def full_name(self):
+            return f"{self.first_name} {self.last_name}"
+
+    # This looks correct but fails:
+    # select(User).where(User.full_name == "John") → AttributeError
+    # Workaround that causes full table scan:
+    all_users = session.scalars(select(User)).all()
+    matches = [u for u in all_users if u.full_name == "John"]  # 500K rows loaded
+  when_applies: >
+    Any computed attribute that needs to be used in WHERE, ORDER BY, or GROUP BY clauses,
+    or any attribute that combines multiple column values.
+  sources:
+    - "https://docs.sqlalchemy.org/en/20/orm/extensions/hybrid.html"
+    - "https://docs.sqlalchemy.org/en/20/orm/extensions/hybrid.html#sqlalchemy.ext.hybrid.hybrid_property.expression"
+
+- id: SQLA-010
+  text: >
+    For many-to-many relationships with extra columns on the association table, use an explicit
+    association object model rather than the secondary= shortcut. Use association_proxy only
+    for pure many-to-many (no extra columns) to simplify access. Never use secondary= when
+    the join table needs timestamps, status, or any metadata.
+  why: >
+    The secondary= shortcut creates a transparent many-to-many that works for simple cases
+    but fails when the association table needs its own fields. Adding a column to a secondary=
+    table requires converting to an explicit model, which breaks all existing relationship code.
+    Teams that started with secondary= for User <-> Role then needed a role_assigned_at timestamp
+    had to refactor all relationships, breaking queries and serializers. Association objects from
+    the start prevent this rewrite. association_proxy provides the same clean access syntax
+    with the flexibility of an explicit model underneath.
+  how_to_do_right: |
+    1. If the join table has ONLY foreign keys (pure pivot): use secondary= for simplicity
+    2. If the join table has or might need extra columns: use explicit association model
+    3. Add association_proxy on both sides for clean access: user.roles, role.users
+    4. Define the association model with proper Mapped[] annotations
+    5. Set cascade="all, delete-orphan" on the relationship to the association object
+    6. Add unique constraint on (left_id, right_id) to prevent duplicate associations
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy]
+  domains:
+    domain: [databases, code_quality]
+    concern: [relationships, schema_design, association]
+  example_good: |
+    from sqlalchemy.ext.associationproxy import association_proxy, AssociationProxy
+    from datetime import datetime
+
+    class UserRole(Base):
+        __tablename__ = "user_roles"
+        user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+        role_id: Mapped[int] = mapped_column(ForeignKey("roles.id"), primary_key=True)
+        assigned_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+        assigned_by_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"))
+
+    class User(Base):
+        __tablename__ = "users"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        user_roles: Mapped[list[UserRole]] = relationship(UserRole, cascade="all, delete-orphan")
+        roles: AssociationProxy[list["Role"]] = association_proxy("user_roles", "role")
+
+    class Role(Base):
+        __tablename__ = "roles"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        name: Mapped[str] = mapped_column(String(50), unique=True)
+  example_bad: |
+    # secondary= — works until you need extra columns, then full rewrite
+    user_role_table = Table("user_roles", Base.metadata,
+        Column("user_id", ForeignKey("users.id")),
+        Column("role_id", ForeignKey("roles.id")),
+        # 6 months later: "we need to add assigned_at" — entire relationship breaks
+    )
+    class User(Base):
+        roles = relationship("Role", secondary=user_role_table)  # Clean but inflexible
+  when_applies: >
+    Designing any many-to-many relationship. Default to association object — only use
+    secondary= if you are certain the join table will never need extra fields.
+  sources:
+    - "https://docs.sqlalchemy.org/en/20/orm/basic_relationships.html#association-object"
+    - "https://docs.sqlalchemy.org/en/20/orm/extensions/associationproxy.html"
+
+- id: SQLA-011
+  text: >
+    Use scoped_session for thread-local session management in non-async applications (Flask,
+    CLI tools, Celery workers). In async applications, pass the session explicitly via
+    dependency injection — never use scoped_session in async contexts as it provides no
+    concurrency isolation.
+  why: >
+    scoped_session provides one session per thread, which is correct for synchronous frameworks
+    where each request runs in one thread. In async frameworks, multiple coroutines share one
+    thread, so scoped_session gives ALL coroutines the same session, causing data corruption
+    when two requests flush simultaneously. Teams that copied Flask patterns into FastAPI had
+    intermittent "already being modified" errors and data bleeding between requests under load.
+    The solution in async: always pass session explicitly, never use a global session registry.
+  how_to_do_right: |
+    1. Sync frameworks (Flask, Celery): use scoped_session(sessionmaker(engine))
+    2. Call db.remove() at end of request (Flask: teardown_appcontext)
+    3. Async frameworks (FastAPI): use explicit dependency injection (see SQLA-003)
+    4. Celery tasks: create a new session per task, close in finally block
+    5. CLI scripts: create session in with block, commit/close explicitly
+    6. NEVER use a module-level Session = AsyncSession(engine) as a global
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy, flask, celery, fastapi]
+  domains:
+    domain: [databases, backend, reliability]
+    concern: [concurrency, session_lifecycle, thread_safety]
+  example_good: |
+    # Flask (sync) — scoped_session is correct
+    from sqlalchemy.orm import scoped_session, sessionmaker
+    db_session = scoped_session(sessionmaker(bind=engine))
+
+    @app.teardown_appcontext
+    def shutdown_session(exception=None):
+        db_session.remove()  # Returns session to pool, resets thread-local
+
+    # FastAPI (async) — explicit injection, NOT scoped_session
+    async def get_session() -> AsyncGenerator[AsyncSession, None]:
+        async with AsyncSessionLocal() as session:
+            yield session  # Each request gets its own isolated session
+
+    # Celery worker — new session per task
+    @celery_app.task
+    def process_order(order_id: int) -> None:
+        with Session(engine) as session:  # Isolated session per task
+            try:
+                order = session.get(Order, order_id)
+                order.status = "processing"
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+  example_bad: |
+    # WRONG: Global session in async app
+    session = AsyncSession(engine)  # Shared across ALL coroutines!
+
+    async def route_a():
+        await session.add(user)   # Flush A
+    async def route_b():
+        await session.add(order)  # Flush B — may commit A's data prematurely
+    # Data corruption under concurrent requests
+  when_applies: >
+    Choosing session management strategy. Sync = scoped_session, Async = dependency injection.
+    Critical decision to make before building any multi-request application.
+  sources:
+    - "https://docs.sqlalchemy.org/en/20/orm/contextual.html"
+    - "https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html#using-asyncio-scoped-session"
+
+- id: SQLA-012
+  text: >
+    Write SQLAlchemy tests using in-memory SQLite for unit tests and a real PostgreSQL instance
+    for integration tests. Never mock the session object — it defeats the purpose of ORM tests.
+    Use transaction rollback fixtures to prevent test data from persisting between tests.
+  why: >
+    Mocking session.add(), session.commit(), etc. tests nothing meaningful — it only verifies
+    that your code calls the right methods in the right order, not that the data is actually
+    stored and retrievable correctly. Real-world bugs like unique constraint violations,
+    cascade behavior, and index usage are only caught with real SQL execution. At a startup,
+    mocked tests passed 100% while production had daily IntegrityError crashes because FK
+    constraints were not tested. Transaction rollback fixtures give test isolation with zero
+    cleanup overhead — each test gets a fresh view of the database.
+  how_to_do_right: |
+    1. conftest.py: create engine once at session scope (module level for speed)
+    2. Create tables once: Base.metadata.create_all(engine)
+    3. Per-test transaction fixture: begin transaction, yield session, rollback (never commit)
+    4. Use SQLite for unit tests (fast, no server): "sqlite://" (in-memory)
+    5. Use PostgreSQL for integration tests: test for dialect-specific behavior
+    6. Use factory_boy + Faker for test data: UserFactory(is_active=True)
+    7. pytest.mark.integration to gate heavy tests behind explicit flag
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy, pytest, factory_boy]
+  domains:
+    domain: [databases, testing]
+    concern: [test_isolation, fixtures, integration_testing]
+  example_good: |
+    # conftest.py
+    import pytest
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from myapp.models import Base
+
+    @pytest.fixture(scope="session")
+    def engine():
+        engine = create_engine("sqlite:///:memory:", future=True)
+        Base.metadata.create_all(engine)
+        return engine
+
+    @pytest.fixture(scope="session")
+    def session_factory(engine):
+        return sessionmaker(engine)
+
+    @pytest.fixture()  # function scope — new transaction per test
+    def session(session_factory):
+        with session_factory() as session:
+            session.begin_nested()          # Savepoint inside outer transaction
+            yield session
+            session.rollback()              # Rollback to savepoint — zero cleanup needed
+
+    # test_user.py
+    def test_create_user(session):
+        user = User(email="test@example.com", name="Test User")
+        session.add(user)
+        session.flush()
+        assert user.id is not None
+        # Rollback happens automatically — no cleanup needed
+  example_bad: |
+    # WRONG: Mocking the session
+    def test_create_user():
+        mock_session = Mock()
+        service = UserService(mock_session)
+        service.create_user("test@example.com")
+        mock_session.add.assert_called_once()  # Tests nothing real
+        # Misses: unique constraints, FK violations, cascade behavior, index usage
+  when_applies: "All SQLAlchemy ORM code. Testing strategy must be decided before writing the first service function."
+  sources:
+    - "https://docs.sqlalchemy.org/en/20/orm/session_transaction.html#using-savepoint"
+    - "https://vittoriocamisa.dev/blog/agile-database-integration-tests-with-python-sqlalchemy-and-factory-boy/"
+
+- id: SQLA-013
+  text: >
+    Use the Unit of Work pattern explicitly: collect all changes within a single transaction
+    boundary, then commit once. Never commit inside a loop or call session.commit() multiple
+    times within a single business operation. Partial commits leave the database in an
+    inconsistent state when the operation fails midway.
+  why: >
+    In an order creation flow that creates Order, OrderItem (loop), and deducts Inventory
+    separately, three commits mean: if the inventory deduction fails, the order and items
+    are already committed and visible to other queries. Compensating transactions are hard.
+    Idempotency is broken. A financial system that committed charges and confirmations
+    separately had 0.3% of transactions in a "charged but not confirmed" state, requiring
+    daily manual reconciliation. The fix: one transaction boundary for the entire business
+    operation, commit once at the end.
+  how_to_do_right: |
+    1. Identify the business operation boundary (what must succeed atomically)
+    2. Wrap entire operation in a single session.begin() context or one session.commit()
+    3. Use session.begin_nested() (savepoints) for inner rollback points within one transaction
+    4. Never call session.commit() inside a for loop — collect then commit once
+    5. Use async with session.begin(): for the happy path (auto-rollback on exception)
+    6. Raise exceptions to trigger rollback — never silently swallow errors in a transaction
+    7. For distributed transactions: use saga pattern or outbox pattern, not nested commits
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy]
+  domains:
+    domain: [databases, architecture, reliability]
+    concern: [unit_of_work, transactions, data_consistency]
+  example_good: |
+    async def create_order(
+        session: AsyncSession, user_id: int, items: list[OrderItemCreate]
+    ) -> Order:
+        # Single transaction for entire business operation
+        async with session.begin():
+            order = Order(user_id=user_id, status="pending")
+            session.add(order)
+            await session.flush()  # Get order.id without committing
+
+            for item_data in items:
+                item = OrderItem(order_id=order.id, **item_data.model_dump())
+                session.add(item)
+
+                # Deduct inventory in same transaction
+                stmt = (
+                    update(Inventory)
+                    .where(Inventory.sku == item_data.sku)
+                    .where(Inventory.quantity >= item_data.quantity)
+                    .values(quantity=Inventory.quantity - item_data.quantity)
+                )
+                result = await session.execute(stmt)
+                if result.rowcount == 0:
+                    raise InsufficientInventoryError(item_data.sku)
+                    # session.begin() rolls back ALL changes automatically
+
+        return order  # Only reachable if ALL steps succeeded
+  example_bad: |
+    async def create_order_broken(session: AsyncSession, ...) -> Order:
+        order = Order(user_id=user_id)
+        session.add(order)
+        await session.commit()  # COMMIT 1 — order visible, items not yet
+
+        for item_data in items:
+            item = OrderItem(order_id=order.id, ...)
+            session.add(item)
+            await session.commit()  # COMMIT per item — partial state visible
+
+            await deduct_inventory(session, item_data.sku)
+            await session.commit()  # If this fails: order + items committed, inventory not deducted
+  when_applies: >
+    Any business operation affecting multiple tables or rows. Mandatory for financial
+    transactions, order management, inventory systems, or any operation with invariants.
+  sources:
+    - "https://docs.sqlalchemy.org/en/20/orm/session_transaction.html"
+    - "https://martinfowler.com/eaaCatalog/unitOfWork.html"
+
+- id: SQLA-014
+  text: >
+    In async SQLAlchemy, never access relationship attributes after session.commit() without
+    re-querying or using expire_on_commit=False. After commit, the session expires all
+    attributes and any lazy-load attempt in async context raises MissingGreenlet error.
+    Always set expire_on_commit=False on the async sessionmaker.
+  why: >
+    SQLAlchemy's default expire_on_commit=True behavior works in sync contexts because
+    attribute access triggers a lazy SELECT transparently. In async contexts, this lazy SELECT
+    requires an event loop greenlet that isn't available when you access the attribute outside
+    async context (e.g., in a Pydantic serializer, a log statement, or a return value inspection).
+    This produces the cryptic MissingGreenlet error that is extremely confusing to debug.
+    Teams spend hours chasing this before finding the solution is one line in sessionmaker config.
+  how_to_do_right: |
+    1. Set expire_on_commit=False on async sessionmaker (see SQLA-003)
+    2. For fresh data after commit: use session.refresh(instance) explicitly
+    3. After commit, use returned object with caution — it has committed state but won't auto-refresh
+    4. If you need relationships after commit: eagerly load them BEFORE commit using selectinload
+    5. For background tasks that use objects after the request session closes: use IDs, not ORM objects
+    6. Test: access obj.attribute AFTER session.commit() in tests to catch this early
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy, fastapi]
+  domains:
+    domain: [databases, backend, reliability]
+    concern: [async, session_lifecycle, expire_on_commit]
+  example_good: |
+    # sessionmaker configured correctly
+    AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def create_user_with_profile(session: AsyncSession, data: UserCreate) -> User:
+        user = User(email=data.email)
+        session.add(user)
+        await session.flush()  # Get user.id
+
+        profile = Profile(user_id=user.id, bio=data.bio)
+        session.add(profile)
+
+        await session.commit()
+
+        # expire_on_commit=False: attributes still accessible after commit
+        return user  # user.email, user.id accessible — no MissingGreenlet
+
+    # If you need relationships after commit, refresh explicitly:
+    async def create_and_return_full(session: AsyncSession, data: UserCreate) -> User:
+        user = User(email=data.email)
+        session.add(user)
+        await session.commit()
+        await session.refresh(user, ["profile"])  # Explicit refresh for relationship
+        return user
+  example_bad: |
+    # Default expire_on_commit=True (DO NOT USE in async)
+    AsyncSessionLocal = async_sessionmaker(engine)  # expire_on_commit=True default
+
+    async def create_user(session: AsyncSession, email: str) -> User:
+        user = User(email=email)
+        session.add(user)
+        await session.commit()
+        # Attributes expired! Accessing user.email triggers lazy load:
+        print(user.email)  # MissingGreenlet: greenlet_spawn has not been called
+        return user         # Serializer accessing user.email → same crash
+  when_applies: >
+    All async SQLAlchemy applications. Set expire_on_commit=False as the first thing when
+    configuring async_sessionmaker. Catch this in code review.
+  sources:
+    - "https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html#preventing-implicit-io-when-using-asyncsession"
+    - "https://docs.sqlalchemy.org/en/20/orm/session_api.html#sqlalchemy.orm.Session.params.expire_on_commit"
+
+- id: SQLA-015
+  text: >
+    Use session.execute(text("..."), {"param": value}) for raw SQL when ORM abstractions
+    are too expensive — complex reporting queries, recursive CTEs, UPSERT with conflict
+    handling. Always use bound parameters, never f-strings or string concatenation with
+    user data. Raw SQL is legitimate — never justify a 10x slower ORM query to avoid it.
+  why: >
+    Complex analytics queries with multiple CTEs, window functions, and conditional aggregations
+    are 5-20x more maintainable in raw SQL than as SQLAlchemy expression trees. A reporting
+    query that took 4 hours to write in SQLAlchemy Core (with 200 lines of Python) was
+    rewritten in 45 minutes as 40 lines of raw SQL, ran 3x faster, and was readable by the
+    data analyst who needed to modify it. The rule is: use ORM for CRUD, use raw SQL for
+    reporting and complex analytics. But ALWAYS use bound parameters — SQL injection via
+    f-strings is the #1 ORM vulnerability.
+  how_to_do_right: |
+    1. Use text() from sqlalchemy: stmt = text("SELECT * FROM users WHERE id = :user_id")
+    2. Pass parameters as dict: session.execute(stmt, {"user_id": user_id})
+    3. For TypedDict results: use session.execute(stmt).mappings().all()
+    4. For scalar results: session.execute(stmt).scalars().all()
+    5. NEVER: text(f"SELECT * FROM users WHERE id = {user_id}") — SQL injection
+    6. For PostgreSQL UPSERT: use insert().on_conflict_do_update() (ORM-friendly)
+    7. Validate raw SQL in tests: test that parameterized values are escaped correctly
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy, postgresql]
+  domains:
+    domain: [databases, security, performance]
+    concern: [sql_injection, raw_sql, reporting]
+  example_good: |
+    from sqlalchemy import text
+
+    async def get_user_activity_report(
+        session: AsyncSession, user_id: int, days: int
+    ) -> list[dict]:
+        stmt = text("""
+            WITH daily_stats AS (
+                SELECT
+                    DATE(created_at) as day,
+                    COUNT(*) as event_count,
+                    SUM(value) as total_value
+                FROM events
+                WHERE user_id = :user_id
+                  AND created_at >= NOW() - INTERVAL ':days days'
+                GROUP BY DATE(created_at)
+            )
+            SELECT day, event_count, total_value,
+                   SUM(total_value) OVER (ORDER BY day) as running_total
+            FROM daily_stats
+            ORDER BY day
+        """)
+        result = await session.execute(stmt, {"user_id": user_id, "days": days})
+        return [dict(row) for row in result.mappings()]
+  example_bad: |
+    # SQL INJECTION — never do this
+    async def get_user_data(session: AsyncSession, user_id: str) -> list:
+        stmt = text(f"SELECT * FROM users WHERE id = {user_id}")  # INJECTION!
+        # user_id = "1 OR 1=1" → returns all users
+        # user_id = "1; DROP TABLE users;" → destroys database
+        return list(await session.execute(stmt))
+  when_applies: >
+    Complex reporting queries, analytics, window functions, recursive CTEs, UPSERT patterns,
+    or any query where ORM abstractions add more complexity than they remove.
+  sources:
+    - "https://docs.sqlalchemy.org/en/20/core/sqlelement.html#sqlalchemy.sql.expression.text"
+    - "https://docs.sqlalchemy.org/en/20/orm/queryguide/dml.html#upsert-statements-for-postgresql-sqlite-mysql-mariadb"

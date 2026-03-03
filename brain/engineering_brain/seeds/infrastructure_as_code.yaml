@@ -1,0 +1,492 @@
+layer: rules
+technology: Terraform
+domain: devops
+knowledge:
+- id: CR-IAC-001
+  text: Store Terraform state in a remote backend (S3+DynamoDB) — never commit tfstate to git.
+  why: Local state files cannot be shared between team members, have no locking (concurrent applies corrupt state), and contain
+    secrets in plaintext. Committing tfstate to git exposes database passwords, API keys, and infrastructure details to anyone
+    with repo access. Lost local state means Terraform wants to recreate ALL resources.
+  how_to_do_right: Configure S3 backend with DynamoDB locking. Enable versioning on the S3 bucket for state recovery. Enable
+    encryption at rest (SSE-S3 or SSE-KMS). Restrict bucket access with IAM policies. Use separate state files per environment.
+    Add tfstate to .gitignore globally.
+  severity: critical
+  technologies:
+    library: [aws s3]
+    platform: [terraform, dynamodb]
+  domains:
+    domain: [operations, devops, security, infrastructure]
+  example_good: "# backend.tf — remote state with locking\nterraform {\n  backend \"s3\" {\n    bucket         = \"mycompany-terraform-state\"\
+    \n    key            = \"production/vpc/terraform.tfstate\"\n    region         = \"us-east-1\"\n    dynamodb_table =\
+    \ \"terraform-locks\"  # Prevents concurrent applies\n    encrypt        = true               # Encryption at rest\n \
+    \ }\n}\n\n# .gitignore\n*.tfstate\n*.tfstate.backup\n.terraform/\n"
+  example_bad: "# Local state — no locking, no sharing, secrets in plaintext\nterraform {\n  backend \"local\" {}  # Default\
+    \ — state file on disk\n}\n# terraform.tfstate committed to git — contains:\n# - RDS master password in plaintext\n# -\
+    \ IAM access keys\n# - Private IP addresses\n# Anyone with repo access sees all secrets\n"
+  when_applies: Any project using Terraform infrastructure as code, AWS S3, or AWS DynamoDB NoSQL
+  when_not_applies: local development only, throwaway experiments
+  sources: ["https://developer.hashicorp.com/terraform/language/settings/backends/s3"]
+- id: CR-IAC-002
+  text: Use one Terraform workspace or state file per environment — never share state across dev/staging/prod.
+  why: Shared state means a mistake in dev can destroy production resources. Terraform's dependency graph spans the entire
+    state — if dev and prod share state, 'terraform destroy' in dev could cascade to prod resources that depend on shared
+    modules. Separate state files create blast radius isolation.
+  how_to_do_right: 'Option A: Separate directories per environment (recommended for large teams). Option B: Terraform workspaces
+    for identical environments. Use terragrunt to DRY the backend config. Each environment has its own state file, its own
+    apply process, and its own approval gate.'
+  severity: critical
+  technologies:
+    library: [terragrunt]
+    platform: [terraform]
+  domains:
+    domain: [operations, devops, infrastructure, reliability]
+  example_good: "# Directory per environment — complete blast radius isolation\ninfrastructure/\n  modules/\n    vpc/\n  \
+    \  rds/\n    ecs/\n  environments/\n    dev/\n      main.tf        # module \"vpc\" { source = \"../../modules/vpc\" }\n\
+    \      terraform.tfvars\n      backend.tf     # key = \"dev/terraform.tfstate\"\n    staging/\n      main.tf\n      terraform.tfvars\n\
+    \      backend.tf     # key = \"staging/terraform.tfstate\"\n    production/\n      main.tf\n      terraform.tfvars\n\
+    \      backend.tf     # key = \"production/terraform.tfstate\"\n"
+  example_bad: "# One state for all environments\ninfrastructure/\n  main.tf     # All environments in one config\n  # \"\
+    terraform apply\" affects dev AND prod simultaneously\n  # One typo → production RDS deleted along with dev RDS\n"
+  when_applies: Any project using Terraform infrastructure as code or Terragrunt
+  when_not_applies: local development only, throwaway experiments. projects not using Terraform or Terragrunt
+  sources: ["https://developer.hashicorp.com/terraform/language/state/workspaces"]
+- id: CR-IAC-003
+  text: Design Terraform modules with clear input variables, output values, and semantic versioning.
+  why: Monolithic Terraform configs become unmaintainable past 500 lines. Without modules, teams copy-paste resource blocks,
+    creating drift between environments. Unversioned modules mean a change to the VPC module can break all consumers simultaneously
+    with no way to roll back.
+  how_to_do_right: Create modules for logical groups (vpc, database, service). Define all inputs as variables with types,
+    descriptions, and defaults. Define all outputs that consumers need. Version modules with git tags (v1.0.0, v1.1.0). Pin
+    module versions in consumers. Use validation blocks for input constraints.
+  severity: high
+  technologies:
+    platform: [terraform]
+  domains:
+    domain: [operations, devops, infrastructure]
+  example_good: "# modules/rds/variables.tf — typed, validated, documented\nvariable \"instance_class\" {\n  type        =\
+    \ string\n  description = \"RDS instance class (e.g., db.t3.medium)\"\n  validation {\n    condition     = can(regex(\"\
+    ^db\\\\.\", var.instance_class))\n    error_message = \"Instance class must start with 'db.'\"\n  }\n}\n\nvariable \"\
+    engine_version\" {\n  type    = string\n  default = \"15.4\"\n}\n\n# modules/rds/outputs.tf\noutput \"endpoint\" {\n \
+    \ value       = aws_db_instance.main.endpoint\n  description = \"RDS connection endpoint\"\n}\n\n# Consumer — pinned version\n\
+    module \"database\" {\n  source  = \"git::https://github.com/mycompany/tf-modules.git//rds?ref=v2.1.0\"\n  instance_class\
+    \ = \"db.t3.medium\"\n}\n"
+  example_bad: '# No modules — 2000-line main.tf with copy-pasted resources
+
+    resource "aws_db_instance" "prod_db" { ... }   # 40 lines
+
+    resource "aws_db_instance" "staging_db" { ... } # 40 lines copy-pasted
+
+    resource "aws_db_instance" "dev_db" { ... }     # 40 lines copy-pasted
+
+    # Drift guaranteed — someone updates prod but not staging
+
+    '
+  when_applies: Projects using Terraform infrastructure as code
+  when_not_applies: local development only, throwaway experiments. projects not using Terraform
+  sources: ["https://developer.hashicorp.com/terraform/language/modules/develop"]
+- id: CR-IAC-004
+  text: Always run terraform plan before terraform apply — review changes before they execute.
+  why: terraform apply without plan is like running SQL DELETE without WHERE on production. Terraform calculates a dependency
+    graph and may destroy/recreate resources you didn't expect. A plan review catches 'destroy and recreate RDS instance'
+    before it happens — saving hours of downtime and data loss.
+  how_to_do_right: 'Run ''terraform plan -out=tfplan'' to save the plan. Review the plan output carefully — look for destroy/replace
+    actions. Apply the saved plan: ''terraform apply tfplan''. In CI, save plan as artifact and require manual approval before
+    apply. Never use ''terraform apply -auto-approve'' on production.'
+  severity: critical
+  technologies:
+    platform: [terraform]
+  domains:
+    domain: [operations, devops, infrastructure, reliability]
+  example_good: "# CI pipeline — plan as artifact, manual approval for prod\n- name: Terraform Plan\n  run: |\n    terraform\
+    \ plan -out=tfplan -detailed-exitcode\n    terraform show -json tfplan > plan.json\n  # Exit code 2 = changes detected\n\
+    \n- name: Terraform Apply (requires approval)\n  if: github.ref == 'refs/heads/main'\n  environment: production  # Requires\
+    \ manual approval in GitHub\n  run: terraform apply tfplan\n\n# In PR comment — post plan summary\n# + aws_instance.web\
+    \ (create)\n# ~ aws_security_group.web (update in-place)\n# - aws_instance.old (DESTROY)  ← reviewer catches this\n"
+  example_bad: '# YOLO apply — no review, no saved plan
+
+    terraform apply -auto-approve  # On production!
+
+    # "Why did our RDS instance get recreated?"
+
+    # "Why did we lose 3 hours of data?"
+
+    # "I just wanted to change a tag..."
+
+    '
+  when_applies: Any project using Terraform infrastructure as code
+  when_not_applies: local development only, throwaway experiments. projects not using Terraform
+  sources: ["https://developer.hashicorp.com/terraform/cli/commands/plan"]
+- id: CR-IAC-005
+  text: Enable state locking to prevent concurrent Terraform modifications from corrupting state.
+  why: Two engineers running 'terraform apply' simultaneously will both read the same state, make different changes, and write
+    conflicting state back. The result is corrupted state that no longer matches reality — resources exist that Terraform
+    doesn't know about, or Terraform thinks resources exist that were destroyed. Recovery requires manual state surgery.
+  how_to_do_right: Use DynamoDB for AWS (automatic with S3 backend). Use blob lease for Azure. Use GCS built-in locking. Never
+    use 'terraform force-unlock' unless you're certain the lock is stale. Configure lock timeout appropriate for your longest
+    apply (default 0 = wait forever).
+  severity: critical
+  technologies:
+    platform: [terraform, dynamodb, aws]
+  domains:
+    domain: [operations, devops, infrastructure]
+  example_good: "# backend.tf — S3 with DynamoDB locking\nterraform {\n  backend \"s3\" {\n    bucket         = \"company-terraform-state\"\
+    \n    key            = \"prod/terraform.tfstate\"\n    region         = \"us-east-1\"\n    dynamodb_table = \"terraform-locks\"\
+    \  # Lock table\n    encrypt        = true\n  }\n}\n\n# DynamoDB table (create once)\nresource \"aws_dynamodb_table\"\
+    \ \"terraform_locks\" {\n  name         = \"terraform-locks\"\n  billing_mode = \"PAY_PER_REQUEST\"\n  hash_key     =\
+    \ \"LockID\"\n  attribute {\n    name = \"LockID\"\n    type = \"S\"\n  }\n}\n# Now concurrent applies will wait/fail\
+    \ instead of corrupting state\n"
+  example_bad: "# No locking — concurrent apply corrupts state\nterraform {\n  backend \"s3\" {\n    bucket = \"company-terraform-state\"\
+    \n    key    = \"prod/terraform.tfstate\"\n    # No dynamodb_table — NO LOCKING\n  }\n}\n# Engineer A: terraform apply\
+    \ (reads state, starts creating EC2)\n# Engineer B: terraform apply (reads SAME state, starts creating RDS)\n# Both write\
+    \ back — one change lost, state corrupted\n"
+  when_applies: Any project using Terraform infrastructure as code, AWS DynamoDB NoSQL, or AWS cloud infrastructure
+  when_not_applies: local development only, throwaway experiments
+  sources: ["https://developer.hashicorp.com/terraform/language/settings/backends/s3#dynamodb-state-locking"]
+- id: CR-IAC-006
+  text: Use terraform import to adopt existing resources — never recreate manually provisioned infrastructure.
+  why: Manually provisioned resources (created via console or CLI) exist outside Terraform's control. If you write Terraform
+    for an existing VPC without importing, Terraform will try to create a DUPLICATE VPC. Import brings existing resources
+    under Terraform management without any downtime or recreation.
+  how_to_do_right: Write the resource block matching the existing resource's configuration. Run 'terraform import <resource_address>
+    <resource_id>'. Run 'terraform plan' to verify no changes (config matches reality). Fix any diffs in the config. Use import
+    blocks (Terraform 1.5+) for declarative imports.
+  severity: high
+  technologies:
+    platform: [terraform]
+  domains:
+    domain: [operations, devops, infrastructure]
+  example_good: "# Terraform 1.5+ — declarative import block\nimport {\n  to = aws_vpc.main\n  id = \"vpc-0abc123def456\"\n\
+    }\n\nresource \"aws_vpc\" \"main\" {\n  cidr_block           = \"10.0.0.0/16\"  # Must match existing\n  enable_dns_hostnames\
+    \ = true\n  tags = {\n    Name = \"production-vpc\"\n  }\n}\n\n# Run: terraform plan\n# Output: \"No changes. Infrastructure\
+    \ is up-to-date.\"\n# Existing VPC is now managed by Terraform — no recreation\n"
+  example_bad: "# Writing Terraform for existing resource WITHOUT import\nresource \"aws_vpc\" \"main\" {\n  cidr_block =\
+    \ \"10.0.0.0/16\"\n}\n# terraform apply → \"Creating aws_vpc.main...\"\n# Now you have TWO VPCs — the original and a duplicate\n\
+    # All resources in the original VPC are orphaned from Terraform\n"
+  when_applies: Projects using Terraform infrastructure as code
+  when_not_applies: local development only, throwaway experiments. projects not using Terraform
+  sources: ["https://developer.hashicorp.com/terraform/language/import"]
+- id: CR-IAC-007
+  text: Mark sensitive variables and outputs — prevent secrets from appearing in plan output and state.
+  why: Terraform plan and apply output is often logged in CI systems and shared in pull request comments. Database passwords,
+    API keys, and certificates in plan output are visible to anyone with CI access. Even with remote state, 'terraform output'
+    shows sensitive values by default. Mark sensitive to redact from all output.
+  how_to_do_right: 'Mark variables as sensitive: sensitive = true. Mark outputs as sensitive: sensitive = true. Use a secrets
+    manager (Vault, AWS Secrets Manager) for actual secret values. Never pass secrets as -var on the command line (visible
+    in process list). Use environment variables (TF_VAR_) or encrypted tfvars files.'
+  severity: high
+  technologies:
+    library: [aws secrets manager]
+    platform: [terraform, vault]
+  domains:
+    domain: [operations, devops, infrastructure, security]
+  example_good: "# variables.tf — sensitive marked\nvariable \"db_password\" {\n  type      = string\n  sensitive = true \
+    \ # Redacted in plan/apply output\n}\n\n# outputs.tf — sensitive marked\noutput \"db_connection_string\" {\n  value  \
+    \   = \"postgres://admin:${var.db_password}@${aws_db_instance.main.endpoint}/app\"\n  sensitive = true  # Won't show in\
+    \ terraform output\n}\n\n# Pass via environment variable (not CLI arg)\n# export TF_VAR_db_password=$(vault kv get -field=password\
+    \ secret/db)\n# terraform plan\n"
+  example_bad: "# Password visible in plan output and state\nvariable \"db_password\" {\n  type    = string\n  default = \"\
+    super_secret_password\"  # Hardcoded default — in git!\n  # No sensitive = true — shows in terraform plan output\n}\n\
+    # CI log: db_password = \"super_secret_password\"\n# Anyone with CI access sees the production database password\n"
+  when_applies: Projects using Terraform infrastructure as code, HashiCorp Vault secrets management, or AWS Secrets Manager
+  when_not_applies: local development only, throwaway experiments
+  sources: ["https://developer.hashicorp.com/terraform/language/values/variables#suppressing-values-in-cli-output"]
+- id: CR-IAC-008
+  text: Run periodic terraform plan to detect configuration drift from manual changes.
+  why: Despite best intentions, engineers make manual changes via console during incidents, experiments, or 'quick fixes.'
+    These changes create drift between Terraform state and reality. Without detection, Terraform state becomes a lie — apply
+    may fail or destroy manual changes. In regulated environments, undetected drift is a compliance violation.
+  how_to_do_right: Schedule 'terraform plan' daily in CI (non-applying). Alert on any detected changes (exit code 2). Use
+    tools like driftctl or Snyk IaC for comprehensive drift detection. Log all drift events for audit. Reconcile drift within
+    24 hours — either import the change or revert it.
+  severity: medium
+  technologies:
+    library: [driftctl]
+    platform: [terraform, github_actions]
+  domains:
+    domain: [operations, devops, infrastructure, compliance]
+  example_good: "# Scheduled drift detection — runs daily, alerts on changes\nname: Drift Detection\non:\n  schedule:\n  \
+    \  - cron: '0 8 * * *'  # Daily at 8 AM UTC\njobs:\n  detect-drift:\n    runs-on: ubuntu-22.04\n    steps:\n      - uses:\
+    \ actions/checkout@v4\n      - run: terraform init\n      - run: |\n          terraform plan -detailed-exitcode -out=drift.plan\
+    \ 2>&1 | tee plan.log\n          EXIT_CODE=$?\n          if [ $EXIT_CODE -eq 2 ]; then\n            echo \"DRIFT DETECTED\
+    \ — sending alert\"\n            # Post to Slack/PagerDuty with plan diff\n          fi\n"
+  example_bad: '# No drift detection — silent divergence
+
+    # Week 1: Engineer adds security group rule via AWS console
+
+    # Week 2: Another engineer modifies RDS parameters via console
+
+    # Week 4: terraform apply → DESTROYS both manual changes
+
+    # "Why did our security group rules disappear?"
+
+    '
+  when_applies: Projects using Terraform infrastructure as code, GitHub Actions, or driftctl
+  when_not_applies: local development only, throwaway experiments
+  sources: ["https://developer.hashicorp.com/terraform/cli/commands/plan#detailed-exitcode"]
+- id: CR-IAC-009
+  text: Compose infrastructure from modules — root module orchestrates child modules, not raw resources.
+  why: Root modules with hundreds of raw resources are impossible to reason about. Module composition creates clear abstraction
+    boundaries — a 'service' module encapsulates its VPC, ALB, ECS, and RDS. Changes to the database module don't affect the
+    networking module. Teams can own modules independently.
+  how_to_do_right: Root module calls child modules with explicit variables. Each module is a logical unit (vpc, database,
+    service, monitoring). Modules have clear interfaces (input variables, output values). Use module outputs to wire modules
+    together. Limit module depth to 2-3 levels to avoid complexity.
+  severity: medium
+  technologies:
+    platform: [terraform]
+  domains:
+    domain: [operations, devops, infrastructure]
+  example_good: "# Root module — clear composition\nmodule \"vpc\" {\n  source = \"./modules/vpc\"\n  cidr   = \"10.0.0.0/16\"\
+    \n  azs    = [\"us-east-1a\", \"us-east-1b\"]\n}\n\nmodule \"database\" {\n  source          = \"./modules/rds\"\n  vpc_id\
+    \          = module.vpc.vpc_id           # Wired via output\n  subnet_ids      = module.vpc.private_subnets  # Wired via\
+    \ output\n  instance_class  = \"db.r6g.large\"\n  engine_version  = \"15.4\"\n}\n\nmodule \"service\" {\n  source    \
+    \  = \"./modules/ecs-service\"\n  vpc_id      = module.vpc.vpc_id\n  subnet_ids  = module.vpc.private_subnets\n  db_endpoint\
+    \ = module.database.endpoint  # Service knows where DB is\n}\n"
+  example_bad: '# Flat main.tf — 800 lines of raw resources
+
+    resource "aws_vpc" "main" { ... }
+
+    resource "aws_subnet" "private_a" { ... }
+
+    resource "aws_subnet" "private_b" { ... }
+
+    resource "aws_db_instance" "main" { ... }
+
+    resource "aws_ecs_cluster" "main" { ... }
+
+    resource "aws_ecs_service" "app" { ... }
+
+    resource "aws_alb" "main" { ... }
+
+    # 50+ resources in one file — nobody can understand the dependency graph
+
+    '
+  when_applies: Projects using Terraform infrastructure as code
+  when_not_applies: local development only, throwaway experiments. projects not using Terraform
+  sources: ["https://developer.hashicorp.com/terraform/language/modules/develop/composition"]
+- id: CR-IAC-010
+  text: Use for_each for maps/sets and count only for boolean resource toggling — never count for named resources.
+  why: count uses numeric indices — removing item [1] from a list of 3 causes item [2] to become [1], triggering destroy+recreate
+    of a perfectly healthy resource. for_each uses map keys — removing key 'staging' only destroys 'staging', leaving 'production'
+    untouched. count with indices has caused production database deletions.
+  how_to_do_right: 'Use for_each with a map for named resources (subnets, security groups, IAM roles). Use count only as a
+    boolean toggle: count = var.create_resource ? 1 : 0. When converting count to for_each, use ''moved'' blocks to prevent
+    destroy/recreate.'
+  severity: high
+  technologies:
+    platform: [terraform]
+  domains:
+    domain: [operations, devops, infrastructure]
+  example_good: "# for_each with map — safe to add/remove entries\nvariable \"subnets\" {\n  type = map(object({\n    cidr\
+    \ = string\n    az   = string\n  }))\n  default = {\n    private-a = { cidr = \"10.0.1.0/24\", az = \"us-east-1a\" }\n\
+    \    private-b = { cidr = \"10.0.2.0/24\", az = \"us-east-1b\" }\n  }\n}\n\nresource \"aws_subnet\" \"private\" {\n  for_each\
+    \          = var.subnets\n  vpc_id            = aws_vpc.main.id\n  cidr_block        = each.value.cidr\n  availability_zone\
+    \ = each.value.az\n  tags = { Name = each.key }\n}\n# Removing \"private-b\" destroys ONLY private-b — private-a untouched\n"
+  example_bad: "# count with list — index shift destroys wrong resources\nvariable \"subnet_cidrs\" {\n  default = [\"10.0.1.0/24\"\
+    , \"10.0.2.0/24\", \"10.0.3.0/24\"]\n}\n\nresource \"aws_subnet\" \"private\" {\n  count      = length(var.subnet_cidrs)\n\
+    \  cidr_block = var.subnet_cidrs[count.index]\n}\n# Remove \"10.0.2.0/24\" (index 1):\n# - subnet[1] becomes \"10.0.3.0/24\"\
+    \ → DESTROY old [1] + RECREATE\n# - subnet[2] is removed → DESTROY\n# Net: 2 subnets destroyed when you only wanted to\
+    \ remove 1\n"
+  when_applies: Projects using Terraform infrastructure as code
+  when_not_applies: local development only, throwaway experiments. projects not using Terraform
+  sources: ["https://developer.hashicorp.com/terraform/language/meta-arguments/for_each"]
+- id: CR-IAC-011
+  text: Use lifecycle prevent_destroy for stateful resources — databases, S3 buckets, encryption keys.
+  why: A single 'terraform destroy' or accidental resource removal from config permanently deletes your production database.
+    There is no undo. prevent_destroy forces an explicit error if Terraform tries to destroy the resource, requiring manual
+    override. This has prevented more production data loss incidents than any other Terraform feature.
+  how_to_do_right: Add lifecycle { prevent_destroy = true } to all stateful resources (RDS, S3, DynamoDB, KMS keys, EBS volumes).
+    When you actually need to destroy, temporarily remove the block, apply, then re-add. Use in combination with deletion
+    protection on the resource itself.
+  severity: critical
+  technologies:
+    library: [aws rds, aws s3]
+    platform: [terraform]
+  domains:
+    domain: [operations, devops, infrastructure, reliability]
+  example_good: "resource \"aws_db_instance\" \"production\" {\n  identifier     = \"production-db\"\n  engine         = \"\
+    postgres\"\n  engine_version = \"15.4\"\n  instance_class = \"db.r6g.large\"\n\n  deletion_protection = true  # AWS-level\
+    \ protection\n\n  lifecycle {\n    prevent_destroy = true  # Terraform-level protection\n  }\n}\n# terraform destroy →\
+    \ Error: Instance cannot be destroyed\n# Must explicitly remove both protections — deliberate, auditable\n"
+  example_bad: "resource \"aws_db_instance\" \"production\" {\n  identifier     = \"production-db\"\n  engine         = \"\
+    postgres\"\n  instance_class = \"db.r6g.large\"\n  # No prevent_destroy — one wrong command deletes production DB\n  #\
+    \ No deletion_protection — AWS won't stop it either\n}\n# terraform destroy → \"Destroyed: aws_db_instance.production\"\
+    \n# All data gone. No recovery without backup.\n"
+  when_applies: Any project using Terraform infrastructure as code, AWS RDS, or AWS S3
+  when_not_applies: local development only, throwaway experiments
+  sources: ["https://developer.hashicorp.com/terraform/language/meta-arguments/lifecycle#prevent_destroy"]
+- id: CR-IAC-012
+  text: Use moved blocks to refactor Terraform resource addresses without destroying and recreating resources.
+  why: Renaming a resource in Terraform config (e.g., aws_instance.web → aws_instance.app) causes Terraform to destroy the
+    old resource and create a new one — even though nothing changed about the actual infrastructure. For stateful resources,
+    this means data loss. Moved blocks tell Terraform 'this resource was renamed, not replaced.'
+  how_to_do_right: Add a 'moved' block mapping old address to new address. Run terraform plan to verify 'moved' appears instead
+    of 'destroy+create'. Apply the change. Keep moved blocks for at least one full apply cycle across all environments. Remove
+    moved blocks after all environments have been updated.
+  severity: high
+  technologies:
+    platform: [terraform]
+  domains:
+    domain: [operations, devops, infrastructure]
+  example_good: "# Rename resource without destroying it\nmoved {\n  from = aws_instance.web\n  to   = aws_instance.app_server\n\
+    }\n\nresource \"aws_instance\" \"app_server\" {\n  ami           = \"ami-0abc123\"\n  instance_type = \"t3.medium\"\n\
+    }\n\n# terraform plan output:\n# aws_instance.web has moved to aws_instance.app_server\n# No destroy, no recreate — just\
+    \ rename in state\n"
+  example_bad: '# Rename without moved block — resource destroyed and recreated
+
+    # Before: resource "aws_instance" "web" { ... }
+
+    # After:  resource "aws_instance" "app_server" { ... }
+
+
+    # terraform plan:
+
+    # - aws_instance.web (DESTROY)       ← Running instance terminated!
+
+    # + aws_instance.app_server (CREATE)  ← New instance, new IP, downtime
+
+    '
+  when_applies: Projects using Terraform infrastructure as code
+  when_not_applies: local development only, throwaway experiments. projects not using Terraform
+  sources: ["https://developer.hashicorp.com/terraform/language/modules/develop/refactoring"]
+- id: CR-IAC-013
+  text: When using Pulumi or CDK, leverage real programming language features — loops, conditions, abstractions, and type
+    safety.
+  why: 'IaC-as-code (Pulumi, CDK) exists because HCL cannot express complex logic without workarounds. Using Pulumi/CDK but
+    writing procedural resource-by-resource code misses the entire point. Real code enables: type-safe resource references
+    (compile-time errors), reusable functions and classes, conditional logic without ternary hacks, and unit-testable infrastructure.'
+  how_to_do_right: 'Create classes/functions for resource groups (like Terraform modules but with type safety). Use language
+    features: loops for similar resources, inheritance for environment variants, generics for reusable patterns. Write unit
+    tests for infrastructure logic. Use IDE features (autocomplete, refactoring).'
+  severity: medium
+  technologies:
+    library: [aws cdk, cdktf]
+    platform: [pulumi]
+  domains:
+    domain: [operations, devops, infrastructure]
+  example_good: "# Pulumi (Python) — type-safe, testable, composable\nimport pulumi\nimport pulumi_aws as aws\n\nclass WebService(pulumi.ComponentResource):\n\
+    \    \"\"\"Encapsulates ALB + ECS + RDS for a web service.\"\"\"\n    def __init__(self, name: str, opts=None, **kwargs):\n\
+    \        super().__init__(\"custom:WebService\", name, None, opts)\n\n        self.db = aws.rds.Instance(f\"{name}-db\"\
+    ,\n            engine=\"postgres\",\n            instance_class=\"db.t3.medium\",\n            opts=pulumi.ResourceOptions(parent=self),\n\
+    \        )\n        self.cluster = aws.ecs.Cluster(f\"{name}-cluster\",\n            opts=pulumi.ResourceOptions(parent=self),\n\
+    \        )\n        # Type-safe: self.db.endpoint is Output[str], not untyped string\n        self.register_outputs({\"\
+    db_endpoint\": self.db.endpoint})\n\n# Usage — clean, composable\napi = WebService(\"api\")\nweb = WebService(\"web\"\
+    )\n"
+  example_bad: '# Pulumi but written like procedural Terraform — misses the point
+
+    db = aws.rds.Instance("db", engine="postgres", instance_class="db.t3.medium")
+
+    cluster = aws.ecs.Cluster("cluster")
+
+    service = aws.ecs.Service("service", cluster=cluster.arn)
+
+    # No abstraction, no types, no tests — just HCL with Python syntax
+
+    '
+  when_applies: Projects using Pulumi infrastructure as code, AWS CDK, or CDKTF
+  when_not_applies: local development only, throwaway experiments
+  sources:
+    - "https://www.pulumi.com/docs/concepts/"
+    - "https://docs.aws.amazon.com/cdk/v2/guide/home.html"
+- id: CR-IAC-014
+  text: Use GitOps (ArgoCD/Flux) for Kubernetes — git repository is the single source of truth for cluster state.
+  why: kubectl apply from laptops is unreproducible, unauditable, and dangerous. You cannot tell who applied what or when.
+    GitOps makes git the single source of truth — every change is a PR with review, approval, and audit trail. The cluster
+    continuously reconciles to match git, automatically fixing drift.
+  how_to_do_right: Store all Kubernetes manifests in a git repo. Use ArgoCD or Flux to watch the repo. Changes deploy via
+    PR merge, not kubectl. Enable auto-sync for dev, manual-sync for production. Monitor sync status and drift alerts. Use
+    Kustomize or Helm for environment-specific overrides.
+  severity: high
+  technologies:
+    library: [flux]
+    platform: [argocd, kubernetes, helm, kustomize]
+  domains:
+    domain: [operations, devops, infrastructure]
+    concern: [kubernetes]
+  example_good: "# ArgoCD Application — watches git, syncs to cluster\napiVersion: argoproj.io/v1alpha1\nkind: Application\n\
+    metadata:\n  name: my-app\n  namespace: argocd\nspec:\n  source:\n    repoURL: https://github.com/mycompany/k8s-manifests\n\
+    \    targetRevision: main\n    path: apps/my-app/production\n  destination:\n    server: https://kubernetes.default.svc\n\
+    \    namespace: production\n  syncPolicy:\n    automated:\n      prune: true       # Delete resources removed from git\n\
+    \      selfHeal: true    # Revert manual kubectl changes\n    syncOptions:\n      - CreateNamespace=true\n# Deploy flow:\
+    \ PR → review → merge → ArgoCD auto-syncs → cluster updated\n"
+  example_bad: '# Manual kubectl — unreproducible, unauditable
+
+    kubectl apply -f deployment.yaml  # From someone''s laptop
+
+    # Questions with no answers:
+
+    # - Who applied this? (no audit trail)
+
+    # - What version is running? (no git reference)
+
+    # - Can we reproduce this? (depends on laptop state)
+
+    # - How do we roll back? (kubectl rollout undo... maybe?)
+
+    '
+  when_applies: Projects using ArgoCD, Flux, Kubernetes-orchestrated deployments, or Helm chart deployments
+  when_not_applies: local development only, throwaway experiments
+  sources: ["https://argo-cd.readthedocs.io/en/stable/"]
+- id: CR-IAC-015
+  text: Promote changes through environments via git — dev branch → staging branch → production branch or directory.
+  why: 'Promoting infrastructure changes by editing configs per environment is error-prone and unreviewable. Git-based promotion
+    creates an audit trail: ''PR #123 promoted v2.3.1 from staging to production, approved by @alice and @bob.'' Rollback
+    is a git revert. Every environment state is reconstructible from git history.'
+  how_to_do_right: 'Option A: Directory per environment (apps/my-app/dev/, apps/my-app/staging/, apps/my-app/prod/). Option
+    B: Branch per environment (dev branch auto-syncs, staging/prod require PR). Use image tag promotion: update image tag
+    in environment directory via PR. Automate dev→staging promotion, require manual approval for staging→prod.'
+  severity: medium
+  technologies:
+    library: [flux]
+    platform: [argocd, kubernetes, kustomize]
+  domains:
+    domain: [operations, devops, infrastructure]
+    concern: [kubernetes]
+  example_good: "# Directory structure — Kustomize overlays per environment\napps/my-app/\n  base/\n    deployment.yaml\n\
+    \    service.yaml\n    kustomization.yaml\n  overlays/\n    dev/\n      kustomization.yaml       # image: app:latest (auto-promoted)\n\
+    \    staging/\n      kustomization.yaml       # image: app:a1b2c3d (PR-promoted)\n    production/\n      kustomization.yaml\
+    \       # image: app:a1b2c3d (manual approval)\n\n# Promotion flow:\n# 1. CI builds app:a1b2c3d\n# 2. Bot opens PR updating\
+    \ staging/kustomization.yaml image tag\n# 3. Staging tests pass → bot opens PR for production\n# 4. Human approves production\
+    \ PR → merge → ArgoCD deploys\n"
+  example_bad: '# Ad-hoc promotion — no trail, no review
+
+    ssh staging-server "docker pull app:latest && docker-compose up -d"
+
+    # Later...
+
+    ssh prod-server "docker pull app:latest && docker-compose up -d"
+
+    # "latest" may have changed between staging and prod deploys
+
+    # No record of who promoted, when, or what version
+
+    '
+  when_applies: Projects using ArgoCD, Flux, Kubernetes-orchestrated deployments, or Kustomize
+  when_not_applies: local development only, throwaway experiments
+  sources: ["https://argo-cd.readthedocs.io/en/stable/user-guide/best_practices/"]
+- id: CR-IAC-016
+  text: Enable drift reconciliation — auto-sync for non-production, manual approve for production.
+  why: 'Kubernetes drift happens constantly: engineers run kubectl for debugging, HPA scales replicas, CRDs auto-update. Without
+    reconciliation, the cluster silently diverges from git — you lose the ''git is truth'' guarantee. Auto-sync for dev/staging
+    catches drift immediately. Manual-sync for production adds a human gate before changes affect customers.'
+  how_to_do_right: Configure ArgoCD/Flux auto-sync with selfHeal=true for dev and staging. Configure manual sync for production
+    with notifications. Set sync windows to prevent deploys during peak hours. Monitor 'OutOfSync' status and alert if production
+    drifts for >1 hour. Log all manual kubectl commands for audit.
+  severity: medium
+  technologies:
+    library: [flux]
+    platform: [argocd, kubernetes]
+  domains:
+    domain: [operations, devops, infrastructure, reliability]
+  example_good: "# Dev — auto-sync, auto-heal (drift fixed immediately)\nsyncPolicy:\n  automated:\n    prune: true\n    selfHeal:\
+    \ true  # Reverts manual kubectl changes automatically\n\n# Production — manual sync with notification\nsyncPolicy:\n\
+    \  automated: null  # No auto-sync — requires manual trigger\n# ArgoCD sends Slack notification: \"Production is OutOfSync\"\
+    \n# Engineer reviews diff in ArgoCD UI → clicks Sync\n\n# Sync window — no deploys during peak hours\nsyncWindows:\n \
+    \ - kind: deny\n    schedule: '0 9 * * 1-5'   # Block Mon-Fri 9AM-5PM\n    duration: 8h\n    clusters: ['production']\n"
+  example_bad: "# Auto-sync on production without review\nsyncPolicy:\n  automated:\n    prune: true      # Auto-deletes resources\
+    \ from production!\n    selfHeal: true   # Reverts manual hotfixes automatically!\n# Scenario: incident at 3AM, engineer\
+    \ adds manual resource\n# ArgoCD immediately deletes it because it's not in git\n# Engineer re-applies, ArgoCD deletes\
+    \ again — fight loop\n"
+  when_applies: Projects using ArgoCD, Flux, or Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments
+  sources: ["https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/"]

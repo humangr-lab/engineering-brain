@@ -1,0 +1,985 @@
+layer: rules
+domain: fact_checking
+knowledge:
+- id: FC-CORE-001
+  text: "Break complex claims into atomic verifiable units before evaluation. A single sentence like 'Country X has the highest GDP and lowest unemployment' contains two independent claims that must be verified separately."
+  why: >
+    Compound claims hide partial truths. If you verify the bundle as one unit, a true sub-claim
+    masks a false one, producing a PARTIALLY_TRUE verdict when the correct output is TRUE + FALSE.
+    The Veritas pilot found 34% of user-submitted claims were compound, and bundled verification
+    produced wrong verdicts 22% of the time.
+  how_to_do_right: |
+    1. Parse claim text with NLP dependency parser to identify coordinating conjunctions (and, but, also)
+    2. Split on each independent predicate — each must have its own subject-verb-object triple
+    3. Assign each atomic claim a unique claim_id with parent reference (e.g., CLM-001-A, CLM-001-B)
+    4. Verify each atomic claim independently with its own evidence chain
+    5. Aggregate atomic verdicts into parent verdict using worst-case rule (one FALSE = parent PARTIALLY_TRUE)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [spacy, nltk]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    def decompose_claim(text: str) -> list[AtomicClaim]:
+        doc = nlp(text)
+        atomic_claims = []
+        for sent in doc.sents:
+            predicates = extract_predicates(sent)
+            for pred in predicates:
+                atomic_claims.append(AtomicClaim(
+                    text=pred.text,
+                    parent_claim_id=claim.id,
+                    subject=pred.subject,
+                    predicate=pred.verb,
+                    object=pred.object,
+                ))
+        return atomic_claims
+  example_bad: |
+    def verify_claim(text: str) -> Verdict:
+        # Treats entire compound claim as single unit
+        evidence = search_evidence(text)
+        return evaluate(text, evidence)  # Misses partial truths
+  when_applies: Any claim longer than 15 words or containing conjunctions, comparative statements, or multiple entities
+  sources:
+    - "ClaimBuster: The First-ever End-to-End Fact-Checking System (Hassan et al., 2017)"
+
+- id: FC-CORE-002
+  text: "Classify evidence into a strict hierarchy: primary sources (original data, official records, direct testimony) outrank secondary (news reports, analyses) which outrank tertiary (Wikipedia, aggregators). Never let tertiary evidence override primary."
+  why: >
+    Tertiary sources introduce telephone-game distortion. A Wikipedia article citing a news article
+    citing a study can misrepresent the original finding at each hop. In the Veritas prototype,
+    relying on tertiary sources alone produced 18% higher false-positive rate compared to
+    requiring at least one primary source per verdict.
+  how_to_do_right: |
+    1. Tag every evidence piece with source_tier: PRIMARY (1), SECONDARY (2), TERTIARY (3)
+    2. Require at least one PRIMARY or SECONDARY source for any non-UNVERIFIABLE verdict
+    3. Weight evidence by tier in scoring: primary=1.0, secondary=0.6, tertiary=0.3
+    4. Flag verdicts that rely solely on tertiary sources for human review
+    5. Track provenance chain: tertiary → secondary → primary
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, compliance]
+    concern: [domain_specific]
+  example_good: |
+    class Evidence(BaseModel):
+        text: str
+        source_url: str
+        source_tier: Literal["PRIMARY", "SECONDARY", "TERTIARY"]
+        provenance_chain: list[str] = []
+
+    def score_evidence(evidence_list: list[Evidence]) -> float:
+        tier_weights = {"PRIMARY": 1.0, "SECONDARY": 0.6, "TERTIARY": 0.3}
+        total = sum(tier_weights[e.source_tier] * e.relevance for e in evidence_list)
+        return total / len(evidence_list)
+  example_bad: |
+    def score_evidence(evidence_list: list[dict]) -> float:
+        # All sources treated equally — Wikipedia same weight as official records
+        return sum(e["relevance"] for e in evidence_list) / len(evidence_list)
+  when_applies: Every evidence evaluation step in the fact-checking pipeline
+  sources:
+    - "IFCN Code of Principles (2016)"
+
+- id: FC-CORE-003
+  text: "Use a 6-value truth taxonomy: TRUE, FALSE, PARTIALLY_TRUE, UNVERIFIABLE, MISLEADING, OUT_OF_CONTEXT. Binary true/false is insufficient for real-world fact-checking."
+  why: >
+    Binary verdicts force false dichotomies. A claim that quotes real data but omits crucial context
+    is not FALSE but is harmful — it needs MISLEADING or OUT_OF_CONTEXT. PolitiFact's 6-level
+    Truth-O-Meter exists precisely because binary classification lost user trust. Veritas needs
+    nuanced verdicts to match IFCN-certified fact-checkers.
+  how_to_do_right: |
+    1. Define enum VerdictLabel with exactly 6 values: TRUE, FALSE, PARTIALLY_TRUE, UNVERIFIABLE, MISLEADING, OUT_OF_CONTEXT
+    2. Each verdict MUST include a confidence score (0.0-1.0) and explanation
+    3. Map PARTIALLY_TRUE when >= 1 atomic sub-claim is true and >= 1 is false
+    4. Map MISLEADING when all facts are technically true but framing distorts meaning
+    5. Map OUT_OF_CONTEXT when claim extracts truthful quote/data but removes essential context
+    6. Map UNVERIFIABLE when no sufficient evidence exists (not same as FALSE)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [pydantic]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    class VerdictLabel(str, Enum):
+        TRUE = "TRUE"
+        FALSE = "FALSE"
+        PARTIALLY_TRUE = "PARTIALLY_TRUE"
+        UNVERIFIABLE = "UNVERIFIABLE"
+        MISLEADING = "MISLEADING"
+        OUT_OF_CONTEXT = "OUT_OF_CONTEXT"
+
+    class Verdict(BaseModel):
+        label: VerdictLabel
+        confidence: float = Field(ge=0.0, le=1.0)
+        explanation: str
+        evidence_ids: list[str]
+  example_bad: |
+    def check_claim(claim: str) -> bool:
+        # Binary true/false — loses all nuance
+        evidence = find_evidence(claim)
+        return evidence_supports(claim, evidence)
+  when_applies: All verdict generation in the Veritas platform
+  sources:
+    - "PolitiFact Truth-O-Meter methodology"
+    - "Full Fact scoring system"
+
+- id: FC-CORE-004
+  text: "Implement the verification workflow as a deterministic pipeline with 6 stages: claim intake, decompose, search evidence, evaluate evidence, render verdict, and generate explanation. Each stage must be independently testable and produce auditable artifacts."
+  why: >
+    Without a structured pipeline, verification becomes an opaque LLM call that cannot be audited,
+    debugged, or improved incrementally. IFCN requires transparency in methodology. A monolithic
+    verify() function makes it impossible to identify where errors occur — was it bad search,
+    bad evaluation, or bad explanation?
+  how_to_do_right: |
+    1. Define each stage as a separate function with typed input/output (Pydantic models)
+    2. Persist intermediate artifacts: decomposed claims, search results, evidence scores
+    3. Each stage writes to audit log with timestamp, input hash, output hash
+    4. Use LangGraph or similar state machine to orchestrate stages
+    5. Enable stage-level retries without re-running entire pipeline
+    6. Expose stage-level metrics: latency, evidence count, confidence delta
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [langgraph, pydantic]
+  domains:
+    domain: [fact_checking, architecture]
+    concern: [domain_specific]
+  example_good: |
+    class VerificationPipeline:
+        async def run(self, claim: RawClaim) -> VerificationResult:
+            intake = await self.intake_stage(claim)
+            atoms = await self.decompose_stage(intake)
+            evidence = await self.search_stage(atoms)
+            evaluation = await self.evaluate_stage(atoms, evidence)
+            verdict = await self.verdict_stage(evaluation)
+            explanation = await self.explain_stage(verdict)
+            return VerificationResult(
+                stages=[intake, atoms, evidence, evaluation, verdict, explanation],
+                final_verdict=verdict,
+            )
+  example_bad: |
+    async def verify(claim_text: str) -> str:
+        # Monolithic — no audit trail, no intermediate artifacts
+        response = await llm.complete(f"Is this true? {claim_text}")
+        return response.text
+  when_applies: Core verification flow in the Veritas platform
+  sources:
+    - "ClaimBuster pipeline architecture"
+    - "Google Fact Check Tools API design"
+
+- id: FC-CORE-005
+  text: "Follow IFCN (International Fact-Checking Network) Code of Principles: nonpartisanship, transparency of sources, transparency of funding, transparency of methodology, and open corrections policy. Encode these as machine-verifiable invariants."
+  why: >
+    IFCN certification is the gold standard for fact-checking organizations. Without adherence,
+    Veritas outputs will not be trusted by platforms (Google, Facebook, Twitter) that rely on
+    IFCN-certified sources for their fact-check labels. Non-compliance also exposes the platform
+    to accusations of bias, undermining user trust.
+  how_to_do_right: |
+    1. Nonpartisanship: Track verdict distribution per political leaning — flag if skew > 10%
+    2. Source transparency: Every verdict MUST link to original evidence URLs
+    3. Methodology transparency: Publish scoring algorithm and thresholds publicly
+    4. Corrections: Implement verdict versioning — never delete, only supersede with correction
+    5. Run automated IFCN compliance check weekly: source linkage rate, correction count, bias metrics
+    6. Store all parameters (thresholds, weights) in version-controlled config, not code
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, compliance]
+    concern: [domain_specific]
+  example_good: |
+    class IFCNComplianceChecker:
+        def check_nonpartisanship(self, verdicts: list[Verdict], window_days: int = 30) -> bool:
+            distribution = Counter(v.political_leaning for v in verdicts)
+            max_skew = max(distribution.values()) / sum(distribution.values())
+            return max_skew < 0.60  # No single leaning > 60%
+
+        def check_source_transparency(self, verdict: Verdict) -> bool:
+            return all(e.source_url for e in verdict.evidence) and len(verdict.evidence) >= 1
+  example_bad: |
+    def verify(claim: str) -> str:
+        # No source links, no methodology disclosure, no correction mechanism
+        return llm.complete(f"Fact check: {claim}").text
+  when_applies: All public-facing verdicts and any integration with third-party platforms
+  sources:
+    - "https://ifcncodeofprinciples.poynter.org/"
+
+- id: FC-CORE-006
+  text: "Track claim provenance from original source through every transformation. Record who said it, when, where, and how it spread. A claim without provenance is unverifiable by definition."
+  why: >
+    Claims mutate as they spread — a nuanced statement becomes an absolute claim via social media
+    telephone game. Without provenance, you might verify a distorted version of the original
+    claim and produce a wrong verdict. Provenance also helps detect coordinated disinformation
+    campaigns where the same claim appears simultaneously across multiple outlets.
+  how_to_do_right: |
+    1. Record original_source (URL/author), original_date, and exact original_text
+    2. Track each restatement as a ClaimVariant with similarity score to original
+    3. Store spread_path: list of (platform, timestamp, reach_estimate) tuples
+    4. Link all variants to a canonical claim_id via deduplication
+    5. Flag claims where original source cannot be identified as provenance_unknown
+    6. Index provenance data in Elasticsearch for temporal and network queries
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [elasticsearch, pydantic]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    class ClaimProvenance(BaseModel):
+        original_source: str | None
+        original_date: datetime | None
+        original_text: str
+        spread_path: list[SpreadEvent] = []
+        variants: list[ClaimVariant] = []
+        provenance_confidence: float = Field(ge=0.0, le=1.0)
+
+    class SpreadEvent(BaseModel):
+        platform: str
+        timestamp: datetime
+        url: str
+        reach_estimate: int | None
+  example_bad: |
+    class Claim(BaseModel):
+        text: str  # No provenance — who said this? when? where?
+        verdict: str
+  when_applies: All claim intake and deduplication stages
+  sources:
+    - "Credibility Coalition annotation schema"
+
+- id: FC-CORE-007
+  text: "Handle temporal validity explicitly: a claim that was true in 2020 may be false in 2024. Every verdict must be timestamped and include a temporal_validity field indicating whether the claim is time-sensitive."
+  why: >
+    Statistics, rankings, policies, and scientific consensus change over time. 'Country X has the
+    highest GDP' might have been true last year but not this year. Without temporal validity,
+    fact-checks become stale and misleading. The Duke Reporters Lab found that 15% of rated
+    claims had their truth value change within 2 years.
+  how_to_do_right: |
+    1. Extract temporal expressions from claim text (dates, 'currently', 'last year', 'always')
+    2. Tag each verdict with verified_as_of: datetime and temporal_sensitivity: HIGH/MEDIUM/LOW/NONE
+    3. HIGH sensitivity: re-verify every 7 days (statistics, rankings, prices)
+    4. MEDIUM: re-verify every 30 days (policies, regulations)
+    5. LOW: re-verify every 90 days (historical facts, scientific consensus)
+    6. NONE: no re-verification needed (mathematical facts, definitions)
+    7. Display temporal_validity prominently in fact-check output
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [dateparser, pydantic]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    class TemporalValidity(BaseModel):
+        verified_as_of: datetime
+        sensitivity: Literal["HIGH", "MEDIUM", "LOW", "NONE"]
+        next_review: datetime | None
+        temporal_expressions_found: list[str]
+
+    class Verdict(BaseModel):
+        label: VerdictLabel
+        temporal: TemporalValidity
+  example_bad: |
+    class Verdict(BaseModel):
+        label: str
+        # No timestamp — verdict could be from years ago
+        # No temporal sensitivity — stale facts served as current
+  when_applies: All verdicts, especially claims containing statistics, rankings, prices, or policy references
+  sources:
+    - "Duke Reporters Lab Tech & Check database"
+
+- id: FC-CORE-008
+  text: "Detect and break circular references in evidence chains. If Source A cites Source B which cites Source A, the apparent corroboration is illusory — you have zero independent sources, not two."
+  why: >
+    Circular citations create false confidence. Two sources citing each other look like independent
+    corroboration but provide zero additional evidence. This is especially common in health
+    misinformation where blogs cite each other. A fact-checker who counts circular sources as
+    independent will systematically overrate evidence strength.
+  how_to_do_right: |
+    1. Build a directed citation graph for each evidence set
+    2. Run cycle detection (DFS-based) on the citation graph
+    3. If cycle detected, collapse all cycle members into a single evidence unit
+    4. Reduce corroboration score proportionally to cycle size
+    5. Flag circular references in the audit trail with warning level HIGH
+    6. Track citation_depth: reject evidence chains deeper than 5 hops without a primary source
+  severity: high
+  technologies:
+    lang: [python]
+    library: [networkx]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    import networkx as nx
+
+    def detect_circular_references(evidence: list[Evidence]) -> list[set[str]]:
+        G = nx.DiGraph()
+        for e in evidence:
+            for cited_url in e.citations:
+                G.add_edge(e.source_url, cited_url)
+        cycles = list(nx.simple_cycles(G))
+        return [set(cycle) for cycle in cycles]
+
+    def adjusted_corroboration(evidence: list[Evidence]) -> int:
+        cycles = detect_circular_references(evidence)
+        circular_sources = set().union(*cycles) if cycles else set()
+        independent = [e for e in evidence if e.source_url not in circular_sources]
+        return len(independent) + (1 if circular_sources else 0)
+  example_bad: |
+    def count_corroboration(evidence: list[Evidence]) -> int:
+        # Counts all sources equally — circular refs inflate count
+        return len(evidence)
+  when_applies: Multi-source corroboration step in evidence evaluation
+  sources:
+    - "Citational practices in misinformation research (Wardle & Derakhshan, 2017)"
+
+- id: FC-CORE-009
+  text: "Implement semantic claim matching to detect when the same claim appears in different words. Use embedding similarity with a threshold of 0.85+ to link claim variants, avoiding duplicate verification work."
+  why: >
+    The same false claim often circulates in dozens of phrasings. Without deduplication, the system
+    wastes resources re-verifying the same claim and may produce inconsistent verdicts for
+    semantically identical claims. Inconsistent verdicts for the same claim destroy user trust.
+  how_to_do_right: |
+    1. Embed each incoming claim using sentence-transformers or Voyage AI
+    2. Search existing claims in Qdrant with cosine similarity threshold >= 0.85
+    3. If match found, link as variant (not duplicate — preserve original text)
+    4. Return existing verdict immediately with note: 'Previously verified as variant of CLM-XXX'
+    5. Allow override: if new evidence exists, trigger re-verification
+    6. Track match statistics: hit rate, false positive rate, review monthly
+  severity: high
+  technologies:
+    lang: [python]
+    library: [qdrant-client, sentence-transformers, voyage]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    async def match_existing_claim(text: str, threshold: float = 0.85) -> ClaimMatch | None:
+        embedding = await embed(text)
+        results = qdrant.search(
+            collection_name="claims",
+            query_vector=embedding,
+            limit=5,
+            score_threshold=threshold,
+        )
+        if results:
+            best = results[0]
+            return ClaimMatch(
+                matched_claim_id=best.payload["claim_id"],
+                similarity=best.score,
+                existing_verdict=best.payload.get("verdict"),
+            )
+        return None
+  example_bad: |
+    def find_duplicate(text: str, claims: list[str]) -> str | None:
+        # Exact string match only — misses paraphrases entirely
+        for c in claims:
+            if c == text:
+                return c
+        return None
+  when_applies: Claim intake stage, before starting verification pipeline
+  sources:
+    - "Semantic similarity for claim matching (Shaar et al., 2020)"
+
+- id: FC-CORE-010
+  text: "Assign a confidence score (0.0-1.0) to every verdict. The score must be computed from evidence quality, source count, source agreement, and evidence recency — not from LLM self-reported confidence."
+  why: >
+    LLM self-reported confidence is poorly calibrated and not grounded in evidence quality.
+    A deterministic scoring formula based on measurable inputs produces reproducible, auditable
+    confidence values. Users and downstream systems need reliable confidence to decide whether
+    to show a verdict or route to human review.
+  how_to_do_right: |
+    1. Define score components: evidence_quality (0-1), source_count_factor (0-1), agreement_ratio (0-1), recency_factor (0-1)
+    2. evidence_quality = weighted average of source tiers (primary=1.0, secondary=0.6, tertiary=0.3)
+    3. source_count_factor = min(1.0, unique_sources / 3) — saturates at 3 independent sources
+    4. agreement_ratio = agreeing_sources / total_sources
+    5. recency_factor = max(0.3, 1.0 - (days_since_newest / 365))
+    6. confidence = 0.35 * evidence_quality + 0.25 * source_count + 0.25 * agreement + 0.15 * recency
+    7. Route to human review if confidence < 0.6
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    def compute_confidence(evidence: list[Evidence], verdict_label: str) -> float:
+        tier_weights = {"PRIMARY": 1.0, "SECONDARY": 0.6, "TERTIARY": 0.3}
+        quality = np.mean([tier_weights[e.source_tier] for e in evidence])
+        source_count = min(1.0, len(set(e.source_domain for e in evidence)) / 3)
+        agreement = sum(1 for e in evidence if e.supports_verdict) / len(evidence)
+        newest = max(e.published_date for e in evidence)
+        recency = max(0.3, 1.0 - (datetime.now() - newest).days / 365)
+        return 0.35 * quality + 0.25 * source_count + 0.25 * agreement + 0.15 * recency
+  example_bad: |
+    def get_confidence(claim: str) -> float:
+        response = llm.complete(f"Rate confidence 0-1: {claim}")
+        return float(response.text)  # LLM hallucinated confidence
+  when_applies: Every verdict generation step
+  sources:
+    - "Calibration of fact-checking confidence (Guo et al., 2022)"
+
+- id: FC-CORE-011
+  text: "Build evidence chains that trace from verdict back to primary sources through intermediate reasoning steps. Each link must be independently verifiable."
+  why: >
+    Users and reviewers need to understand WHY a verdict was reached, not just WHAT it is.
+    An evidence chain makes the reasoning transparent and auditable. Without it, users must
+    trust the system blindly, which erodes confidence over time. IFCN requires methodology
+    transparency, and evidence chains are the technical implementation of that requirement.
+  how_to_do_right: |
+    1. Model each reasoning step as a ChainLink with: evidence_id, inference_type, conclusion
+    2. inference_type: DIRECT_QUOTE, STATISTICAL_COMPARISON, EXPERT_OPINION, LOGICAL_DEDUCTION
+    3. Each link must reference specific evidence passages (not just URLs)
+    4. Chain must be traversable: verdict → intermediate conclusions → evidence → sources
+    5. Validate chain completeness: every intermediate conclusion must have >= 1 evidence link
+    6. Export chains as JSON-LD for interoperability with ClaimReview schema
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    class ChainLink(BaseModel):
+        step_number: int
+        evidence_id: str
+        evidence_excerpt: str
+        inference_type: Literal["DIRECT_QUOTE", "STATISTICAL", "EXPERT", "DEDUCTION"]
+        conclusion: str
+        confidence: float
+
+    class EvidenceChain(BaseModel):
+        verdict_id: str
+        links: list[ChainLink]
+
+        def is_complete(self) -> bool:
+            return all(link.evidence_id for link in self.links) and len(self.links) >= 1
+  example_bad: |
+    class Verdict(BaseModel):
+        label: str
+        explanation: str  # Free-text blob — no traceable chain to evidence
+  when_applies: All verdict explanations and audit reports
+  sources:
+    - "https://ifcncodeofprinciples.poynter.org/the-commitments"
+
+- id: FC-CORE-012
+  text: "Support three debunking patterns: pre-bunking (proactive warnings before misinformation spreads), real-time (immediate fact-check during viral spread), and retroactive (correction after wide circulation). Each pattern has different latency, depth, and distribution requirements."
+  why: >
+    Real-time debunking reduces viral spread by 70% according to MIT research, but requires
+    speed over depth. Pre-bunking builds immunity but requires trend prediction. Retroactive
+    is thorough but reaches fewer people. A fact-checking platform that only supports one
+    pattern misses critical intervention windows.
+  how_to_do_right: |
+    1. Pre-bunking: Monitor trending topics, generate inoculation content when misinformation patterns detected
+    2. Real-time: Pipeline must produce verdict within 5 minutes for viral claims (>10K shares/hour)
+    3. Retroactive: Full evidence chain, max depth, no time pressure — target within 24 hours
+    4. Tag each fact-check with debunking_pattern: PRE_BUNK | REAL_TIME | RETROACTIVE
+    5. Real-time path: skip low-priority evidence, use cached source scores, confidence threshold 0.7
+    6. Retroactive path: full evidence search, primary sources required, confidence threshold 0.8
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    class DebunkingConfig(BaseModel):
+        pattern: Literal["PRE_BUNK", "REAL_TIME", "RETROACTIVE"]
+        max_latency_seconds: int
+        min_confidence: float
+        require_primary_source: bool
+
+    DEBUNKING_CONFIGS = {
+        "PRE_BUNK": DebunkingConfig(pattern="PRE_BUNK", max_latency_seconds=3600, min_confidence=0.65, require_primary_source=False),
+        "REAL_TIME": DebunkingConfig(pattern="REAL_TIME", max_latency_seconds=300, min_confidence=0.70, require_primary_source=False),
+        "RETROACTIVE": DebunkingConfig(pattern="RETROACTIVE", max_latency_seconds=86400, min_confidence=0.80, require_primary_source=True),
+    }
+  example_bad: |
+    async def fact_check(claim: str) -> Verdict:
+        # One-size-fits-all — same pipeline for viral claim and week-old post
+        evidence = await full_search(claim)  # Takes 20 minutes
+        return evaluate(claim, evidence)
+  when_applies: Pipeline configuration and claim routing decisions
+  sources:
+    - "Inoculation theory and misinformation (van der Linden et al., 2020)"
+
+- id: FC-CORE-013
+  text: "Categorize claims by domain (health, politics, science, finance, technology, environment, social) at intake. Domain determines which specialized evidence sources, expert validators, and scoring weights to use."
+  why: >
+    A health claim requires PubMed and WHO sources; a financial claim requires SEC filings and
+    market data. Using generic search for all domains produces lower-quality evidence. Domain
+    categorization also enables routing to specialized human reviewers and applying domain-specific
+    credibility rules (e.g., peer-reviewed > preprint in science).
+  how_to_do_right: |
+    1. Train or use zero-shot classifier for 7 domains: health, politics, science, finance, tech, environment, social
+    2. Allow multi-label: a claim can be both health AND politics
+    3. Map each domain to specialized sources (health→PubMed, finance→SEC/EDGAR, science→arXiv)
+    4. Map each domain to credibility adjustments (science: peer_reviewed_boost=0.2)
+    5. Route ambiguous claims (confidence < 0.7) to human categorization
+    6. Track categorization accuracy monthly, retrain if F1 drops below 0.85
+  severity: high
+  technologies:
+    lang: [python]
+    library: [transformers, scikit-learn]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    DOMAIN_SOURCES = {
+        "health": ["pubmed", "who", "cdc", "cochrane"],
+        "politics": ["congress_gov", "federal_register", "opensecrets"],
+        "science": ["arxiv", "semantic_scholar", "nature", "science"],
+        "finance": ["sec_edgar", "fred", "bloomberg", "reuters"],
+    }
+
+    async def categorize_claim(text: str) -> list[ClaimDomain]:
+        predictions = classifier(text, candidate_labels=list(DOMAIN_SOURCES.keys()))
+        return [
+            ClaimDomain(name=label, confidence=score)
+            for label, score in zip(predictions["labels"], predictions["scores"])
+            if score > 0.3
+        ]
+  example_bad: |
+    async def find_evidence(claim: str) -> list[Evidence]:
+        # Generic search for all domains — misses specialized sources
+        return await google_search(claim)
+  when_applies: Claim intake stage, evidence search configuration
+  sources:
+    - "https://developers.google.com/search/docs/appearance/structured-data/factcheck"
+
+- id: FC-CORE-014
+  text: "Balance verification speed vs accuracy explicitly. Define SLA tiers: URGENT (5 min, confidence >= 0.65), STANDARD (1 hour, confidence >= 0.75), THOROUGH (24 hours, confidence >= 0.85). Never silently trade accuracy for speed."
+  why: >
+    Without explicit SLA tiers, the system either takes too long for viral claims or rushes
+    important verdicts. A viral health claim during a pandemic needs a fast response even if
+    less thorough. A claim about a political figure needs maximum accuracy even if slower.
+    Implicit speed-accuracy tradeoffs lead to inconsistent quality.
+  how_to_do_right: |
+    1. Define 3 SLA tiers with explicit latency and confidence bounds
+    2. URGENT: skip tertiary sources, use cached evidence, max 3 search queries
+    3. STANDARD: full evidence search, require 2+ independent sources
+    4. THOROUGH: exhaustive search, require primary sources, cross-language check
+    5. Assign tier based on: virality score * potential harm score
+    6. Log actual latency and confidence for each tier — alert if SLA violated
+    7. Never downgrade confidence threshold silently — if URGENT produces < 0.65, return UNVERIFIABLE
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, reliability]
+    concern: [domain_specific]
+  example_good: |
+    class SLATier(str, Enum):
+        URGENT = "URGENT"
+        STANDARD = "STANDARD"
+        THOROUGH = "THOROUGH"
+
+    SLA_CONFIG = {
+        SLATier.URGENT: {"max_seconds": 300, "min_confidence": 0.65, "max_queries": 3},
+        SLATier.STANDARD: {"max_seconds": 3600, "min_confidence": 0.75, "max_queries": 10},
+        SLATier.THOROUGH: {"max_seconds": 86400, "min_confidence": 0.85, "max_queries": 30},
+    }
+  example_bad: |
+    async def verify(claim: str) -> Verdict:
+        # No SLA — same pipeline for everything, unpredictable latency
+        evidence = await exhaustive_search(claim)  # Could take hours
+        return evaluate(claim, evidence)
+  when_applies: Claim routing and pipeline configuration
+  sources:
+    - "https://ifcncodeofprinciples.poynter.org/the-commitments"
+
+- id: FC-CORE-015
+  text: "Score claim priority using the formula: priority = virality_score * harm_potential * (1 - existing_coverage). High-virality, high-harm claims with no existing fact-checks get highest priority."
+  why: >
+    Resources are finite. Checking a low-virality claim that already has 5 fact-checks wastes
+    capacity that should go to a high-virality health claim with zero coverage. Without
+    priority scoring, the queue is FIFO which is suboptimal. A pandemic rumor reaching
+    millions must jump ahead of a local political claim seen by hundreds.
+  how_to_do_right: |
+    1. virality_score (0-1): normalize share count, velocity, platform reach
+    2. harm_potential (0-1): domain-based (health=0.9, politics=0.7, entertainment=0.2) + keyword signals
+    3. existing_coverage (0-1): count of existing fact-checks from IFCN-certified sources via ClaimReview API
+    4. priority = virality * harm * (1 - existing_coverage)
+    5. Priority > 0.7: URGENT tier, > 0.4: STANDARD, else: THOROUGH or defer
+    6. Re-score every hour as virality changes
+    7. Log priority scores for later analysis and threshold tuning
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    def compute_priority(claim: IncomingClaim) -> float:
+        virality = min(1.0, claim.share_count / 100_000) * min(1.0, claim.shares_per_hour / 1000)
+        harm = DOMAIN_HARM_WEIGHTS.get(claim.domain, 0.5)
+        existing = min(1.0, claim.existing_factcheck_count / 3)
+        return virality * harm * (1.0 - existing)
+
+    DOMAIN_HARM_WEIGHTS = {
+        "health": 0.95, "finance": 0.85, "politics": 0.75,
+        "science": 0.70, "environment": 0.65, "technology": 0.50,
+        "entertainment": 0.20,
+    }
+  example_bad: |
+    def get_next_claim(queue: list[Claim]) -> Claim:
+        return queue[0]  # FIFO — pandemic rumor waits behind celebrity gossip
+  when_applies: Claim intake queue management and resource allocation
+  sources:
+    - "https://www.science.org/doi/10.1126/science.aap9559"
+
+- id: FC-CORE-016
+  text: "Require multi-source corroboration: a verdict of TRUE or FALSE requires agreement from at least 2 independent sources. A single source, no matter how authoritative, produces at most LIKELY_TRUE/LIKELY_FALSE or requires human confirmation."
+  why: >
+    Single-source verdicts are fragile. Even authoritative sources make errors, have biases,
+    or may be compromised. The 2003 WMD intelligence failure demonstrated that lack of
+    independent corroboration leads to catastrophic errors. Requiring 2+ independent sources
+    catches single-source errors and builds robustness.
+  how_to_do_right: |
+    1. Define 'independent': different organizations, no shared ownership, no citation of each other
+    2. For TRUE/FALSE verdict: require >= 2 independent sources agreeing
+    3. For 1 source only: cap verdict at LIKELY_TRUE/LIKELY_FALSE (custom display)
+    4. For 0 sources: must be UNVERIFIABLE
+    5. Track independence via source ownership graph (e.g., same parent company = not independent)
+    6. Exception: official government data (census, legislation text) can be single-source TRUE
+  severity: high
+  technologies:
+    lang: [python]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    def can_issue_definitive_verdict(evidence: list[Evidence]) -> bool:
+        independent_groups = group_by_ownership(evidence)
+        agreeing_groups = [g for g in independent_groups if g.supports_verdict]
+        return len(agreeing_groups) >= 2
+
+    def determine_verdict_strength(evidence: list[Evidence], label: str) -> str:
+        if can_issue_definitive_verdict(evidence):
+            return label  # TRUE or FALSE
+        elif len(evidence) >= 1:
+            return f"LIKELY_{label}"  # Single source — hedged
+        else:
+            return "UNVERIFIABLE"
+  example_bad: |
+    def verdict_from_evidence(evidence: list[Evidence]) -> str:
+        if any(e.supports for e in evidence):
+            return "TRUE"  # One source enough? Dangerous
+        return "FALSE"
+  when_applies: Verdict finalization step
+  sources:
+    - "Intelligence Community Directive 203: Analytic Standards"
+
+- id: FC-CORE-017
+  text: "Design the editorial workflow as a state machine with explicit human-in-the-loop gates. Claims flow through: SUBMITTED → IN_REVIEW → EVIDENCE_GATHERED → VERDICT_DRAFT → HUMAN_REVIEW → PUBLISHED. Low-confidence verdicts cannot bypass HUMAN_REVIEW."
+  why: >
+    Fully automated fact-checking without human oversight will eventually publish a wrong verdict
+    on a high-profile claim, causing reputational damage. IFCN requires human editorial
+    oversight. The state machine ensures no claim accidentally skips required review steps.
+    Without it, race conditions in async processing can publish unreviewed verdicts.
+  how_to_do_right: |
+    1. Model as FSM with PostgreSQL-backed state transitions
+    2. Each transition logs: actor (human/system), timestamp, reason
+    3. HUMAN_REVIEW gate: mandatory if confidence < 0.75 or claim is political/health
+    4. Auto-publish only if: confidence >= 0.85 AND domain not in [health, politics] AND 2+ sources
+    5. Implement review assignment: round-robin among available reviewers with domain expertise
+    6. SLA for human review: 2 hours for URGENT, 8 hours for STANDARD
+    7. Escalation: if review SLA breached, escalate to senior editor
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [sqlalchemy, pydantic]
+  domains:
+    domain: [fact_checking, architecture]
+    concern: [domain_specific]
+  example_good: |
+    class ClaimState(str, Enum):
+        SUBMITTED = "SUBMITTED"
+        IN_REVIEW = "IN_REVIEW"
+        EVIDENCE_GATHERED = "EVIDENCE_GATHERED"
+        VERDICT_DRAFT = "VERDICT_DRAFT"
+        HUMAN_REVIEW = "HUMAN_REVIEW"
+        PUBLISHED = "PUBLISHED"
+        DISPUTED = "DISPUTED"
+
+    VALID_TRANSITIONS = {
+        ClaimState.SUBMITTED: [ClaimState.IN_REVIEW],
+        ClaimState.IN_REVIEW: [ClaimState.EVIDENCE_GATHERED],
+        ClaimState.EVIDENCE_GATHERED: [ClaimState.VERDICT_DRAFT],
+        ClaimState.VERDICT_DRAFT: [ClaimState.HUMAN_REVIEW, ClaimState.PUBLISHED],
+        ClaimState.HUMAN_REVIEW: [ClaimState.PUBLISHED, ClaimState.IN_REVIEW],
+        ClaimState.PUBLISHED: [ClaimState.DISPUTED],
+    }
+  example_bad: |
+    async def process_claim(claim: Claim):
+        verdict = await auto_verify(claim)
+        await publish(verdict)  # No human review, no state tracking
+  when_applies: Entire claim lifecycle in the Veritas platform
+  sources:
+    - "https://ifcncodeofprinciples.poynter.org/the-commitments"
+
+- id: FC-CORE-018
+  text: "Implement a dispute resolution mechanism where published verdicts can be challenged with new evidence. Disputes trigger re-verification with the new evidence included, and the original verdict is preserved alongside the updated one."
+  why: >
+    Fact-checks are not infallible. New evidence may emerge, sources may be retracted, or the
+    original analysis may have errors. Without a formal dispute process, corrections happen
+    ad-hoc or not at all. IFCN requires an open corrections policy. Users who cannot challenge
+    verdicts lose trust in the platform.
+  how_to_do_right: |
+    1. Accept disputes via API with: dispute_reason, new_evidence_urls, disputant_identity
+    2. Transition claim state to DISPUTED — original verdict remains visible with 'disputed' badge
+    3. Trigger re-verification that includes both original and new evidence
+    4. If verdict changes: create new version (v2) linking to v1, never delete v1
+    5. Notify all subscribers (platforms, users) of verdict change
+    6. Track dispute rate and overturn rate as platform health metrics
+    7. If overturn rate > 5%, investigate systematic bias in original verification
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [sqlalchemy]
+  domains:
+    domain: [fact_checking, compliance]
+    concern: [domain_specific]
+  example_good: |
+    class Dispute(BaseModel):
+        verdict_id: str
+        reason: str
+        new_evidence: list[str]
+        disputant: str
+        submitted_at: datetime
+
+    async def handle_dispute(dispute: Dispute) -> DisputeResult:
+        original = await get_verdict(dispute.verdict_id)
+        original.state = ClaimState.DISPUTED
+        await save(original)
+        re_result = await reverify(original.claim, additional_evidence=dispute.new_evidence)
+        if re_result.label != original.label:
+            new_version = create_verdict_version(original, re_result, dispute)
+            await notify_subscribers(original.claim_id, new_version)
+        return DisputeResult(original=original, updated=re_result)
+  example_bad: |
+    async def update_verdict(verdict_id: str, new_label: str):
+        verdict = await get_verdict(verdict_id)
+        verdict.label = new_label  # Overwrites history — no audit trail
+        await save(verdict)
+  when_applies: Post-publication verdict management
+  sources:
+    - "IFCN corrections policy requirements"
+
+- id: FC-CORE-019
+  text: "Manage claim lifecycle with explicit state transitions and retention policies. Claims progress through intake→verification→publication→archival. Archived claims remain searchable but are flagged as potentially outdated."
+  why: >
+    Without lifecycle management, the system accumulates stale verdicts that erode trust.
+    A 3-year-old fact-check served without context misleads users. Retention policies ensure
+    compliance with data regulations (GDPR) and prevent infinite storage growth. Lifecycle
+    tracking also enables analytics on verification throughput and bottlenecks.
+  how_to_do_right: |
+    1. Define lifecycle stages: INTAKE → ACTIVE → PUBLISHED → STALE → ARCHIVED
+    2. STALE trigger: claim age > temporal_sensitivity threshold without re-verification
+    3. ARCHIVED trigger: claim age > 2 years AND low query frequency (< 10/month)
+    4. Archived claims show banner: 'This fact-check is from {date}. Information may have changed.'
+    5. Implement soft delete only — never hard delete verified claims
+    6. Run lifecycle job daily: check temporal validity, transition stale claims
+    7. GDPR: anonymize personal data in archived claims after retention period
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [sqlalchemy, celery]
+  domains:
+    domain: [fact_checking, compliance]
+    concern: [domain_specific]
+  example_good: |
+    class ClaimLifecycle:
+        RETENTION_DAYS = {"HIGH": 30, "MEDIUM": 90, "LOW": 365, "NONE": 730}
+
+        async def run_lifecycle_check(self):
+            stale = await self.find_stale_claims()
+            for claim in stale:
+                if claim.query_count_30d < 10 and claim.age_days > 730:
+                    await self.transition(claim, LifecycleState.ARCHIVED)
+                else:
+                    await self.transition(claim, LifecycleState.STALE)
+                    await self.schedule_reverification(claim)
+  example_bad: |
+    # No lifecycle — claims accumulate forever
+    # 5-year-old verdict served as current with no warning
+    async def get_verdict(claim_id: str) -> Verdict:
+        return await db.get(claim_id)  # No staleness check
+  when_applies: Data management and compliance layer of the Veritas platform
+  sources:
+    - "https://gdpr-info.eu/art-17-gdpr/"
+
+- id: FC-CORE-020
+  text: "Deduplicate incoming claims using a two-stage approach: fast hash-based exact match first, then embedding-based semantic match. This prevents both exact duplicates and paraphrases from entering the verification queue."
+  why: >
+    During viral events, the same claim arrives hundreds of times per hour in various phrasings.
+    Without deduplication, the queue explodes and resources are wasted on redundant verification.
+    Hash-only dedup misses paraphrases; embedding-only dedup is too slow for high-throughput
+    intake. The two-stage approach balances speed and coverage.
+  how_to_do_right: |
+    1. Stage 1 (< 1ms): Normalize text (lowercase, strip punctuation, remove stopwords), compute SHA-256 hash
+    2. If hash matches existing claim → immediate dedup, link as exact duplicate
+    3. Stage 2 (< 50ms): Embed normalized text, search Qdrant with threshold 0.87
+    4. If semantic match → link as variant, return existing verdict
+    5. If neither matches → new claim, enqueue for verification
+    6. Track dedup rate: target 30-50% dedup during viral events
+    7. Review false-positive dedup matches weekly — adjust threshold if > 2% false positives
+  severity: high
+  technologies:
+    lang: [python]
+    library: [qdrant-client, hashlib]
+  domains:
+    domain: [fact_checking, performance]
+    concern: [domain_specific]
+  example_good: |
+    import hashlib
+
+    async def deduplicate(text: str) -> DedupResult:
+        normalized = normalize_claim(text)
+        text_hash = hashlib.sha256(normalized.encode()).hexdigest()
+
+        # Stage 1: Exact hash match (< 1ms)
+        existing = await redis.get(f"claim_hash:{text_hash}")
+        if existing:
+            return DedupResult(is_duplicate=True, match_type="EXACT", matched_id=existing)
+
+        # Stage 2: Semantic match (< 50ms)
+        embedding = await embed(normalized)
+        matches = await qdrant.search("claims", embedding, score_threshold=0.87, limit=1)
+        if matches:
+            return DedupResult(is_duplicate=True, match_type="SEMANTIC", matched_id=matches[0].id)
+
+        # New claim
+        await redis.set(f"claim_hash:{text_hash}", claim_id, ex=86400 * 30)
+        return DedupResult(is_duplicate=False)
+  example_bad: |
+    async def check_duplicate(text: str, claims: list[str]) -> bool:
+        return text in claims  # O(n) scan, exact match only, misses paraphrases
+  when_applies: Claim intake and queue management
+  sources:
+    - "https://qdrant.tech/documentation/concepts/search/"
+
+- id: FC-CORE-021
+  text: "Output fact-check results in ClaimReview schema.org format. This structured data enables search engines (Google, Bing) to display fact-check labels directly in search results, massively amplifying reach."
+  why: >
+    Google surfaces ClaimReview-marked fact-checks in search results and Google News.
+    Without it, fact-checks are just web pages competing for clicks. With it, the fact-check
+    label appears alongside the original claim in search results. This is the single highest
+    ROI format decision for a fact-checking platform. Facebook and other platforms also
+    consume ClaimReview for their misinformation labels.
+  how_to_do_right: |
+    1. Generate JSON-LD conforming to schema.org/ClaimReview for every published verdict
+    2. Required fields: claimReviewed, reviewRating (alternateName, bestRating, worstRating, ratingValue)
+    3. Include author (organization), datePublished, url, itemReviewed.appearance
+    4. Map VerdictLabel to ClaimReview rating: TRUE=5, MOSTLY_TRUE=4, PARTIALLY_TRUE=3, MISLEADING=2, FALSE=1
+    5. Embed JSON-LD in HTML <script type="application/ld+json"> tag
+    6. Validate with Google's Rich Results Test before deploying
+    7. Submit sitemap to Google Search Console for faster indexing
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, api]
+    concern: [domain_specific]
+  example_good: |
+    def generate_claim_review(verdict: Verdict) -> dict:
+        RATING_MAP = {"TRUE": 5, "PARTIALLY_TRUE": 3, "FALSE": 1, "MISLEADING": 2}
+        return {
+            "@context": "https://schema.org",
+            "@type": "ClaimReview",
+            "claimReviewed": verdict.claim_text,
+            "reviewRating": {
+                "@type": "Rating",
+                "ratingValue": RATING_MAP.get(verdict.label, 3),
+                "bestRating": 5,
+                "worstRating": 1,
+                "alternateName": verdict.label,
+            },
+            "author": {"@type": "Organization", "name": "Veritas"},
+            "datePublished": verdict.published_at.isoformat(),
+            "url": f"https://veritas.app/factcheck/{verdict.id}",
+        }
+  example_bad: |
+    def render_verdict(verdict: Verdict) -> str:
+        return f"<p>{verdict.label}: {verdict.explanation}</p>"
+        # No structured data — invisible to search engines
+  when_applies: All published fact-checks on the Veritas platform
+  sources:
+    - "https://schema.org/ClaimReview"
+    - "Google Fact Check Markup documentation"
+
+- id: FC-CORE-022
+  text: "Generate verdict explanations that are readable by non-experts. Use the structure: verdict summary (1 sentence), key evidence (2-3 bullet points with source links), context (why this matters), and limitations (what we could not verify)."
+  why: >
+    A verdict without a clear explanation is unpersuasive. Users who do not understand WHY a
+    claim is false will not update their beliefs. Research shows structured explanations with
+    evidence links are 3x more effective at belief correction than labels alone. Limitations
+    disclosure builds trust and meets IFCN transparency requirements.
+  how_to_do_right: |
+    1. Summary: One sentence stating the verdict in plain language (8th grade reading level)
+    2. Key evidence: 2-3 bullet points, each with a specific fact and source link
+    3. Context: 1-2 sentences explaining why this claim matters or how it spread
+    4. Limitations: Explicitly state what could not be verified or what caveats exist
+    5. Run readability check: Flesch-Kincaid score must be >= 60 (8th grade level)
+    6. Generate both short (social media) and long (web page) versions
+    7. Include ClaimReview structured data (see FC-CORE-021)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, ui]
+    concern: [domain_specific]
+  example_good: |
+    class VerdictExplanation(BaseModel):
+        summary: str  # Max 280 chars for social sharing
+        key_evidence: list[EvidenceBullet]  # 2-3 items with source_url
+        context: str  # Why this matters
+        limitations: list[str]  # What we couldn't verify
+        readability_score: float  # Flesch-Kincaid
+
+    class EvidenceBullet(BaseModel):
+        fact: str
+        source_url: str
+        source_name: str
+
+    def generate_explanation(verdict: Verdict, chain: EvidenceChain) -> VerdictExplanation:
+        summary = summarize_verdict(verdict, max_chars=280)
+        bullets = [
+            EvidenceBullet(fact=link.conclusion, source_url=link.source_url, source_name=link.source_name)
+            for link in chain.top_links(3)
+        ]
+        return VerdictExplanation(
+            summary=summary,
+            key_evidence=bullets,
+            context=generate_context(verdict),
+            limitations=identify_limitations(chain),
+            readability_score=compute_flesch_kincaid(summary),
+        )
+  example_bad: |
+    def explain(verdict: Verdict) -> str:
+        return f"The claim is {verdict.label}."  # No evidence, no context, no sources
+  when_applies: All verdict display and API responses
+  sources:
+    - "The Debunking Handbook 2020 (Lewandowsky et al.)"

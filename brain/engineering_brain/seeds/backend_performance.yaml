@@ -1,0 +1,857 @@
+layer: rules
+domain: performance
+knowledge:
+- id: PERF-BE-001
+  text: "Run EXPLAIN ANALYZE before adding any database index. Adding indexes without query analysis causes write slowdowns, storage bloat, and often does not improve the queries you think it will."
+  why: >
+    Each index slows down every INSERT, UPDATE, and DELETE on that table. A table with 8 indexes
+    means every write operation updates 8 B-tree structures. Teams routinely add indexes based on
+    intuition ('this column is used in WHERE'), then discover the query planner ignores the index
+    due to low selectivity, table statistics, or type mismatch. One team added 12 indexes to a
+    high-write table, degrading write throughput by 40% with zero query improvement.
+  how_to_do_right: |
+    1. Run EXPLAIN ANALYZE on the slow query BEFORE adding any index
+    2. Check for Seq Scan on large tables — this indicates a missing or unused index
+    3. Check actual vs estimated rows — large discrepancy means stale statistics (run ANALYZE)
+    4. Add the index, then re-run EXPLAIN ANALYZE to confirm it is used
+    5. Monitor pg_stat_user_indexes for unused indexes (idx_scan = 0 after 30 days → drop it)
+    6. Prefer partial indexes (WHERE clause) and covering indexes (INCLUDE) over full-table indexes
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [sqlalchemy, asyncpg]
+  domains:
+    domain: [performance, databases]
+    concern: [sql]
+  example_good: |
+    -- Step 1: Analyze the slow query
+    EXPLAIN ANALYZE
+    SELECT * FROM orders WHERE status = 'pending' AND created_at > '2026-01-01';
+
+    -- Step 2: See Seq Scan, decide on partial index
+    CREATE INDEX CONCURRENTLY idx_orders_pending
+    ON orders (created_at)
+    WHERE status = 'pending';  -- partial index, smaller and faster
+
+    -- Step 3: Verify index is used
+    EXPLAIN ANALYZE
+    SELECT * FROM orders WHERE status = 'pending' AND created_at > '2026-01-01';
+    -- Should now show Index Scan using idx_orders_pending
+  example_bad: |
+    -- WRONG: Adding indexes by intuition without EXPLAIN
+    CREATE INDEX idx_orders_status ON orders (status);
+    CREATE INDEX idx_orders_created ON orders (created_at);
+    CREATE INDEX idx_orders_user ON orders (user_id);
+    -- 3 indexes added, none may be used by the actual slow query
+    -- Each one slows down every write to the orders table
+  when_applies: "Any PostgreSQL database optimization, especially when queries are slow and the instinct is to 'just add an index'"
+  sources: ["https://www.postgresql.org/docs/current/using-explain.html"]
+
+- id: PERF-BE-002
+  text: "Use pgBouncer for PostgreSQL connection pooling in transaction mode with pool_size=20 per application instance. Direct connections exhaust PostgreSQL's default max_connections=100 under moderate load."
+  why: >
+    Each PostgreSQL connection uses 5-10MB of RAM. With 4 application instances each opening 25
+    connections, you hit 100 connections — PostgreSQL's default limit. The next request gets
+    'FATAL: too many connections'. pgBouncer in transaction mode multiplexes thousands of
+    application connections into a small pool of actual PostgreSQL connections. Without it, a
+    traffic spike from 100 to 200 concurrent users crashes your database.
+  how_to_do_right: |
+    1. Deploy pgBouncer between application and PostgreSQL
+    2. Set pool_mode = transaction (not session — session pins connections)
+    3. Set default_pool_size = 20 per database
+    4. Set max_client_conn = 1000 (application-side connections)
+    5. Set server_idle_timeout = 300 (release idle server connections after 5 min)
+    6. Application connects to pgBouncer (port 6432), not PostgreSQL directly (port 5432)
+    7. Disable prepared statements in SQLAlchemy when using transaction mode
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [sqlalchemy, asyncpg]
+  domains:
+    domain: [performance, databases, reliability]
+    concern: [connection_pooling]
+  example_good: |
+    # pgbouncer.ini
+    # [databases]
+    # mydb = host=localhost port=5432 dbname=mydb
+    # [pgbouncer]
+    # pool_mode = transaction
+    # default_pool_size = 20
+    # max_client_conn = 1000
+    # server_idle_timeout = 300
+
+    # SQLAlchemy — connect through pgBouncer
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(
+        "postgresql+asyncpg://user:pass@localhost:6432/mydb",  # pgBouncer port
+        pool_size=10,          # SQLAlchemy's own pool (smaller, pgBouncer handles the rest)
+        max_overflow=5,
+        pool_pre_ping=True,    # Detect stale connections
+        pool_recycle=1800,     # Recycle connections every 30 min
+    )
+  example_bad: |
+    # WRONG: Direct connection to PostgreSQL with large pool
+    engine = create_async_engine(
+        "postgresql+asyncpg://user:pass@localhost:5432/mydb",  # Direct to PG
+        pool_size=50,          # 50 connections per instance x 4 instances = 200 > max_connections
+        max_overflow=20,       # Could spike to 70 per instance
+    )
+    # Result: "FATAL: too many connections for role" under load
+  when_applies: "Any production PostgreSQL deployment with more than 1 application instance or more than 50 concurrent users"
+  sources: ["https://www.pgbouncer.org/config.html"]
+
+- id: PERF-BE-003
+  text: "Detect and prevent N+1 queries: for every parent-child relationship you display, you need either a JOIN, a subquery, or an ORM eager load — never a loop of individual queries."
+  why: >
+    An N+1 query fetches 1 parent query, then N child queries in a loop. Listing 100 orders with
+    their items generates 101 queries instead of 1-2. Each query has network round-trip overhead
+    (~1ms local, ~5ms remote). 101 queries at 5ms each = 505ms. A JOIN or eager load does it in
+    1-2 queries (~10ms). At 1,000 records, N+1 takes 5 seconds vs 20ms. This is the most common
+    performance bug in ORM-based applications and causes cascading slowdowns.
+  how_to_do_right: |
+    1. Use SQLAlchemy's joinedload() or selectinload() for eager loading
+    2. Use select_related() and prefetch_related() in Django ORM
+    3. Log SQL queries in development (echo=True in SQLAlchemy) and count them
+    4. Use tools like nplusone (Python) to detect N+1 in tests
+    5. Rule of thumb: if you access a relationship inside a loop, you have an N+1
+    6. For GraphQL: use DataLoader pattern to batch resolve
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [sqlalchemy]
+  domains:
+    domain: [performance, databases]
+    concern: [sql]
+  example_good: |
+    from sqlalchemy.orm import selectinload, joinedload
+    from sqlalchemy import select
+
+    # Eager load — 2 queries total regardless of result count
+    stmt = (
+        select(Order)
+        .options(selectinload(Order.items))  # Batch load all items
+        .where(Order.status == "pending")
+    )
+    orders = await session.execute(stmt)
+
+    # Or use joinedload for single query with JOIN
+    stmt = (
+        select(Order)
+        .options(joinedload(Order.items))
+        .where(Order.status == "pending")
+    )
+  example_bad: |
+    # N+1 QUERY: 1 query for orders + N queries for items
+    orders = await session.execute(select(Order).where(Order.status == "pending"))
+    for order in orders.scalars():
+        # This triggers a lazy load query FOR EACH order
+        items = order.items  # SELECT * FROM items WHERE order_id = ? (N times!)
+        print(f"Order {order.id}: {len(items)} items")
+    # 100 orders = 101 queries, 1000 orders = 1001 queries
+  when_applies: "Any application using an ORM to query parent-child or many-to-many relationships, especially in list/table views"
+  sources: ["https://docs.sqlalchemy.org/en/20/orm/queryguide/relationships.html#joined-eager-loading"]
+
+- id: PERF-BE-004
+  text: "Implement cache-aside pattern: check cache first, on miss query database, set cache, then return. This is the simplest and most reliable caching strategy for read-heavy workloads."
+  why: >
+    Without a caching strategy, every request hits the database. A product catalog page queried
+    500 times per minute regenerates the same data each time. Cache-aside is the safest pattern
+    because the application controls what enters the cache and when. Unlike write-through or
+    write-behind caching, cache-aside has no risk of stale writes reaching the database. The
+    database remains the source of truth, and cache misses gracefully fall back to direct queries.
+  how_to_do_right: |
+    1. Check cache by key (e.g., "product:{id}")
+    2. On cache hit: return cached data immediately
+    3. On cache miss: query database, serialize result, SET in cache with TTL
+    4. On data write: invalidate (DELETE) the cache key — do NOT update cache directly
+    5. Set appropriate TTL: 5 min for frequently changing data, 1 hour for semi-static
+    6. Use consistent key naming: "{entity}:{id}" or "{entity}:{query_hash}"
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [redis]
+  domains:
+    domain: [performance, architecture]
+    concern: [caching]
+  example_good: |
+    import json
+    from redis.asyncio import Redis
+
+    redis = Redis(host="localhost", port=6379, decode_responses=True)
+
+    async def get_product(product_id: str) -> dict:
+        cache_key = f"product:{product_id}"
+
+        # 1. Check cache
+        cached = await redis.get(cache_key)
+        if cached:
+            return json.loads(cached)
+
+        # 2. Cache miss — query database
+        product = await db.get_product(product_id)
+        if product is None:
+            return None
+
+        # 3. Set cache with TTL (5 minutes)
+        await redis.set(cache_key, json.dumps(product), ex=300)
+
+        return product
+
+    async def update_product(product_id: str, data: dict):
+        await db.update_product(product_id, data)
+        # 4. Invalidate cache on write
+        await redis.delete(f"product:{product_id}")
+  example_bad: |
+    # WRONG: No cache — every request hits the database
+    async def get_product(product_id: str) -> dict:
+        return await db.get_product(product_id)  # 500 queries/min for popular products
+
+    # WRONG: Cache with no invalidation — serves stale data forever
+    async def get_product(product_id: str) -> dict:
+        cached = await redis.get(f"product:{product_id}")
+        if cached:
+            return json.loads(cached)
+        product = await db.get_product(product_id)
+        await redis.set(f"product:{product_id}", json.dumps(product))  # No TTL, no invalidation
+        return product
+  when_applies: "Any read-heavy endpoint where the same data is requested multiple times within a short window"
+  sources: ["https://docs.microsoft.com/en-us/azure/architecture/patterns/cache-aside"]
+
+- id: PERF-BE-005
+  text: "Prevent cache stampede (thundering herd) by using probabilistic early expiration or distributed locking. When a popular cache key expires, hundreds of concurrent requests simultaneously hit the database."
+  why: >
+    A cache key for a popular product page serves 500 req/sec. When the TTL expires, all 500
+    requests simultaneously see a cache miss and query the database. This spike can overwhelm
+    the database, causing cascading timeouts. The stampede effect is worst for expensive queries
+    (complex JOINs, aggregations) that take seconds to compute. A single stampede can cause a
+    5-minute database outage affecting all endpoints.
+  how_to_do_right: |
+    1. Probabilistic early expiration (PER): refresh cache before TTL with probability that increases near expiry
+    2. Distributed lock (simple): first request acquires lock, computes, sets cache; others wait or serve stale
+    3. Stale-while-revalidate: serve expired cache while one request refreshes in background
+    4. For critical keys: use background refresh (Celery task) that runs before TTL expires
+    5. Never set same TTL for all keys — add jitter (TTL + random(0, 60))
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [redis]
+  domains:
+    domain: [performance, reliability]
+    concern: [caching]
+  example_good: |
+    import json
+    import random
+    from redis.asyncio import Redis
+
+    redis = Redis(host="localhost", port=6379, decode_responses=True)
+    LOCK_TTL = 10  # seconds
+
+    async def get_with_lock(key: str, compute_fn, ttl: int = 300):
+        """Cache-aside with distributed lock to prevent stampede."""
+        cached = await redis.get(key)
+        if cached:
+            return json.loads(cached)
+
+        # Try to acquire lock
+        lock_key = f"lock:{key}"
+        acquired = await redis.set(lock_key, "1", ex=LOCK_TTL, nx=True)
+
+        if acquired:
+            # Winner: compute and set cache
+            try:
+                result = await compute_fn()
+                jitter = random.randint(0, 60)  # prevent synchronized expiry
+                await redis.set(key, json.dumps(result), ex=ttl + jitter)
+                return result
+            finally:
+                await redis.delete(lock_key)
+        else:
+            # Loser: wait briefly and retry (lock holder will fill cache)
+            import asyncio
+            await asyncio.sleep(0.1)
+            cached = await redis.get(key)
+            if cached:
+                return json.loads(cached)
+            # Fallback: compute directly (lock holder may have failed)
+            return await compute_fn()
+  example_bad: |
+    # WRONG: No stampede protection — 500 concurrent DB queries on cache expiry
+    async def get_product(product_id: str):
+        cached = await redis.get(f"product:{product_id}")
+        if cached:
+            return json.loads(cached)
+        # All 500 concurrent requests execute this simultaneously
+        product = await db.get_product(product_id)  # DB melts
+        await redis.set(f"product:{product_id}", json.dumps(product), ex=300)
+        return product
+  when_applies: "Any cache key that serves more than 50 requests per second, especially for expensive database queries"
+  sources: ["https://redis.io/docs/latest/develop/use/patterns/distributed-locks/"]
+
+- id: PERF-BE-006
+  text: "Use asyncio for I/O-bound work (HTTP calls, database queries, file I/O) and multiprocessing for CPU-bound work (data transformation, image processing, ML inference). Never use threading for CPU-bound in Python due to GIL."
+  why: >
+    Python's GIL (Global Interpreter Lock) means only one thread executes Python bytecode at a
+    time. Threading gives you concurrency for I/O-bound work (threads release GIL during I/O
+    waits) but zero parallelism for CPU-bound work. A CPU-intensive task split across 4 threads
+    runs slower than single-threaded due to GIL contention overhead. asyncio is more efficient
+    than threading for I/O because it avoids thread context-switching overhead (coroutine switch
+    is ~100x cheaper than thread switch).
+  how_to_do_right: |
+    1. FastAPI endpoints: use async def for I/O-bound handlers (default)
+    2. Database queries: use async drivers (asyncpg, aioredis)
+    3. HTTP calls: use httpx.AsyncClient or aiohttp
+    4. CPU-bound within async handler: offload to ProcessPoolExecutor via loop.run_in_executor()
+    5. Background CPU tasks: use Celery worker (separate process, no GIL issue)
+    6. Never use threading.Thread for CPU-bound computation
+    7. Use concurrent.futures.ProcessPoolExecutor with max_workers = cpu_count()
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [celery]
+  domains:
+    domain: [performance, architecture]
+    concern: [decision_making]
+  example_good: |
+    import asyncio
+    from concurrent.futures import ProcessPoolExecutor
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    executor = ProcessPoolExecutor(max_workers=4)
+
+    # I/O-bound: use async natively
+    @app.get("/users/{user_id}")
+    async def get_user(user_id: str):
+        user = await db.get_user(user_id)        # async I/O — no blocking
+        profile = await http_client.get(f"/profiles/{user_id}")  # async HTTP
+        return {"user": user, "profile": profile}
+
+    # CPU-bound: offload to process pool
+    def heavy_computation(data: list) -> dict:
+        # Runs in separate process — no GIL contention
+        return {"result": sum(x ** 2 for x in data)}
+
+    @app.post("/compute")
+    async def compute(data: list[int]):
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(executor, heavy_computation, data)
+        return result
+  example_bad: |
+    import threading
+
+    # WRONG: Threading for CPU-bound work — GIL prevents parallelism
+    def process_data(data):
+        threads = [threading.Thread(target=heavy_math, args=(chunk,))
+                   for chunk in split(data, 4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # Slower than single-threaded due to GIL contention!
+
+    # WRONG: Blocking I/O in async handler
+    @app.get("/data")
+    async def get_data():
+        result = requests.get("http://external-api/data")  # BLOCKS event loop!
+        return result.json()
+  when_applies: "Any Python application mixing I/O-bound and CPU-bound workloads, especially FastAPI services"
+  sources: ["https://docs.python.org/3/library/asyncio.html"]
+
+- id: PERF-BE-007
+  text: "Use keyset (cursor) pagination instead of OFFSET for large tables. OFFSET forces PostgreSQL to scan and discard N rows, making page 1000 take 1000x longer than page 1."
+  why: >
+    OFFSET 100000 LIMIT 20 means PostgreSQL reads 100,020 rows, discards 100,000, and returns 20.
+    As the user pages deeper, queries get linearly slower. At 1 million rows with OFFSET 500000,
+    the query takes 5+ seconds. Keyset pagination uses a WHERE clause on an indexed column
+    (WHERE id > last_seen_id), which always reads only the requested rows regardless of page
+    depth. Response time is constant: page 1 and page 10,000 both take ~5ms.
+  how_to_do_right: |
+    1. Use keyset pagination: WHERE id > :last_id ORDER BY id ASC LIMIT :page_size
+    2. Return the last item's id as the cursor in the API response
+    3. Client sends cursor on next request: GET /items?cursor=abc123&limit=20
+    4. Encode cursor as opaque token (base64 of last_id) so clients don't depend on internals
+    5. For multi-column sort: WHERE (created_at, id) > (:last_created_at, :last_id)
+    6. Only fall back to OFFSET for small tables (<10K rows) or admin-only endpoints
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [sqlalchemy]
+  domains:
+    domain: [performance, databases, api]
+    concern: [sql]
+  example_good: |
+    from fastapi import FastAPI, Query
+    from sqlalchemy import select
+    import base64
+
+    @app.get("/items")
+    async def list_items(
+        cursor: str | None = Query(None),
+        limit: int = Query(20, le=100),
+    ):
+        stmt = select(Item).order_by(Item.id.asc()).limit(limit)
+
+        if cursor:
+            last_id = base64.b64decode(cursor).decode()
+            stmt = stmt.where(Item.id > last_id)  # Keyset: uses index, constant time
+
+        items = (await session.execute(stmt)).scalars().all()
+        next_cursor = base64.b64encode(str(items[-1].id).encode()).decode() if items else None
+
+        return {"items": items, "next_cursor": next_cursor}
+  example_bad: |
+    # WRONG: OFFSET pagination — linearly slower as page increases
+    @app.get("/items")
+    async def list_items(page: int = 1, limit: int = 20):
+        offset = (page - 1) * limit
+        stmt = select(Item).order_by(Item.id).offset(offset).limit(limit)
+        # Page 1: reads 20 rows (fast)
+        # Page 1000: reads 20,000 rows, discards 19,980 (slow)
+        # Page 50000: reads 1,000,000 rows, discards 999,980 (5+ seconds)
+        items = (await session.execute(stmt)).scalars().all()
+        return {"items": items, "page": page}
+  when_applies: "Any paginated API endpoint on tables with more than 10,000 rows"
+  sources: ["https://use-the-index-luke.com/no-offset"]
+
+- id: PERF-BE-008
+  text: "Use bulk operations for batch data processing: executemany for moderate inserts, COPY for large imports. Individual INSERT statements in a loop are 10-100x slower."
+  why: >
+    Each individual INSERT has overhead: SQL parsing, query planning, WAL logging, network
+    round-trip. Inserting 10,000 rows one by one takes 10,000 round-trips (~10 seconds with 1ms
+    latency). executemany batches them into fewer round-trips (~0.5 seconds). PostgreSQL's COPY
+    command bypasses the SQL parser entirely and streams data directly into the table (~0.1 seconds
+    for 10,000 rows). For large data migrations, COPY is 100x faster than individual INSERTs.
+  how_to_do_right: |
+    1. For <1,000 rows: use executemany or SQLAlchemy bulk_save_objects
+    2. For 1,000-100,000 rows: use COPY via psycopg2.copy_from or asyncpg.copy_records_to_table
+    3. For >100,000 rows: stream COPY with chunked file-like object
+    4. Disable indexes and constraints during bulk import, re-enable after
+    5. Use UNLOGGED tables for temporary staging data
+    6. Commit in batches of 5,000-10,000 rows to avoid long transactions
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [sqlalchemy, asyncpg]
+  domains:
+    domain: [performance, databases]
+    concern: [sql]
+  example_good: |
+    # Bulk insert with SQLAlchemy (moderate volume)
+    from sqlalchemy import insert
+
+    async def bulk_create_users(users: list[dict]):
+        stmt = insert(User)
+        await session.execute(stmt, users)  # Single round-trip for all rows
+        await session.commit()
+
+    # COPY for large imports (asyncpg)
+    import asyncpg
+
+    async def import_large_dataset(records: list[tuple]):
+        conn = await asyncpg.connect(dsn)
+        await conn.copy_records_to_table(
+            'events',
+            records=records,
+            columns=['event_type', 'payload', 'created_at'],
+        )
+        await conn.close()
+  example_bad: |
+    # WRONG: Individual INSERT in a loop — 10,000 round-trips
+    async def create_users(users: list[dict]):
+        for user_data in users:  # 10,000 iterations
+            user = User(**user_data)
+            session.add(user)
+            await session.commit()  # Commit per row = 10,000 transactions!
+  when_applies: "Any operation inserting or updating more than 100 rows at once"
+  sources: ["https://www.postgresql.org/docs/current/sql-copy.html"]
+
+- id: PERF-BE-009
+  text: "Choose eager loading for relationships you always need, lazy loading for relationships you rarely need. The wrong default causes either N+1 queries (lazy everywhere) or unnecessary data transfer (eager everywhere)."
+  why: >
+    Eagerly loading a User's orders, addresses, and payment methods when you only need the user's
+    name wastes bandwidth and memory — 3 JOINs and 10x more data transferred per request. Lazily
+    loading everything means the first time you access any relationship, a new query fires —
+    resulting in N+1 problems in list views. The correct approach is to choose per-use-case: an
+    order detail page needs eager-loaded items; a user list page needs only user fields.
+  how_to_do_right: |
+    1. Default to lazy loading in model definitions (SQLAlchemy default)
+    2. Use eager loading explicitly in queries that need relationships: selectinload(), joinedload()
+    3. Use selectinload for one-to-many (separate IN query, avoids row multiplication)
+    4. Use joinedload for many-to-one or one-to-one (single JOIN, efficient)
+    5. Create query functions per use-case: get_order_summary() vs get_order_detail()
+    6. Never set eager loading as the model default — it affects every query on that model
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [sqlalchemy]
+  domains:
+    domain: [performance, databases]
+    concern: [sql]
+  example_good: |
+    from sqlalchemy.orm import selectinload, joinedload, relationship
+    from sqlalchemy import select
+
+    class Order(Base):
+        __tablename__ = "orders"
+        items = relationship("OrderItem", lazy="select")  # Default: lazy
+
+    # Use-case 1: Order list (no items needed)
+    async def list_orders():
+        stmt = select(Order).where(Order.status == "pending")
+        return (await session.execute(stmt)).scalars().all()
+
+    # Use-case 2: Order detail (items needed)
+    async def get_order_detail(order_id: int):
+        stmt = (
+            select(Order)
+            .options(selectinload(Order.items))  # Explicitly eager for this query
+            .where(Order.id == order_id)
+        )
+        return (await session.execute(stmt)).scalar_one()
+  example_bad: |
+    # WRONG: Eager loading as model default — every query loads items
+    class Order(Base):
+        items = relationship("OrderItem", lazy="joined")  # Always JOINs, even for list views
+
+    # WRONG: Lazy loading in a loop — N+1
+    orders = await session.execute(select(Order))
+    for order in orders.scalars():
+        total = sum(item.price for item in order.items)  # N queries!
+  when_applies: "Any application using SQLAlchemy ORM with related models, especially endpoints that serve both list and detail views"
+  sources: ["https://docs.sqlalchemy.org/en/20/orm/queryguide/relationships.html"]
+
+- id: PERF-BE-010
+  text: "Compress API responses larger than 1KB with gzip. For JSON APIs, gzip typically achieves 70-90% compression ratio, reducing bandwidth costs and improving client-perceived latency."
+  why: >
+    A JSON response with 100 user objects is ~50KB uncompressed but ~5KB gzipped. For mobile
+    users on 3G connections (500 Kbps), 50KB takes 800ms to download vs 80ms for 5KB. The
+    server-side CPU cost of gzip is ~1ms for a 50KB response — negligible compared to the
+    network savings. Without compression, bandwidth costs scale linearly with traffic, and
+    mobile users experience unnecessary latency.
+  how_to_do_right: |
+    1. Add GZipMiddleware to FastAPI with minimum_size=1000 (skip tiny responses)
+    2. Set compresslevel=6 (default) — good compression/CPU tradeoff
+    3. Check client supports gzip via Accept-Encoding header (middleware handles this)
+    4. For static files: pre-compress with gzip -9 and serve with Content-Encoding: gzip
+    5. Do not compress already-compressed formats (images, videos, zip files)
+    6. Monitor CPU usage — if gzip CPU exceeds 5%, reduce compresslevel or increase minimum_size
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [performance, api]
+    concern: [web]
+  example_good: |
+    from fastapi import FastAPI
+    from fastapi.middleware.gzip import GZipMiddleware
+
+    app = FastAPI()
+    app.add_middleware(GZipMiddleware, minimum_size=1000)  # Only compress >1KB
+
+    @app.get("/users")
+    async def list_users():
+        users = await db.get_all_users()
+        return users  # 50KB JSON → 5KB gzipped automatically
+  example_bad: |
+    # WRONG: No compression — all responses sent uncompressed
+    app = FastAPI()
+
+    @app.get("/users")
+    async def list_users():
+        users = await db.get_all_users()
+        return users  # 50KB transferred every request, 500 req/min = 25MB/min wasted
+  when_applies: "Any API that returns JSON responses larger than 1KB, especially list endpoints or data-heavy responses"
+  sources: ["https://fastapi.tiangolo.com/advanced/middleware/#gzipmiddleware"]
+
+- id: PERF-BE-011
+  text: "Serve static assets through a CDN, not your application server. Your FastAPI/Flask server should handle dynamic API requests only — static files (JS, CSS, images) should be served from edge locations."
+  why: >
+    An application server handling static file requests wastes compute capacity on a task that
+    CDNs do better and cheaper. Each static file request occupies an event loop slot, reducing
+    capacity for API requests. A CDN serves files from edge locations (50-100ms latency globally
+    vs 200-500ms from a single origin). For a React SPA, the bundle (2-5MB) served from origin
+    blocks the event loop during transfer; from CDN, it's a non-issue.
+  how_to_do_right: |
+    1. Upload static assets to S3 or equivalent object storage after build
+    2. Put CloudFront, Cloudflare, or Fastly CDN in front of the storage
+    3. Set Cache-Control headers: max-age=31536000 for hashed assets, no-cache for index.html
+    4. Use content-hash in filenames (main.abc123.js) for cache busting
+    5. In FastAPI, do NOT mount StaticFiles in production — only in development
+    6. Return only JSON from your API endpoints
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [fastapi, react]
+  domains:
+    domain: [performance, deployment]
+    concern: [web]
+  example_good: |
+    # Production FastAPI — API only, no static files
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+    @app.get("/api/users")
+    async def list_users():
+        return await db.get_users()
+
+    # Static files served by CDN (CloudFront → S3)
+    # React build output uploaded to s3://my-app-static/
+    # CDN URL: https://cdn.myapp.com/static/main.abc123.js
+
+    # Development only — mount static for local dev
+    # if settings.DEBUG:
+    #     app.mount("/static", StaticFiles(directory="static"), name="static")
+  example_bad: |
+    # WRONG: Application server serving static files in production
+    from fastapi.staticfiles import StaticFiles
+
+    app = FastAPI()
+    app.mount("/static", StaticFiles(directory="build/static"), name="static")
+    # Every JS/CSS/image request occupies your API server
+    # 100 concurrent users loading the SPA = 100 static file connections
+    # Your API endpoints compete for the same event loop
+  when_applies: "Any production web application serving both API endpoints and static frontend assets"
+  sources: ["https://web.dev/articles/performance-optimizing-content-efficiency"]
+
+- id: PERF-BE-012
+  text: "Use Celery or RQ for background job processing. Never run heavy computation (report generation, email sending, image processing) inside an API request handler — it blocks the response and risks timeouts."
+  why: >
+    A report generation that takes 30 seconds inside a request handler means the user stares at
+    a spinner for 30 seconds, the connection may timeout (most load balancers timeout at 30-60s),
+    and one slow request blocks a worker for the entire duration. With 4 workers and 4 concurrent
+    report requests, your API is completely unresponsive. Background jobs process asynchronously:
+    the API returns immediately with a job ID, the user can poll for status or receive a webhook.
+  how_to_do_right: |
+    1. API endpoint enqueues task and returns 202 Accepted with job_id
+    2. Celery/RQ worker picks up task from Redis queue
+    3. Worker processes task, stores result in Redis/database
+    4. Client polls GET /jobs/{job_id} or subscribes to WebSocket for completion
+    5. Set task timeout (soft_time_limit=300, time_limit=600 in Celery)
+    6. Configure retry with exponential backoff for transient failures
+    7. Monitor queue depth — alert if >100 pending tasks
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [celery, redis]
+  domains:
+    domain: [performance, architecture]
+    concern: [decision_making]
+  example_good: |
+    from celery import Celery
+    from fastapi import FastAPI
+
+    celery_app = Celery("tasks", broker="redis://localhost:6379/0")
+    app = FastAPI()
+
+    @celery_app.task(soft_time_limit=300, time_limit=600)
+    def generate_report(report_params: dict) -> str:
+        """Runs in Celery worker process — does not block API."""
+        result = heavy_computation(report_params)
+        save_report(result)
+        return result.url
+
+    @app.post("/reports", status_code=202)
+    async def create_report(params: ReportRequest):
+        task = generate_report.delay(params.dict())
+        return {"job_id": task.id, "status": "processing"}
+
+    @app.get("/jobs/{job_id}")
+    async def get_job_status(job_id: str):
+        task = celery_app.AsyncResult(job_id)
+        return {"status": task.status, "result": task.result if task.ready() else None}
+  example_bad: |
+    # WRONG: Heavy computation inside request handler
+    @app.post("/reports")
+    async def create_report(params: ReportRequest):
+        result = heavy_computation(params)  # 30 seconds blocking!
+        # User timeout, load balancer may kill the connection
+        # Worker is blocked, cannot serve other requests
+        return {"report": result}
+  when_applies: "Any API endpoint where processing takes more than 2 seconds, including report generation, file processing, email campaigns, and data exports"
+  sources: ["https://docs.celeryq.dev/en/stable/getting-started/introduction.html"]
+
+- id: PERF-BE-013
+  text: "Route read queries to a database read replica and writes to the primary. This simple split doubles your read capacity without application changes beyond connection routing."
+  why: >
+    Most applications are 80-90% reads. A single PostgreSQL instance handles ~5,000 simple
+    queries/second. With a read replica, reads go to the replica (5,000 QPS) and writes go to
+    the primary (5,000 QPS), effectively doubling total capacity to 10,000 QPS. Without read
+    replicas, scaling requires vertical scaling (bigger server, 2-4x cost) or sharding
+    (10x complexity). Read replicas are the highest-ROI scaling technique for databases.
+  how_to_do_right: |
+    1. Create read replica in your cloud provider (AWS RDS, Cloud SQL, etc.)
+    2. Configure two SQLAlchemy engines: primary (read-write) and replica (read-only)
+    3. Use a session router: write operations use primary, read operations use replica
+    4. Handle replication lag: for read-after-write consistency, use primary for 2-5 seconds after write
+    5. Monitor replication lag — alert if >5 seconds
+    6. Do NOT write to the replica — it will cause replication to break
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [sqlalchemy]
+  domains:
+    domain: [performance, databases, architecture]
+    concern: [sql]
+  example_good: |
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+    from sqlalchemy.orm import sessionmaker
+
+    primary_engine = create_async_engine("postgresql+asyncpg://user:pass@primary:5432/db")
+    replica_engine = create_async_engine("postgresql+asyncpg://user:pass@replica:5432/db")
+
+    PrimarySession = sessionmaker(primary_engine, class_=AsyncSession)
+    ReplicaSession = sessionmaker(replica_engine, class_=AsyncSession)
+
+    async def get_user(user_id: str):
+        """Read operation → replica."""
+        async with ReplicaSession() as session:
+            return await session.get(User, user_id)
+
+    async def create_user(data: dict):
+        """Write operation → primary."""
+        async with PrimarySession() as session:
+            user = User(**data)
+            session.add(user)
+            await session.commit()
+            return user
+  example_bad: |
+    # WRONG: All queries go to single database instance
+    engine = create_async_engine("postgresql+asyncpg://user:pass@single-db:5432/db")
+
+    # Both reads and writes compete for the same connection pool
+    # At 5,000 QPS you hit the ceiling — vertical scaling only option
+  when_applies: "Any production database handling more than 1,000 queries per second or experiencing read-heavy workload patterns"
+  sources: ["https://www.postgresql.org/docs/current/hot-standby.html"]
+
+- id: PERF-BE-014
+  text: "Use materialized views for complex aggregation queries that are read frequently but change infrequently. They pre-compute JOINs and GROUP BYs so dashboards load in milliseconds instead of seconds."
+  why: >
+    A dashboard showing 'total revenue per region per month' joins 3 tables with GROUP BY and
+    SUM — takes 2-5 seconds on large datasets. If the dashboard is loaded 100 times per hour
+    but data changes every 15 minutes, you're computing the same aggregation 100 times for the
+    same result. A materialized view computes it once, stores the result, and serves reads from
+    the pre-computed table. Refresh it every 15 minutes with REFRESH MATERIALIZED VIEW CONCURRENTLY.
+  how_to_do_right: |
+    1. Create materialized view with CONCURRENTLY option (requires unique index)
+    2. Create a unique index on the materialized view for CONCURRENTLY refresh
+    3. Schedule refresh via pg_cron or Celery beat (every 5-15 minutes for dashboards)
+    4. Use CONCURRENTLY to avoid locking the view during refresh
+    5. Monitor refresh duration — if >30 seconds, optimize the underlying query
+    6. Add regular index on frequently-filtered columns of the materialized view
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [sqlalchemy]
+  domains:
+    domain: [performance, databases]
+    concern: [sql]
+  example_good: |
+    -- Create materialized view for dashboard aggregations
+    CREATE MATERIALIZED VIEW mv_revenue_by_region AS
+    SELECT
+        r.name AS region,
+        DATE_TRUNC('month', o.created_at) AS month,
+        SUM(o.total_amount) AS revenue,
+        COUNT(*) AS order_count
+    FROM orders o
+    JOIN stores s ON o.store_id = s.id
+    JOIN regions r ON s.region_id = r.id
+    GROUP BY r.name, DATE_TRUNC('month', o.created_at);
+
+    -- Required for CONCURRENTLY refresh
+    CREATE UNIQUE INDEX idx_mv_revenue_region_month
+    ON mv_revenue_by_region (region, month);
+
+    -- Refresh without locking (run via pg_cron every 15 min)
+    REFRESH MATERIALIZED VIEW CONCURRENTLY mv_revenue_by_region;
+
+    -- Query is now a simple table scan: <5ms instead of 2-5 seconds
+    SELECT * FROM mv_revenue_by_region WHERE month >= '2026-01-01';
+  example_bad: |
+    # WRONG: Complex aggregation query on every dashboard load
+    @app.get("/dashboard/revenue")
+    async def get_revenue():
+        # This 3-table JOIN with GROUP BY runs on every request
+        result = await session.execute("""
+            SELECT r.name, DATE_TRUNC('month', o.created_at), SUM(o.total_amount)
+            FROM orders o JOIN stores s ON ... JOIN regions r ON ...
+            GROUP BY 1, 2
+        """)  # 2-5 seconds per request, 100 times per hour = waste
+        return result.all()
+  when_applies: "Any dashboard or reporting endpoint that aggregates data across multiple tables and is accessed more than 10 times per hour"
+  sources: ["https://www.postgresql.org/docs/current/rules-materializedviews.html"]
+
+- id: PERF-BE-015
+  text: "Profile before optimizing. Use cProfile for CPU bottlenecks, memory_profiler for memory leaks, and py-spy for production profiling without code changes. Never optimize based on intuition alone."
+  why: >
+    Developers spend 80% of optimization effort on code that accounts for 3% of execution time.
+    Without profiling, you optimize the wrong function. A team spent 2 weeks rewriting a 'slow'
+    serializer that profiling later revealed was 0.5% of request time — the actual bottleneck
+    was a synchronous DNS lookup taking 200ms per request. Profiling reveals the truth: optimize
+    the function that appears at the top of the cumulative time chart, not the one you think is slow.
+  how_to_do_right: |
+    1. CPU profiling: python -m cProfile -o output.prof script.py, then snakeviz output.prof
+    2. Line profiling: @profile decorator with kernprof -l -v script.py
+    3. Memory profiling: from memory_profiler import profile; @profile on suspect functions
+    4. Production profiling: py-spy record -o profile.svg --pid <PID> (no code changes needed)
+    5. Async profiling: use aiomonitor or yappi with async support
+    6. Set performance budget: endpoint must respond in <200ms p95, profile if >200ms
+    7. Profile with realistic data — 10 rows behaves differently than 10,000 rows
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [performance, code_quality]
+    concern: [diagnosis]
+  example_good: |
+    # Step 1: Profile with cProfile
+    # python -m cProfile -s cumulative my_app.py 2>&1 | head -30
+
+    # Step 2: Visual profiling with py-spy (production-safe)
+    # py-spy record -o profile.svg --pid $(pgrep -f "uvicorn")
+    # Open profile.svg in browser — flame graph shows hotspots
+
+    # Step 3: Memory profiling for suspect functions
+    from memory_profiler import profile
+
+    @profile
+    def process_large_dataset(data: list[dict]) -> list:
+        results = []
+        for item in data:
+            transformed = transform(item)  # Is this leaking memory?
+            results.append(transformed)
+        return results
+
+    # Step 4: Line-level timing
+    # kernprof -l -v my_module.py
+    # Shows time per line — find the exact slow line
+  example_bad: |
+    # WRONG: Optimizing based on intuition
+    # "I think the serializer is slow, let me rewrite it in Cython"
+    def serialize_response(data):
+        # Developer spends 2 weeks optimizing this (0.5% of total time)
+        return orjson.dumps(data)  # Already fast — not the bottleneck
+
+    # Meanwhile, the actual bottleneck is never investigated:
+    def get_user(user_id):
+        # Synchronous DNS lookup: 200ms per request (99.5% of total time)
+        response = requests.get(f"http://user-service/users/{user_id}")
+        return response.json()
+  when_applies: "Any performance optimization effort — always profile first, optimize second, measure improvement third"
+  sources: ["https://docs.python.org/3/library/profile.html"]

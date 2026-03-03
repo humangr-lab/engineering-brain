@@ -1,0 +1,220 @@
+layer: rules
+technology: SRE
+domain: containers
+knowledge:
+- id: CR-SRE-DOCK-001
+  text: Docker images must be minimal — use multi-stage builds to produce images with only the runtime and application code. A 1.5GB image with gcc, build tools, and test fixtures is not a production image.
+    A 50MB image with just the runtime and compiled code is.
+  why: 'Google''s container management (Borg, reflected in Chapter 8) optimizes for minimal images because image size affects: pull time (1.5GB takes 30 seconds to pull, 50MB takes 2 seconds), storage cost
+    (every version stored in the registry), attack surface (every installed package is a potential vulnerability), and startup time (larger images = longer container start). Multi-stage builds separate
+    the build environment (compilers, build tools, test frameworks) from the runtime environment (just the application and its runtime dependencies). The build stage produces artifacts; the runtime stage
+    copies only those artifacts. Google''s internal build system (Blaze/Bazel) produces minimal containers by default — only the binary and its runtime dependencies.
+
+    '
+  how_to_do_right: '1. Use multi-stage builds: first stage builds/compiles, second stage copies only the output. The final image doesn''t include build tools.
+
+    2. Use minimal base images: python:3.12-slim (150MB) instead of python:3.12 (900MB). alpine (5MB) for Go/Rust compiled binaries.
+
+    3. Order Dockerfile layers for cache efficiency: COPY requirements.txt first, RUN pip install, then COPY source code. Source changes don''t invalidate the pip cache.
+
+    4. Don''t install unnecessary packages: no vim, no curl, no debugging tools in production images. Use ephemeral debug containers for debugging.
+
+    5. Use .dockerignore to exclude: .git, __pycache__, node_modules, test fixtures, documentation, IDE files.
+
+    6. Scan images for vulnerabilities: trivy, grype, or Docker Scout. A minimal image has fewer packages = fewer vulnerabilities.
+
+    '
+  example_good: "# Multi-stage build: build in stage 1, minimal runtime in stage 2\n# Dockerfile\nFROM python:3.12 AS builder\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install --no-cache-dir --target=/deps -r requirements.txt\nCOPY src/ ./src/\n\nFROM python:3.12-slim\nWORKDIR /app\nCOPY --from=builder /deps /usr/local/lib/python3.12/site-packages/\nCOPY --from=builder /app/src ./src/\nUSER 1000:1000\nCMD [\"python\", \"-m\", \"src.main\"]\n\n# Result: ~150MB image (slim base + deps + source)\n# No gcc, no build tools, no test fixtures, no .git\n# .dockerignore: .git, __pycache__, tests/, *.md, .env\n"
+  example_bad: "# Fat image with build tools and test fixtures\nFROM python:3.12\nWORKDIR /app\nCOPY . .  # copies .git, tests, docs, everything\nRUN pip install -r requirements.txt\nRUN pip install pytest coverage mypy  # test tools in production\nCMD [\"python\", \"main.py\"]\n\n# Result: 1.5GB image\n# Contains: gcc, build-essential, test fixtures, .git history\n# 30 seconds to pull, 500+ CVEs from unnecessary packages\n# Runs as root (default)\n"
+  when_applies: "When building Docker images for any production service where image size, security, and pull speed matter."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [docker, kubernetes]
+  domains:
+    domain: [deployment, reliability, security]
+    concern: [containers]
+  sources:
+  - url: https://sre.google/sre-book/release-engineering/
+    title: 'Google SRE Book — Chapter 8: Release Engineering'
+  validation_status: cross_checked
+- id: CR-SRE-DOCK-002
+  text: Container images must be tagged with the git commit SHA, not "latest." Deploying "myapp:latest" is non-deterministic — it resolves to whatever was last pushed, which may differ between pull operations.
+    SHA-tagged images are immutable and traceable.
+  why: 'Google''s release engineering (Chapter 8) mandates that every deployment is traceable to an exact code version. The "latest" tag problem: you deploy myapp:latest at 14:00 (which is commit abc123).
+    At 14:30, someone pushes a new image also tagged "latest" (commit def456). At 15:00, a node restarts and pulls myapp:latest — it gets commit def456, which is different from what''s running on other
+    nodes. Now you have a split deployment with two different versions running simultaneously. With SHA tagging: deploy myapp:abc123. Every pull always gets the same image. If a node restarts, it pulls
+    the same version. Rollback is: deploy myapp:prev_sha. Audit is: which commit is running in production? Check the tag.
+
+    '
+  how_to_do_right: '1. Tag images with git commit SHA: myapp:abc123def. This is unique, immutable, and traceable.
+
+    2. Optionally also tag with semantic version: myapp:1.2.3. But ALWAYS include the SHA tag as well.
+
+    3. Never use "latest" in production deployments. "latest" is a convenience for development, not a production practice.
+
+    4. Reference images by SHA digest for maximum immutability: myapp@sha256:abc123... (even tags can be overwritten; digests cannot).
+
+    5. Include the SHA in deployment metadata: Kubernetes deployment annotations, Grafana dashboard links, alert context.
+
+    6. Keep at least 10 previous image versions in the registry for rollback. Don''t garbage collect recent versions.
+
+    '
+  example_good: "# Tag with git commit SHA for traceability\n# CI/CD pipeline:\nCOMMIT_SHA=$(git rev-parse --short HEAD)\ndocker build -t myapp:${COMMIT_SHA} .\ndocker tag myapp:${COMMIT_SHA} myapp:1.2.3  # optional semver tag\ndocker push myapp:${COMMIT_SHA}\n\n# Kubernetes deployment references SHA:\napiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    metadata:\n      annotations:\n        deploy.commit: \"abc123def\"  # traceable\n    spec:\n      containers:\n      - name: api\n        image: myapp:abc123def       # immutable, deterministic\n\n# Even better: reference by digest (can't be overwritten)\n# image: myapp@sha256:a1b2c3d4e5...\n"
+  example_bad: "# Using 'latest' tag — non-deterministic deployments\napiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n      - name: api\n        image: myapp:latest   # which version?\n        imagePullPolicy: Always\n# Problem: Pod A pulls myapp:latest at 14:00 (commit abc)\n# Someone pushes new image at 14:30 (commit def)\n# Pod B restarts at 15:00, pulls myapp:latest (commit def)\n# Now Pods A and B run different versions!\n# Rollback: 'deploy myapp:latest' -> deploys whatever is current, not previous\n"
+  when_applies: "When tagging and referencing Docker images in production deployments where traceability and determinism are essential."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [docker, kubernetes]
+  domains:
+    domain: [architecture, deployment, reliability]
+    concern: [api_design, containers]
+  sources:
+  - url: https://sre.google/sre-book/release-engineering/
+    title: 'Google SRE Book — Chapter 8: Release Engineering'
+  validation_status: cross_checked
+- id: CR-SRE-DOCK-003
+  text: Containers must run as non-root users — a container running as root that is compromised gives the attacker root access to the container and potentially the host. Use USER directive in Dockerfile
+    and set runAsNonRoot in Kubernetes SecurityContext.
+  why: 'Google''s container security practices mandate non-root execution because container isolation (namespaces, cgroups) has known escape vulnerabilities. If a container runs as root and an attacker
+    exploits a container escape vulnerability, they get root on the host. If the container runs as a non-root user (UID 1000), a container escape gives them non-root access — significantly limiting the
+    damage. Additionally, running as root inside the container means: the application can modify any file in the container filesystem (including system files), it can bind to privileged ports (< 1024),
+    and it can install software (undermining image immutability). Running as non-root prevents all of these.
+
+    '
+  how_to_do_right: '1. Dockerfile: add USER 1000:1000 (or a named user) before the ENTRYPOINT/CMD. The application runs as this user.
+
+    2. Kubernetes: set securityContext.runAsNonRoot: true on the pod spec. Kubernetes rejects pods that attempt to run as root.
+
+    3. Set securityContext.allowPrivilegeEscalation: false to prevent the process from gaining more privileges.
+
+    4. Set securityContext.readOnlyRootFilesystem: true to prevent writes to the container filesystem (use volumes for writable data).
+
+    5. Don''t use capabilities unless specifically needed. Drop all capabilities: securityContext.capabilities.drop: ["ALL"].
+
+    6. Test that the application works as non-root: some applications assume root (binding port 80, writing to /var/log). Fix these assumptions.
+
+    '
+  example_good: "# Dockerfile: non-root user + Kubernetes SecurityContext\n# Dockerfile\nFROM python:3.12-slim\nRUN groupadd -r appuser && useradd -r -g appuser appuser\nWORKDIR /app\nCOPY --chown=appuser:appuser . .\nUSER appuser  # run as non-root (UID 1000)\nCMD [\"python\", \"-m\", \"src.main\"]\n\n# Kubernetes SecurityContext\napiVersion: v1\nkind: Pod\nspec:\n  securityContext:\n    runAsNonRoot: true             # reject if image runs as root\n    runAsUser: 1000\n    fsGroup: 1000\n  containers:\n  - name: api\n    securityContext:\n      allowPrivilegeEscalation: false  # no privilege escalation\n      readOnlyRootFilesystem: true     # immutable container filesystem\n      capabilities:\n        drop: [\"ALL\"]                  # drop all Linux capabilities\n"
+  example_bad: "# Running as root — container escape = host root access\nFROM python:3.12\nWORKDIR /app\nCOPY . .\nRUN pip install -r requirements.txt\nCMD [\"python\", \"main.py\"]\n# No USER directive -> runs as root (UID 0)\n# Container escape vulnerability + root = root on host\n# Can modify system files, bind privileged ports, install software\n# No securityContext in Kubernetes -> no enforcement\n"
+  when_applies: "When building Docker images and deploying containers to production, especially in shared Kubernetes clusters."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [docker, kubernetes]
+  domains:
+    domain: [deployment, reliability, security]
+    concern: [containers]
+  sources:
+  - url: https://sre.google/sre-book/reliable-product-launches/
+    title: 'Google SRE Book — Chapter 27: Reliable Product Launches at Scale'
+  validation_status: cross_checked
+- id: CR-SRE-DOCK-004
+  text: Container health checks must be lightweight and independent — a health check that calls an external service or runs a heavy query defeats the purpose. If the health check itself consumes significant
+    resources or depends on external state, it becomes a source of false positives.
+  why: 'Google''s container orchestration treats health checks as critical infrastructure — they determine whether containers receive traffic and whether they''re restarted. A health check that: calls a
+    database (adds 10ms + a connection from the pool), calls an external service (adds latency + network dependency), runs a complex computation (consumes CPU), or reads a large file (consumes I/O) introduces
+    problems. The health check runs every 10-30 seconds per container. With 100 containers, that''s 100-300 health checks per 10 seconds. If each health check opens a database connection, that''s 10-30
+    connections/second consumed just by health checks. Google''s approach: health checks should verify LOCAL state only — "is the process alive and ready?" — not external state.
+
+    '
+  how_to_do_right: '1. Liveness check: verify the process responds (GET /healthz returns 200). No database calls, no external calls. < 10ms response time.
+
+    2. Readiness check: verify cached dependency status (check a local flag set by a background health monitor). < 100ms response time.
+
+    3. Don''t open new connections in health checks: check the connection pool status, don''t create a new connection.
+
+    4. Use a background health monitor: a separate thread/goroutine checks dependencies every 30 seconds and updates a local flag. The readiness endpoint reads the flag.
+
+    5. Health check endpoints must be unauthenticated: load balancers and Kubernetes kubelets need access without credentials.
+
+    6. Monitor health check latency: if health checks take > 1 second, they''re too heavy and may cause false positives (timeout → unhealthy → restart loop).
+
+    '
+  example_good: "# Lightweight health checks with background dependency monitor\nimport threading\nimport time\nfrom flask import Flask, jsonify\n\napp = Flask(__name__)\n\n# Background thread checks dependencies every 30 seconds\n_deps_healthy = True\ndef _check_deps():\n    global _deps_healthy\n    while True:\n        try:\n            db.execute('SELECT 1')    # check DB\n            cache.ping()              # check Redis\n            _deps_healthy = True\n        except Exception:\n            _deps_healthy = False\n        time.sleep(30)\nthreading.Thread(target=_check_deps, daemon=True).start()\n\n@app.route('/healthz')  # Liveness: local state only, < 10ms\ndef liveness():\n    return jsonify({'status': 'alive'}), 200\n\n@app.route('/readyz')  # Readiness: reads cached flag, < 10ms\ndef readiness():\n    if _deps_healthy:\n        return jsonify({'status': 'ready'}), 200\n    return jsonify({'status': 'not ready'}), 503\n"
+  example_bad: "# Health check queries database on every call — expensive and fragile\n@app.route('/healthz')\ndef liveness():\n    # Opens new DB connection on every health check!\n    conn = psycopg2.connect(DATABASE_URL)  # pool slot consumed\n    cur = conn.cursor()\n    cur.execute('SELECT COUNT(*) FROM users')  # heavy query!\n    count = cur.fetchone()[0]\n    conn.close()\n    return jsonify({'status': 'ok', 'users': count}), 200\n\n# 100 pods * health check every 10s = 10 DB connections/second just for health\n# DB slow -> health check slow -> timeout -> pod marked unhealthy -> restart\n# Restart storm -> all pods restarting -> total outage\n"
+  when_applies: "When implementing liveness and readiness probes for containers running in Kubernetes or behind a load balancer."
+  severity: medium
+  technologies:
+    lang: [general]
+    platform: [docker, kubernetes]
+  domains:
+    domain: [deployment, observability, reliability]
+    concern: [containers, monitoring, health_checks]
+  sources:
+  - url: https://sre.google/sre-book/load-balancing-datacenter/
+    title: 'Google SRE Book — Chapter 20: Load Balancing in the Datacenter'
+  validation_status: cross_checked
+- id: CR-SRE-DOCK-005
+  text: Container logging must write to stdout/stderr, not to files inside the container. Kubernetes and Docker capture stdout/stderr automatically. Log files inside the container are lost when the container
+    is replaced and are invisible to centralized log aggregation.
+  why: 'Google''s container design follows the twelve-factor app principle that logs are event streams written to stdout. In Kubernetes: stdout/stderr from the container is captured by the kubelet, stored
+    on the node, and collected by log aggregators (Fluentd, Fluent Bit, Promtail). Log files inside the container: are lost when the container restarts (ephemeral filesystem), consume container disk space
+    (potentially causing disk pressure and eviction), are not collected by the log pipeline (invisible), and require volume mounts for persistence (additional complexity). Writing to stdout is simpler,
+    more reliable, and compatible with every container orchestration platform.
+
+    '
+  how_to_do_right: '1. Configure the application to log to stdout/stderr: Python logging to StreamHandler, Go log to os.Stdout, Java logback ConsoleAppender.
+
+    2. Don''t write log files inside the container: no /var/log/app.log, no rotating file handlers.
+
+    3. Use structured logging (JSON) to stdout: log aggregators parse JSON automatically. Unstructured text requires regex parsing.
+
+    4. Separate stdout (application logs) and stderr (error logs) for different processing in the log pipeline.
+
+    5. Set log level via environment variable: LOG_LEVEL=INFO. Don''t require a config file change to adjust verbosity.
+
+    6. If the application MUST write to files (legacy apps): use a sidecar container that tails the log file to stdout.
+
+    '
+  example_good: "# Log to stdout with structured JSON\nimport logging\nimport json\nimport sys\nimport os\n\nclass JSONFormatter(logging.Formatter):\n    def format(self, record):\n        return json.dumps({\n            'timestamp': self.formatTime(record),\n            'level': record.levelname,\n            'message': record.getMessage(),\n            'module': record.module,\n            'function': record.funcName,\n        })\n\nhandler = logging.StreamHandler(sys.stdout)  # stdout, not file\nhandler.setFormatter(JSONFormatter())\nlogger = logging.getLogger('app')\nlogger.addHandler(handler)\nlogger.setLevel(os.getenv('LOG_LEVEL', 'INFO'))  # configurable via env var\n\nlogger.info('Request processed', extra={'user_id': 123, 'latency_ms': 45})\n# Kubernetes captures stdout -> Fluentd/Fluent Bit -> aggregation\n"
+  example_bad: "# Log to files inside container — lost on restart, invisible to aggregation\nimport logging\n\nhandler = logging.FileHandler('/var/log/app.log')  # file inside container\nlogger = logging.getLogger('app')\nlogger.addHandler(handler)\n\nlogger.info('Request processed')\n# Container restarts -> /var/log/app.log is GONE (ephemeral filesystem)\n# Log aggregator (Fluentd) doesn't see file logs\n# No JSON structure -> regex parsing needed\n# No env var for log level -> redeployment needed to change verbosity\n"
+  when_applies: "When configuring logging for containerized applications running in Docker or Kubernetes environments with centralized log aggregation."
+  severity: medium
+  technologies:
+    lang: [general]
+    platform: [docker, kubernetes]
+  domains:
+    domain: [deployment, observability, reliability]
+    concern: [containers, logging]
+  sources:
+  - url: https://sre.google/sre-book/monitoring-distributed-systems/
+    title: 'Google SRE Book — Chapter 6: Monitoring Distributed Systems'
+  validation_status: cross_checked
+- id: CR-SRE-DOCK-006
+  text: Container networking — each pod should expose exactly one port for its primary service. Don't run multiple services in one container (web server + worker + cron in one container is an anti-pattern).
+    Use separate containers for separate concerns, composed via pods or deployments.
+  why: 'Google''s container design (Borg, reflected in Kubernetes) follows the single-responsibility principle: one container does one thing. The anti-pattern: a single container runs nginx, the application,
+    a background worker, and a cron scheduler. Problems: you can''t scale the web server independently of the worker, a crash in the worker kills the web server, resource limits apply to the combined processes
+    (the worker may starve the web server), and health checks can''t distinguish between component failures. Google''s approach: one process per container, one container per responsibility, composed via
+    pods (sidecar pattern) or separate deployments.
+
+    '
+  how_to_do_right: '1. One process per container: the web server, the background worker, and the cron scheduler are separate containers in separate deployments.
+
+    2. Scale independently: web server scaled to 10 replicas for traffic, worker scaled to 3 replicas for background jobs.
+
+    3. Sidecar pattern for tightly-coupled processes: log shipper, proxy, config reloader run as sidecar containers in the same pod.
+
+    4. Health checks per container: each container has its own liveness and readiness probes checking its specific function.
+
+    5. Resource limits per container: the web server gets 500m CPU, the worker gets 2000m CPU. Not shared.
+
+    6. If legacy apps require multiple processes in one container: use a process manager (supervisord, tini) but plan to split into separate containers.
+
+    '
+  example_good: "# One process per container, separate deployments for scaling\n# docker-compose.yml (development)\nservices:\n  api:\n    build: .\n    command: python -m uvicorn src.api:app --port 8000\n    ports: ['8000:8000']\n  worker:\n    build: .\n    command: python -m celery -A src.tasks worker --concurrency=4\n  scheduler:\n    build: .\n    command: python -m celery -A src.tasks beat\n\n# Kubernetes: separate Deployments for independent scaling\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\nspec:\n  replicas: 10  # scale for traffic\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: worker\nspec:\n  replicas: 3  # scale for background jobs\n# Each has own health checks, resource limits, scaling policies\n"
+  example_bad: "# Multiple processes in one container — can't scale independently\n# Dockerfile\nFROM python:3.12\nCOPY . .\nRUN pip install -r requirements.txt supervisor\nCOPY supervisord.conf /etc/supervisord.conf\nCMD [\"supervisord\", \"-c\", \"/etc/supervisord.conf\"]\n\n# supervisord.conf:\n# [program:web] command=gunicorn app:app\n# [program:worker] command=celery worker\n# [program:cron] command=celery beat\n\n# Problems:\n# - Can't scale web independently of worker\n# - Worker crash kills web server (same container)\n# - Resource limits shared (worker starves web)\n# - Health check can't distinguish component failures\n"
+  when_applies: "When containerizing applications with multiple components (web server, background worker, scheduler) that have different scaling and reliability requirements."
+  severity: medium
+  technologies:
+    lang: [general]
+    platform: [docker, kubernetes]
+  domains:
+    domain: [architecture, deployment, reliability]
+    concern: [containers]
+  sources:
+  - url: https://sre.google/sre-book/release-engineering/
+    title: 'Google SRE Book — Chapter 8: Release Engineering'
+  validation_status: cross_checked

@@ -1,0 +1,1226 @@
+layer: rules
+domain: security
+knowledge:
+- id: AUDIT-001
+  text: >
+    Design audit log tables as INSERT-ONLY: add a PostgreSQL trigger that
+    raises an exception on UPDATE or DELETE. The audit table owner role
+    must have INSERT only — revoke UPDATE, DELETE, and TRUNCATE explicitly.
+    No application code, migration, or admin action should be able to
+    silently alter a past record.
+  why: >
+    Regulators (SOX, PCI-DSS, HIPAA) require that audit logs cannot be
+    altered after the fact. In a PostgreSQL database without explicit
+    INSERT-only enforcement, a developer running a routine "cleanup
+    migration" can accidentally (or deliberately) DELETE audit records.
+    In the 2022 FTX collapse, absence of immutable transaction logs made
+    reconstruction of fraudulent transfers impossible — costing months of
+    forensic reconstruction. A trigger-enforced INSERT-only table makes
+    accidental deletion a runtime error, not a silent data loss.
+  how_to_do_right: |
+    1. Create audit table with no primary key autoincrement (use seq column
+       to prevent gap injection attacks).
+    2. Create a BEFORE UPDATE OR DELETE trigger that always raises:
+       RAISE EXCEPTION 'Audit log is immutable: % on audit_log is prohibited', TG_OP;
+    3. Create a dedicated role with INSERT-only on audit_log:
+       REVOKE ALL ON audit_log FROM audit_writer;
+       GRANT INSERT ON audit_log TO audit_writer;
+    4. NEVER grant UPDATE, DELETE, or TRUNCATE to any role other than
+       a superuser-equivalent with multi-party authorization.
+    5. For compliance export: add a dedicated read-only role for auditors.
+    6. Test immutability in CI:
+       with pytest.raises(Exception, match="immutable"):
+           db.execute("UPDATE audit_log SET action = 'fake' WHERE id = 1")
+  severity: critical
+  technologies:
+    lang: [sql, python]
+    framework: [postgresql, sqlalchemy]
+  domains:
+    domain: [security, compliance, audit]
+    concern: [immutability, tamper_prevention]
+  example_good: |
+    -- schema.sql — immutable audit log table
+    CREATE TABLE audit_log (
+        seq          BIGSERIAL NOT NULL,   -- monotonic, no gaps detectable
+        event_time   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        actor_id     TEXT NOT NULL,        -- who performed the action
+        action       TEXT NOT NULL,        -- what happened (e.g., 'payment.created')
+        resource_id  TEXT NOT NULL,        -- which resource was affected
+        resource_type TEXT NOT NULL,
+        old_data     JSONB,               -- previous state (NULL for inserts)
+        new_data     JSONB,               -- new state (NULL for deletes)
+        client_ip    INET,
+        session_id   TEXT,
+        prev_hash    TEXT NOT NULL,        -- hash of previous record
+        entry_hash   TEXT NOT NULL         -- SHA-256 of this record content
+    );
+
+    -- Immutability trigger
+    CREATE OR REPLACE FUNCTION audit_log_immutable()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        RAISE EXCEPTION
+            'Audit log is immutable: % operation on audit_log is prohibited. '
+            'Contact security team if audit correction is needed.',
+            TG_OP;
+    END;
+    $$ LANGUAGE plpgsql SECURITY DEFINER;
+
+    CREATE TRIGGER enforce_audit_immutability
+        BEFORE UPDATE OR DELETE OR TRUNCATE ON audit_log
+        FOR EACH STATEMENT EXECUTE FUNCTION audit_log_immutable();
+
+    -- Role permissions
+    REVOKE ALL ON audit_log FROM audit_writer_role;
+    GRANT INSERT ON audit_log TO audit_writer_role;
+    GRANT SELECT ON audit_log TO audit_reader_role;
+  example_bad: |
+    -- Audit table with no immutability enforcement
+    CREATE TABLE audit_log (
+        id         SERIAL PRIMARY KEY,
+        action     TEXT,
+        actor_id   TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+    -- No trigger, no role restrictions
+    -- Developer runs: UPDATE audit_log SET action = 'login' WHERE id = 42;
+    -- Silently succeeds. Audit log falsified.
+    -- During compliance audit: "Who deleted record #1337?" — impossible to answer
+  when_applies: "Any table that stores audit events, compliance records, financial transactions, or regulatory data."
+  sources:
+    - "NIST SP 800-92 (2006). Guide to Computer Security Log Management — https://csrc.nist.gov/publications/detail/sp/800-92/final"
+    - "PostgreSQL Documentation. Trigger Procedures — https://www.postgresql.org/docs/current/plpgsql-trigger.html"
+    - "EDB. Working with Postgres Audit Triggers — https://www.enterprisedb.com/postgres-tutorials/working-postgres-audit-triggers"
+
+- id: AUDIT-002
+  text: >
+    Implement SHA-256 hash chaining: each audit log record includes the
+    SHA-256 hash of the previous record's content (prev_hash), and its
+    own content hash (entry_hash). To verify integrity: recompute every
+    entry_hash and verify prev_hash linkage in sequence. Any gap, reorder,
+    or modification breaks the chain at a detectable position.
+  why: >
+    An INSERT-only table prevents casual tampering, but a database superuser
+    or a backup-restore attack can still modify records. Hash chaining
+    provides cryptographic evidence of tampering: you cannot change record N
+    without invalidating every subsequent record's prev_hash. This matches
+    the design of Google's Trillian (Certificate Transparency) and audit
+    systems used by financial regulators. The SHA-256 chain turns a passive
+    INSERT-only constraint into an active tamper detection mechanism.
+  how_to_do_right: |
+    1. Canonicalize entry content before hashing (sort keys, strip whitespace):
+       import json, hashlib
+       canonical = json.dumps(entry_dict, sort_keys=True, separators=(',', ':'))
+       entry_hash = hashlib.sha256(canonical.encode()).hexdigest()
+    2. prev_hash for seq=1: use a well-known genesis value, e.g., SHA-256("genesis").
+    3. Insert atomically: compute hashes inside a transaction using
+       SELECT entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1 FOR UPDATE.
+       The FOR UPDATE lock prevents concurrent inserts from racing and breaking
+       the chain.
+    4. Periodically checkpoint: store chain head hash in a separate, write-once
+       location (HSM, external service, paper printout) for out-of-band verification.
+    5. Verification function returns: (is_valid: bool, first_broken_seq: int | None).
+  severity: critical
+  technologies:
+    lang: [python, sql]
+    framework: [postgresql, sqlalchemy, hashlib]
+  domains:
+    domain: [security, audit, cryptography]
+    concern: [hash_chain, tamper_detection, integrity]
+  example_good: |
+    import hashlib
+    import json
+    from datetime import datetime, timezone
+    from sqlalchemy import text
+
+    GENESIS_HASH = hashlib.sha256(b"genesis").hexdigest()
+
+    def canonicalize(entry: dict) -> str:
+        """Deterministic JSON serialization for consistent hashing."""
+        # Exclude the hash fields themselves from the content hash
+        content = {k: v for k, v in entry.items()
+                   if k not in ("prev_hash", "entry_hash")}
+        return json.dumps(content, sort_keys=True, separators=(',', ':'),
+                          default=str)
+
+    def insert_audit_entry(db, actor_id: str, action: str,
+                            resource_id: str, new_data: dict) -> dict:
+        with db.begin():
+            # Get last record — lock to prevent concurrent chain breaks
+            row = db.execute(text(
+                "SELECT seq, entry_hash FROM audit_log "
+                "ORDER BY seq DESC LIMIT 1 FOR UPDATE"
+            )).fetchone()
+
+            prev_hash = row.entry_hash if row else GENESIS_HASH
+
+            entry = {
+                "actor_id": actor_id,
+                "action": action,
+                "resource_id": resource_id,
+                "new_data": new_data,
+                "event_time": datetime.now(timezone.utc).isoformat(),
+                "prev_hash": prev_hash,
+            }
+            entry["entry_hash"] = hashlib.sha256(
+                canonicalize(entry).encode()
+            ).hexdigest()
+
+            db.execute(text("""
+                INSERT INTO audit_log
+                    (actor_id, action, resource_id, new_data, event_time,
+                     prev_hash, entry_hash)
+                VALUES (:actor_id, :action, :resource_id, :new_data::jsonb,
+                        :event_time, :prev_hash, :entry_hash)
+            """), entry)
+        return entry
+
+    def verify_chain(db) -> tuple[bool, int | None]:
+        """Returns (valid, first_broken_seq). O(n) scan — run offline."""
+        rows = db.execute(text(
+            "SELECT seq, actor_id, action, resource_id, new_data, "
+            "event_time, prev_hash, entry_hash FROM audit_log ORDER BY seq"
+        )).fetchall()
+
+        expected_prev = GENESIS_HASH
+        for row in rows:
+            entry = dict(row._mapping)
+            stored_hash = entry.pop("entry_hash")
+            recomputed = hashlib.sha256(canonicalize(entry).encode()).hexdigest()
+
+            if entry["prev_hash"] != expected_prev:
+                return False, row.seq  # Chain linkage broken
+            if recomputed != stored_hash:
+                return False, row.seq  # Content was modified
+
+            expected_prev = stored_hash
+
+        return True, None
+  example_bad: |
+    # Audit log without hash chain — integrity cannot be verified
+    def log_event(db, actor_id: str, action: str):
+        db.execute(
+            "INSERT INTO audit_log (actor_id, action, ts) VALUES (%s, %s, NOW())",
+            (actor_id, action)
+        )
+        # If DBA runs: DELETE FROM audit_log WHERE actor_id = 'admin@company.com';
+        # No evidence remains. Cannot detect the deletion.
+        # Regulator asks: "What did admin do on Nov 3?" → "We don't know"
+  when_applies: "Audit logs for financial transactions, user access events, configuration changes, and any compliance-regulated activities."
+  sources:
+    - "Cossack Labs. Audit logs security: cryptographically signed tamper-proof logs — https://www.cossacklabs.com/blog/audit-logs-security/"
+    - "Google Trillian (Transparency Log) — https://transparency.dev/"
+    - "NIST SP 800-92. Guide to Computer Security Log Management — https://csrc.nist.gov/publications/detail/sp/800-92/final"
+
+- id: AUDIT-003
+  text: >
+    Use Merkle trees to enable efficient proof-of-inclusion for audit records
+    without scanning the entire log. Build a Merkle tree over a batch of
+    records (e.g., 1,000 entries). Store only the Merkle root in an external,
+    immutable location. To prove record R exists without modification: provide
+    the Merkle path (O(log n) hashes), not the full log.
+  why: >
+    For a 100-million-row audit log, verifying whether a specific record is
+    authentic requires either a full O(n) chain walk (impractical for
+    real-time auditing) or a Merkle inclusion proof (O(log n) = 17 hashes
+    for 100K records). Certificate Transparency (RFC 9162) uses this exact
+    design for verifying TLS certificates. Financial regulators increasingly
+    accept Merkle inclusion proofs as evidence in proceedings because they
+    are cryptographically unforgeable and computationally feasible to verify
+    on-demand.
+  how_to_do_right: |
+    1. Batch records into epochs of 1,000 entries (configurable).
+    2. Build Merkle tree: leaf[i] = SHA-256(entry_hash[i]).
+       Parent = SHA-256(left_child || right_child) — concatenate raw bytes.
+    3. Store Merkle root per epoch in audit_epochs table (immutable once sealed).
+    4. For inclusion proof of record R in epoch E:
+       - Collect sibling hashes along path from leaf R to root.
+       - Proof = [sibling_0, sibling_1, ..., sibling_k, root].
+    5. Verification: recompute root from leaf and siblings; compare to stored root.
+    6. Publish Merkle roots to an external, independently verifiable location
+       (public blockchain timestamp, trusted third-party service, HSM).
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [hashlib, postgresql]
+  domains:
+    domain: [security, audit, cryptography]
+    concern: [merkle_tree, inclusion_proof, efficient_verification]
+  example_good: |
+    import hashlib
+    from typing import NamedTuple
+
+    def sha256_bytes(data: bytes) -> bytes:
+        return hashlib.sha256(data).digest()
+
+    def build_merkle_tree(entry_hashes: list[str]) -> list[list[bytes]]:
+        """
+        Build Merkle tree. Returns list of levels, level[0] = leaves.
+        entry_hashes: list of hex SHA-256 strings from audit_log.
+        """
+        if not entry_hashes:
+            return []
+        # Pad to even count by duplicating last leaf
+        leaves = [bytes.fromhex(h) for h in entry_hashes]
+        if len(leaves) % 2 == 1:
+            leaves.append(leaves[-1])
+
+        levels = [leaves]
+        while len(levels[-1]) > 1:
+            current = levels[-1]
+            next_level = []
+            for i in range(0, len(current), 2):
+                parent = sha256_bytes(current[i] + current[i+1])
+                next_level.append(parent)
+            if len(next_level) % 2 == 1 and len(next_level) > 1:
+                next_level.append(next_level[-1])
+            levels.append(next_level)
+        return levels
+
+    def get_merkle_root(entry_hashes: list[str]) -> str:
+        tree = build_merkle_tree(entry_hashes)
+        return tree[-1][0].hex() if tree else ""
+
+    def get_inclusion_proof(entry_hashes: list[str], index: int) -> list[str]:
+        """Return sibling hashes from leaf to root (Merkle path)."""
+        tree = build_merkle_tree(entry_hashes)
+        proof = []
+        for level in tree[:-1]:  # exclude root
+            sibling_idx = index ^ 1  # flip last bit
+            if sibling_idx < len(level):
+                proof.append(level[sibling_idx].hex())
+            index //= 2
+        return proof
+
+    def verify_inclusion(leaf_hash: str, proof: list[str], root: str) -> bool:
+        """Verify leaf is in tree with given root using O(log n) proof."""
+        current = bytes.fromhex(leaf_hash)
+        for sibling_hex in proof:
+            sibling = bytes.fromhex(sibling_hex)
+            current = sha256_bytes(current + sibling)
+        return current.hex() == root
+  example_bad: |
+    # Full table scan for every audit verification — O(n)
+    def verify_record_exists(record_id: int, expected_hash: str) -> bool:
+        # Must scan entire 50M row table to verify one record
+        rows = db.execute("SELECT * FROM audit_log ORDER BY seq").fetchall()
+        for row in rows:  # 50M iterations
+            if row.seq == record_id:
+                return compute_hash(row) == expected_hash
+        return False
+    # At 50M rows, this scan takes 10-30 minutes
+    # Regulator asking for real-time verification: impossible
+  when_applies: "Audit logs exceeding 100,000 records where on-demand inclusion proofs are required for compliance or legal proceedings."
+  sources:
+    - "RFC 9162. Certificate Transparency Version 2.0 — https://tools.ietf.org/html/rfc9162"
+    - "Google Trillian. An Open-Source Append-Only Ledger — https://transparency.dev/"
+    - "NIST SP 800-92. Guide to Computer Security Log Management — https://csrc.nist.gov/publications/detail/sp/800-92/final"
+
+- id: AUDIT-004
+  text: >
+    Sign every audit log batch with Ed25519 private key held in an HSM or
+    environment secret. The signature covers the Merkle root of the batch.
+    Publish verification public key in a well-known location. This enables
+    any third party to verify log authenticity without trusting the log
+    producer's infrastructure.
+  why: >
+    Hash chains prove internal consistency (records haven't been modified
+    relative to each other) but don't prove who wrote the log or when.
+    Digital signatures provide non-repudiation: the log producer cannot
+    later claim the records are forged, and an attacker who compromises
+    the database cannot fabricate new records that pass signature verification
+    without the private key. Ed25519 is preferred over RSA-2048 for audit
+    signing because it is faster (sign: 50μs vs 1ms), has smaller signatures
+    (64 bytes vs 256 bytes), and has no known timing side channels.
+  how_to_do_right: |
+    1. Generate Ed25519 key pair. Store private key in HSM or AWS KMS.
+       from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+       private_key = Ed25519PrivateKey.generate()
+    2. Sign the Merkle root of each epoch batch (not individual records):
+       signature = private_key.sign(merkle_root.encode())
+    3. Store (epoch_id, merkle_root, signature, public_key_id) in audit_epochs.
+    4. Publish public key at a well-known URL: /audit/public-key.pem
+    5. Verification (any party can do this):
+       public_key.verify(signature, merkle_root.encode())
+    6. Rotate signing keys annually. Old signatures remain valid under old key.
+       Store key rotation events in the audit log itself.
+    7. For highest assurance: use RFC 3161 timestamp authority to bind
+       the signature to a trusted time source.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [cryptography, aws-kms, hashlib]
+  domains:
+    domain: [security, audit, cryptography]
+    concern: [digital_signature, non_repudiation, ed25519]
+  example_good: |
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey, Ed25519PublicKey
+    )
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, PublicFormat, PrivateFormat, NoEncryption
+    )
+    import base64
+
+    def generate_signing_key() -> tuple[bytes, bytes]:
+        """Returns (private_key_pem, public_key_pem). Store private in HSM."""
+        private_key = Ed25519PrivateKey.generate()
+        private_pem = private_key.private_bytes(
+            Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
+        )
+        public_pem = private_key.public_key().public_bytes(
+            Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+        )
+        return private_pem, public_pem
+
+    def sign_epoch(merkle_root: str, private_key_pem: bytes) -> str:
+        """Sign the Merkle root of an audit epoch. Returns base64 signature."""
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+        private_key = load_pem_private_key(private_key_pem, password=None)
+        signature = private_key.sign(merkle_root.encode("utf-8"))
+        return base64.b64encode(signature).decode("ascii")
+
+    def verify_epoch_signature(
+        merkle_root: str,
+        signature_b64: str,
+        public_key_pem: bytes,
+    ) -> bool:
+        """Verify epoch signature. Can be called by any third party."""
+        from cryptography.hazmat.primitives.serialization import load_pem_public_key
+        from cryptography.exceptions import InvalidSignature
+        public_key = load_pem_public_key(public_key_pem)
+        signature = base64.b64decode(signature_b64)
+        try:
+            public_key.verify(signature, merkle_root.encode("utf-8"))
+            return True
+        except InvalidSignature:
+            return False
+
+    # Epoch sealing workflow
+    def seal_epoch(db, epoch_id: int, entry_hashes: list[str],
+                   private_key_pem: bytes) -> dict:
+        merkle_root = get_merkle_root(entry_hashes)
+        signature = sign_epoch(merkle_root, private_key_pem)
+        db.execute(
+            "INSERT INTO audit_epochs (epoch_id, merkle_root, signature, sealed_at) "
+            "VALUES (%s, %s, %s, NOW())",
+            (epoch_id, merkle_root, signature)
+        )
+        return {"epoch_id": epoch_id, "merkle_root": merkle_root, "signature": signature}
+  example_bad: |
+    # Unsigned audit log — anyone with DB access can fabricate records
+    def log_event(db, actor_id: str, action: str):
+        db.execute(
+            "INSERT INTO audit_log (actor_id, action) VALUES (%s, %s)",
+            (actor_id, action)
+        )
+    # Attacker with DB access: INSERT INTO audit_log (actor_id, action)
+    #   VALUES ('admin', 'approved_suspicious_transaction');
+    # No signature = no way to prove this record is fabricated
+    # Legal proceedings: "We can't trust this audit log" → case dismissed
+  when_applies: "Any audit log used for regulatory compliance (SOX, PCI-DSS, HIPAA, GDPR) or legal proceedings."
+  sources:
+    - "Bernstein, D.J. (2011). High-speed high-security signatures. Ed25519 specification."
+    - "RFC 3161. Internet X.509 PKI Time-Stamp Protocol — https://tools.ietf.org/html/rfc3161"
+    - "Cossack Labs. Audit logs security — https://www.cossacklabs.com/blog/audit-logs-security/"
+
+- id: AUDIT-005
+  text: >
+    Implement tamper detection as an offline verification job that runs daily
+    on a read replica. The job walks the full hash chain, verifies every
+    entry_hash and prev_hash linkage, and alerts (PagerDuty or equivalent)
+    if any break is detected. Never run chain verification on the primary
+    write replica — it holds the lock on INSERT, causing contention.
+  why: >
+    Hash chains only provide value if they are actually verified. A corrupted
+    chain that is never checked gives false confidence. Google's Certificate
+    Transparency logs are monitored continuously by third-party monitors.
+    Financial audit systems verified monthly in retrospect have caught
+    tampering events 6 months after they occurred — too late for remediation.
+    Daily verification on a read replica finds tampering within 24 hours
+    with zero impact on write throughput.
+  how_to_do_right: |
+    1. Set up PostgreSQL streaming replication to a read replica.
+    2. Schedule daily verification job at 02:00 UTC (low traffic):
+       python3 -m audit.verify_chain --db-url "$AUDIT_READ_REPLICA_URL"
+    3. Verification algorithm:
+       SELECT seq, entry_hash, prev_hash, actor_id, action, event_time,
+              resource_id, new_data
+       FROM audit_log ORDER BY seq;
+       For each row: recompute SHA-256(canonicalize(row_without_hashes))
+       Compare to stored entry_hash. Check prev_hash linkage.
+    4. On failure: send PagerDuty HIGH alert with (first_broken_seq, break_type).
+    5. Store verification run results in audit_verifications table
+       (run_at, records_checked, result, first_broken_seq).
+    6. Smoke test: insert a known-good record, verify it passes; insert a
+       tampered record in test DB, verify detection fires. Run in CI.
+  severity: critical
+  technologies:
+    lang: [python, sql]
+    framework: [postgresql, pagerduty, sqlalchemy]
+  domains:
+    domain: [security, audit, monitoring]
+    concern: [tamper_detection, continuous_monitoring]
+  example_good: |
+    import hashlib
+    import json
+    import logging
+    from datetime import datetime, timezone
+    from enum import Enum
+    from dataclasses import dataclass
+
+    logger = logging.getLogger("audit.verification")
+
+    class BreakType(Enum):
+        CONTENT_MODIFIED = "content_modified"      # entry_hash mismatch
+        CHAIN_BROKEN = "chain_linkage_broken"      # prev_hash mismatch
+        RECORD_DELETED = "sequence_gap_detected"   # seq gap
+
+    @dataclass
+    class VerificationResult:
+        records_checked: int
+        is_valid: bool
+        first_broken_seq: int | None
+        break_type: BreakType | None
+
+    GENESIS_HASH = hashlib.sha256(b"genesis").hexdigest()
+
+    def verify_chain_integrity(db) -> VerificationResult:
+        rows = db.execute("""
+            SELECT seq, actor_id, action, resource_id, event_time,
+                   old_data, new_data, client_ip, session_id,
+                   prev_hash, entry_hash
+            FROM audit_log ORDER BY seq
+        """).fetchall()
+
+        if not rows:
+            return VerificationResult(0, True, None, None)
+
+        expected_prev = GENESIS_HASH
+        expected_seq = 1
+
+        for row in rows:
+            d = dict(row._mapping)
+            stored_hash = d.pop("entry_hash")
+            stored_prev = d["prev_hash"]
+
+            # Check for sequence gaps (deleted records)
+            if d["seq"] != expected_seq:
+                return VerificationResult(
+                    expected_seq - 1, False, d["seq"], BreakType.RECORD_DELETED
+                )
+
+            # Check chain linkage
+            if stored_prev != expected_prev:
+                return VerificationResult(
+                    d["seq"] - 1, False, d["seq"], BreakType.CHAIN_BROKEN
+                )
+
+            # Check content integrity
+            canonical = json.dumps(
+                {k: str(v) for k, v in d.items()},
+                sort_keys=True, separators=(',', ':')
+            )
+            recomputed = hashlib.sha256(canonical.encode()).hexdigest()
+            if recomputed != stored_hash:
+                return VerificationResult(
+                    d["seq"] - 1, False, d["seq"], BreakType.CONTENT_MODIFIED
+                )
+
+            expected_prev = stored_hash
+            expected_seq += 1
+
+        return VerificationResult(len(rows), True, None, None)
+  example_bad: |
+    # No verification job — tampered log discovered during compliance audit
+    # After 6 months of undiscovered tampering:
+    # Compliance auditor: "These timestamps don't match your transaction system"
+    # Engineering: "The audit log says X but the DB says Y"
+    # Forensics team: "We can't determine when the tampering started"
+    # Result: 6 months of audit records are legally inadmissible
+    # $500K in forensic investigation costs, regulatory fine pending
+  when_applies: "Any system where audit log integrity is required for compliance, legal, or forensic purposes."
+  sources:
+    - "NIST SP 800-92. Guide to Computer Security Log Management — https://csrc.nist.gov/publications/detail/sp/800-92/final"
+    - "Cossack Labs. Audit logs security — https://www.cossacklabs.com/blog/audit-logs-security/"
+    - "Google Trillian. An Open-Source Append-Only Ledger — https://transparency.dev/"
+
+- id: AUDIT-006
+  text: >
+    Implement tiered retention with hot/warm/cold archival: hot storage
+    (PostgreSQL) for the last 90 days, warm storage (compressed S3/GCS)
+    for 90 days to 3 years, cold storage (Glacier/Archive) for 3+ years.
+    Each tier transition must verify the hash chain of the migrated segment
+    before deleting from the hot tier — never delete until integrity is confirmed.
+  why: >
+    GDPR requires data minimization (delete what you don't need) but SOX
+    requires 7-year audit retention. PCI-DSS requires 1-year online, 3-year
+    total. Storing all audit data in PostgreSQL forever is prohibitively
+    expensive (500GB/year for a mid-size SaaS) and degrades query performance.
+    Tiered storage with verified migration satisfies both constraints: recent
+    data is fast-queryable, old data is cheap-but-verifiable. Teams that
+    delete from hot without verification have lost compliance evidence for
+    records that were corrupted during archival.
+  how_to_do_right: |
+    1. Define retention tiers in config:
+       HOT_RETENTION_DAYS = 90
+       WARM_RETENTION_YEARS = 3
+       COLD_RETENTION_YEARS = 7
+    2. Archival process (run monthly):
+       a. Export records for period to JSONL + merkle_root.
+       b. Compress and encrypt with AES-256-GCM (key in KMS).
+       c. Upload to S3 with server-side encryption.
+       d. Verify upload: re-download, re-verify hash chain.
+       e. ONLY THEN: DELETE FROM audit_log WHERE event_time < threshold.
+    3. Archive file includes: epoch_id, merkle_root, signature, records count.
+    4. Maintain an archive_catalog table: (archive_id, s3_key, epoch_range,
+       merkle_root, signature, archived_at) — itself immutable.
+    5. Regulatory export: can reconstruct full chain from hot + warm + cold.
+  severity: high
+  technologies:
+    lang: [python, sql]
+    framework: [postgresql, s3, aws-glacier, boto3, cryptography]
+  domains:
+    domain: [security, audit, data_retention, compliance]
+    concern: [hot_warm_cold_storage, archival, regulatory_retention]
+  example_good: |
+    import boto3
+    import gzip
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    S3_BUCKET = "company-audit-archive"
+    HOT_RETENTION_DAYS = 90
+
+    def archive_old_records(db, s3_client) -> dict:
+        """Move records older than HOT_RETENTION_DAYS to S3. Verify before delete."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=HOT_RETENTION_DAYS)
+
+        rows = db.execute("""
+            SELECT * FROM audit_log
+            WHERE event_time < :cutoff
+            ORDER BY seq
+        """, {"cutoff": cutoff}).fetchall()
+
+        if not rows:
+            return {"archived": 0}
+
+        records = [dict(r._mapping) for r in rows]
+        entry_hashes = [r["entry_hash"] for r in records]
+
+        # Verify chain integrity BEFORE archiving
+        verification = verify_chain_integrity(db)  # uses read-only query
+        if not verification.is_valid:
+            raise RuntimeError(
+                f"Chain integrity check failed at seq {verification.first_broken_seq}. "
+                "Refusing to archive corrupted data."
+            )
+
+        merkle_root = get_merkle_root(entry_hashes)
+        archive_id = f"audit-{cutoff.date().isoformat()}"
+        s3_key = f"archives/{archive_id}.jsonl.gz"
+
+        # Compress and upload
+        payload = gzip.compress(
+            "\n".join(json.dumps(r, default=str) for r in records).encode()
+        )
+        s3_client.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=payload,
+                             ServerSideEncryption="aws:kms")
+
+        # Record archive metadata (immutable catalog)
+        db.execute("""
+            INSERT INTO archive_catalog (archive_id, s3_key, seq_min, seq_max,
+                                          merkle_root, record_count, archived_at)
+            VALUES (:id, :key, :min_seq, :max_seq, :root, :count, NOW())
+        """, {"id": archive_id, "key": s3_key,
+               "min_seq": records[0]["seq"], "max_seq": records[-1]["seq"],
+               "root": merkle_root, "count": len(records)})
+
+        # ONLY NOW delete from hot storage
+        db.execute("DELETE FROM audit_log WHERE event_time < :cutoff",
+                   {"cutoff": cutoff})
+
+        return {"archived": len(records), "s3_key": s3_key, "merkle_root": merkle_root}
+  example_bad: |
+    # Delete-first archival — no verification, data loss risk
+    def archive_old_records(db):
+        cutoff = datetime.now() - timedelta(days=90)
+        db.execute("DELETE FROM audit_log WHERE created_at < %s", (cutoff,))
+        # Records deleted WITHOUT archiving or verification
+        # 3 years later: "Show me all admin actions from 2022 Q1"
+        # Answer: "Sorry, we deleted those records in our cleanup job"
+        # Regulatory consequence: $250K fine for SOX non-compliance
+  when_applies: "Any production audit log system expected to run for more than 90 days, especially under SOX, PCI-DSS, HIPAA, or GDPR retention requirements."
+  sources:
+    - "NIST SP 800-92. Guide to Computer Security Log Management — https://csrc.nist.gov/publications/detail/sp/800-92/final"
+    - "PCI DSS v4.0 Requirement 10.5 — https://www.pcisecuritystandards.org/document_library/"
+    - "SOX Section 802. Criminal penalties for altering documents."
+
+- id: AUDIT-007
+  text: >
+    For financial transaction audit logs, implement double-entry accounting
+    verification: every debit must have a corresponding credit (same amount,
+    opposite sign). Run a continuous reconciliation job that verifies
+    balance invariant: SUM(debits) + SUM(credits) == 0 for every closed period.
+    Alert immediately on any reconciliation failure.
+  why: >
+    A hash chain proves a record wasn't modified, but it cannot detect whether
+    the record was correct to begin with. Double-entry verification catches
+    financial fraud at the audit layer: if someone inserts a fraudulent credit
+    without a corresponding debit, SUM(debits + credits) != 0 for that period.
+    This is the exact control that would have caught the Société Générale
+    rogue trader event (2008, €4.9B loss) earlier — internal reconciliation
+    checks were bypassed. Double-entry at the audit layer is an independent
+    verification layer below application logic.
+  how_to_do_right: |
+    1. All financial audit entries include: amount (positive or negative decimal),
+       account_id, counterparty_account_id, transaction_id.
+    2. Every transaction inserts TWO audit records atomically:
+       debit: amount = -X, account = source_account
+       credit: amount = +X, account = dest_account
+    3. Reconciliation query (run hourly for closed periods):
+       SELECT transaction_id, SUM(amount) as balance
+       FROM financial_audit_log
+       GROUP BY transaction_id
+       HAVING ABS(SUM(amount)) > 0.001;  -- any non-zero sum is an error
+    4. On reconciliation failure: FREEZE all transactions for affected accounts,
+       alert finance team + on-call engineer immediately.
+    5. Store reconciliation results: (period, total_transactions, failures,
+       verified_at) — in audit_reconciliations table.
+  severity: critical
+  technologies:
+    lang: [python, sql]
+    framework: [postgresql, sqlalchemy]
+  domains:
+    domain: [security, audit, financial, compliance]
+    concern: [double_entry, reconciliation, financial_integrity]
+  example_good: |
+    from decimal import Decimal
+    from sqlalchemy import text
+
+    def record_financial_transaction(db, transaction_id: str,
+                                      source_account: str, dest_account: str,
+                                      amount: Decimal) -> None:
+        """Insert exactly TWO audit records atomically. Always balanced."""
+        if amount <= 0:
+            raise ValueError(f"Amount must be positive, got {amount}")
+
+        with db.begin():
+            # Debit: source account loses money
+            insert_audit_entry(db, actor_id="system", action="financial.debit",
+                                resource_id=source_account,
+                                new_data={"transaction_id": transaction_id,
+                                          "amount": str(-amount),
+                                          "counterparty": dest_account})
+            # Credit: dest account gains money
+            insert_audit_entry(db, actor_id="system", action="financial.credit",
+                                resource_id=dest_account,
+                                new_data={"transaction_id": transaction_id,
+                                          "amount": str(amount),
+                                          "counterparty": source_account})
+        # Now SUM(amount for this transaction_id) == 0.00 ✓
+
+    def reconcile_transactions(db) -> list[dict]:
+        """Returns list of unbalanced transactions. Should always be empty."""
+        rows = db.execute(text("""
+            SELECT
+                new_data->>'transaction_id' AS transaction_id,
+                SUM((new_data->>'amount')::DECIMAL) AS balance
+            FROM audit_log
+            WHERE action IN ('financial.debit', 'financial.credit')
+            GROUP BY new_data->>'transaction_id'
+            HAVING ABS(SUM((new_data->>'amount')::DECIMAL)) > 0.001
+        """)).fetchall()
+        return [dict(r._mapping) for r in rows]
+  example_bad: |
+    # Single-entry financial audit — undetectable partial transactions
+    def log_payment(db, user_id: str, amount: float):
+        db.execute(
+            "INSERT INTO payments (user_id, amount, ts) VALUES (%s, %s, NOW())",
+            (user_id, amount)
+        )
+        # Fraudster inserts: INSERT INTO payments (user_id, amount) VALUES ('attacker', 50000)
+        # No debit record. SUM of debits != SUM of credits. Goes undetected.
+        # Discovered 6 months later during external audit. $2M in fraudulent credits.
+  when_applies: "All financial transaction systems, payment processors, accounting ledgers, and any system handling monetary value."
+  sources:
+    - "NIST SP 800-53 Rev.5. AU-9: Protection of Audit Information — https://csf.tools/reference/nist-sp-800-53/r5/au/au-9/"
+    - "Pacioli, L. (1494). Summa de arithmetica, geometria, proportioni et proportionalità. (Double-entry accounting origin)"
+    - "ISACA. Audit and Assurance Standards — https://www.isaca.org/resources/audit-and-assurance"
+
+- id: AUDIT-008
+  text: >
+    Implement access logging for audit log queries themselves: every SELECT
+    on audit_log must be logged (who queried, when, what filter, how many
+    rows returned). Use PostgreSQL row-level security or a middleware layer
+    to enforce this. The audit log of the audit log must itself be
+    immutable and hash-chained.
+  why: >
+    An audit log that can be read without leaving traces enables selective
+    exfiltration: an insider can query specific records (for example, all
+    actions by a whistleblower) without detection. This is a known attack
+    vector in corporate espionage cases. The "meta-audit" (who reads the
+    audit log) is required by NIST SP 800-53 AU-9 and PCI-DSS 10.2.7.
+    Several financial firms have been fined by SEC for failing to log
+    who accessed their audit records.
+  how_to_do_right: |
+    1. Create audit_access_log table with same INSERT-only, hash-chain structure.
+    2. Create a PostgreSQL view that logs access on read:
+       -- Cannot log in SELECT trigger directly; use a wrapper function
+       CREATE OR REPLACE FUNCTION query_audit_log(
+           actor TEXT, filter_clause TEXT DEFAULT NULL
+       ) RETURNS TABLE(...) AS $$
+       BEGIN
+           INSERT INTO audit_access_log (accessor, query_filter, accessed_at)
+           VALUES (actor, filter_clause, NOW());
+           RETURN QUERY SELECT * FROM audit_log
+               WHERE filter_clause IS NULL OR event_time::TEXT LIKE filter_clause;
+       END $$ LANGUAGE plpgsql SECURITY DEFINER;
+    3. Revoke SELECT directly on audit_log from all roles.
+    4. Grant EXECUTE on query_audit_log function to audit_reader_role only.
+    5. Alert if audit_access_log shows >100 rows read by a single actor in 1h.
+    6. For compliance export: include audit_access_log alongside audit_log.
+  severity: high
+  technologies:
+    lang: [sql, python]
+    framework: [postgresql, sqlalchemy]
+  domains:
+    domain: [security, audit, access_control]
+    concern: [meta_audit, access_logging, insider_threat]
+  example_good: |
+    -- Revoke direct SELECT from all non-superuser roles
+    REVOKE SELECT ON audit_log FROM audit_reader_role;
+    REVOKE SELECT ON audit_log FROM app_role;
+
+    -- All access goes through this function (logs who reads what)
+    CREATE OR REPLACE FUNCTION query_audit_log(
+        p_actor        TEXT,
+        p_start_time   TIMESTAMPTZ DEFAULT NULL,
+        p_end_time     TIMESTAMPTZ DEFAULT NULL,
+        p_resource_id  TEXT DEFAULT NULL
+    )
+    RETURNS SETOF audit_log
+    LANGUAGE plpgsql SECURITY DEFINER
+    AS $$
+    DECLARE
+        v_row_count INT;
+    BEGIN
+        -- Log the access attempt first
+        INSERT INTO audit_access_log
+            (accessor, filter_start, filter_end, filter_resource, accessed_at)
+        VALUES (p_actor, p_start_time, p_end_time, p_resource_id, NOW());
+
+        -- Return filtered results
+        RETURN QUERY
+            SELECT * FROM audit_log
+            WHERE (p_start_time IS NULL OR event_time >= p_start_time)
+              AND (p_end_time IS NULL OR event_time <= p_end_time)
+              AND (p_resource_id IS NULL OR resource_id = p_resource_id)
+            ORDER BY seq;
+
+        GET DIAGNOSTICS v_row_count = ROW_COUNT;
+
+        -- Update row count in access log
+        UPDATE audit_access_log
+        SET rows_returned = v_row_count
+        WHERE accessor = p_actor
+          AND accessed_at = (SELECT MAX(accessed_at) FROM audit_access_log
+                              WHERE accessor = p_actor);
+    END;
+    $$;
+
+    GRANT EXECUTE ON FUNCTION query_audit_log TO audit_reader_role;
+  example_bad: |
+    -- Direct SELECT allowed — no access logging
+    GRANT SELECT ON audit_log TO audit_reader_role;
+    -- Insider can: SELECT * FROM audit_log WHERE actor_id = 'whistleblower@co.com';
+    -- Access is invisible. No record of who queried what.
+    -- SEC investigation: "Did you log who accessed the trading activity records?"
+    -- Answer: "No." → regulatory violation, $2M fine.
+  when_applies: "Any audit log system used for compliance, particularly in regulated industries (finance, healthcare, government)."
+  sources:
+    - "NIST SP 800-53 Rev.5. AU-9: Protection of Audit Information — https://csf.tools/reference/nist-sp-800-53/r5/au/au-9/"
+    - "PCI DSS v4.0 Requirement 10.2.7. Audit log access — https://www.pcisecuritystandards.org/document_library/"
+    - "PostgreSQL Documentation. Row Security Policies — https://www.postgresql.org/docs/current/ddl-rowsecurity.html"
+
+- id: AUDIT-009
+  text: >
+    Export audit logs in machine-readable compliance formats: JSONL with
+    Merkle root header for programmatic verification, and W3C PROV-O format
+    for provenance exchange between systems. Each export file must include
+    the Merkle root, epoch signature, and public key fingerprint so the
+    recipient can verify authenticity without contacting the producer.
+  why: >
+    Regulatory bodies increasingly require structured, verifiable exports —
+    not PDF printouts or unverifiable CSV. The SEC's 17a-4 rule requires
+    broker-dealers to produce audit records that can be independently
+    verified. A JSONL export with embedded Merkle root and signature allows
+    the receiving auditor to run the same verification algorithm you use
+    internally — no trust required. W3C PROV-O (Provenance Ontology) is the
+    ISO standard format for provenance exchange, used by US federal agencies
+    (NIST, NIH) for data lineage.
+  how_to_do_right: |
+    1. JSONL export format (one record per line, header on line 1):
+       Line 1 (header): {"format": "audit-log-v1", "epoch_id": "...",
+                          "merkle_root": "...", "signature": "...",
+                          "public_key_fingerprint": "..."}
+       Lines 2+: one JSON audit record per line.
+    2. Recipient verification:
+       a. Read header, extract public_key_fingerprint.
+       b. Fetch public key from /audit/public-key.pem (or use bundled key).
+       c. Recompute Merkle root of all records.
+       d. Verify signature(merkle_root, public_key) == True.
+    3. For PROV-O export: use prov Python library to generate W3C PROV-N
+       or PROV-JSON format with entity/activity/agent triples.
+    4. Export endpoints must require audit access logging (AUDIT-008).
+    5. Rate-limit bulk exports: max 10 exports per day per accessor.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [prov, jsonl, w3c-prov-o]
+  domains:
+    domain: [security, audit, compliance, data_export]
+    concern: [regulatory_export, verifiable_format]
+  example_good: |
+    import json
+    import gzip
+    from pathlib import Path
+
+    def export_audit_period(db, start: str, end: str,
+                             signing_public_key_pem: bytes,
+                             signature: str, merkle_root: str,
+                             output_path: Path) -> dict:
+        """Export audit records as verifiable JSONL with Merkle root header."""
+        rows = db.execute("""
+            SELECT * FROM audit_log
+            WHERE event_time BETWEEN :start AND :end
+            ORDER BY seq
+        """, {"start": start, "end": end}).fetchall()
+
+        import hashlib
+        key_fingerprint = hashlib.sha256(signing_public_key_pem).hexdigest()[:16]
+
+        header = {
+            "format": "audit-log-v1",
+            "export_time": datetime.now(timezone.utc).isoformat(),
+            "period_start": start,
+            "period_end": end,
+            "record_count": len(rows),
+            "merkle_root": merkle_root,
+            "signature": signature,
+            "public_key_fingerprint": key_fingerprint,
+            "verification_instructions": (
+                "1. Recompute merkle root from records. "
+                "2. Fetch public key from /audit/public-key.pem. "
+                "3. Verify Ed25519 signature over merkle_root."
+            ),
+        }
+
+        with gzip.open(output_path, "wt", encoding="utf-8") as f:
+            f.write(json.dumps(header) + "\n")
+            for row in rows:
+                f.write(json.dumps(dict(row._mapping), default=str) + "\n")
+
+        return {"records": len(rows), "output": str(output_path),
+                "merkle_root": merkle_root}
+  example_bad: |
+    # PDF export — unverifiable, unmachine-readable
+    def export_audit_period(start, end):
+        rows = db.execute("SELECT * FROM audit_log WHERE ts BETWEEN %s AND %s",
+                          (start, end)).fetchall()
+        # Generate PDF with reportlab
+        pdf = generate_pdf_table(rows)
+        return pdf
+    # Regulator: "Can you prove these records haven't been modified?"
+    # Answer: "We generated a PDF... you can see the timestamps?"
+    # Regulator: "That's not verifiable. Non-compliant."
+  when_applies: "Any compliance-driven audit export, particularly for financial regulators, HIPAA auditors, or legal discovery requests."
+  sources:
+    - "W3C PROV-O: The PROV Ontology — https://www.w3.org/TR/prov-o/"
+    - "SEC Rule 17a-4. Electronic Recordkeeping Requirements — https://www.sec.gov/rules/final/2023/34-96796.pdf"
+    - "NIST SP 800-92. Guide to Computer Security Log Management — https://csrc.nist.gov/publications/detail/sp/800-92/final"
+
+- id: AUDIT-010
+  text: >
+    Apply RFC 3161 trusted timestamps to Merkle epoch roots using a
+    qualified Timestamp Authority (TSA). The TSA binds the Merkle root
+    to a cryptographically certified time — proving the audit batch
+    existed before that timestamp, independent of your internal clock.
+    Store TSA responses alongside epoch signatures.
+  why: >
+    An internal digital signature proves who signed but not when. An
+    attacker who steals the signing key could backdate signatures. RFC 3161
+    timestamps from an independent TSA are signed by the TSA's own key —
+    which the attacker doesn't have. Courts in EU (eIDAS Regulation Art. 41)
+    and the US (ESIGN Act) treat qualified RFC 3161 timestamps as legally
+    binding evidence of document existence time. Financial regulators
+    increasingly require qualified timestamps for audit log submissions.
+  how_to_do_right: |
+    1. After sealing each audit epoch (computing Merkle root + Ed25519 sig):
+       a. Send TSA request: rfc3161ng.make_timestamp_request(data=merkle_root.encode())
+       b. POST to TSA URL (e.g., https://freetsa.org/tsr, DigiCert, Entrust).
+       c. Store TSA response (DER bytes) in audit_epochs.tsa_response.
+    2. TSA response verification:
+       rfc3161ng.check_timestamp(tsr=response, data=merkle_root.encode(), hashname="sha256")
+    3. Use a qualified TSA for regulatory compliance (not freetsa.org in prod).
+       Recommended: DigiCert TSA, GlobalSign TSA, Entrust TSA.
+    4. TSA response is ~2-5KB — store inline in epochs table.
+    5. Test TSA availability: fallback to secondary TSA if primary is unreachable.
+       Never skip timestamping on TSA failure — queue and retry within 1 hour.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [rfc3161ng, cryptography]
+  domains:
+    domain: [security, audit, cryptography, compliance]
+    concern: [trusted_timestamp, non_repudiation, rfc3161]
+  example_good: |
+    import httpx
+    import rfc3161ng  # pip install rfc3161ng
+
+    TSA_URLS = [
+        "https://timestamp.digicert.com",   # primary
+        "https://timestamp.globalsign.com/tsa/r6advanced1",  # fallback
+    ]
+
+    def get_trusted_timestamp(data: bytes) -> bytes:
+        """
+        Request RFC 3161 trusted timestamp from TSA.
+        Returns DER-encoded TimeStampResponse.
+        Tries TSA URLs in order until one succeeds.
+        """
+        request = rfc3161ng.make_timestamp_request(data=data, hashname="sha256")
+        request_bytes = rfc3161ng.encode_timestamp_request(request)
+
+        for tsa_url in TSA_URLS:
+            try:
+                response = httpx.post(
+                    tsa_url,
+                    content=request_bytes,
+                    headers={"Content-Type": "application/timestamp-query"},
+                    timeout=10.0,
+                )
+                if response.status_code == 200:
+                    tsr_bytes = response.content
+                    # Verify immediately before storing
+                    rfc3161ng.check_timestamp(tsr=tsr_bytes, data=data,
+                                               hashname="sha256")
+                    return tsr_bytes
+            except Exception as e:
+                continue  # try next TSA
+
+        raise RuntimeError("All TSA endpoints unreachable. Queuing for retry.")
+
+    def seal_epoch_with_timestamp(db, epoch_id: int, merkle_root: str,
+                                   signature: str) -> None:
+        """Seal audit epoch with Ed25519 signature AND RFC 3161 timestamp."""
+        tsr_bytes = get_trusted_timestamp(merkle_root.encode())
+        db.execute("""
+            UPDATE audit_epochs
+            SET tsa_response = :tsr, tsa_sealed_at = NOW()
+            WHERE epoch_id = :epoch_id
+        """, {"epoch_id": epoch_id, "tsr": tsr_bytes})
+  example_bad: |
+    # Internal timestamp only — backdating possible if key is compromised
+    def seal_epoch(db, epoch_id, merkle_root, signature):
+        db.execute("""
+            INSERT INTO audit_epochs (epoch_id, merkle_root, signature, sealed_at)
+            VALUES (%s, %s, %s, NOW())
+        """, (epoch_id, merkle_root, signature))
+        # sealed_at is server clock — can be manipulated
+        # Attacker with DB access: UPDATE audit_epochs SET sealed_at = '2023-01-01'
+        # No external TSA to contradict the backdated timestamp
+        # eIDAS compliance: FAILED — qualified timestamp required
+  when_applies: "Audit logs used for financial compliance (SOX, eIDAS), legal evidence, or any context where proving document existence time has legal significance."
+  sources:
+    - "RFC 3161. Internet X.509 PKI Time-Stamp Protocol (TSP) — https://tools.ietf.org/html/rfc3161"
+    - "eIDAS Regulation Art. 41. Legal effects of electronic time stamps — https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32014R0910"
+    - "Trusted Timestamping — Wikipedia — https://en.wikipedia.org/wiki/Trusted_timestamping"
+
+- id: AUDIT-011
+  text: >
+    Index audit logs for fast query without full table scan. Index the four
+    most common query patterns: (event_time), (actor_id, event_time),
+    (resource_id, event_time), (action, event_time). Use partial indexes
+    for high-cardinality filters. Partition by month using PostgreSQL
+    declarative partitioning. Drop old partitions instead of DELETE — O(1) vs O(n).
+  severity: medium
+  technologies:
+    lang: [sql]
+    framework: [postgresql]
+  domains:
+    domain: [security, audit, performance]
+    concern: [index_strategy, partitioning, query_performance]
+  why: >
+    A 100M-row audit table without indexes forces sequential scans on every
+    compliance query. A 30-day audit export that should take 2 seconds takes
+    20 minutes, making compliance reports impractical. PostgreSQL table
+    partitioning by month reduces each query to a single partition scan.
+    Dropping a partition (for archival) takes milliseconds vs hours for
+    DELETE WHERE event_time < cutoff on a 100M-row table. This is the
+    difference between a compliance export that works and one that times out
+    during an audit.
+  how_to_do_right: |
+    1. Create partitioned audit table:
+       CREATE TABLE audit_log (... event_time TIMESTAMPTZ NOT NULL ...)
+       PARTITION BY RANGE (event_time);
+    2. Create monthly partitions (automate with pg_partman):
+       CREATE TABLE audit_log_2025_01
+       PARTITION OF audit_log
+       FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+    3. Create indexes ON EACH PARTITION (not just parent):
+       CREATE INDEX idx_audit_actor_time
+       ON audit_log_2025_01 (actor_id, event_time DESC);
+    4. Use pg_partman extension to automate partition creation/retention.
+    5. For archival: DETACH PARTITION, export to S3, DROP TABLE — O(1) op.
+    6. Query performance target: <100ms for 30-day single-actor filter.
+  example_good: |
+    -- Partitioned table with proper indexes
+    CREATE TABLE audit_log (
+        seq         BIGSERIAL,
+        event_time  TIMESTAMPTZ NOT NULL,
+        actor_id    TEXT NOT NULL,
+        action      TEXT NOT NULL,
+        resource_id TEXT NOT NULL,
+        new_data    JSONB,
+        prev_hash   TEXT NOT NULL,
+        entry_hash  TEXT NOT NULL
+    ) PARTITION BY RANGE (event_time);
+
+    -- Monthly partitions (use pg_partman to automate)
+    CREATE TABLE audit_log_2025_01
+        PARTITION OF audit_log
+        FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+
+    -- Index each partition
+    CREATE INDEX ON audit_log_2025_01 (event_time DESC);
+    CREATE INDEX ON audit_log_2025_01 (actor_id, event_time DESC);
+    CREATE INDEX ON audit_log_2025_01 (resource_id, event_time DESC);
+    CREATE INDEX ON audit_log_2025_01 (action, event_time DESC);
+
+    -- Archival: O(1) drop instead of O(n) DELETE
+    ALTER TABLE audit_log DETACH PARTITION audit_log_2024_01;
+    -- Export audit_log_2024_01 to S3 here
+    DROP TABLE audit_log_2024_01;  -- milliseconds, not hours
+  example_bad: |
+    -- Unpartitioned, no indexes — full table scan on every query
+    CREATE TABLE audit_log (
+        id         SERIAL PRIMARY KEY,
+        actor_id   TEXT,
+        action     TEXT,
+        created_at TIMESTAMP
+    );
+    -- 100M rows, no indexes
+    -- SELECT * FROM audit_log WHERE actor_id = 'admin@co.com'
+    --   AND created_at BETWEEN '2025-01-01' AND '2025-01-31';
+    -- Execution plan: Seq Scan on audit_log (cost=0..4800000 rows=8500)
+    -- Execution time: 4 minutes 20 seconds
+    -- Auditor timeout: query killed after 2 minutes
+  when_applies: "Any audit log table expected to grow beyond 1 million rows or used for compliance reporting."
+  sources:
+    - "PostgreSQL Documentation. Table Partitioning — https://www.postgresql.org/docs/current/ddl-partitioning.html"
+    - "EDB. Working with Postgres Audit Triggers — https://www.enterprisedb.com/postgres-tutorials/working-postgres-audit-triggers"
+    - "Bemi. The Ultimate Guide to PostgreSQL Data Change Tracking — https://blog.bemi.io/the-ultimate-guide-to-postgresql-data-change-tracking/"
+
+- id: AUDIT-012
+  text: >
+    Implement cross-system audit correlation using a shared trace_id that
+    propagates through all services involved in a single user action. Every
+    audit record stores the trace_id. To reconstruct a complete audit trail
+    for one user action, query by trace_id across all service audit tables —
+    not by timestamp approximation.
+  severity: high
+  technologies:
+    lang: [python, sql]
+    framework: [opentelemetry, postgresql, fastapi]
+  domains:
+    domain: [security, audit, distributed_systems]
+    concern: [correlation, trace_id, cross_service_audit]
+  why: >
+    In microservice architectures, a single user action (e.g., "place order")
+    touches 5-8 services. Reconstructing what happened requires correlating
+    audit records across all services by time range — error-prone and
+    incomplete. Shared trace_id correlation is exact: query all service audit
+    tables WHERE trace_id = 'abc123' and you have the complete causal chain.
+    OpenTelemetry trace context (W3C Trace Context) is the standard mechanism.
+    Incident investigations at AWS-scale organizations consistently cite
+    trace_id correlation as the difference between 30-minute and 8-hour MTTR.
+  how_to_do_right: |
+    1. Propagate W3C Trace Context (traceparent header) across all service calls.
+    2. Every audit record includes trace_id extracted from current span:
+       from opentelemetry import trace
+       span = trace.get_current_span()
+       trace_id = format(span.get_span_context().trace_id, '032x')
+    3. Index trace_id on every audit table.
+    4. For cross-service correlation queries: use a unified audit query service
+       that fans out to all service audit tables and joins on trace_id.
+    5. Centralize audit records in a single log aggregation system
+       (Splunk, Elastic, Loki) with trace_id as a correlation key.
+    6. Retention policy: trace_id must be present on 100% of audit records —
+       alert if audit_records_missing_trace_id / total > 0.001% in any hour.
+  example_good: |
+    from opentelemetry import trace
+    from opentelemetry.propagate import inject, extract
+    import uuid
+
+    def get_or_create_trace_id() -> str:
+        """Get current OpenTelemetry trace ID, or create a correlation ID."""
+        span = trace.get_current_span()
+        ctx = span.get_span_context()
+        if ctx.is_valid:
+            return format(ctx.trace_id, '032x')
+        # Fallback: use request-scoped correlation ID from context
+        return str(uuid.uuid4()).replace('-', '')
+
+    # In FastAPI middleware — propagate trace context to audit records
+    from fastapi import Request
+
+    async def audit_middleware(request: Request, call_next):
+        trace_id = get_or_create_trace_id()
+        request.state.trace_id = trace_id
+
+        response = await call_next(request)
+        return response
+
+    # In audit log writer
+    def insert_audit_with_trace(db, actor_id: str, action: str,
+                                  resource_id: str, trace_id: str) -> None:
+        entry = {
+            "actor_id": actor_id,
+            "action": action,
+            "resource_id": resource_id,
+            "trace_id": trace_id,   # cross-system correlation key
+        }
+        insert_audit_entry(db, **entry)
+
+    # Cross-service reconstruction (query all services' audit tables)
+    def get_full_action_trace(trace_id: str) -> list[dict]:
+        """Reconstruct complete audit trail for a user action across all services."""
+        services = ["order_service", "payment_service", "inventory_service",
+                    "notification_service"]
+        combined = []
+        for svc in services:
+            rows = db.execute(f"""
+                SELECT *, '{svc}' as source_service
+                FROM {svc}.audit_log
+                WHERE trace_id = :tid ORDER BY event_time
+            """, {"tid": trace_id}).fetchall()
+            combined.extend([dict(r._mapping) for r in rows])
+        return sorted(combined, key=lambda r: r["event_time"])
+  example_bad: |
+    # Audit records without trace_id — correlation by time range only
+    def log_payment_event(actor_id: str, action: str):
+        db.execute(
+            "INSERT INTO payment_audit (actor_id, action, ts) VALUES (%s, %s, NOW())",
+            (actor_id, action)
+        )
+    # Incident: "Show me everything that happened for order #12345"
+    # Engineer: SELECT * FROM payment_audit WHERE ts BETWEEN '14:03:00' AND '14:04:00'
+    # Gets 847 rows from all users in that minute — impossible to filter to order
+    # Cross-correlating with order_service: "which timestamp range to use?"
+    # MTTR: 8 hours instead of 30 minutes
+  when_applies: "Microservice architectures where a single user action spans multiple services and requires end-to-end audit trail reconstruction."
+  sources:
+    - "W3C Trace Context Recommendation — https://www.w3.org/TR/trace-context/"
+    - "OpenTelemetry Python SDK — https://opentelemetry.io/docs/instrumentation/python/"
+    - "NIST SP 800-92. Guide to Computer Security Log Management — https://csrc.nist.gov/publications/detail/sp/800-92/final"

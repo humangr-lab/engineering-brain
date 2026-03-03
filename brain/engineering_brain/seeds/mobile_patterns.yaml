@@ -1,0 +1,753 @@
+layer: rules
+technology: General
+domain: mobile
+knowledge:
+- id: CR-MOB-001
+  text: Design offline-first from day one — every feature must work without network connectivity, syncing when connection
+    returns
+  why: 'Mobile devices lose connectivity constantly: elevators, subways, rural areas, airplane mode, carrier switching. An
+    app that shows a blank screen or error spinner when offline loses the user immediately. Retrofitting offline support into
+    an online-first app requires rewriting every data layer to add local persistence, conflict resolution, and sync queues.
+    Apps designed offline-first from day one have local-first data access (instant reads), optimistic UI (immediate feedback),
+    and background sync (eventual consistency). Users perceive these apps as "fast" even on slow 3G connections because reads
+    never hit the network.
+
+    '
+  how_to_do_right: '1. Every data read goes through local storage first (Room/Core Data/SQLite)
+
+    2. Network requests populate local storage, not UI directly
+
+    3. UI observes local storage reactively (Flow/Combine/LiveData)
+
+    4. Writes go to a sync queue that processes when online
+
+    5. Sync queue is persistent (survives app kill and device reboot)
+
+    6. Conflict resolution strategy defined per entity type
+
+    '
+  severity: critical
+  technologies:
+    lang: [swift, kotlin]
+    framework: [mobile, react_native, flutter]
+  domains:
+    domain: [architecture, mobile]
+    concern: [data]
+  example_good: "// Repository pattern — offline-first with sync queue\nclass OrderRepository(\n    private val localDb: OrderDao,\
+    \         // Room/Core Data\n    private val api: OrderApi,             // Network\n    private val syncQueue: SyncQueue,\
+    \      // Persistent queue\n    private val connectivity: ConnectivityMonitor,\n) {\n    // READ: always from local, never\
+    \ waits for network\n    fun observeOrders(): Flow<List<Order>> = localDb.observeAll()\n\n    // WRITE: save locally +\
+    \ queue for sync\n    suspend fun createOrder(order: Order) {\n        localDb.insert(order.copy(syncStatus = SyncStatus.PENDING))\n\
+    \        syncQueue.enqueue(SyncTask.CreateOrder(order.id))\n        // UI sees the order immediately — no spinner\n  \
+    \  }\n\n    // SYNC: process queue when online\n    suspend fun processSync() {\n        val pending = syncQueue.getPending()\n\
+    \        for (task in pending) {\n            try {\n                when (task) {\n                    is SyncTask.CreateOrder\
+    \ -> {\n                        val local = localDb.getById(task.orderId)\n                        val remote = api.createOrder(local)\n\
+    \                        localDb.update(remote.copy(syncStatus = SyncStatus.SYNCED))\n                        syncQueue.markComplete(task.id)\n\
+    \                    }\n                }\n            } catch (e: ConflictException) {\n                resolveConflict(task,\
+    \ e.serverVersion)\n            }\n            // Network error: task stays in queue, retried next sync\n        }\n \
+    \   }\n\n    // Background sync triggered by connectivity change\n    init {\n        connectivity.onConnected { processSync()\
+    \ }\n    }\n}\n"
+  example_bad: "// Online-only — blank screen without network\nclass OrderRepository(private val api: OrderApi) {\n    suspend\
+    \ fun getOrders(): List<Order> {\n        return api.getOrders() // throws on no network → blank screen\n    }\n\n   \
+    \ suspend fun createOrder(order: Order) {\n        api.createOrder(order) // throws on no network → user loses input\n\
+    \    }\n}\n\n// \"Offline support\" as afterthought — cache only, no sync\nclass OrderRepository(private val api: OrderApi,\
+    \ private val cache: Cache) {\n    suspend fun getOrders(): List<Order> {\n        return try {\n            val remote\
+    \ = api.getOrders()\n            cache.save(remote)\n            remote\n        } catch (e: Exception) {\n          \
+    \  cache.load() // stale data, no pending writes, no conflict resolution\n        }\n    }\n}\n"
+  when_applies: Any project using React Native, Flutter cross-platform apps, Swift/iOS development, or Kotlin/Android development
+  when_not_applies: web-only applications, backend services, desktop applications
+  sources: ["https://developer.android.com/topic/architecture/data-layer/offline-first"]
+- id: CR-MOB-002
+  text: Implement a deterministic conflict resolution strategy — last-writer-wins for simple data, CRDT or manual merge for
+    complex data
+  why: 'When an offline app syncs pending changes, the server may have been updated by another device or user. Without conflict
+    resolution, one of three things happens: data loss (server overwrites local), sync failure (error with no recovery), or
+    data duplication (both versions saved). Last-writer-wins (LWW) is simple and correct for independent fields (user name,
+    settings). For collaborative data (shared documents, shopping lists), CRDTs (Conflict-free Replicated Data Types) or operational
+    transform enable automatic merge without data loss. The strategy must be defined per entity type before implementation.
+
+    '
+  how_to_do_right: '1. Define conflict strategy per entity: LWW, CRDT, or manual merge
+
+    2. LWW: add updatedAt timestamp to every entity, server keeps latest
+
+    3. CRDT: use grow-only sets for lists, LWW registers for fields
+
+    4. Manual merge: present both versions to user for resolution
+
+    5. Add a version/etag field for optimistic concurrency control
+
+    6. Test conflict scenarios: offline edit → different online edit → sync
+
+    '
+  severity: high
+  technologies:
+    lang: [swift, kotlin]
+    framework: [mobile, react_native, flutter]
+  domains:
+    domain: [architecture, mobile]
+    concern: [data, sync]
+  example_good: "// Conflict resolution with version-based strategy\nsealed class ConflictStrategy {\n    object LastWriterWins\
+    \ : ConflictStrategy()\n    object MergeFields : ConflictStrategy()\n    object AskUser : ConflictStrategy()\n}\n\nclass\
+    \ SyncResolver {\n    fun resolve(\n        local: SyncableEntity,\n        remote: SyncableEntity,\n        strategy:\
+    \ ConflictStrategy,\n    ): ResolvedEntity {\n        return when (strategy) {\n            // LWW: compare timestamps,\
+    \ keep latest\n            is ConflictStrategy.LastWriterWins -> {\n                if (local.updatedAt > remote.updatedAt)\
+    \ {\n                    ResolvedEntity(data = local, action = SyncAction.PUSH)\n                } else {\n          \
+    \          ResolvedEntity(data = remote, action = SyncAction.PULL)\n                }\n            }\n\n            //\
+    \ Merge: combine non-conflicting fields, flag conflicts\n            is ConflictStrategy.MergeFields -> {\n          \
+    \      val merged = mergeFields(local, remote)\n                if (merged.hasConflicts) {\n                    ResolvedEntity(data\
+    \ = merged, action = SyncAction.ASK_USER)\n                } else {\n                    ResolvedEntity(data = merged,\
+    \ action = SyncAction.PUSH_MERGED)\n                }\n            }\n\n            // Ask user: save both, present choice\n\
+    \            is ConflictStrategy.AskUser -> {\n                ResolvedEntity(\n                    data = local,\n  \
+    \                  conflictData = remote,\n                    action = SyncAction.SHOW_CONFLICT_UI,\n               \
+    \ )\n            }\n        }\n    }\n\n    private fun mergeFields(local: SyncableEntity, remote: SyncableEntity): MergedEntity\
+    \ {\n        // Per-field comparison: if only one changed, take that version\n        // If both changed same field, flag\
+    \ as conflict\n        val fields = mutableMapOf<String, FieldResolution>()\n        for (field in local.fields) {\n \
+    \           val localChanged = local.getField(field) != local.getBaseField(field)\n            val remoteChanged = remote.getField(field)\
+    \ != remote.getBaseField(field)\n            fields[field] = when {\n                localChanged && !remoteChanged ->\
+    \ FieldResolution.UseLocal\n                !localChanged && remoteChanged -> FieldResolution.UseRemote\n            \
+    \    localChanged && remoteChanged -> FieldResolution.Conflict\n                else -> FieldResolution.NoChange\n   \
+    \         }\n        }\n        return MergedEntity(fields)\n    }\n}\n"
+  example_bad: "// No conflict resolution — data loss\nsuspend fun sync(localOrder: Order) {\n    api.updateOrder(localOrder)\
+    \ // silently overwrites server version\n    // Server had updates from web app — now lost\n}\n\n// Crash on conflict\n\
+    suspend fun sync(localOrder: Order) {\n    try {\n        api.updateOrder(localOrder)\n    } catch (e: Http409ConflictException)\
+    \ {\n        // App crashes or shows generic error\n        // User's offline edits are stuck in limbo forever\n     \
+    \   throw e\n    }\n}\n"
+  when_applies: Projects using React Native, Flutter cross-platform apps, Swift/iOS development, or Kotlin/Android development
+  when_not_applies: web-only applications, backend services, desktop applications
+  sources: ["https://crdt.tech/"]
+- id: CR-MOB-003
+  text: Use stale-while-revalidate cache strategy — show cached data immediately, refresh in background, update UI when fresh
+    data arrives
+  why: 'Users expect instant screen loads. A network-first approach shows a loading spinner for 200-2000ms on every screen
+    transition, making the app feel slow even on fast connections. Stale-while-revalidate shows cached data instantly (0ms
+    perceived load), then refreshes in the background. When fresh data arrives, the UI updates seamlessly. The user sees content
+    immediately and gets updated content within seconds. This is the pattern used by every major social media app (Instagram,
+    Twitter, TikTok) for feed content.
+
+    '
+  how_to_do_right: '1. On screen load: return cached data immediately (0ms)
+
+    2. Simultaneously start background refresh
+
+    3. When refresh completes: update local storage (triggers reactive UI update)
+
+    4. Set max stale time per data type (feed: 5min, profile: 30min, settings: 24hr)
+
+    5. Force refresh on pull-to-refresh gesture
+
+    6. Show subtle refresh indicator (not full-screen spinner)
+
+    '
+  severity: high
+  technologies:
+    lang: [swift, kotlin]
+    framework: [mobile, react_native, flutter]
+  domains:
+    domain: [architecture, mobile, performance]
+    concern: [data]
+  example_good: "// Stale-while-revalidate pattern\nclass FeedRepository(\n    private val localDb: FeedDao,\n    private\
+    \ val api: FeedApi,\n) {\n    private val maxStaleTime = 5.minutes\n\n    // Returns Flow: first emit = cache (instant),\
+    \ second = fresh data\n    fun observeFeed(): Flow<FeedState> = flow {\n        // 1. Emit cached data immediately\n \
+    \       val cached = localDb.getAll()\n        if (cached.isNotEmpty()) {\n            emit(FeedState.Data(cached, isStale\
+    \ = isStale(cached)))\n        } else {\n            emit(FeedState.Loading)\n        }\n\n        // 2. Refresh in parallel\n\
+    \        try {\n            val fresh = api.getFeed()\n            localDb.replaceAll(fresh)\n            emit(FeedState.Data(fresh,\
+    \ isStale = false))\n        } catch (e: Exception) {\n            if (cached.isEmpty()) {\n                emit(FeedState.Error(e.message\
+    \ ?: \"Network error\"))\n            }\n            // If we have cache, silently keep showing it\n        }\n    }\n\
+    \n    private fun isStale(items: List<FeedItem>): Boolean {\n        val lastFetch = items.maxOfOrNull { it.fetchedAt\
+    \ } ?: return true\n        return (Clock.System.now() - lastFetch) > maxStaleTime\n    }\n\n    // Force refresh (pull-to-refresh)\n\
+    \    suspend fun refresh(): Result<Unit> = runCatching {\n        val fresh = api.getFeed()\n        localDb.replaceAll(fresh)\n\
+    \    }\n}\n\n// UI shows cache immediately, subtle indicator for refresh\nsealed class FeedState {\n    object Loading\
+    \ : FeedState()\n    data class Data(val items: List<FeedItem>, val isStale: Boolean) : FeedState()\n    data class Error(val\
+    \ message: String) : FeedState()\n}\n"
+  example_bad: "// Network-first — spinner on every load\nclass FeedRepository(private val api: FeedApi) {\n    suspend fun\
+    \ getFeed(): List<FeedItem> {\n        return api.getFeed() // 200-2000ms spinner EVERY time\n    }\n}\n\n// Cache-only\
+    \ — stale data forever\nclass FeedRepository(private val cache: Cache) {\n    fun getFeed(): List<FeedItem> {\n      \
+    \  return cache.get(\"feed\") // never refreshes — user sees week-old data\n    }\n}\n"
+  when_applies: Projects using React Native, Flutter cross-platform apps, Swift/iOS development, or Kotlin/Android development
+  when_not_applies: web-only applications, backend services, desktop applications
+  sources: ["https://web.dev/articles/stale-while-revalidate"]
+- id: CR-MOB-004
+  text: Implement biometric authentication with PIN/password fallback — never biometric-only, and store credentials in platform
+    secure storage
+  why: 'Biometric authentication (Face ID, fingerprint) provides frictionless security but is not always available: wet fingers,
+    face mask, hardware damage, OS updates that reset biometric data. An app that only supports biometric locks users out
+    when biometrics fail. The fallback must be PIN or password, never "skip" or "cancel" (which defeats security). Biometric
+    data itself is never accessible to apps — the OS returns a success/failure boolean. The actual credentials (tokens, encryption
+    keys) must be stored in Keychain (iOS) or Android Keystore, locked behind biometric authentication policy.
+
+    '
+  how_to_do_right: '1. Biometric prompt with automatic fallback to device PIN/password
+
+    2. Store auth tokens in Keychain (iOS) or EncryptedSharedPreferences (Android)
+
+    3. Set authentication policy: .biometryAny + .devicePasscode fallback
+
+    4. Handle biometric enrollment changes (new fingerprint added = re-authenticate)
+
+    5. Support "Remember me" with refresh token rotation
+
+    6. Clear biometric-locked data on logout
+
+    '
+  severity: critical
+  technologies:
+    lang: [swift, kotlin]
+    framework: [mobile, react_native, flutter]
+  domains:
+    domain: [architecture, mobile, security]
+    concern: [authentication]
+  example_good: "// Cross-platform biometric auth pattern\nclass BiometricAuthService {\n    private val secureStorage: SecureStorage\
+    \ // Keychain / EncryptedSharedPrefs\n\n    // Check if biometric is available\n    fun isBiometricAvailable(): BiometricStatus\
+    \ {\n        return when {\n            !device.hasBiometricHardware -> BiometricStatus.NOT_AVAILABLE\n            !device.hasBiometricEnrolled\
+    \ -> BiometricStatus.NOT_ENROLLED\n            else -> BiometricStatus.AVAILABLE\n        }\n    }\n\n    // Authenticate\
+    \ with biometric + fallback to device PIN\n    suspend fun authenticate(): AuthResult {\n        return try {\n      \
+    \      val success = showBiometricPrompt(\n                title = \"Verify Identity\",\n                subtitle = \"\
+    Use biometrics or device PIN\",\n                allowDeviceCredential = true, // PIN fallback\n                invalidatedByBiometricEnrollment\
+    \ = true, // re-auth on new fingerprint\n            )\n\n            if (success) {\n                val token = secureStorage.getToken()\
+    \ // retrieved after biometric success\n                if (token != null && !isTokenExpired(token)) {\n             \
+    \       AuthResult.Success(token)\n                } else {\n                    AuthResult.TokenExpired // need full\
+    \ re-login\n                }\n            } else {\n                AuthResult.Cancelled\n            }\n        } catch\
+    \ (e: BiometricLockoutException) {\n            AuthResult.LockedOut(e.duration) // too many failed attempts\n       \
+    \ }\n    }\n\n    // Store credentials after successful login\n    fun saveCredentials(token: String, refreshToken: String)\
+    \ {\n        secureStorage.save(\"auth_token\", token, requireBiometric = true)\n        secureStorage.save(\"refresh_token\"\
+    , refreshToken, requireBiometric = true)\n    }\n\n    // Clear on logout\n    fun clearCredentials() {\n        secureStorage.deleteAll()\n\
+    \    }\n}\n"
+  example_bad: "// Biometric-only — no fallback\nfun authenticate() {\n    showBiometricPrompt(allowDeviceCredential = false)\n\
+    \    // Wet fingers → locked out, no recovery\n}\n\n// Token stored in plain text\nfun saveToken(token: String) {\n  \
+    \  SharedPreferences.edit().putString(\"token\", token).apply()\n    // Readable by any root process\n}\n\n// Skip button\
+    \ on biometric — defeats security\nBiometricPrompt(\n    onSuccess = { proceedToApp() },\n    onFailure = { showPinInput()\
+    \ },\n    onCancel = { proceedToApp() }, // SKIP — anyone can bypass\n)\n"
+  when_applies: Any project using React Native, Flutter cross-platform apps, Swift/iOS development, or Kotlin/Android development
+  when_not_applies: web-only applications, backend services, desktop applications
+  sources: ["https://developer.apple.com/documentation/localauthentication", "https://developer.android.com/training/sign-in/biometric-auth"]
+- id: CR-MOB-005
+  text: Implement OAuth 2.0 with PKCE for mobile apps — never use implicit grant or store client secrets in the app
+  why: 'Mobile apps are public clients — the binary can be decompiled, so client secrets are extractable. OAuth Implicit Grant
+    was designed for browsers and sends tokens in URL fragments, vulnerable to interception. Authorization Code with PKCE
+    (Proof Key for Code Exchange) is the recommended flow for mobile: the app generates a random code verifier, hashes it
+    to a code challenge, and exchanges the authorization code for tokens server-side. Even if an attacker intercepts the authorization
+    code, they can''t exchange it without the original code verifier. This is mandated by OAuth 2.1 and recommended by OWASP
+    Mobile.
+
+    '
+  how_to_do_right: '1. Use Authorization Code flow with PKCE (RFC 7636)
+
+    2. Generate code_verifier (43-128 char random string) per auth request
+
+    3. Hash to code_challenge with SHA-256 (S256 method)
+
+    4. Use Custom URL Scheme or Universal Links for redirect
+
+    5. Exchange auth code + code_verifier for tokens
+
+    6. Store tokens in secure storage, refresh proactively before expiry
+
+    '
+  severity: critical
+  technologies:
+    lang: [swift, kotlin]
+    framework: [mobile, react_native, flutter]
+  domains:
+    domain: [architecture, mobile, security]
+    concern: [authentication]
+  example_good: "// OAuth 2.0 + PKCE flow\nclass OAuthService {\n    private val secureStorage: SecureStorage\n\n    suspend\
+    \ fun startLogin(): LoginResult {\n        // 1. Generate PKCE pair\n        val codeVerifier = generateRandomString(64)\
+    \ // 43-128 chars\n        val codeChallenge = sha256Base64Url(codeVerifier)\n\n        // 2. Store verifier securely\
+    \ (needed for token exchange)\n        secureStorage.save(\"pkce_verifier\", codeVerifier)\n\n        // 3. Open authorization\
+    \ URL in system browser (not WebView!)\n        val authUrl = buildUrl(\n            baseUrl = \"https://auth.example.com/authorize\"\
+    ,\n            params = mapOf(\n                \"client_id\" to CLIENT_ID,\n                \"response_type\" to \"code\"\
+    ,\n                \"redirect_uri\" to \"myapp://auth/callback\",\n                \"scope\" to \"openid profile email\"\
+    ,\n                \"code_challenge\" to codeChallenge,\n                \"code_challenge_method\" to \"S256\",\n    \
+    \            \"state\" to generateRandomString(32), // CSRF protection\n            )\n        )\n\n        // Use ASWebAuthenticationSession\
+    \ (iOS) or Custom Tabs (Android)\n        val callbackUrl = openSystemBrowser(authUrl)\n\n        // 4. Extract auth code\
+    \ from callback\n        val code = callbackUrl.getQueryParam(\"code\")\n            ?: return LoginResult.Error(\"No\
+    \ auth code received\")\n\n        // 5. Exchange code + verifier for tokens (server-side call)\n        val verifier\
+    \ = secureStorage.get(\"pkce_verifier\")\n        val tokens = api.exchangeCode(\n            code = code,\n         \
+    \   codeVerifier = verifier,\n            redirectUri = \"myapp://auth/callback\",\n        )\n\n        // 6. Store tokens\
+    \ securely\n        secureStorage.save(\"access_token\", tokens.accessToken)\n        secureStorage.save(\"refresh_token\"\
+    , tokens.refreshToken)\n        secureStorage.delete(\"pkce_verifier\") // cleanup\n\n        return LoginResult.Success(tokens)\n\
+    \    }\n\n    // Proactive token refresh\n    suspend fun refreshIfNeeded(): String {\n        val token = secureStorage.get(\"\
+    access_token\") ?: throw NotLoggedInException()\n        if (!isExpiringSoon(token)) return token\n\n        val refreshToken\
+    \ = secureStorage.get(\"refresh_token\")\n            ?: throw NotLoggedInException()\n\n        val newTokens = api.refreshToken(refreshToken)\n\
+    \        secureStorage.save(\"access_token\", newTokens.accessToken)\n        secureStorage.save(\"refresh_token\", newTokens.refreshToken)\n\
+    \        return newTokens.accessToken\n    }\n}\n"
+  example_bad: "// Implicit grant — token in URL, interceptable\nval authUrl = \"https://auth.example.com/authorize?response_type=token\"\
+    \n// Token appears in URL fragment — logged by proxies, browser history, analytics\n\n// Client secret in mobile app —\
+    \ extractable via decompilation\nval tokens = api.exchangeCode(\n    code = authCode,\n    client_secret = \"super-secret-key-123\"\
+    , // in binary, readable with `strings`\n)\n\n// WebView instead of system browser — app can read user's password\nWebView(url\
+    \ = authUrl) // app has access to all form inputs — password theft\n\n// No PKCE — auth code interceptable via malicious\
+    \ redirect\nval authUrl = \"https://auth.example.com/authorize?response_type=code\"\n// No code_challenge — intercepted\
+    \ code can be exchanged by attacker\n"
+  when_applies: Any project using React Native, Flutter cross-platform apps, Swift/iOS development, or Kotlin/Android development
+  when_not_applies: web-only applications, backend services, desktop applications
+  sources: ["https://tools.ietf.org/html/rfc7636"]
+- id: CR-MOB-006
+  text: Optimize app startup (cold/warm/hot) — defer non-essential initialization, lazy-load features, and measure Time to
+    Interactive
+  why: 'App startup time directly correlates with user retention. Google reports that 53% of users abandon apps that take
+    >3 seconds to load. Cold start (app not in memory) is the most critical: it includes process creation, library loading,
+    Application.onCreate()/AppDelegate, and initial render. Every SDK initialized at startup adds 50-500ms. Analytics, crash
+    reporting, feature flags, and push notification SDKs are commonly initialized eagerly but only needed after first render.
+    Deferring them to after the first frame renders can cut startup time by 40-60%.
+
+    '
+  how_to_do_right: '1. Measure startup with platform tools: Android Macrobenchmark, Xcode Instruments
+
+    2. Classify init work: CRITICAL (auth, navigation) vs DEFERRABLE (analytics, ads)
+
+    3. Defer non-critical SDK init to after first frame renders
+
+    4. Lazy-load features: don''t initialize camera SDK until camera screen opens
+
+    5. Use Baseline Profiles (Android) or pre-warm (iOS) for faster code execution
+
+    6. Target: <1s cold start on mid-range device (3 year old)
+
+    '
+  severity: high
+  technologies:
+    lang: [swift, kotlin]
+    framework: [mobile, react_native, flutter]
+  domains:
+    domain: [architecture, mobile, performance]
+  example_good: "// Startup optimization pattern\nclass AppInitializer {\n    // Phase 1: CRITICAL — must complete before\
+    \ first frame\n    fun initCritical() {\n        initSecureStorage()      // needed for auth check\n        initNavigation()\
+    \         // needed for first screen\n        initTheme()              // needed for rendering\n        // Total: ~100ms\n\
+    \    }\n\n    // Phase 2: DEFERRED — after first frame renders\n    fun initDeferred() {\n        // Schedule after first\
+    \ frame is on screen\n        postFirstFrame {\n            initAnalytics()       // 200ms — not needed for first render\n\
+    \            initCrashReporting()  // 150ms — can miss first 500ms of crashes\n            initPushNotifications() //\
+    \ 300ms — async permission anyway\n            initRemoteConfig()    // 100ms — use cached values initially\n        \
+    \    prefetchUserData()    // 200ms — show skeleton first\n        }\n    }\n\n    // Phase 3: LAZY — only when feature\
+    \ is accessed\n    val cameraModule by lazy { CameraModule.initialize() }    // 500ms\n    val mapModule by lazy { MapModule.initialize()\
+    \ }          // 400ms\n    val arModule by lazy { ARModule.initialize() }            // 800ms\n}\n\n// Android: postFirstFrame\n\
+    class MainActivity : ComponentActivity() {\n    override fun onCreate(savedInstanceState: Bundle?) {\n        super.onCreate(savedInstanceState)\n\
+    \        AppInitializer.initCritical()\n        setContent { AppRoot() }\n\n        // Deferred init after first frame\n\
+    \        window.decorView.post {\n            AppInitializer.initDeferred()\n        }\n    }\n}\n\n// iOS: postFirstFrame\n\
+    @main\nstruct MyApp: App {\n    init() {\n        AppInitializer.initCritical()\n    }\n\n    var body: some Scene {\n\
+    \        WindowGroup {\n            ContentView()\n                .task {\n                    AppInitializer.initDeferred()\n\
+    \                }\n        }\n    }\n}\n"
+  example_bad: "// Everything initialized eagerly — 3+ second startup\nclass MyApplication : Application() {\n    override\
+    \ fun onCreate() {\n        super.onCreate()\n        Firebase.initialize(this)        // 200ms\n        Analytics.init(this)\
+    \             // 150ms\n        CrashReporting.init(this)        // 100ms\n        PushNotifications.init(this)     //\
+    \ 300ms\n        Maps.init(this, API_KEY)         // 400ms\n        Camera.init(this)                // 500ms\n      \
+    \  AR.init(this)                    // 800ms\n        FeatureFlags.init(this)          // 200ms\n        Ads.init(this)\
+    \                   // 300ms\n        // Total: 2950ms before first frame — user stares at blank screen\n    }\n}\n"
+  when_applies: Projects using React Native, Flutter cross-platform apps, Swift/iOS development, or Kotlin/Android development
+  when_not_applies: web-only applications, backend services, desktop applications
+  sources: ["https://developer.android.com/topic/performance/vitals/launch-time"]
+- id: CR-MOB-007
+  text: Optimize image loading with progressive rendering, resize to display size, and aggressive caching with eviction
+  why: 'Images are the #1 source of memory pressure and network bandwidth in mobile apps. A single 4000x3000 photo decoded
+    at full resolution consumes 48MB of RAM (4000 * 3000 * 4 bytes/pixel). Displaying it in a 200x150 point container wastes
+    99% of that memory. On a feed with 20 such images visible, that''s 960MB — causing immediate OOM crash on most devices.
+    Progressive loading (blur-up or low-res placeholder) eliminates perceived load time. Disk caching prevents re-downloading.
+    Memory caching prevents re-decoding. Resize before decode prevents OOM.
+
+    '
+  how_to_do_right: '1. ALWAYS resize to display dimensions before decoding (not after)
+
+    2. Use progressive/blur-up loading: tiny thumbnail → full image
+
+    3. Disk cache with size limit (200MB typical) and LRU eviction
+
+    4. Memory cache with size limit (1/8 of available memory)
+
+    5. Use WebP/AVIF format for 30-50% smaller files than JPEG/PNG
+
+    6. CDN image transformation: request exact size from server (e.g., Cloudinary, imgix)
+
+    '
+  severity: critical
+  technologies:
+    lang: [swift, kotlin]
+    framework: [mobile, react_native, flutter]
+  domains:
+    domain: [architecture, mobile, performance]
+  example_good: "// Image loading best practices — cross-platform pattern\nclass ImageLoader {\n    private val memoryCache\
+    \ = LruCache<String, Bitmap>(maxMemory / 8)\n    private val diskCache = DiskLruCache(200 * 1024 * 1024) // 200MB\n\n\
+    \    suspend fun load(\n        url: String,\n        targetWidth: Int,\n        targetHeight: Int,\n    ): ImageResult\
+    \ {\n        val cacheKey = \"$url:${targetWidth}x${targetHeight}\"\n\n        // 1. Memory cache — instant\n        memoryCache.get(cacheKey)?.let\
+    \ {\n            return ImageResult.Cached(it)\n        }\n\n        // 2. Disk cache — fast (~5ms)\n        diskCache.get(cacheKey)?.let\
+    \ { bytes ->\n            val bitmap = decodeResized(bytes, targetWidth, targetHeight)\n            memoryCache.put(cacheKey,\
+    \ bitmap)\n            return ImageResult.DiskCached(bitmap)\n        }\n\n        // 3. Network with resize — request\
+    \ exact size from CDN\n        val resizedUrl = \"$url?w=$targetWidth&h=$targetHeight&fit=cover&format=webp\"\n      \
+    \  val bytes = httpClient.get(resizedUrl)\n\n        // Decode at target size (never full resolution)\n        val bitmap\
+    \ = decodeResized(bytes, targetWidth, targetHeight)\n        diskCache.put(cacheKey, bytes)\n        memoryCache.put(cacheKey,\
+    \ bitmap)\n\n        return ImageResult.Network(bitmap)\n    }\n\n    private fun decodeResized(bytes: ByteArray, w: Int,\
+    \ h: Int): Bitmap {\n        // Sample size calculation — decode at 1/2, 1/4, 1/8 resolution\n        val options = BitmapFactory.Options().apply\
+    \ {\n            inJustDecodeBounds = true\n        }\n        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)\n\
+    \n        options.inSampleSize = calculateInSampleSize(options, w, h)\n        options.inJustDecodeBounds = false\n  \
+    \      return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)\n    }\n}\n\n// CDN URL transformation\nfun\
+    \ getOptimizedImageUrl(\n    baseUrl: String,\n    displayWidth: Int,\n    pixelDensity: Float,\n): String {\n    val\
+    \ physicalWidth = (displayWidth * pixelDensity).toInt()\n    return \"$baseUrl?w=$physicalWidth&format=webp&quality=80\"\
+    \n}\n"
+  example_bad: '// Full-resolution decode — 48MB per image, OOM crash
+
+    val bitmap = BitmapFactory.decodeByteArray(data, 0, data.size)
+
+    // 4000x3000 image → 48MB, displayed in 200x150 container
+
+
+    // No caching — re-downloads on every scroll
+
+    Image.network(url) // Flutter: no disk cache by default
+
+    <Image source={{ uri: url }} /> // React Native: no disk cache on Android
+
+
+    // No CDN resize — downloading 5MB images for thumbnails
+
+    val imageUrl = "https://cdn.example.com/photos/original.jpg"
+
+    // Server sends 5MB original when 50KB thumbnail would suffice
+
+    '
+  when_applies: Any project using React Native, Flutter cross-platform apps, Swift/iOS development, or Kotlin/Android development
+  when_not_applies: web-only applications, backend services, desktop applications
+  sources: ["https://developer.android.com/develop/ui/views/graphics/drawables"]
+- id: CR-MOB-008
+  text: Implement certificate pinning for API communication to prevent man-in-the-middle attacks
+  why: 'TLS/HTTPS protects against passive eavesdropping but not against active MITM (man-in-the- middle) attacks where the
+    attacker presents a valid certificate from a compromised or rogue Certificate Authority. Charles Proxy, mitmproxy, and
+    Fiddler can intercept HTTPS traffic on mobile by installing a custom CA certificate. Certificate pinning validates that
+    the server''s certificate matches a known hash, rejecting any impersonation even with a valid CA signature. Without pinning,
+    any device with a custom CA (corporate MDM, parental controls, malware) can intercept all API traffic including auth tokens.
+
+    '
+  how_to_do_right: '1. Pin the public key hash (SPKI), not the certificate itself (certificates rotate)
+
+    2. Include backup pins for certificate rotation (at least 2 pins)
+
+    3. Use platform-native pinning: NSURLSession/TrustKit (iOS), OkHttp CertificatePinner (Android)
+
+    4. Pin against your CDN''s intermediate CA if using CloudFlare/Fastly
+
+    5. Disable pinning in debug builds for development with proxies
+
+    6. Have a remote kill switch to disable pinning if certificates rotate unexpectedly
+
+    '
+  severity: high
+  technologies:
+    lang: [swift, kotlin]
+    framework: [mobile, react_native, flutter]
+  domains:
+    domain: [architecture, mobile, security]
+  example_good: "// Android: OkHttp certificate pinning\nval client = OkHttpClient.Builder()\n    .certificatePinner(\n  \
+    \      CertificatePinner.Builder()\n            .add(\n                \"api.myapp.com\",\n                \"sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\
+    , // current\n                \"sha256/BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\", // backup\n            )\n    \
+    \        .build()\n    )\n    .build()\n\n// iOS: TrustKit configuration\n// Info.plist or programmatic\nlet trustKitConfig:\
+    \ [String: Any] = [\n    kTSKSwizzleNetworkDelegates: false,\n    kTSKPinnedDomains: [\n        \"api.myapp.com\": [\n\
+    \            kTSKPublicKeyHashes: [\n                \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\", // current\n  \
+    \              \"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\", // backup\n            ],\n            kTSKEnforcePinning:\
+    \ true,\n            kTSKIncludeSubdomains: true,\n        ]\n    ]\n]\n\n// Debug builds: disable pinning for proxy debugging\n\
+    #if DEBUG\nlet client = OkHttpClient.Builder().build() // no pinning\n#else\nlet client = pinnedClient // production pinning\n\
+    #endif\n\n// Remote kill switch: server can signal to disable pinning\n// Fetch pin config from a DIFFERENT pinned endpoint\
+    \ or embed update schedule\n"
+  example_bad: "// No certificate pinning — MITM with Charles Proxy trivial\nval client = OkHttpClient.Builder().build()\n\
+    // Anyone on the same network with a proxy can read all API traffic\n\n// Pinning the full certificate — breaks on certificate\
+    \ rotation\nval client = OkHttpClient.Builder()\n    .certificatePinner(\n        CertificatePinner.Builder()\n      \
+    \      .add(\"api.myapp.com\", \"sha256/exactCertHash\") // only one pin\n            .build()\n    )\n    .build()\n\
+    // Certificate renews → app stops working → emergency app update needed\n\n// Disabled security for all builds — shipped\
+    \ to production\nval client = OkHttpClient.Builder()\n    .hostnameVerifier { _, _ -> true } // accepts ANY certificate\n\
+    \    .build()\n"
+  when_applies: Projects using React Native, Flutter cross-platform apps, Swift/iOS development, or Kotlin/Android development
+  when_not_applies: web-only applications, backend services, desktop applications
+  sources: ["https://developer.android.com/privacy-and-security/security-ssl"]
+- id: CR-MOB-009
+  text: Detect rooted/jailbroken devices and implement appropriate security responses for sensitive operations
+  why: 'Rooted (Android) and jailbroken (iOS) devices bypass the OS security sandbox, giving any app or process access to
+    all other apps'' data, Keychain entries, and file systems. On a rooted device, an attacker can: read Keychain/Keystore
+    credentials, inject code into your app process, intercept all function calls (Frida), and modify app behavior at runtime.
+    For banking, payment, and authentication apps, running on a compromised device is a security risk that must be mitigated.
+    The response should be proportional: warn for low-risk apps, restrict for medium-risk, block for high-risk operations.
+
+    '
+  how_to_do_right: '1. Detect root/jailbreak using multiple heuristics (no single check is reliable)
+
+    2. Check for: su binary, Magisk, Cydia, substrate, custom recovery, SELinux status
+
+    3. Response levels: WARN (show notice), RESTRICT (disable sensitive features), BLOCK (deny access)
+
+    4. Allow override for development builds
+
+    5. Combine with integrity attestation (Play Integrity API, App Attest)
+
+    6. Never trust client-side checks alone — verify server-side too
+
+    '
+  severity: medium
+  technologies:
+    lang: [swift, kotlin]
+    framework: [mobile, react_native, flutter]
+  domains:
+    domain: [architecture, mobile, security]
+  example_good: "// Multi-heuristic root/jailbreak detection\nclass DeviceIntegrityChecker {\n    data class IntegrityResult(\n\
+    \        val isCompromised: Boolean,\n        val riskLevel: RiskLevel,\n        val detections: List<String>,\n    )\n\
+    \n    enum class RiskLevel { CLEAN, LOW, MEDIUM, HIGH }\n\n    fun check(): IntegrityResult {\n        val detections\
+    \ = mutableListOf<String>()\n\n        // Heuristic 1: Check for known root binaries\n        val rootBinaries = listOf(\"\
+    /system/bin/su\", \"/system/xbin/su\",\n            \"/sbin/su\", \"/data/local/xbin/su\")\n        if (rootBinaries.any\
+    \ { File(it).exists() }) {\n            detections.add(\"ROOT_BINARY_FOUND\")\n        }\n\n        // Heuristic 2: Check\
+    \ for root management apps\n        val rootApps = listOf(\"com.topjohnwu.magisk\", \"eu.chainfire.supersu\")\n      \
+    \  if (rootApps.any { isPackageInstalled(it) }) {\n            detections.add(\"ROOT_APP_INSTALLED\")\n        }\n\n \
+    \       // Heuristic 3: Check build tags\n        if (Build.TAGS?.contains(\"test-keys\") == true) {\n            detections.add(\"\
+    TEST_KEYS_BUILD\")\n        }\n\n        // Heuristic 4: Check SELinux status\n        if (getSelinuxStatus() == \"permissive\"\
+    ) {\n            detections.add(\"SELINUX_PERMISSIVE\")\n        }\n\n        val riskLevel = when (detections.size) {\n\
+    \            0 -> RiskLevel.CLEAN\n            1 -> RiskLevel.LOW\n            2 -> RiskLevel.MEDIUM\n            else\
+    \ -> RiskLevel.HIGH\n        }\n\n        return IntegrityResult(\n            isCompromised = detections.isNotEmpty(),\n\
+    \            riskLevel = riskLevel,\n            detections = detections,\n        )\n    }\n}\n\n// Response based on\
+    \ risk level\nfun handleIntegrityResult(result: IntegrityResult) {\n    when (result.riskLevel) {\n        RiskLevel.CLEAN\
+    \ -> {} // proceed normally\n        RiskLevel.LOW -> showSecurityWarning() // informational\n        RiskLevel.MEDIUM\
+    \ -> disableSensitiveFeatures() // restrict payments\n        RiskLevel.HIGH -> blockAppAccess() // deny access for banking\
+    \ app\n    }\n    // ALWAYS report to server — don't rely on client-side enforcement alone\n    api.reportDeviceIntegrity(result)\n\
+    }\n"
+  example_bad: "// Single check — easily bypassed by Magisk Hide\nfun isRooted(): Boolean {\n    return File(\"/system/bin/su\"\
+    ).exists()\n    // Magisk hides su binary from detection — always returns false\n}\n\n// Block all rooted devices — punishes\
+    \ legitimate users\nif (isRooted()) {\n    showError(\"This app cannot run on rooted devices\")\n    finish()\n    //\
+    \ Developers, security researchers, custom ROM users all blocked\n    // Single bypass defeats the entire check\n}\n\n\
+    // No server-side verification — client check trivially patched out\n// Attacker patches isRooted() to return false →\
+    \ full access\n"
+  when_applies: Projects using React Native, Flutter cross-platform apps, Swift/iOS development, or Kotlin/Android development
+  when_not_applies: web-only applications, backend services, desktop applications
+  sources: ["https://developer.android.com/privacy-and-security/security-tips"]
+- id: CR-MOB-010
+  text: Use staged rollouts (1% -> 10% -> 50% -> 100%) with crash rate monitoring — never release to 100% immediately
+  why: 'A bug that crashes 5% of sessions deployed to 100% of users affects millions of users simultaneously. Staged rollouts
+    limit blast radius: at 1%, the same bug affects only 1% of users, giving time to detect, diagnose, and halt before wider
+    rollout. Both Apple (phased release) and Google Play (staged rollout) support this natively. Combined with real-time crash
+    monitoring (Crashlytics, Sentry), teams can set automatic halt rules: if crash rate exceeds 1% during rollout, halt automatically.
+    Without staged rollouts, every release is a gamble with the entire user base.
+
+    '
+  how_to_do_right: '1. Stage 1: 1% for 24 hours — catch critical crashes and ANRs
+
+    2. Stage 2: 10% for 48 hours — catch edge case crashes and performance regressions
+
+    3. Stage 3: 50% for 24 hours — validate at scale
+
+    4. Stage 4: 100% — full release
+
+    5. Monitor: crash rate, ANR rate, uninstall rate, star ratings at each stage
+
+    6. Automatic halt: if crash-free rate drops below 99.5%, pause rollout
+
+    '
+  severity: high
+  technologies:
+    lang: [swift, kotlin]
+    framework: [mobile, react_native, flutter]
+  domains:
+    domain: [architecture, mobile, operations, devops]
+    concern: [release]
+  example_good: "// Release checklist with staged rollout\n# release_playbook.yaml\nrelease:\n  pre_checks:\n    - all_tests_pass:\
+    \ true\n    - no_p0_bugs: true\n    - performance_baseline_met: true\n    - security_review_complete: true\n\n  staged_rollout:\n\
+    \    stage_1:\n      percentage: 1\n      duration_hours: 24\n      halt_criteria:\n        crash_free_rate_below: 99.5\n\
+    \        anr_rate_above: 0.5\n        uninstall_spike: 2x_baseline\n\n    stage_2:\n      percentage: 10\n      duration_hours:\
+    \ 48\n      halt_criteria:\n        crash_free_rate_below: 99.5\n        negative_reviews_spike: 3x_baseline\n\n    stage_3:\n\
+    \      percentage: 50\n      duration_hours: 24\n      halt_criteria:\n        crash_free_rate_below: 99.7\n\n    stage_4:\n\
+    \      percentage: 100\n\n  rollback_plan:\n    - halt_rollout_immediately\n    - push_hotfix_to_existing_users\n    -\
+    \ notify_affected_users\n\n# Monitoring dashboard alerts\n# Crashlytics/Sentry alert: crash rate > 0.5% for 1 hour\n#\
+    \ Google Play Console: staged rollout halt recommendation\n"
+  example_bad: '# Ship to 100% immediately
+
+    # Monday 5pm: "LGTM, ship it" → 100% rollout
+
+    # Monday 5:30pm: crash rate spikes to 15%
+
+    # Monday 6pm: team already left for the day
+
+    # Tuesday 9am: 50,000 1-star reviews, app ranking dropped
+
+    # Tuesday 10am: emergency hotfix, 24-hour App Store review
+
+
+    # No monitoring — crashes discovered from user reviews
+
+    # "App crashes on startup since update" — 500 reviews before team notices
+
+    '
+  when_applies: Projects using React Native, Flutter cross-platform apps, Swift/iOS development, or Kotlin/Android development
+  when_not_applies: web-only applications, backend services, desktop applications
+  sources: ["https://developer.android.com/studio/publish/versioning", "https://developer.apple.com/help/app-store-connect/reference/platform-version-information"]
+- id: CR-MOB-011
+  text: Use semantic versioning with proper build numbers — separate user-visible version from internal build tracking
+  why: 'Mobile apps have two version identifiers: user-visible version (1.2.3) shown in the app store, and build number (456)
+    used for internal tracking. Semantic versioning (major.minor. patch) communicates breaking changes (major), new features
+    (minor), and bug fixes (patch) to users and tooling. The build number must be monotonically increasing for app store acceptance
+    (both Apple and Google reject uploads with a build number <= the previous one). Without proper versioning, teams can''t
+    track which build a crash report came from, can''t roll back to a specific version, and waste hours debugging "which build
+    is this?"
+
+    '
+  how_to_do_right: '1. User version: MAJOR.MINOR.PATCH (semantic versioning)
+
+    2. Build number: monotonically increasing integer (CI build number)
+
+    3. Automate version bumping in CI (never manual)
+
+    4. Tag git commits with version: git tag v1.2.3
+
+    5. Include version in crash reports and analytics
+
+    6. Document what changed in each version (changelog)
+
+    '
+  severity: medium
+  technologies:
+    lang: [swift, kotlin]
+    framework: [mobile, react_native, flutter]
+  domains:
+    domain: [architecture, mobile, operations, devops]
+    concern: [release]
+  example_good: "// Automated versioning in CI\n# .github/workflows/release.yml\n# version_name: from package.json/pubspec.yaml/build.gradle\n\
+    # version_code: CI build number (auto-incremented)\n\n# Android: build.gradle.kts\nandroid {\n    defaultConfig {\n  \
+    \      versionName = project.findProperty(\"VERSION_NAME\") as String? ?: \"1.0.0\"\n        versionCode = (project.findProperty(\"\
+    VERSION_CODE\") as String?)?.toInt()\n            ?: System.getenv(\"CI_BUILD_NUMBER\")?.toInt()\n            ?: 1\n \
+    \   }\n}\n\n# iOS: automated with agvtool or Xcode Cloud\n# agvtool new-marketing-version 1.2.3\n# agvtool new-version\
+    \ -all $CI_BUILD_NUMBER\n\n# React Native: package.json + CI\n// package.json\n{\n  \"version\": \"1.2.3\"\n}\n// CI:\
+    \ BUILD_NUMBER=$GITHUB_RUN_NUMBER\n\n# Flutter: pubspec.yaml\n# version: 1.2.3+456  (name+build)\n\n// Version tracking\
+    \ in crash reports\nclass AppInfo {\n    val versionName: String  // \"1.2.3\"\n    val buildNumber: Int     // 456\n\
+    \    val gitCommit: String    // \"abc1234\"\n\n    fun fullVersion(): String = \"$versionName ($buildNumber)\"\n}\n\n\
+    // Changelog\n// v1.2.3 (2026-02-17)\n// - Fixed: Crash on login when biometric hardware unavailable\n// - Added: Pull-to-refresh\
+    \ on feed\n// - Changed: Updated payment flow for PSD2 compliance\n"
+  example_bad: '// Manual version bumping — forgotten, inconsistent
+
+    versionName = "1.0" // never updated, same "version" for 6 months
+
+    versionCode = 1     // must manually increment — often forgotten
+
+
+    // No build number in crash reports
+
+    // Crash report: "version 1.0" — which of 50 builds is this?
+
+
+    // Non-semantic versioning
+
+    versionName = "20260217" // date-based — is this a breaking change?
+
+    versionName = "2.0.0.1.beta.3" // non-standard, tools can''t parse
+
+    '
+  when_applies: Projects using React Native, Flutter cross-platform apps, Swift/iOS development, or Kotlin/Android development
+  when_not_applies: web-only applications, backend services, desktop applications
+  sources: ["https://semver.org/"]
+- id: CR-MOB-012
+  text: Integrate crash reporting (Crashlytics/Sentry) from day one with proper symbolication and breadcrumbs
+  why: 'Production crashes are invisible without crash reporting — users silently switch to a competitor. Apple and Google
+    provide crash data but with 24-48 hour delay and limited context. Crashlytics/Sentry provide real-time crash alerts, automatic
+    grouping of similar crashes, affected user count, stack traces with source maps (JS) or dSYMs (native), and breadcrumbs
+    showing user actions leading to the crash. Without symbolication, stack traces show obfuscated addresses (0x00007fff2e3d4a00)
+    instead of readable function names. Without breadcrumbs, engineers can''t reproduce the crash because they don''t know
+    what the user did before it happened.
+
+    '
+  how_to_do_right: '1. Initialize crash reporting in Application/AppDelegate BEFORE any other SDK
+
+    2. Upload dSYMs (iOS) and ProGuard/R8 mapping files (Android) on every build
+
+    3. Upload source maps for JS-based frameworks (React Native, Flutter web)
+
+    4. Add breadcrumbs for user actions: screen views, button taps, API calls
+
+    5. Set user identifier for affected user lookup (anonymized)
+
+    6. Set up alerts: new crash type → Slack/PagerDuty, crash rate spike → on-call
+
+    '
+  severity: high
+  technologies:
+    lang: [swift, kotlin]
+    framework: [mobile, react_native, flutter]
+  domains:
+    domain: [architecture, mobile, observability]
+    concern: [monitoring, release]
+  example_good: "// Android: Crashlytics with breadcrumbs\n@HiltAndroidApp\nclass MyApplication : Application() {\n    override\
+    \ fun onCreate() {\n        super.onCreate()\n\n        // Initialize FIRST — catches crashes in other SDK inits\n   \
+    \     FirebaseCrashlytics.getInstance().apply {\n            setCrashlyticsCollectionEnabled(!BuildConfig.DEBUG)\n   \
+    \         setUserId(anonymizedUserId) // not PII\n        }\n    }\n}\n\n// Add breadcrumbs throughout the app\nclass\
+    \ AnalyticsTracker {\n    fun trackScreenView(screenName: String) {\n        FirebaseCrashlytics.getInstance()\n     \
+    \       .log(\"Screen: $screenName\")\n    }\n\n    fun trackAction(action: String, params: Map<String, String>) {\n \
+    \       FirebaseCrashlytics.getInstance()\n            .log(\"Action: $action ${params.entries.joinToString()}\")\n  \
+    \  }\n\n    fun trackApiCall(endpoint: String, statusCode: Int) {\n        FirebaseCrashlytics.getInstance()\n       \
+    \     .log(\"API: $endpoint → $statusCode\")\n    }\n}\n\n// Custom keys for debugging context\nfun setUserContext(user:\
+    \ User) {\n    FirebaseCrashlytics.getInstance().apply {\n        setCustomKey(\"subscription_tier\", user.tier.name)\n\
+    \        setCustomKey(\"account_age_days\", user.accountAgeDays)\n        setCustomKey(\"device_storage_low\", isStorageLow())\n\
+    \    }\n}\n\n// CI: upload symbols automatically\n// Android: mapping.txt uploaded by Gradle plugin\n// iOS: dSYMs uploaded\
+    \ by Fastlane or Xcode Cloud\n// React Native: source maps uploaded by sentry-cli\n"
+  example_bad: '// No crash reporting — crashes discovered from app store reviews
+
+    // "App crashes on startup" — no stack trace, no context, no repro steps
+
+
+    // Crash reporting without symbols — unreadable traces
+
+    // Caused by: 0x00007fff2e3d4a00 (which function? which file?)
+
+    // Forgot to upload mapping.txt → obfuscated R8 names only
+
+
+    // No breadcrumbs — can''t reproduce
+
+    // Stack trace shows crash in NetworkManager.fetch()
+
+    // But WHAT was being fetched? WHICH screen? WHAT was the user doing?
+
+    // Without breadcrumbs: 3 days debugging → "works on my device"
+
+    '
+  when_applies: Projects using React Native, Flutter cross-platform apps, Swift/iOS development, or Kotlin/Android development
+  when_not_applies: web-only applications, backend services, desktop applications
+  sources: ["https://firebase.google.com/docs/crashlytics"]
+- id: CR-MOB-013
+  text: Use OTA (Over-The-Air) updates for JavaScript/Dart bundle changes to ship fixes without app store review — but never
+    for native code changes
+  why: 'App store review takes 24-72 hours (Apple) or 2-8 hours (Google). For critical bug fixes in JS/Dart code, this delay
+    is unacceptable. OTA update systems (CodePush for React Native, Shorebird for Flutter) push updated bundles directly to
+    devices, bypassing the app store. Users get the fix on next app launch. However, OTA updates CANNOT change native code
+    (Objective-C, Java, Kotlin, Swift) — only JavaScript/Dart bundles. Apple explicitly prohibits OTA updates that change
+    app behavior significantly (adding features, changing UI substantially). Use OTA for bug fixes and minor tweaks only,
+    or risk app store rejection.
+
+    '
+  how_to_do_right: '1. OTA for: bug fixes, copy changes, small UI tweaks, config updates
+
+    2. NOT for: new features, native module changes, permission changes
+
+    3. Staged rollout for OTA too: 10% → 50% → 100%
+
+    4. Mandatory update for critical security fixes
+
+    5. Optional update for minor improvements (user can defer)
+
+    6. Always test OTA update path — fresh install AND update-over-existing
+
+    '
+  severity: medium
+  technologies:
+    framework: [mobile, react_native, flutter]
+  domains:
+    domain: [architecture, mobile, operations, devops]
+    concern: [release]
+  example_good: "// React Native: CodePush configuration\nimport codePush from 'react-native-code-push';\n\nconst codePushOptions\
+    \ = {\n  // Check on app resume (not just startup)\n  checkFrequency: codePush.CheckFrequency.ON_APP_RESUME,\n  // Install\
+    \ on next restart (not disruptive)\n  installMode: codePush.InstallMode.ON_NEXT_RESTART,\n};\n\nfunction App() {\n  const\
+    \ [updateAvailable, setUpdateAvailable] = useState(false);\n\n  useEffect(() => {\n    codePush.checkForUpdate().then((update)\
+    \ => {\n      if (update) {\n        if (update.isMandatory) {\n          // Critical fix — install immediately\n    \
+    \      codePush.sync({\n            installMode: codePush.InstallMode.IMMEDIATE,\n            mandatoryInstallMode: codePush.InstallMode.IMMEDIATE,\n\
+    \          });\n        } else {\n          // Optional — show banner, install on next restart\n          setUpdateAvailable(true);\n\
+    \        }\n      }\n    });\n  }, []);\n\n  return (\n    <>\n      {updateAvailable && (\n        <UpdateBanner onDismiss={()\
+    \ => setUpdateAvailable(false)} />\n      )}\n      <AppRoot />\n    </>\n  );\n}\n\nexport default codePush(codePushOptions)(App);\n\
+    \n// Release: staged OTA deployment\n// appcenter codepush release-react -a MyOrg/MyApp -d Production --rollout 10\n//\
+    \ Monitor crash rate...\n// appcenter codepush patch -a MyOrg/MyApp Production --rollout 50\n// appcenter codepush patch\
+    \ -a MyOrg/MyApp Production --rollout 100\n"
+  example_bad: "// OTA for native code changes — will crash\n// Changed a native module → pushed via CodePush\n// JS bundle\
+    \ expects new native method → native doesn't have it → crash\n\n// OTA for new features — Apple rejects on next review\n\
+    // \"Your app was found to be using CodePush to significantly change\n//  app functionality after review\" — App Store\
+    \ Guideline 3.3.2\n\n// Immediate mandatory update for minor change — bad UX\ncodePush.sync({\n  installMode: codePush.InstallMode.IMMEDIATE,\n\
+    \  mandatoryInstallMode: codePush.InstallMode.IMMEDIATE,\n});\n// App restarts mid-use for a copy change — user loses\
+    \ context\n"
+  when_applies: Projects using React Native or Flutter cross-platform apps
+  when_not_applies: web-only applications, backend services, desktop applications. projects not using React Native or Flutter
+  sources: ["https://microsoft.github.io/code-push/"]

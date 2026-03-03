@@ -1,0 +1,364 @@
+layer: rules
+technology: SRE
+domain: api_design
+knowledge:
+- id: CR-SRE-API-001
+  text: API versioning must be explicit and immutable — once an API version is published, its behavior must not change. New behavior requires a new version. If v1 returns field X as a string and you want
+    it to be an integer, create v2. Never silently change v1.
+  why: 'Google''s internal API design guides (reflected in their public AIP guidelines and SRE practices) treat API versioning as a reliability contract. A published API version is a promise: clients that
+    work today will work tomorrow. Breaking changes are the #1 cause of cascading failures in microservice architectures — service A updates its API, service B (which depends on it) breaks, service C (which
+    depends on B) cascades. Google''s rule: published APIs are immutable. All changes are additive (new fields, new endpoints) or require a new version. Deprecation of old versions follows a published timeline
+    with monitoring of remaining consumers.
+
+    '
+  how_to_do_right: '1. Include version in URL path (/v1/users) or header (API-Version: 2024-01-15). URL path is simpler to debug and cache.
+
+    2. Never remove or rename fields in an existing version. Only add new fields. Clients must ignore unknown fields.
+
+    3. Never change the type or semantics of an existing field. If "count" was a string, it stays a string in this version.
+
+    4. Support at least 2 concurrent versions (current + previous). Monitor usage of old versions to plan deprecation.
+
+    5. Publish a deprecation timeline: "v1 will be removed on 2025-06-01. Migrate to v2 by then."
+
+    6. Monitor per-version usage: if v1 still has 40% of traffic, you cannot deprecate it regardless of timeline.
+
+    '
+  example_good: "from fastapi import FastAPI, APIRouter\n\napp = FastAPI()\nv1_router = APIRouter(prefix='/v1')\nv2_router = APIRouter(prefix='/v2')\n\n@v1_router.get('/users/{user_id}')\ndef get_user_v1(user_id: str):\n    user = db.get_user(user_id)\n    return {'id': user.id, 'name': user.name, 'count': str(user.count)}  # count is string in v1\n\n@v2_router.get('/users/{user_id}')\ndef get_user_v2(user_id: str):\n    user = db.get_user(user_id)\n    return {'id': user.id, 'name': user.name, 'count': user.count, 'email': user.email}  # count is int in v2, email added\n\napp.include_router(v1_router)\napp.include_router(v2_router)\n\n# Monitor per-version usage for deprecation planning\n# v1 deprecation: announced 2025-01-01, removal 2025-06-01\n"
+  example_bad: "from fastapi import FastAPI\n\napp = FastAPI()\n\n@app.get('/users/{user_id}')\ndef get_user(user_id: str):\n    user = db.get_user(user_id)\n    return {'id': user.id, 'name': user.name, 'count': user.count}  # Changed count from str to int!\n    # All existing clients that parse count as string now break\n    # No version in URL — no way for clients to pin to old behavior\n    # Silent breaking change deployed on Friday afternoon\n"
+  when_applies: "When publishing any API that will have external consumers — version explicitly and never change behavior of published versions."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [grpc, http]
+  domains:
+    domain: [architecture, reliability]
+    concern: [api_design, versioning]
+  sources:
+  - url: https://sre.google/sre-book/reliable-product-launches/
+    title: 'Google SRE Book — Chapter 27: Reliable Product Launches at Scale'
+  validation_status: cross_checked
+- id: CR-SRE-API-002
+  text: Idempotency keys for all mutating API operations — clients must be able to safely retry any POST/PUT/DELETE without causing duplicate side effects. Without idempotency, network failures force clients
+    to choose between "maybe duplicated" and "maybe lost."
+  why: 'Google designs all mutating APIs to be idempotent because network unreliability is guaranteed in distributed systems. The scenario: client sends POST /payments, server processes it, response is
+    lost in transit. Client doesn''t know if the payment was created. Without idempotency, the client has two bad choices: retry (risking duplicate payment) or don''t retry (risking lost payment). With
+    idempotency keys, the client retries safely — the server recognizes the duplicate request and returns the original response. Google implements this via client-generated idempotency keys (UUIDs) sent
+    in request headers. The server stores the key→response mapping for a window (24-72 hours).
+
+    '
+  how_to_do_right: '1. Accept Idempotency-Key header on all POST/PUT/DELETE endpoints. Reject requests without it for critical operations.
+
+    2. Store idempotency key → response mapping for 24-72 hours. Return cached response on duplicate key.
+
+    3. Use database-level uniqueness constraints as backup: UNIQUE(idempotency_key) prevents duplicates even under race conditions.
+
+    4. The idempotency key scope is per-client, per-operation. Different clients can use the same key value without conflict.
+
+    5. Return the original response (including original status code) on duplicate requests. Don''t return 409 Conflict.
+
+    6. Document which operations are idempotent and which require explicit idempotency keys.
+
+    '
+  example_good: "import uuid\nimport json\nfrom fastapi import FastAPI, Header, HTTPException\n\napp = FastAPI()\nidempotency_store = {}  # In production: Redis with 24h TTL\n\n@app.post('/v1/payments')\ndef create_payment(amount: float, recipient: str, idempotency_key: str = Header(...)):\n    # Check for duplicate\n    cached = idempotency_store.get(idempotency_key)\n    if cached:\n        return cached  # Return original response, same status code\n\n    # Process payment\n    payment_id = str(uuid.uuid4())\n    db.execute(\n        'INSERT INTO payments (id, idempotency_key, amount, recipient) '\n        'VALUES (%s, %s, %s, %s) ON CONFLICT (idempotency_key) DO NOTHING',\n        (payment_id, idempotency_key, amount, recipient)\n    )\n    result = {'payment_id': payment_id, 'status': 'created'}\n    idempotency_store[idempotency_key] = result  # Cache for 24h\n    return result\n\n# Client usage:\n# key = str(uuid.uuid4())\n# response = requests.post('/v1/payments', json={...}, headers={'Idempotency-Key': key})\n# Safe to retry with same key if response is lost\n"
+  example_bad: "from fastapi import FastAPI\n\napp = FastAPI()\n\n@app.post('/payments')\ndef create_payment(amount: float, recipient: str):\n    # No idempotency key — retries create duplicates\n    payment_id = str(uuid.uuid4())\n    db.execute('INSERT INTO payments (id, amount, recipient) VALUES (%s, %s, %s)',\n               (payment_id, amount, recipient))\n    return {'payment_id': payment_id}\n    # Network drops response → client retries → duplicate payment\n    # User charged twice with no safe way to retry\n"
+  when_applies: "When designing any mutating API endpoint (POST/PUT/DELETE) — idempotency keys are mandatory for safe client retries."
+  severity: critical
+  technologies:
+    lang: [general, go, python]
+    platform: [grpc, http]
+  domains:
+    domain: [architecture, reliability]
+    concern: [api_design, distributed_systems]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-API-003
+  text: Pagination must be cursor-based, not offset-based, for any dataset that can change between requests. Offset pagination breaks when items are inserted or deleted between pages — users see duplicates
+    or miss items entirely.
+  why: 'Google''s API design guides mandate cursor-based pagination for all dynamic datasets. Offset pagination (page=2, limit=20 → OFFSET 20 LIMIT 20) assumes the dataset doesn''t change between requests.
+    If an item is inserted at position 5 between page 1 and page 2, item 20 (which was the last item on page 1) shifts to position 21 and appears again on page 2. If an item is deleted, position 21 shifts
+    to 20 and is never seen. Cursor pagination (next_cursor=abc123) anchors to a specific item, not a position. The cursor encodes "items after this one" which is stable regardless of insertions or deletions
+    elsewhere in the dataset.
+
+    '
+  how_to_do_right: '1. Use opaque cursor tokens (base64-encoded composite keys), not raw database IDs. This allows changing the implementation without breaking clients.
+
+    2. Return next_cursor in every paginated response. When next_cursor is null/absent, there are no more pages.
+
+    3. Cursor should encode: last item''s sort key + direction + any filter state. Don''t just encode the item ID.
+
+    4. Support page_size parameter (default 20, max 100). Reject requests for more than max.
+
+    5. Never return total_count for large datasets — it requires a full count query which is expensive. Return has_more: true/false instead.
+
+    6. Cursors should expire after a reasonable time (1-24 hours). Return a clear error when an expired cursor is used.
+
+    '
+  example_good: "import base64\nimport json\nfrom fastapi import FastAPI, Query\nfrom typing import Optional\n\napp = FastAPI()\n\n@app.get('/v1/users')\ndef list_users(page_size: int = Query(default=20, le=100), cursor: Optional[str] = None):\n    if cursor:\n        decoded = json.loads(base64.b64decode(cursor))\n        last_id = decoded['last_id']\n        users = db.query('SELECT * FROM users WHERE id > %s ORDER BY id LIMIT %s', (last_id, page_size + 1))\n    else:\n        users = db.query('SELECT * FROM users ORDER BY id LIMIT %s', (page_size + 1,))\n\n    has_more = len(users) > page_size\n    users = users[:page_size]\n\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.b64encode(json.dumps({'last_id': users[-1]['id']}).encode()).decode()\n\n    return {\n        'users': users,\n        'next_cursor': next_cursor,\n        'has_more': has_more,\n        # No total_count — would require expensive COUNT(*)\n    }\n"
+  example_bad: "from fastapi import FastAPI\n\napp = FastAPI()\n\n@app.get('/users')\ndef list_users(page: int = 1, limit: int = 20):\n    offset = (page - 1) * limit\n    users = db.query('SELECT * FROM users ORDER BY id LIMIT %s OFFSET %s', (limit, offset))\n    total = db.query('SELECT COUNT(*) FROM users')[0]  # Expensive!\n    return {'users': users, 'total': total, 'page': page}\n    # If user is inserted between page 1 and page 2 requests:\n    # Item 20 shifts to position 21 and appears on BOTH pages\n    # If user is deleted, item 21 shifts to 20 and is NEVER seen\n"
+  when_applies: "When implementing list/search endpoints that return dynamic datasets — use cursor-based pagination to prevent duplicate/missing items."
+  severity: medium
+  technologies:
+    lang: [general]
+    platform: [postgresql, http]
+  domains:
+    domain: [architecture, performance, reliability]
+    concern: [api_design]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-API-004
+  text: Rate limiting must return actionable information — 429 responses without Retry-After headers are useless. The client needs to know WHEN to retry, not just that it was rejected. Include remaining
+    quota, reset time, and limit in every response.
+  why: 'Google''s overload handling (Chapter 21) describes rate limiting as a reliability mechanism that must help clients self-regulate. A bare 429 response forces clients to guess: retry in 1 second?
+    10 seconds? 60 seconds? Most clients default to aggressive retry, which worsens the overload. Informative rate limit headers enable cooperative load management: clients know their quota, can distribute
+    requests evenly, and know exactly when to retry. Google''s API guidelines mandate: X-RateLimit-Limit (max requests per window), X-RateLimit-Remaining (requests left in current window), X-RateLimit-Reset
+    (when the window resets), and Retry-After on 429 responses.
+
+    '
+  how_to_do_right: '1. Return rate limit headers on EVERY response (not just 429s): X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset.
+
+    2. On 429 responses, always include Retry-After header (seconds until retry is safe).
+
+    3. Use sliding window algorithm (not fixed window). Fixed windows cause burst patterns at window boundaries.
+
+    4. Implement per-client rate limits (not just global). Use API keys or client certificates for identification.
+
+    5. Different rate limits for different endpoints: read-heavy endpoints get higher limits, write endpoints get lower limits.
+
+    6. Log rate limit hits as a reliability signal. Frequent 429s from a specific client = they need a higher limit or architectural change.
+
+    '
+  example_good: "from fastapi import FastAPI, Request, Response\nimport time\n\napp = FastAPI()\n\nclass RateLimiter:\n    def __init__(self, limit: int, window_seconds: int):\n        self.limit = limit\n        self.window = window_seconds\n\n    def check(self, client_id: str) -> dict:\n        key = f'rate:{client_id}:{int(time.time()) // self.window}'\n        current = redis.incr(key)\n        if current == 1:\n            redis.expire(key, self.window)\n        remaining = max(0, self.limit - current)\n        reset = (int(time.time()) // self.window + 1) * self.window\n        return {'allowed': current <= self.limit, 'remaining': remaining, 'reset': reset}\n\n@app.middleware('http')\nasync def rate_limit_middleware(request: Request, call_next):\n    client_id = request.headers.get('X-API-Key', request.client.host)\n    result = rate_limiter.check(client_id)\n    if not result['allowed']:\n        return Response(\n            status_code=429,\n            headers={\n                'X-RateLimit-Limit': str(rate_limiter.limit),\n                'X-RateLimit-Remaining': '0',\n                'X-RateLimit-Reset': str(result['reset']),\n                'Retry-After': str(result['reset'] - int(time.time())),\n            },\n            content='Rate limit exceeded',\n        )\n    response = await call_next(request)\n    response.headers['X-RateLimit-Limit'] = str(rate_limiter.limit)\n    response.headers['X-RateLimit-Remaining'] = str(result['remaining'])\n    response.headers['X-RateLimit-Reset'] = str(result['reset'])\n    return response\n"
+  example_bad: "from fastapi import FastAPI\n\napp = FastAPI()\n\n@app.get('/api/data')\ndef get_data():\n    # No rate limiting at all\n    # Or worse: returns bare 429 with no information\n    if over_limit():\n        return Response(status_code=429)  # No Retry-After, no remaining, no reset\n        # Client has no idea when to retry — guesses 1 second\n        # Aggressive retry makes overload worse\n    return {'data': fetch_data()}\n"
+  when_applies: "When implementing rate limiting on any API — 429 responses must include Retry-After and rate limit headers to enable cooperative client behavior."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kubernetes, grpc, http, load_balancer]
+  domains:
+    domain: [architecture, reliability, security]
+    concern: [api_design, fault_tolerance, rate_limiting]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-API-005
+  text: API error responses must be structured, machine-readable, and actionable. A 500 response with "Internal Server Error" tells the client nothing useful. Return a structured error with code, message,
+    details, and suggested action.
+  why: 'Google''s API error model (used across all Google Cloud APIs) provides a structured error format because unstructured errors create cascading debugging costs. When service A calls service B and
+    gets "Internal Server Error," A cannot distinguish between: a transient error (retry), a client error (fix the request), a permanent error (give up), or a capacity error (back off). Structured errors
+    enable automated error handling: retry on transient errors, alert on permanent errors, back off on capacity errors. The cost of unstructured errors compounds across service chains — each service in
+    the chain adds its own "something went wrong" wrapper until the root cause is completely obscured.
+
+    '
+  how_to_do_right: '1. Use a consistent error format: {"error": {"code": "RESOURCE_NOT_FOUND", "message": "User 123 not found", "details": [...], "retry_after": null}}.
+
+    2. Error codes must be machine-readable constants (RESOURCE_NOT_FOUND), not HTTP status descriptions ("Not Found").
+
+    3. Include whether the error is retryable: transient errors (UNAVAILABLE, DEADLINE_EXCEEDED) vs permanent errors (NOT_FOUND, INVALID_ARGUMENT).
+
+    4. Include request ID in every error response for debugging: {"error": {..., "request_id": "req_abc123"}}.
+
+    5. NEVER expose internal details in production error responses: no stack traces, no database errors, no internal service names.
+
+    6. Log the full error server-side (with stack trace) and reference via request_id. The client gets the safe summary, operators get the full details.
+
+    '
+  example_good: "from fastapi import FastAPI, HTTPException\nfrom pydantic import BaseModel\nimport uuid\nimport logging\n\nlogger = logging.getLogger(__name__)\napp = FastAPI()\n\nclass ErrorResponse(BaseModel):\n    code: str  # Machine-readable: RESOURCE_NOT_FOUND, INVALID_ARGUMENT\n    message: str  # Human-readable\n    request_id: str\n    retryable: bool\n    details: list = []\n\n@app.exception_handler(Exception)\nasync def structured_error_handler(request, exc):\n    request_id = str(uuid.uuid4())\n    # Log full details server-side\n    logger.error(f'[{request_id}] {exc}', exc_info=True)\n    # Return safe summary to client\n    return JSONResponse(\n        status_code=500,\n        content=ErrorResponse(\n            code='INTERNAL_ERROR',\n            message='An unexpected error occurred',\n            request_id=request_id,  # Client can reference this for support\n            retryable=True,\n        ).dict(),\n    )\n\n@app.get('/users/{user_id}')\ndef get_user(user_id: str):\n    user = db.get(user_id)\n    if not user:\n        raise HTTPException(status_code=404, detail=ErrorResponse(\n            code='RESOURCE_NOT_FOUND',\n            message=f'User {user_id} not found',\n            request_id=str(uuid.uuid4()),\n            retryable=False,\n        ).dict())\n    return user\n"
+  example_bad: "from fastapi import FastAPI\n\napp = FastAPI()\n\n@app.get('/users/{user_id}')\ndef get_user(user_id: str):\n    try:\n        return db.get(user_id)\n    except Exception as e:\n        # Unstructured error with internal details exposed\n        return {'error': str(e)}  # Might contain SQL query, internal hostname, stack trace\n        # Client can't distinguish transient vs permanent error\n        # No request_id for correlation with server logs\n        # No machine-readable error code for automated handling\n"
+  when_applies: "When designing error responses for any API — structured, machine-readable errors enable automated client error handling and faster debugging."
+  severity: high
+  technologies:
+    lang: [general, go, python]
+    platform: [grpc, http]
+  domains:
+    domain: [architecture, code_quality, reliability]
+    concern: [api_design, error_handling]
+  sources:
+  - url: https://sre.google/sre-book/effective-troubleshooting/
+    title: 'Google SRE Book — Chapter 12: Effective Troubleshooting'
+  validation_status: cross_checked
+- id: CR-SRE-API-006
+  text: Request validation must happen at the API boundary with clear, specific error messages — not deep in the business logic where the error context is lost. Validate early, fail fast, return precise
+    errors.
+  why: 'Google''s API design principle: validate inputs at the edge, not in the core. When validation happens deep in the business logic, errors are vague ("invalid input"), stack traces are unhelpful,
+    and the client has to guess which field was wrong. When validation happens at the API boundary: the error is precise ("field ''email'' must be a valid email address"), the response is fast (no wasted
+    computation), and the API contract is explicit. Edge validation also prevents injection attacks — SQL injection, command injection, and path traversal are all prevented by validating inputs before they
+    reach the system interior. Google mandates: every API parameter must have explicit type, format, range, and required/optional constraints.
+
+    '
+  how_to_do_right: '1. Validate ALL inputs at the API handler level before calling any business logic. Use schema validation (Pydantic, JSON Schema, protobuf).
+
+    2. Return ALL validation errors at once, not one at a time. If email and name are both invalid, return both errors in a single response.
+
+    3. Error messages must reference the specific field: {"field": "email", "message": "Must be a valid email address", "value": "not-an-email"}.
+
+    4. Validate: required fields present, types correct, strings within length bounds, numbers within range, enums match valid values, arrays within size limits.
+
+    5. Sanitize AFTER validation: trim whitespace, normalize unicode, escape special characters. Never trust client input even after validation.
+
+    6. Log validation failures as a signal: frequent validation errors on a specific field = the API documentation is unclear or the client has a bug.
+
+    '
+  example_good: "from pydantic import BaseModel, Field, EmailStr, validator\nfrom fastapi import FastAPI\nfrom typing import List\n\nclass CreateUserRequest(BaseModel):\n    name: str = Field(..., min_length=1, max_length=256)\n    email: EmailStr\n    age: int = Field(..., ge=0, le=150)\n    tags: List[str] = Field(default=[], max_length=20)\n\n    @validator('name')\n    def name_not_blank(cls, v):\n        if not v.strip():\n            raise ValueError('Name cannot be blank')\n        return v.strip()\n\napp = FastAPI()\n\n@app.post('/v1/users')\ndef create_user(request: CreateUserRequest):\n    # All validation happens HERE at the boundary, before business logic\n    # Pydantic returns ALL errors at once:\n    # {'detail': [{'field': 'email', 'msg': 'invalid email'}, {'field': 'age', 'msg': 'must be >= 0'}]}\n    user = user_service.create(request.name, request.email, request.age)\n    return user\n"
+  example_bad: "from fastapi import FastAPI\n\napp = FastAPI()\n\n@app.post('/users')\ndef create_user(data: dict):  # No schema validation!\n    # Validation happens deep in business logic\n    name = data.get('name')  # Could be None, int, or a 10MB string\n    email = data['email']    # KeyError if missing — raw 500 error\n    # SQL injection via name field — no sanitization\n    user = db.execute(f\"INSERT INTO users (name) VALUES ('{name}')\")\n    # Errors are vague: 'invalid input' — which field? what's wrong?\n    return user\n"
+  when_applies: "When building any API endpoint that accepts user input — validate all inputs at the API boundary with specific error messages before any business logic."
+  severity: high
+  technologies:
+    lang: [general, python, pydantic]
+    platform: [grpc, http]
+  domains:
+    domain: [architecture, reliability, security]
+    concern: [api_design, validation]
+  sources:
+  - url: https://sre.google/sre-book/reliable-product-launches/
+    title: 'Google SRE Book — Chapter 27: Reliable Product Launches at Scale'
+  validation_status: cross_checked
+- id: CR-SRE-API-007
+  text: API timeouts must be explicit in the contract — both client and server must agree on the maximum response time. If the server doesn't respond within the timeout, the client must treat it as a failure
+    and not wait indefinitely.
+  why: 'Google''s overload handling (Chapter 21) identifies missing timeouts as the #1 cause of thread/connection exhaustion. Without explicit timeouts: a slow downstream causes the client to wait indefinitely
+    → the client''s thread pool fills with waiting threads → the client stops accepting new requests → the client''s upstream fills with waiting threads → cascade. Google mandates: every RPC has a deadline
+    (absolute time, not relative duration). The deadline propagates through the entire call chain. If the original client set a 5-second deadline, and 3 seconds were spent in service A, service B has 2
+    seconds remaining — not a fresh 5 seconds. This prevents the "timeout amplification" problem where each service adds its own timeout to the chain.
+
+    '
+  how_to_do_right: '1. Set explicit timeouts on EVERY outbound call: HTTP requests, database queries, cache lookups, file operations. No call should wait indefinitely.
+
+    2. Use deadline propagation: pass the remaining deadline to downstream services. In gRPC this is automatic. In HTTP, use a custom header (X-Deadline).
+
+    3. Set server-side request timeout shorter than client timeout: if client waits 10s, server should abort at 9s (leaving 1s for response delivery).
+
+    4. Log timeout events with context: which downstream timed out, what the deadline was, how long it waited.
+
+    5. Different timeouts for different operations: read-heavy (short, 1-5s), write-heavy (medium, 5-30s), batch (long, 60-300s).
+
+    6. Monitor timeout rates per dependency. Increasing timeout rate = the dependency is degrading.
+
+    '
+  example_good: "import httpx\nimport time\nimport logging\n\nlogger = logging.getLogger(__name__)\n\nTIMEOUTS = {\n    'read': httpx.Timeout(connect=2.0, read=5.0),   # Short for reads\n    'write': httpx.Timeout(connect=2.0, read=30.0),  # Medium for writes\n    'batch': httpx.Timeout(connect=5.0, read=300.0), # Long for batch ops\n}\n\nclass ServiceClient:\n    def __init__(self, base_url: str, operation_type: str = 'read'):\n        self.client = httpx.Client(base_url=base_url, timeout=TIMEOUTS[operation_type])\n\n    def call(self, path: str, deadline: float = None) -> dict:\n        if deadline:\n            remaining = deadline - time.monotonic()\n            if remaining <= 0:\n                raise TimeoutError('Deadline already expired')\n            timeout = min(remaining - 0.1, self.client.timeout.read)  # Reserve 100ms\n        else:\n            timeout = self.client.timeout.read\n\n        try:\n            response = self.client.get(path, timeout=timeout)\n            return response.json()\n        except httpx.TimeoutException:\n            logger.warning(f'Timeout calling {path} after {timeout}s')\n            raise\n"
+  example_bad: "import requests\n\ndef call_service(url: str):\n    response = requests.get(url)  # No timeout! Waits indefinitely.\n    # If downstream is slow, this thread is blocked forever\n    # Thread pool fills with blocked threads\n    # Service stops accepting new requests\n    # Upstream services also fill their thread pools waiting\n    # Cascade: one slow service takes down the entire system\n    return response.json()\n"
+  when_applies: "When making any outbound call (HTTP, database, cache, file I/O) — every call must have an explicit timeout to prevent thread/connection exhaustion."
+  severity: critical
+  technologies:
+    lang: [general, go, python]
+    platform: [grpc, http]
+  domains:
+    domain: [architecture, reliability]
+    concern: [api_design, distributed_systems, fault_tolerance, timeout]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-API-008
+  text: Backward compatibility means additive-only changes — new fields, new endpoints, new optional parameters. Removing fields, renaming fields, changing types, making optional fields required, or changing
+    default values are ALL breaking changes.
+  why: 'Google''s API evolution principle: backward compatibility is not about what you think clients use — it''s about what clients CAN use. If you add an optional field "nickname" and one client starts
+    using it, removing "nickname" is a breaking change even if 99% of clients never used it. The full list of breaking changes that teams commonly miss: removing a field (obvious), renaming a field (client
+    sees removal + addition), changing a field type (string→number breaks parsers), making an optional field required (existing requests fail), changing default values (behavior changes silently), changing
+    error codes (client error handling breaks), changing pagination behavior, and changing sort order of results.
+
+    '
+  how_to_do_right: '1. Fields can be ADDED but never REMOVED from a response in an existing version. Clients must ignore unknown fields.
+
+    2. Request parameters can be ADDED as OPTIONAL but existing required params cannot change. New required params = new version.
+
+    3. Default values must not change — if "sort=created_at" is the default, it stays the default in this version.
+
+    4. Error codes must be stable — if an operation returns NOT_FOUND for missing resources, it must continue to do so.
+
+    5. Document all changes in a changelog. Flag any change that could affect behavior, even if technically backward-compatible.
+
+    6. Run backward-compatibility tests: serialize a response with the old schema, deserialize with the new schema — both must work.
+
+    '
+  example_good: "import json\n\n# Additive-only changes: safe evolution\n# v1 response: {\"id\": \"123\", \"name\": \"Alice\"}\n# v1 response after safe change: {\"id\": \"123\", \"name\": \"Alice\", \"email\": \"alice@example.com\"}\n# New field 'email' added — old clients ignore unknown fields\n\nclass BackwardCompatibilityTest:\n    \"\"\"Run this in CI for every API change.\"\"\"\n\n    def test_old_schema_reads_new_response(self):\n        old_schema = {'id': str, 'name': str}  # v1 client expects these\n        new_response = {'id': '123', 'name': 'Alice', 'email': 'alice@example.com'}\n        # Old client ignores 'email' — no breakage\n        for field, expected_type in old_schema.items():\n            assert field in new_response, f'Field {field} removed — BREAKING'\n            assert isinstance(new_response[field], expected_type), f'Field {field} type changed — BREAKING'\n\n    def test_new_schema_reads_old_response(self):\n        new_schema = {'id': str, 'name': str, 'email': str}  # v1 client sends these\n        old_response = {'id': '123', 'name': 'Alice'}  # old response has no email\n        for field in ['id', 'name']:  # Required fields must still exist\n            assert field in old_response\n"
+  example_bad: "# Breaking changes disguised as 'improvements'\n# Before: {\"id\": \"123\", \"name\": \"Alice\", \"count\": \"42\"}\n# After:  {\"id\": \"123\", \"name\": \"Alice\", \"count\": 42}\n# Changed count from string to int — BREAKING (parsers fail)\n\n# Before: {\"id\": \"123\", \"name\": \"Alice\", \"status\": \"active\"}\n# After:  {\"id\": \"123\", \"full_name\": \"Alice\"}  # Renamed name→full_name, removed status\n# Two breaking changes: field rename + field removal\n\n# Before: sort defaults to 'created_at'\n# After:  sort defaults to 'updated_at'\n# Changed default — clients see different order without changing their code\n"
+  when_applies: "When evolving any published API — only additive changes are safe; removing, renaming, or changing field types requires a new version."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [grpc, http]
+  domains:
+    domain: [architecture, reliability]
+    concern: [api_design, backward_compatibility, versioning]
+  sources:
+  - url: https://sre.google/sre-book/release-engineering/
+    title: 'Google SRE Book — Chapter 8: Release Engineering'
+  validation_status: cross_checked
+- id: CR-SRE-API-009
+  text: Health check endpoints must distinguish between liveness (is the process running?) and readiness (can it serve traffic?). A single /health endpoint that returns 200 when the process is alive but
+    the database is disconnected will route traffic to a broken instance.
+  why: 'Google and Kubernetes distinguish between liveness and readiness because they require different responses. Liveness failure = restart the process. Readiness failure = stop sending traffic (but don''t
+    restart). A single /health endpoint forces a binary choice: if it checks the database and the database is down, returning 503 causes the load balancer to restart the instance — but restarting won''t
+    fix the database. If it doesn''t check the database, returning 200 causes traffic to reach an instance that can''t serve it. The solution: /healthz for liveness (checks only local process health), /readyz
+    for readiness (checks dependencies too), and optionally /startupz for initialization.
+
+    '
+  how_to_do_right: '1. Implement /healthz (liveness): checks process is running, event loop is not blocked, memory is not exhausted. Does NOT check external dependencies.
+
+    2. Implement /readyz (readiness): checks database connected, cache reachable, required config loaded. If ANY dependency is unhealthy, return 503.
+
+    3. /healthz should be fast (< 10ms). Don''t do heavy computation or I/O in liveness checks.
+
+    4. /readyz can be slower (< 1s) but should use cached dependency status (don''t query the database on every health check).
+
+    5. Include dependency details in readiness response: {"ready": false, "checks": {"database": "ok", "cache": "timeout", "config": "ok"}}.
+
+    6. Both endpoints must be unauthenticated — load balancers and orchestrators need to access them without credentials.
+
+    '
+  example_good: "from fastapi import FastAPI\nimport time\n\napp = FastAPI()\n\n@app.get('/healthz')  # Liveness: is the process alive?\ndef liveness():\n    # Fast (< 10ms), local checks only\n    # Does NOT check external dependencies\n    return {'status': 'alive', 'uptime': time.monotonic()}\n\n@app.get('/readyz')  # Readiness: can it serve traffic?\ndef readiness():\n    checks = {}\n    # Check each dependency\n    try:\n        db.execute('SELECT 1')\n        checks['database'] = 'ok'\n    except Exception:\n        checks['database'] = 'failed'\n    try:\n        redis_client.ping()\n        checks['cache'] = 'ok'\n    except Exception:\n        checks['cache'] = 'failed'\n\n    all_ok = all(v == 'ok' for v in checks.values())\n    status_code = 200 if all_ok else 503\n    return JSONResponse(\n        status_code=status_code,\n        content={'ready': all_ok, 'checks': checks},\n    )\n\n# Kubernetes config:\n# livenessProbe: httpGet path: /healthz  (restart if fails)\n# readinessProbe: httpGet path: /readyz  (stop traffic if fails, don't restart)\n"
+  example_bad: "from fastapi import FastAPI\n\napp = FastAPI()\n\n@app.get('/health')  # Single endpoint for everything\ndef health():\n    db.execute('SELECT 1')  # If DB is down, returns 500\n    # Load balancer sees 500 → restarts instance\n    # But restarting won't fix the database!\n    # Instance restart loop while DB is down\n    # OR: don't check DB → return 200 with dead DB → serve errors to users\n    return {'status': 'ok'}\n"
+  when_applies: "When implementing health check endpoints for any service deployed behind a load balancer or orchestrator — separate liveness from readiness."
+  severity: high
+  technologies:
+    lang: [general, go, python]
+    platform: [kubernetes, http]
+  domains:
+    domain: [architecture, deployment, observability, reliability]
+    concern: [api_design, orchestration, kubernetes, monitoring, health_checks]
+  sources:
+  - url: https://sre.google/sre-book/load-balancing-datacenter/
+    title: 'Google SRE Book — Chapter 20: Load Balancing in the Datacenter'
+  validation_status: cross_checked
+- id: CR-SRE-API-010
+  text: API request/response size limits must be explicitly defined and enforced. An API that accepts a 100MB JSON body because no one set a limit will be used as a denial-of-service vector — by attackers
+    intentionally, or by clients accidentally.
+  why: 'Google sets explicit size limits on all API operations because unbounded input sizes create reliability risks at every layer. A 100MB request body: consumes server memory (possibly OOM), takes minutes
+    to parse (blocking the thread), fills logs with oversized entries, and can exceed downstream capacity (database insert limits, message queue payload limits). Google''s approach: define maximum sizes
+    at every boundary. Request body: typically 1-10MB. Individual field values: 1KB-1MB depending on type. Array lengths: 100-10000 items. Response size: paginate to keep responses under 1MB. These limits
+    are documented in the API contract and enforced at the edge (not deep in the stack where OOM already happened).
+
+    '
+  how_to_do_right: '1. Set explicit request body size limit at the reverse proxy level (Nginx: client_max_body_size 10m). Reject before it reaches the application.
+
+    2. Set per-field limits in the API schema: name max 256 chars, description max 10000 chars, array max 1000 items.
+
+    3. Set response page size limits: default 20, max 100. Never return unbounded result sets.
+
+    4. For file uploads: separate endpoint with streaming, size limit, content-type validation.
+
+    5. Document all size limits in the API specification. Clients need to know before they hit the limit.
+
+    6. Monitor request size distribution: a sudden increase in average request size may indicate abuse or a client bug.
+
+    '
+  example_good: "from fastapi import FastAPI, Request, HTTPException\nfrom pydantic import BaseModel, Field\nfrom typing import List\n\napp = FastAPI()\n\n# Nginx config: client_max_body_size 10m;\n# Rejects before reaching application\n\nclass CreateOrderRequest(BaseModel):\n    description: str = Field(..., max_length=10000)  # 10KB max\n    items: List[dict] = Field(..., max_length=1000)   # 1000 items max\n\n@app.post('/v1/orders')\ndef create_order(request: CreateOrderRequest):\n    return order_service.create(request)\n\n@app.get('/v1/orders')\ndef list_orders(page_size: int = 20):\n    if page_size > 100:\n        raise HTTPException(400, 'page_size max is 100')\n    return order_service.list(page_size=page_size)\n\n# File upload: separate endpoint with streaming\n@app.post('/v1/uploads')\nasync def upload_file(request: Request):\n    content_length = int(request.headers.get('content-length', 0))\n    if content_length > 50 * 1024 * 1024:  # 50MB max\n        raise HTTPException(413, 'File too large. Max 50MB.')\n    # Stream to storage instead of loading into memory\n    async for chunk in request.stream():\n        await storage.write(chunk)\n"
+  example_bad: "from fastapi import FastAPI\n\napp = FastAPI()\n\n@app.post('/orders')\ndef create_order(data: dict):  # No size limits!\n    # Client sends 100MB JSON body → server OOM\n    # Client sends array with 1M items → server hangs parsing\n    # Client sends description with 10M characters → fills database\n    return order_service.create(data)\n\n@app.get('/orders')\ndef list_orders():\n    return db.query('SELECT * FROM orders')  # Returns ALL orders, unbounded!\n    # 1M rows → 500MB response → client OOM or network timeout\n"
+  when_applies: "When defining any API that accepts input or returns collections — explicit size limits at every boundary prevent resource exhaustion."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [grpc, http, load_balancer]
+  domains:
+    domain: [architecture, performance, reliability, security]
+    concern: [api_design]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked

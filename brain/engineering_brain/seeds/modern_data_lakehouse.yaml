@@ -1,0 +1,490 @@
+layer: rules
+domain: data_engineering
+knowledge:
+- id: LAKE-001
+  text: "Apache Iceberg must be the default open table format for new data lakehouse projects. Iceberg provides ACID transactions, time travel, schema evolution, partition evolution, and hidden partitioning."
+  why: "A data team used raw Parquet on S3 with Hive partitioning. Adding a column required rewriting 2 TB (8 hours). Changing partitions required full migration. Concurrent writers corrupted data. Iceberg eliminated all three problems."
+  how_to_do_right: |
+    1. Use Iceberg as the table format for all new tables
+    2. Enable schema evolution: add/rename/drop columns via ALTER TABLE
+    3. Use partition evolution: change partitioning without rewriting data
+    4. Use hidden partitioning: partition by month(timestamp) without physical directory structure
+    5. Enable time travel for debugging and auditing
+    6. Configure snapshot expiration and orphan file cleanup
+  severity: critical
+  technologies:
+    lang: [python, sql]
+    framework: [spark, trino, duckdb]
+    library: [pyiceberg, apache_iceberg]
+  domains:
+    domain: [data_engineering]
+    concern: [table_format, data_lakehouse, data_management]
+  example_good: |
+    from pyiceberg.catalog import load_catalog
+    catalog = load_catalog("glue", **{"type": "glue"})
+    table = catalog.load_table("analytics.events")
+    # Schema evolution — no data rewrite
+    with table.update_schema() as update:
+        update.add_column("user_segment", StringType(), doc="User segment label")
+    # Time travel
+    snapshot_id = table.history()[-2].snapshot_id
+    df = table.scan(snapshot_id=snapshot_id).to_pandas()
+  example_bad: |
+    # Raw Parquet on S3
+    # Adding column: rewrite ALL files (2 TB, 8 hours)
+    # Concurrent writes: silent data corruption
+    # No time travel: "what did this table look like yesterday?" — impossible
+  when_applies: "Any new data lakehouse project on S3/GCS/ADLS where ACID transactions, schema evolution, and time travel are needed"
+  sources:
+    - "https://iceberg.apache.org/docs/latest/"
+    - "https://www.dremio.com/blog/apache-iceberg-101/"
+
+- id: LAKE-002
+  text: "Delta Lake provides Z-ordering for multi-dimensional data skipping, liquid clustering for automatic data layout optimization, and UniForm for Iceberg/Hudi interoperability. Use Delta Lake when deeply integrated with Spark/Databricks."
+  why: "A team queried a 10 TB table filtered by both date and region. Without Z-ordering, queries scanned 8 TB. With Z-ordering on (date, region), queries scanned 200 GB (40x improvement). Liquid clustering (Delta 3.0) auto-optimizes without manual OPTIMIZE commands."
+  how_to_do_right: |
+    1. Enable Z-ordering on columns frequently used in WHERE clauses
+    2. Use liquid clustering (Delta 3.0+) for automatic layout optimization
+    3. Enable UniForm for Iceberg compatibility: read Delta tables with Iceberg-compatible engines
+    4. Configure OPTIMIZE to run automatically on write (auto-compact)
+    5. Use deletion vectors for fast DELETE/UPDATE without full file rewrites
+  severity: high
+  technologies:
+    lang: [python, sql]
+    framework: [spark, databricks]
+    library: [delta_lake, delta_rs]
+  domains:
+    domain: [data_engineering]
+    concern: [table_format, query_optimization]
+  example_good: |
+    -- Delta Lake Z-ordering
+    CREATE TABLE events USING delta
+    TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true');
+    OPTIMIZE events ZORDER BY (event_date, region);
+    -- Liquid clustering (Delta 3.0)
+    ALTER TABLE events CLUSTER BY (event_date, region);
+    -- UniForm: auto-generate Iceberg metadata
+    ALTER TABLE events SET TBLPROPERTIES ('delta.universalFormat.enabledFormats' = 'iceberg');
+  example_bad: |
+    -- No optimization — full table scan on every query
+    SELECT * FROM events WHERE event_date = '2025-01-15' AND region = 'us-east'
+    -- Scans 10 TB instead of 200 GB. Query takes 45 min instead of 2 min.
+  when_applies: "Databricks/Spark environments where query performance optimization and Iceberg interoperability are needed"
+  sources:
+    - "https://docs.delta.io/latest/index.html"
+    - "https://docs.databricks.com/en/delta/liquid-clustering.html"
+
+- id: LAKE-003
+  text: "Use DuckDB as the embedded OLAP engine for local development, notebook analysis, and small-to-medium data processing. DuckDB reads Parquet, Iceberg, and Delta directly from S3 without a cluster."
+  why: "A data analyst needed to query 50 GB of Parquet files on S3. Options: spin up a Spark cluster (15 min setup, $5/hour) or use DuckDB (pip install, 30 seconds, free). DuckDB processed the query in 45 seconds on a laptop."
+  how_to_do_right: |
+    1. Use DuckDB for ad-hoc analysis on Parquet/CSV files up to 100 GB
+    2. Read directly from S3: SELECT * FROM read_parquet('s3://bucket/path/*.parquet')
+    3. Use DuckDB's Iceberg extension for reading Iceberg tables
+    4. Use for CI/CD data validation (faster than Spark for small datasets)
+    5. Integrate with Python via duckdb package (zero-copy with Pandas/Polars)
+  severity: medium
+  technologies:
+    lang: [python, sql]
+    framework: [duckdb]
+    library: [duckdb, pyarrow, polars]
+  domains:
+    domain: [data_engineering, data_science]
+    concern: [local_development, adhoc_analysis]
+  example_good: |
+    import duckdb
+    con = duckdb.connect()
+    con.execute("INSTALL httpfs; LOAD httpfs;")
+    con.execute("SET s3_region='us-east-1';")
+    # Query Parquet on S3 directly — no cluster needed
+    df = con.execute("""
+        SELECT date_trunc('hour', event_time) as hour,
+               count(*) as events, count(distinct user_id) as users
+        FROM read_parquet('s3://datalake/events/2025/01/*.parquet')
+        WHERE event_type = 'purchase'
+        GROUP BY 1 ORDER BY 1
+    """).fetchdf()
+  example_bad: |
+    # Spin up Spark cluster for a simple query
+    spark = SparkSession.builder.master("yarn").getOrCreate()  # 15 min startup
+    df = spark.read.parquet("s3://datalake/events/")  # $5/hour cluster
+    # DuckDB: same query, 30 seconds, free, on your laptop
+  when_applies: "Data analysis on files up to 100 GB where spinning up a distributed cluster is overkill"
+  sources:
+    - "https://duckdb.org/docs/"
+    - "https://duckdb.org/docs/extensions/httpfs/s3api"
+
+- id: LAKE-004
+  text: "Use dbt (data build tool) with ref() for all SQL transformations. Models must be incremental where possible, tested with dbt tests, and documented with descriptions and column-level docs."
+  why: "A team had 200 SQL scripts with hardcoded table names. Renaming a table required find-and-replace across all scripts. dbt's ref() macro creates a dependency graph: rename once, all downstream models update automatically."
+  how_to_do_right: |
+    1. Use ref() for all table references — never hardcode table names
+    2. Use incremental models for large tables (process only new/changed rows)
+    3. Add dbt tests: unique, not_null, accepted_values, relationships
+    4. Document every model with description and column-level docs
+    5. Use dbt sources for raw tables with freshness checks
+    6. Organize models in staging/intermediate/marts layers
+  severity: high
+  technologies:
+    lang: [sql, python]
+    framework: [dbt, dbt_core]
+    library: [dbt_utils, dbt_expectations]
+  domains:
+    domain: [data_engineering]
+    concern: [data_transformation, data_quality, documentation]
+  example_good: |
+    -- models/marts/orders_daily.sql
+    {{config(materialized='incremental', unique_key='order_date')}}
+    SELECT date_trunc('day', created_at) as order_date,
+           count(*) as order_count,
+           sum(amount) as total_revenue
+    FROM {{ ref('stg_orders') }}
+    {% if is_incremental() %}
+    WHERE created_at > (SELECT max(order_date) FROM {{ this }})
+    {% endif %}
+    GROUP BY 1
+  example_bad: |
+    -- Hardcoded table names, no tests, no docs
+    SELECT * FROM raw_db.public.orders  -- Breaks when table moves
+    -- No incremental: reprocesses 2 years of data every run (4 hours)
+  when_applies: "Any data team using SQL for transformations in a data warehouse or lakehouse"
+  sources:
+    - "https://docs.getdbt.com/docs/introduction"
+    - "https://docs.getdbt.com/docs/build/incremental-models"
+
+- id: LAKE-005
+  text: "Implement data contracts between producers and consumers using schema validation tools (Soda, Great Expectations, dbt tests). Contracts must define schema, freshness, volume, and data quality expectations."
+  why: "An upstream team renamed a column from 'user_id' to 'customer_id' without notice. 12 downstream pipelines broke. Data contracts make expectations explicit and testable: schema, freshness, volume bounds, and quality rules."
+  how_to_do_right: |
+    1. Define contracts in code: schema (columns, types), freshness (max age), volume (min/max rows)
+    2. Validate on every pipeline run with Soda or Great Expectations
+    3. Alert contract violations before downstream processing begins
+    4. Version contracts: breaking changes require explicit migration
+    5. Test contracts in CI for both producers and consumers
+  severity: high
+  technologies:
+    lang: [python, yaml]
+    framework: [soda, great_expectations, dbt]
+    library: [soda_core, great_expectations]
+  domains:
+    domain: [data_engineering, governance]
+    concern: [data_contracts, data_quality, schema_management]
+  example_good: |
+    # Soda data contract
+    # checks/orders_contract.yml
+    checks for orders:
+      - schema:
+          fail:
+            when required column missing: [order_id, customer_id, amount, created_at]
+            when wrong type:
+              order_id: varchar
+              amount: decimal
+      - freshness(created_at) < 1h
+      - row_count > 0
+      - missing_percent(customer_id) = 0
+      - valid_percent(amount) > 99:
+          valid min: 0
+  example_bad: |
+    # No data contract — upstream changes break downstream silently
+    # Upstream renames user_id -> customer_id
+    # 12 downstream pipelines fail at different times over 3 days
+    # Some fail loudly (SQL error), some silently (NULL joins)
+  when_applies: "Any data pipeline where upstream schema changes can break downstream consumers"
+  sources:
+    - "https://docs.soda.io/soda/data-contracts.html"
+    - "https://docs.greatexpectations.io/docs/"
+
+- id: LAKE-006
+  text: "Implement data mesh principles: domain ownership (teams own their data products), self-serve data platform (infrastructure as a service), federated governance (global standards, local implementation), and data as a product (SLAs, documentation, discoverability)."
+  why: "A centralized data team of 8 people was the bottleneck for 200 engineers. Every data request went through them. Queue time: 3-4 weeks. Data mesh distributes ownership to domain teams, who publish data products with SLAs."
+  how_to_do_right: |
+    1. Domain ownership: each team owns their data products end-to-end
+    2. Self-serve platform: provide infrastructure (Spark, dbt, Airflow) as a service
+    3. Federated governance: central team sets standards, domain teams implement
+    4. Data as a product: every dataset has SLA, documentation, owner, quality tests
+    5. Interoperability: standard formats (Parquet/Iceberg) and discovery (data catalog)
+  severity: medium
+  technologies:
+    lang: [python, sql]
+    framework: [datamesh]
+    library: [datahub, openmetadata, amundsen]
+  domains:
+    domain: [data_engineering, architecture]
+    concern: [data_mesh, data_governance, organizational_design]
+  example_good: |
+    # Data product specification
+    data_product:
+      name: "orders_daily"
+      owner: "order-team"
+      sla:
+        freshness: "< 2 hours"
+        availability: "99.9%"
+        quality: "< 0.1% nulls on required fields"
+      schema_version: "2.1.0"
+      documentation: "https://datacatalog.company.com/orders_daily"
+      consumers: ["analytics", "ml-team", "finance"]
+  example_bad: |
+    # Centralized data team bottleneck
+    # 200 engineers -> 8 data engineers
+    # Queue time: 3-4 weeks for any data request
+    # No SLAs, no documentation, no ownership
+  when_applies: "Organizations with 50+ engineers where a centralized data team is a bottleneck and domain teams need to own their data"
+  sources:
+    - "https://www.datamesh-architecture.com/"
+    - "https://martinfowler.com/articles/data-mesh-principles.html"
+
+- id: LAKE-007
+  text: "Organize lakehouse tables in medallion architecture: Bronze (raw ingestion), Silver (cleaned/conformed), Gold (business-level aggregates). Each layer has clear ownership, quality expectations, and retention policies."
+  why: "A team stored raw JSON alongside aggregated metrics in the same schema. Analysts queried raw data thinking it was clean, producing wrong reports. Medallion architecture creates clear boundaries: Bronze is raw, Silver is clean, Gold is trusted."
+  how_to_do_right: |
+    1. Bronze: raw ingestion, append-only, full fidelity, schema-on-read
+    2. Silver: cleaned, deduplicated, conformed to standard schema, validated
+    3. Gold: business-level aggregates, denormalized for consumption
+    4. Clear ownership per layer: data engineers own Bronze/Silver, analysts own Gold
+    5. Quality gates between layers: data must pass validation to promote
+    6. Retention: Bronze 90 days, Silver 1 year, Gold indefinite
+  severity: high
+  technologies:
+    lang: [python, sql]
+    framework: [databricks, dbt]
+    library: [delta_lake, apache_iceberg]
+  domains:
+    domain: [data_engineering]
+    concern: [data_architecture, medallion, data_quality]
+  example_good: |
+    -- Bronze: raw ingestion (append-only, full fidelity)
+    CREATE TABLE bronze.raw_orders (
+        _ingested_at TIMESTAMP DEFAULT current_timestamp(),
+        _source_file STRING,
+        raw_payload STRING  -- Full JSON, no transformation
+    );
+    -- Silver: cleaned and validated
+    CREATE TABLE silver.orders AS
+    SELECT json_extract(raw_payload, '$.order_id') as order_id,
+           CAST(json_extract(raw_payload, '$.amount') AS DECIMAL(10,2)) as amount
+    FROM bronze.raw_orders WHERE _quality_check_passed = true;
+    -- Gold: business aggregates
+    CREATE TABLE gold.daily_revenue AS
+    SELECT date_trunc('day', created_at) as day, sum(amount) as revenue
+    FROM silver.orders GROUP BY 1;
+  example_bad: |
+    -- Everything in one schema, no layers
+    -- Raw JSON next to aggregated metrics
+    -- Analysts query raw data thinking it's clean -> wrong reports
+  when_applies: "Any data lakehouse project that needs clear data quality boundaries between raw ingestion and business consumption"
+  sources:
+    - "https://www.databricks.com/glossary/medallion-architecture"
+    - "https://learn.microsoft.com/en-us/azure/databricks/lakehouse/medallion"
+
+- id: LAKE-008
+  text: "Deploy a data catalog (OpenMetadata, DataHub, or Amundsen) for discoverability, lineage tracking, and governance. Every table must have: description, owner, freshness SLA, column descriptions, and upstream/downstream lineage."
+  why: "A 500-person company had 3,000 tables. Nobody knew which tables were authoritative. Three teams maintained different 'daily revenue' tables with different numbers. A data catalog provides a single source of truth for metadata."
+  how_to_do_right: |
+    1. Deploy OpenMetadata or DataHub as centralized catalog
+    2. Auto-ingest metadata from databases, warehouses, and pipelines
+    3. Require: description, owner, freshness SLA, column docs for every table
+    4. Track lineage: show upstream sources and downstream consumers
+    5. Enable search: analysts find data by keyword, not by asking Slack
+    6. Integrate with dbt: auto-publish dbt model docs to catalog
+  severity: medium
+  technologies:
+    lang: [python, yaml]
+    framework: [openmetadata, datahub]
+    library: [openmetadata_ingestion, datahub_cli]
+  domains:
+    domain: [data_engineering, governance]
+    concern: [data_catalog, discoverability, lineage]
+  example_good: |
+    # OpenMetadata — table metadata
+    from metadata.ingestion.api.workflow import Workflow
+    config = {
+        "source": {"type": "bigquery", "config": {"project_id": "my-project"}},
+        "sink": {"type": "metadata-rest", "config": {"api_endpoint": "http://openmetadata:8585"}},
+    }
+    workflow = Workflow.create(config)
+    workflow.execute()
+    # Result: all tables discoverable with lineage, descriptions, owners
+  example_bad: |
+    # No catalog — tribal knowledge
+    # Slack: "Where is the daily revenue table?"
+    # 3 different answers from 3 teams
+    # All 3 tables have different numbers
+  when_applies: "Any organization with 100+ tables where data discoverability and lineage are operational needs"
+  sources:
+    - "https://docs.open-metadata.org/"
+    - "https://datahubproject.io/docs/"
+
+- id: LAKE-009
+  text: "Optimize Parquet file sizes to 128 MB - 1 GB per file. Too many small files (< 10 MB) cause metadata overhead and slow queries. Too few large files (> 2 GB) cause memory pressure and poor parallelism."
+  why: "A streaming pipeline created 100,000 small Parquet files (50 KB each) per day. Query planning took 45 seconds just to list files. After compaction to 256 MB files, query planning dropped to 0.5 seconds and query speed improved 10x."
+  how_to_do_right: |
+    1. Target file size: 128 MB - 1 GB (sweet spot for most engines)
+    2. Use compaction jobs to merge small files (Iceberg rewrite_data_files, Delta OPTIMIZE)
+    3. Configure writers to target optimal file sizes (spark.sql.files.maxRecordsPerFile)
+    4. For streaming: use micro-batch with sufficient batch interval (5-15 min)
+    5. Monitor file size distribution: alert if median < 10 MB or > 2 GB
+  severity: high
+  technologies:
+    lang: [python, sql]
+    framework: [spark, iceberg]
+    library: [pyiceberg, delta_lake]
+  domains:
+    domain: [data_engineering]
+    concern: [file_optimization, query_performance]
+  example_good: |
+    -- Iceberg compaction — merge small files
+    CALL catalog.system.rewrite_data_files(
+        table => 'analytics.events',
+        options => map('target-file-size-bytes', '268435456')  -- 256 MB
+    );
+    -- Iceberg snapshot cleanup
+    CALL catalog.system.expire_snapshots('analytics.events', TIMESTAMP '2025-01-01');
+    CALL catalog.system.remove_orphan_files('analytics.events');
+  example_bad: |
+    # 100,000 small files (50 KB each) from streaming
+    # Query planning: 45 seconds (listing files)
+    # Query execution: 3 minutes (opening 100K file handles)
+    # After compaction: planning 0.5s, execution 18s
+  when_applies: "Any data lake where streaming ingestion or frequent small writes create many small Parquet files"
+  sources:
+    - "https://iceberg.apache.org/docs/latest/maintenance/"
+    - "https://docs.delta.io/latest/optimizations-oss.html"
+
+- id: LAKE-010
+  text: "Use lakeFS or Nessie for data versioning: git-like branching and merging for data lakes. Create branches for ETL development, preview changes before merging to production, and rollback bad data loads instantly."
+  why: "A data engineer ran a DELETE without WHERE clause on a production table. 2 million rows deleted. Recovery from backup took 6 hours. With lakeFS, rollback is one command (lakectl branch revert) executed in seconds."
+  how_to_do_right: |
+    1. Deploy lakeFS as a gateway in front of S3/GCS/ADLS
+    2. Create branches for development: lakectl branch create dev-feature-x
+    3. Run ETL on the branch: changes are isolated from production
+    4. Review changes: lakectl diff main..dev-feature-x
+    5. Merge to production: lakectl merge dev-feature-x main
+    6. Instant rollback: lakectl branch revert main --commit <previous_commit>
+  severity: medium
+  technologies:
+    lang: [python, bash]
+    framework: [lakefs, nessie]
+    library: [lakefs_sdk, pynessie]
+  domains:
+    domain: [data_engineering]
+    concern: [data_versioning, data_governance, disaster_recovery]
+  example_good: |
+    import lakefs_sdk
+    client = lakefs_sdk.Client(host="http://lakefs:8000")
+    # Create branch for ETL development
+    client.branches.create_branch("my-repo", branch_creation={
+        "name": "feature/new-pipeline", "source": "main"
+    })
+    # Run ETL on branch (isolated from production)
+    # spark.read.parquet("lakefs://my-repo/feature/new-pipeline/data/")
+    # Review and merge
+    client.refs.merge_into_branch("my-repo", "feature/new-pipeline", merge={
+        "message": "Add customer segmentation pipeline"
+    })
+  example_bad: |
+    # No data versioning
+    # DELETE FROM orders WHERE 1=1  -- Oops, no WHERE clause
+    # 2 million rows deleted in production
+    # Recovery: restore from backup (6 hours downtime)
+  when_applies: "Any data lake where ETL development needs isolation, data changes need review, or instant rollback from bad loads is required"
+  sources:
+    - "https://docs.lakefs.io/"
+    - "https://projectnessie.org/develop/spec/"
+
+- id: LAKE-011
+  text: "Optimize data lake storage costs with lifecycle policies, compression (Zstd over Snappy for 30% better ratio), and tiered storage (hot/warm/cold). Monitor storage growth and set alerts for unexpected increases."
+  why: "A company's S3 bill grew from $5K to $45K in 12 months. 60% was old data never queried. Lifecycle policies (move to Glacier after 90 days, delete after 365) reduced storage costs by 70%."
+  how_to_do_right: |
+    1. Use Zstd compression for Parquet (30% better ratio than Snappy, similar speed)
+    2. Lifecycle policies: S3 Standard -> Infrequent Access (30 days) -> Glacier (90 days)
+    3. Set retention: delete data older than regulatory requirement
+    4. Monitor: track storage growth per dataset, alert on unexpected spikes
+    5. Column pruning: drop unused columns in Silver/Gold layers
+    6. Partition pruning: ensure queries hit only relevant partitions
+  severity: high
+  technologies:
+    lang: [python, terraform]
+    framework: [spark]
+    library: [boto3, s3_lifecycle]
+  domains:
+    domain: [data_engineering, operations]
+    concern: [storage_optimization, cost_reduction]
+  example_good: |
+    # S3 lifecycle policy (Terraform)
+    resource "aws_s3_bucket_lifecycle_configuration" "data_lake" {
+      bucket = aws_s3_bucket.data_lake.id
+      rule {
+        id     = "archive-old-data"
+        status = "Enabled"
+        filter { prefix = "bronze/" }
+        transition {
+          days          = 30
+          storage_class = "STANDARD_IA"  # 45% cheaper
+        }
+        transition {
+          days          = 90
+          storage_class = "GLACIER"       # 80% cheaper
+        }
+        expiration { days = 365 }
+      }
+    }
+    # Zstd compression in Spark
+    spark.conf.set("spark.sql.parquet.compression.codec", "zstd")
+  example_bad: |
+    # All data in S3 Standard forever
+    # 60% of data never queried (3+ months old)
+    # S3 bill: $45K/month, could be $13K with lifecycle policies
+  when_applies: "Any data lake where storage costs are growing and historical data access patterns can be tiered"
+  sources:
+    - "https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html"
+    - "https://parquet.apache.org/docs/file-format/configurations/"
+
+- id: LAKE-012
+  text: "Implement real-time data ingestion with Apache Kafka + Flink or Spark Structured Streaming for sub-minute latency. Use exactly-once semantics with Kafka transactions and Iceberg/Delta Lake ACID writes."
+  why: "A fraud detection system had 4-hour data latency (batch ETL). Fraudulent transactions were detected after the money had left. Real-time streaming with Kafka + Flink reduced latency to 30 seconds, catching 40% more fraud."
+  how_to_do_right: |
+    1. Use Kafka as the streaming backbone (durable, ordered, replayable)
+    2. Process with Flink (lowest latency) or Spark Structured Streaming (simpler)
+    3. Write to Iceberg/Delta with exactly-once semantics (Kafka transactions + ACID writes)
+    4. Use watermarking for late-arriving data handling
+    5. Monitor: consumer lag, processing latency, throughput, error rate
+    6. Schema: use Avro/Protobuf with Schema Registry for event schemas
+  severity: high
+  technologies:
+    lang: [python, java]
+    framework: [kafka, flink, spark_streaming]
+    library: [confluent_kafka, pyflink, spark_structured_streaming]
+  domains:
+    domain: [data_engineering]
+    concern: [real_time_ingestion, streaming, event_processing]
+  example_good: |
+    # Spark Structured Streaming -> Iceberg (exactly-once)
+    from pyspark.sql import SparkSession
+    spark = SparkSession.builder.config(
+        "spark.sql.catalog.lakehouse", "org.apache.iceberg.spark.SparkCatalog"
+    ).getOrCreate()
+
+    # Read from Kafka
+    stream = (spark.readStream
+        .format("kafka")
+        .option("kafka.bootstrap.servers", "broker:9092")
+        .option("subscribe", "events")
+        .option("startingOffsets", "latest")
+        .load())
+
+    # Parse and write to Iceberg with exactly-once
+    parsed = stream.select(from_json(col("value").cast("string"), schema).alias("data"))
+    (parsed.writeStream
+        .format("iceberg")
+        .outputMode("append")
+        .option("checkpointLocation", "s3://checkpoints/events")
+        .toTable("lakehouse.analytics.events"))
+  example_bad: |
+    # Batch ETL with 4-hour latency
+    # Cron job runs every 4 hours: SELECT * FROM source WHERE ts > last_run
+    # Fraud detected 4 hours after transaction — money already gone
+    # No exactly-once: duplicate rows on retry, missing rows on failure
+  when_applies: "Any data pipeline where sub-minute latency is required for time-sensitive analytics, fraud detection, or operational dashboards"
+  sources:
+    - "https://nightlies.apache.org/flink/flink-docs-stable/"
+    - "https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html"

@@ -1,0 +1,296 @@
+layer: rules
+technology: SRE
+domain: databases
+knowledge:
+- id: CR-SRE-DB-001
+  text: Database connection limits must be explicitly configured and monitored. The default max_connections in PostgreSQL (100) or MySQL (151) is almost never correct for production. Running out of connections
+    is one of the most common causes of application downtime.
+  why: 'Database connection exhaustion is a recurring theme in Google''s cascading failure patterns (Chapter 22). The typical sequence: application scales horizontally (more pods), each pod opens connections
+    to the database, the database hits max_connections, new connection attempts fail, the application returns 500 errors. The problem is that most teams never configure max_connections — they use the default,
+    which was designed for a single-machine deployment. With 10 application pods each maintaining a pool of 20 connections, you need 200 connections minimum. With connection poolers (PgBouncer, ProxySQL),
+    the configuration becomes even more critical because the pooler must be configured with its own limits that match the database''s limits.
+
+    '
+  how_to_do_right: '1. Calculate required connections: (number_of_app_instances × pool_size_per_instance) + monitoring_connections + admin_connections + 20% headroom.
+
+    2. Configure the database max_connections to match. Don''t use the default.
+
+    3. Use a connection pooler (PgBouncer, ProxySQL) between applications and the database to multiplex connections.
+
+    4. Monitor active connections as a percentage of max. Alert at 70%. At 90%, new requests will start failing.
+
+    5. Set application pool sizes explicitly: min_idle=5, max_size=20 (not unlimited). Size based on actual concurrent query needs.
+
+    6. Close idle connections aggressively: connections idle > 5 minutes should be returned to the pool. Long-lived idle connections waste database resources.
+
+    '
+  example_good: "# Explicit connection limit configuration with monitoring\nimport psycopg2.pool\nimport os\n\n# Calculate: (app_instances * pool_size) + monitoring + admin + 20% headroom\nAPP_INSTANCES = 10\nPOOL_PER_INSTANCE = 20\nMONITORING_CONNS = 5\nADMIN_CONNS = 5\nHEADROOM = 0.2\n\nrequired = (APP_INSTANCES * POOL_PER_INSTANCE) + MONITORING_CONNS + ADMIN_CONNS\nmax_connections = int(required * (1 + HEADROOM))  # 252\n\n# PostgreSQL: ALTER SYSTEM SET max_connections = 252;\n# Application pool:\npool = psycopg2.pool.ThreadedConnectionPool(\n    minconn=5,                    # idle minimum\n    maxconn=POOL_PER_INSTANCE,    # max per instance\n)\n# Alert at 70% utilization: 252 * 0.7 = 176 active connections\n"
+  example_bad: "# Default max_connections, no pool sizing\nimport psycopg2\n\n# PostgreSQL default: max_connections = 100\n# App opens new connection per request (no pool)\ndef handle_request():\n    conn = psycopg2.connect('postgres://localhost/mydb')  # new connection each time\n    # ... query ...\n    conn.close()\n\n# 10 app pods * 20 concurrent requests = 200 connections needed\n# max_connections = 100 -> connection refused -> 500 errors\n"
+  when_applies: "When deploying applications that connect to PostgreSQL or MySQL, especially with multiple application instances sharing the same database."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [mysql, postgresql, connection_pooling]
+  domains:
+    domain: [databases, reliability]
+    concern: [relational, connection_management]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-DB-002
+  text: Database schema migrations in production must be backward-compatible and reversible. A migration that adds a NOT NULL column without a default, renames a column, or changes a type will break running
+    application instances that don't know about the change.
+  why: 'In any system that deploys application code and database schema separately (which is most systems), there is a window during deployment where old application code runs against the new schema, or
+    new application code runs against the old schema. Google''s release engineering practices (Chapter 8) handle this by requiring migrations to be backward-compatible: the old code must work with the new
+    schema, and the new code must work with the old schema. This enables safe rollback — if the new code has a bug, rolling back to the old code doesn''t break because the old schema still works. Common
+    unsafe migrations: adding a NOT NULL column (old code doesn''t provide a value), renaming a column (old code reads the old name), dropping a column (old code reads the dropped column), changing a column
+    type (old code expects the old type).
+
+    '
+  how_to_do_right: '1. Every migration must be backward-compatible: old code must work with the new schema.
+
+    2. Add columns with NULL or DEFAULT. Never add NOT NULL without a default — running code will fail.
+
+    3. To rename a column: add new column → deploy code that reads both → migrate data → deploy code that reads only new → drop old column. FOUR steps, not one.
+
+    4. To change a column type: add new column with new type → dual-write → backfill → switch reads → drop old column.
+
+    5. Test migrations against the currently deployed code version (not just the new version).
+
+    6. Every migration must have a rollback script. Test the rollback in staging before applying in production.
+
+    '
+  example_good: "# Backward-compatible migration: add column with default\n# Alembic migration (SQLAlchemy)\ndef upgrade():\n    # Safe: adds nullable column — old code ignores it\n    op.add_column('users', sa.Column('phone', sa.String(20), nullable=True))\n\ndef downgrade():\n    op.drop_column('users', 'phone')\n\n# To rename: 4-step process across separate deployments\n# Deploy 1: Add new column (both old and new code work)\n# Deploy 2: Code reads both columns, writes to both\n# Deploy 3: Backfill old column -> new column\n# Deploy 4: Drop old column (after all instances updated)\n"
+  example_bad: "# Unsafe migration: NOT NULL without default breaks running code\ndef upgrade():\n    op.add_column('users', sa.Column('phone', sa.String(20), nullable=False))\n    # Old code inserting users doesn't provide 'phone'\n    # -> INSERT fails -> 500 errors during rolling deployment\n\n# Also unsafe: renaming in single migration\ndef upgrade():\n    op.alter_column('users', 'name', new_column_name='full_name')\n    # Old code: SELECT name FROM users -> column 'name' not found\n"
+  when_applies: "When writing database migrations that will be applied to production databases serving applications with rolling deployments."
+  severity: critical
+  technologies:
+    lang: [general]
+    framework: [orm, sqlalchemy, web, django]
+    platform: [mysql, postgresql]
+  domains:
+    domain: [databases, deployment, reliability]
+    concern: [relational, database_migrations]
+  sources:
+  - url: https://sre.google/sre-book/release-engineering/
+    title: 'Google SRE Book — Chapter 8: Release Engineering'
+  validation_status: cross_checked
+- id: CR-SRE-DB-003
+  text: Read replicas are not a backup — they replicate corruption too. If the primary writes corrupt data, replicas will faithfully replicate the corruption. You need point-in-time recovery (PITR) from
+    WAL/binlog to recover from logical corruption.
+  why: 'Google''s data integrity chapter (Chapter 26) distinguishes between hardware failures (where replicas help) and logical corruption (where replicas make things worse). A disk failure on the primary
+    is handled by failover to a replica — the replica has correct data. But an application bug that corrupts 1 million records is replicated to ALL replicas within seconds. Now primary and replicas all
+    have corrupt data. The only recovery path is Point-in-Time Recovery: restore from the last good backup, then replay the WAL/binlog up to the moment BEFORE the corruption. This requires: regular backups,
+    continuous WAL archiving, and the ability to identify WHEN the corruption started. Without all three, logical corruption is unrecoverable.
+
+    '
+  how_to_do_right: '1. Maintain PITR capability: continuous WAL archiving (PostgreSQL) or binlog shipping (MySQL) to durable storage.
+
+    2. Test PITR recovery quarterly: restore to a specific point in time and verify data is correct.
+
+    3. Retain WAL/binlog for at least 7 days (30 days preferred). Logical corruption may not be discovered immediately.
+
+    4. Regular full backups (daily) + continuous WAL enable recovery to any point in time within the retention window.
+
+    5. Monitor replication lag: if a replica is 5 minutes behind, restoring from it loses 5 minutes of data. Zero lag means instant corruption replication.
+
+    6. Consider delayed replicas: a replica that intentionally lags by 1-4 hours provides a window to catch corruption before it''s replicated.
+
+    '
+  example_good: "# PITR setup with WAL archiving + delayed replica\n-- PostgreSQL: continuous WAL archiving to S3\n-- postgresql.conf:\n-- archive_mode = on\n-- archive_command = 'aws s3 cp %p s3://wal-archive/%f'\n-- wal_keep_size = '2GB'\n\n-- Delayed replica for logical corruption recovery\n-- recovery.conf (on delayed replica):\n-- recovery_min_apply_delay = '4h'  # 4-hour lag\n-- -> corruption at 14:00, detected at 14:30\n-- -> delayed replica still has clean data from 10:30\n-- -> PITR to 13:59 from delayed replica\n\n-- Test PITR quarterly:\n-- pg_basebackup + pg_restore --target-time='2024-01-15 13:59:00'\n-- Verify data integrity after restore\n"
+  example_bad: "# Read replicas as 'backup' — replicates corruption too\n-- Setup: primary + 2 synchronous replicas\n-- Application bug corrupts 1M records at 14:00\n-- By 14:01, all 3 replicas have corrupt data\n-- No WAL archive -> no PITR capability\n-- No delayed replica -> no time window to catch corruption\n-- Result: 1M records permanently lost\n-- 'But we have replicas!' -> replicas are for availability, not backup\n"
+  when_applies: "When designing backup and disaster recovery strategies for production databases, especially where logical corruption is a concern."
+  severity: critical
+  technologies:
+    lang: [general]
+    platform: [aws, rds, gcp, mysql, postgresql]
+  domains:
+    domain: [databases, reliability]
+    concern: [relational, data_integrity, backup]
+  sources:
+  - url: https://sre.google/sre-book/data-integrity/
+    title: 'Google SRE Book — Chapter 26: Data Integrity: What You Read Is What You Wrote'
+  validation_status: cross_checked
+- id: CR-SRE-DB-004
+  text: Query performance degrades nonlinearly with data volume. A query that takes 10ms on 1 million rows may take 10 SECONDS on 100 million rows — not 1 second. Always test query performance at production
+    data volume, not development data volume.
+  why: 'This is one of the most common production surprises across Google''s services. Developers test against a small dataset (1K-10K rows), queries are fast, they ship. In production with millions of
+    rows, the same queries become catastrophically slow because: sequential scans that were fast on 1K rows are O(n) and become slow on 1M rows, joins that worked fine with small tables create enormous
+    intermediate results with large tables, missing indexes were harmless with small data but fatal with large data, and the query planner chooses different (often worse) execution plans with larger statistics.
+    Google requires load testing with production-scale data volumes specifically to catch these nonlinear performance cliffs.
+
+    '
+  how_to_do_right: '1. Test ALL queries against production-scale data. If production has 100M rows, test with 100M rows, not 10K rows.
+
+    2. Use EXPLAIN ANALYZE (PostgreSQL) or EXPLAIN FORMAT=JSON (MySQL) to verify query plans. Ensure indexes are used.
+
+    3. Set query timeout: if a query takes > 5 seconds, it should fail rather than hold a connection for minutes.
+
+    4. Monitor slow query logs: any query > 1 second in production should be investigated and optimized.
+
+    5. Test with realistic data distribution: if 90% of queries hit 10% of the data (hot partition), test with that skew.
+
+    6. Set up performance regression tests: run key queries against a test database with production-scale data as part of CI/CD.
+
+    '
+  example_good: "# Test queries at production scale + EXPLAIN ANALYZE\nimport psycopg2\nimport time\n\ndef test_query_performance(conn, query: str, params: tuple,\n                           max_ms: float = 5000) -> dict:\n    with conn.cursor() as cur:\n        # Check execution plan first\n        cur.execute(f'EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {query}', params)\n        plan = cur.fetchone()[0]\n        execution_time = plan[0]['Execution Time']\n\n        # Verify index usage\n        seq_scans = [n for n in str(plan) if 'Seq Scan' in str(n)]\n        index_scans = [n for n in str(plan) if 'Index' in str(n)]\n\n        return {\n            'execution_time_ms': execution_time,\n            'uses_index': len(index_scans) > 0,\n            'has_seq_scan': len(seq_scans) > 0,\n            'within_budget': execution_time < max_ms,\n        }\n\n# Run against staging with production-scale data (100M rows)\n# pytest test_query_perf.py --db=staging\n"
+  example_bad: "# Test on dev database with 100 rows — fast, but meaningless\ndef test_get_user():\n    conn = connect('postgres://localhost/myapp_dev')  # 100 rows\n    start = time.time()\n    conn.execute('SELECT * FROM users WHERE email = %s', ('test@test.com',))\n    elapsed = time.time() - start\n    assert elapsed < 0.01  # 10ms — passes on 100 rows\n    # Production: 100M rows, no index on email\n    # Same query: 10 SECONDS (full table scan)\n    # Performance cliff not caught until production\n"
+  when_applies: "When developing or reviewing database queries that will run against tables expected to grow beyond development dataset sizes."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [mongodb, mysql, postgresql]
+  domains:
+    domain: [databases, performance, reliability]
+    concern: [relational]
+  sources:
+  - url: https://sre.google/sre-book/testing-reliability/
+    title: 'Google SRE Book — Chapter 17: Testing for Reliability'
+  validation_status: cross_checked
+- id: CR-SRE-DB-005
+  text: Database failover must be tested regularly — not just planned, not just documented, but actually executed. An untested failover is like an untested backup — it probably doesn't work when you need
+    it.
+  why: 'Google''s emergency response chapter (Chapter 13) describes incidents where failover procedures failed because they had never been tested. Common failover failures: the replica has a different schema
+    version (migration was applied to primary but not replicated), the application doesn''t support connecting to a new primary (hardcoded connection string), the DNS record update takes 30 minutes to propagate
+    (TTL was set to 1800 instead of 60), the replica is undersized (smaller instance, less memory, fewer connections), and the application doesn''t handle the brief disconnect during failover (no retry
+    logic). Each of these is a predictable failure that would have been caught by a single failover test. Google tests failover regularly by intentionally promoting replicas and verifying that the application
+    continues serving correctly.
+
+    '
+  how_to_do_right: '1. Test database failover monthly. Actually promote the replica and verify the application works.
+
+    2. Use DNS-based failover with short TTL (60 seconds max). Test that the application reconnects within 2 minutes.
+
+    3. Verify that replicas have identical schema, extensions, and configuration as the primary.
+
+    4. Test application behavior during failover: do connections retry? Do transactions retry? Is there data loss?
+
+    5. Measure failover time: from primary failure to application serving from replica. Track this as a metric.
+
+    6. After failover test, fail BACK to the original primary. Both directions must work.
+
+    '
+  example_good: "# Regular failover testing with verification\nimport subprocess\nimport time\nimport psycopg2\n\ndef test_failover(primary_host: str, replica_host: str, app_url: str) -> dict:\n    start = time.time()\n    # 1. Promote replica\n    subprocess.run(['pg_ctl', 'promote', '-D', '/var/lib/postgresql/data'],\n                   check=True)\n    # 2. Update DNS (short TTL: 60s)\n    update_dns_record('db.myapp.com', replica_host, ttl=60)\n    # 3. Verify application reconnects\n    for _ in range(12):  # wait up to 2 minutes\n        try:\n            resp = requests.get(f'{app_url}/health')\n            if resp.status_code == 200:\n                break\n        except Exception:\n            pass\n        time.sleep(10)\n    failover_time = time.time() - start\n    # 4. Verify data integrity\n    conn = psycopg2.connect(f'postgres://{replica_host}/mydb')\n    with conn.cursor() as cur:\n        cur.execute('SELECT COUNT(*) FROM users')\n        count = cur.fetchone()[0]\n    return {'failover_seconds': failover_time, 'data_intact': count > 0}\n\n# Run monthly: test_failover() + test failback\n"
+  example_bad: "# Failover never tested — fails when needed most\n# 'We have a replica, failover will work'\n# During incident:\n# - Replica has different schema (migration not replicated)\n# - App has hardcoded primary IP (no DNS-based routing)\n# - DNS TTL is 3600s (1 hour to propagate)\n# - App doesn't retry on connection failure (no reconnect logic)\n# - Replica is a smaller instance (OOM under production load)\n# Result: 4-hour outage instead of 5-minute failover\n"
+  when_applies: "When operating database clusters with replicas intended for failover during primary failures."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [aws, rds, gcp, mysql, postgresql]
+  domains:
+    domain: [databases, reliability]
+    concern: [relational, resilience, disaster_recovery]
+  sources:
+  - url: https://sre.google/sre-book/emergency-response/
+    title: 'Google SRE Book — Chapter 13: Emergency Response'
+  validation_status: cross_checked
+- id: CR-SRE-DB-006
+  text: Write-ahead logging (WAL) is the foundation of database reliability — every mutation must be written to a durable log BEFORE being applied to the data. This guarantees that committed transactions
+    survive crashes. Understanding WAL is essential for anyone operating databases in production.
+  why: 'WAL is the mechanism that makes databases ACID-compliant through crashes. When a transaction commits, the WAL entry is fsynced to disk BEFORE the data pages are updated. If the database crashes
+    between the WAL write and the data page update, recovery replays the WAL to reconstruct committed transactions. Without WAL, a crash during a write can leave the database in a corrupt state — some pages
+    updated, others not. WAL is also the mechanism behind replication (replicas replay the primary''s WAL) and PITR (restoring to a point in time by replaying WAL up to that moment). Understanding WAL behavior
+    is critical for operations: WAL disk filling up causes the database to halt, WAL archiving failures prevent PITR, and WAL replay speed determines recovery time.
+
+    '
+  how_to_do_right: '1. Monitor WAL disk usage. If the WAL disk fills up, the database stops accepting writes. Alert at 70% disk usage.
+
+    2. Configure WAL archiving to durable storage (S3, GCS). Without archived WAL, PITR is impossible.
+
+    3. Monitor WAL archiving lag: if archiving falls behind, the gap represents potential data loss in a disaster.
+
+    4. Size the WAL disk for at least 2x the daily WAL generation. Spikes in write activity can double WAL volume.
+
+    5. Monitor WAL replay time during recovery: if replaying 1 hour of WAL takes 4 hours, your RTO is 4x the outage duration.
+
+    6. Tune WAL settings for your workload: wal_buffers for write-heavy workloads, checkpoint_timeout for recovery speed.
+
+    '
+  example_good: "# WAL monitoring and configuration for reliability\n-- postgresql.conf: WAL configuration\n-- wal_level = replica            -- enable replication + PITR\n-- archive_mode = on              -- archive WAL segments\n-- archive_command = 'aws s3 cp %p s3://wal-archive/%f'\n-- wal_buffers = 64MB             -- write-heavy workload\n-- checkpoint_timeout = 10min     -- balance recovery speed vs performance\n\n-- Monitor WAL disk usage (alert at 70%)\n-- SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0') / 1024 / 1024 AS wal_mb;\n\n-- Monitor archiving lag\n-- SELECT last_archived_wal, last_failed_wal,\n--        (EXTRACT(EPOCH FROM now() - last_archived_time))::int AS lag_seconds\n-- FROM pg_stat_archiver;\n-- Alert if lag_seconds > 300 (5 min behind)\n\n-- Monitor WAL generation rate for disk sizing\n-- SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0') / 1024 / 1024 / 1024 AS wal_gb;\n"
+  example_bad: "# WAL disk not monitored — database halts when full\n-- Default WAL settings, no monitoring\n-- Write-heavy workload fills WAL disk overnight\n-- 3 AM: ERROR: could not write to file 'pg_wal/...': No space left on device\n-- Database refuses ALL writes until WAL disk is freed\n-- No archive_command -> no PITR capability\n-- Recovery: manual intervention at 3 AM, potential data loss\n"
+  when_applies: "When operating PostgreSQL or MySQL in production where data durability, replication, and point-in-time recovery depend on WAL/binlog integrity."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [mysql, postgresql]
+  domains:
+    domain: [databases, reliability]
+    concern: [relational, data_integrity]
+  sources:
+  - url: https://sre.google/sre-book/data-integrity/
+    title: 'Google SRE Book — Chapter 26: Data Integrity: What You Read Is What You Wrote'
+  validation_status: cross_checked
+- id: CR-SRE-DB-007
+  text: Cache invalidation is one of the two hard problems in computer science. Serving stale cached data when the source has changed causes subtle, hard-to-diagnose bugs. If your cache TTL is 5 minutes,
+    users see stale data for up to 5 minutes after every change.
+  why: 'Google operates some of the largest caching systems in the world and has extensive experience with cache consistency bugs. The fundamental tension: caching improves performance (fewer database queries,
+    lower latency) but introduces staleness (cached data may not reflect recent changes). Cache invalidation strategies each have tradeoffs: TTL-based (simple but stale for up to TTL duration), write-through
+    (consistent but adds write latency), event-driven invalidation (consistent and fast but complex to implement and debug). Google found that the most dangerous pattern is implicit caching — caching that
+    was added for performance without considering consistency implications. A developer adds a cache to reduce database load, sets a 5-minute TTL, and forgets about it. Months later, a user changes their
+    email and sees the old email for 5 minutes — a bug that is extremely difficult to trace to a cache TTL.
+
+    '
+  how_to_do_right: '1. Document EVERY cache in the system: what data is cached, what TTL, what invalidation strategy. Undocumented caches are the source of the hardest bugs.
+
+    2. For user-facing mutable data, prefer write-through (update cache on write) or event-driven invalidation (invalidate on change event).
+
+    3. For read-heavy, rarely-changing data, TTL-based caching is acceptable. Set TTL based on acceptable staleness, not arbitrary values.
+
+    4. Include cache-control headers in API responses so clients know whether they can cache and for how long.
+
+    5. Monitor cache hit rate: if < 50%, the cache is not helping. If > 99.9%, the cache may be hiding a slow backend that would collapse without it.
+
+    6. Test with cache disabled: if disabling the cache causes the database to be overloaded, you are dependent on the cache for capacity, not just performance.
+
+    '
+  example_good: "# Write-through cache with documented invalidation strategy\nimport redis\nimport json\nfrom typing import Optional\n\nclass UserCache:\n    \"\"\"Cache with write-through invalidation. TTL: 5 min (acceptable staleness).\"\"\"\n    def __init__(self, redis_client: redis.Redis, db):\n        self.redis = redis_client\n        self.db = db\n        self.TTL = 300  # 5 minutes — documented acceptable staleness\n\n    def get_user(self, user_id: int) -> Optional[dict]:\n        cached = self.redis.get(f'user:{user_id}')\n        if cached:\n            return json.loads(cached)\n        user = self.db.get_user(user_id)\n        if user:\n            self.redis.setex(f'user:{user_id}', self.TTL, json.dumps(user))\n        return user\n\n    def update_user(self, user_id: int, data: dict) -> None:\n        self.db.update_user(user_id, data)\n        self.redis.delete(f'user:{user_id}')  # invalidate on write\n\n# EVERY cache documented: what, TTL, invalidation strategy\n"
+  example_bad: "# Implicit cache with no invalidation — stale data bugs\nimport functools\n\n@functools.lru_cache(maxsize=1000)\ndef get_user(user_id: int) -> dict:\n    return db.execute('SELECT * FROM users WHERE id = %s', (user_id,))\n\ndef update_user(user_id: int, data: dict) -> None:\n    db.execute('UPDATE users SET email = %s WHERE id = %s', (data['email'], user_id))\n    # Cache NOT invalidated! User changes email but sees old email\n    # lru_cache has no TTL — stale forever until process restart\n    # Undocumented — nobody knows this cache exists\n"
+  when_applies: "When adding caching to any system that serves mutable data, especially user-facing data where staleness causes visible bugs."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [redis, networking]
+  domains:
+    domain: [architecture, databases, performance, reliability]
+    concern: [distributed_systems, relational, caching, data_integrity]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-DB-008
+  text: Database locks that are held too long cascade into application-wide failures. A long-running transaction that holds row locks blocks all other transactions on those rows, which queue up, exhaust
+    the connection pool, and cause the entire application to hang.
+  why: 'Lock contention is a cascading failure pattern that Google observes frequently in database-backed services. The sequence: a long-running query (or slow migration) acquires locks. Other transactions
+    that need the same rows wait. Waiting transactions hold their database connections. More transactions arrive and wait. The connection pool is exhausted. New requests can''t get a connection. The entire
+    application returns errors — not just requests that need the locked rows, but ALL requests (because the connection pool is shared). The original long-running query has no idea it''s causing a global
+    outage. Google''s defense: short transaction timeouts, lock wait timeouts, and monitoring lock contention as a primary metric.
+
+    '
+  how_to_do_right: '1. Set lock_timeout (PostgreSQL) or innodb_lock_wait_timeout (MySQL) to a reasonable value (5-10 seconds). Don''t let transactions wait indefinitely.
+
+    2. Set statement_timeout to kill queries that run longer than expected (30 seconds for OLTP, longer for batch).
+
+    3. Keep transactions short: read, compute, write. Don''t hold transactions open while making HTTP calls or waiting for user input.
+
+    4. Monitor lock waits: alert when the number of transactions waiting for locks exceeds a threshold.
+
+    5. Run DDL migrations (ALTER TABLE) with lock timeouts: if the lock can''t be acquired in 5 seconds, abort and retry during low traffic.
+
+    6. Use advisory locks or application-level locking for long operations instead of database row locks.
+
+    '
+  example_good: "# Short transactions with lock timeout to prevent cascading failures\nimport psycopg2\n\ndef update_order_status(conn, order_id: int, new_status: str) -> None:\n    with conn.cursor() as cur:\n        # Set lock timeout — don't wait forever\n        cur.execute(\"SET LOCAL lock_timeout = '5s'\")\n        cur.execute(\"SET LOCAL statement_timeout = '10s'\")\n        try:\n            cur.execute(\n                'UPDATE orders SET status = %s WHERE id = %s',\n                (new_status, order_id)\n            )\n            conn.commit()\n        except psycopg2.errors.LockNotAvailable:\n            conn.rollback()\n            raise TimeoutError(f'Could not acquire lock on order {order_id}')\n    # Transaction is SHORT: read, compute, write, commit\n    # No HTTP calls, no user input, no sleeping while holding locks\n"
+  example_bad: "# Long transaction holds locks while making HTTP calls\ndef process_order(conn, order_id: int) -> None:\n    cur = conn.cursor()\n    cur.execute('SELECT * FROM orders WHERE id = %s FOR UPDATE', (order_id,))\n    # Lock acquired on order row\n    response = requests.post('https://payment-api.com/charge', ...)  # 2-30 seconds\n    # Lock held during entire HTTP call!\n    if response.ok:\n        cur.execute('UPDATE orders SET status = %s', ('paid',))\n    conn.commit()\n    # 30 seconds of lock holding -> all other transactions on this row queue\n    # Connection pool fills with waiting transactions -> total outage\n"
+  when_applies: "When writing database transactions that may contend with other transactions, especially in high-concurrency OLTP systems."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [mysql, postgresql]
+  domains:
+    domain: [code_quality, databases, performance, reliability]
+    concern: [concurrency, relational]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked

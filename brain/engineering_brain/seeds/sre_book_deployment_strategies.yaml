@@ -1,0 +1,295 @@
+layer: rules
+technology: SRE
+domain: deployment
+knowledge:
+- id: CR-SRE-DEPLOY-001
+  text: Canary deployments must have automated analysis — a human watching dashboards for 30 minutes is not a canary strategy.
+    Automated canary analysis compares canary metrics against baseline metrics and decides promote/rollback without human
+    intervention.
+  why: 'Google''s release engineering (Chapter 8) uses automated canary analysis (Kayenta) because human observation is unreliable
+    at scale. A human watching dashboards: may miss a 2% error rate increase (within visual noise), cannot correlate 50 metrics
+    simultaneously, is biased (deployment owner wants to see success), and is expensive (30+ minutes of engineer time per
+    deployment). Automated canary analysis: compares 100+ metrics between canary and baseline statistically, detects < 1%
+    regression in any metric, is unbiased, and runs in minutes. Google''s canary process: deploy new version to 1% of traffic,
+    run automated analysis for 10-15 minutes, compare error rates, latency percentiles, and saturation metrics. If any metric
+    degrades statistically, rollback automatically.
+
+    '
+  how_to_do_right: '1. Deploy canary to 1-5% of traffic. Not 0.1% (insufficient signal) and not 50% (too much blast radius).
+
+    2. Run automated comparison: canary metrics vs baseline metrics for the same time window. Use statistical tests (Mann-Whitney,
+    Kolmogorov-Smirnov).
+
+    3. Compare: error rate, P50/P95/P99 latency, CPU/memory usage, business metrics (conversion rate, checkout success).
+
+    4. Decision criteria: if any critical metric is statistically worse in canary, rollback automatically. No human approval
+    needed for rollback.
+
+    5. Canary duration: 10-30 minutes for most services. Longer for services with infrequent traffic patterns.
+
+    6. Use tools: Flagger (Kubernetes), Argo Rollouts, Kayenta (Spinnaker), or custom implementation with Prometheus queries.
+
+    '
+  example_good: "# Automated canary analysis with Argo Rollouts\napiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: api-server\nspec:\n  strategy:\n    canary:\n      canaryService: api-canary\n      stableService: api-stable\n      steps:\n      - setWeight: 5           # 5% traffic to canary\n      - pause: {duration: 15m} # wait 15 minutes\n      - analysis:              # automated metric comparison\n          templates:\n          - templateName: canary-analysis\n          args:\n          - name: canary-service\n            value: api-canary\n      - setWeight: 25          # if analysis passes, 25%\n      - pause: {duration: 30m}\n      - setWeight: 100         # full rollout\n---\napiVersion: argoproj.io/v1alpha1\nkind: AnalysisTemplate\nmetadata:\n  name: canary-analysis\nspec:\n  metrics:\n  - name: error-rate\n    successCondition: result < 0.02  # <2% error rate\n    provider:\n      prometheus:\n        query: rate(http_errors_total{service='api-canary'}[5m])\n"
+  example_bad: "# Human-watching-dashboards 'canary'\n# 1. Deploy new version to 50% of pods (too much blast radius)\n# 2. Engineer watches Grafana for 30 minutes\n# 3. 'Looks fine to me' (misses 2% error rate increase)\n# 4. Deploy to 100%\n# 5. 3 hours later: customer reports show 2% of orders failing\n# No automated metrics, no statistical comparison, human bias\n"
+  when_applies: "When deploying any production service where a bad deployment could impact users and automated rollback decisions are needed."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [deployment, kubernetes]
+  domains:
+    domain: [deployment, operations, reliability]
+    concern: [strategies, canary, maintenance, automation]
+  sources:
+  - url: https://sre.google/sre-book/release-engineering/
+    title: 'Google SRE Book — Chapter 8: Release Engineering'
+  validation_status: cross_checked
+- id: CR-SRE-DEPLOY-002
+  text: Blue-green deployments eliminate downtime but double the infrastructure cost during deployment. The tradeoff is worth
+    it for critical services — instant rollback (switch traffic back to blue) is the killer feature that justifies the cost.
+  why: 'Google uses blue-green (or red-black) deployments for services where rollback speed is more important than infrastructure
+    cost. The mechanism: maintain two identical environments (blue and green). Blue runs the current version, green is idle.
+    To deploy: deploy new version to green, run smoke tests, switch traffic from blue to green. If problems detected: switch
+    traffic back to blue (instant rollback — no deployment needed). The cost: two full environments running simultaneously
+    during deployment (and the standby environment running idle between deployments). The benefit: rollback is a traffic switch
+    (< 1 second), not a redeployment (5-30 minutes). For services where 5 minutes of degraded service costs more than the
+    idle infrastructure, blue-green is the right choice.
+
+    '
+  how_to_do_right: '1. Maintain two identical environments: same instance count, same configuration, same dependencies.
+
+    2. Deploy to the idle environment: run full test suite, smoke tests, and health checks BEFORE switching traffic.
+
+    3. Switch traffic at the load balancer level: change the backend target from blue to green. This is near-instant.
+
+    4. Keep the old environment running for at least 30 minutes after switch: this is your rollback target.
+
+    5. For database changes: use backward-compatible migrations. Both blue and green must work with the same database schema.
+
+    6. Automate the entire process: deploy → test → switch → monitor → rollback-if-needed. No manual steps.
+
+    '
+  example_good: "# Blue-green deployment with instant rollback via load balancer\nimport boto3\n\ndef blue_green_deploy(new_version: str, lb_arn: str,\n                      blue_tg: str, green_tg: str) -> dict:\n    elbv2 = boto3.client('elbv2')\n    # 1. Deploy to green (idle) environment\n    deploy_to_target_group(green_tg, new_version)\n    # 2. Run smoke tests against green\n    if not run_smoke_tests(green_tg):\n        return {'status': 'failed', 'reason': 'smoke tests failed'}\n    # 3. Switch traffic: blue -> green (near-instant)\n    elbv2.modify_listener(\n        ListenerArn=lb_arn,\n        DefaultActions=[{'Type': 'forward', 'TargetGroupArn': green_tg}]\n    )\n    # 4. Keep blue running for 30 min (rollback target)\n    return {'status': 'success', 'rollback_target': blue_tg,\n            'rollback_command': f'switch traffic back to {blue_tg}'}\n\n# Rollback: single API call to switch traffic back to blue (< 1 second)\n"
+  example_bad: "# 'Blue-green' without keeping the old environment\ndef deploy(new_version: str):\n    stop_all_pods()           # downtime starts here\n    deploy_new_version(new_version)\n    wait_for_healthy()\n    # Total downtime: 2-5 minutes\n    # Rollback: rebuild old version (20 min), redeploy (5 min)\n    # Not blue-green — just regular deployment with downtime\n"
+  when_applies: "When deploying critical services that require zero-downtime deployments and instant rollback capability."
+  severity: medium
+  technologies:
+    lang: [general]
+    platform: [aws, kubernetes, load_balancer]
+  domains:
+    domain: [deployment, reliability]
+    concern: [database_migrations, zero_downtime, strategies, blue_green]
+  sources:
+  - url: https://sre.google/sre-book/release-engineering/
+    title: 'Google SRE Book — Chapter 8: Release Engineering'
+  validation_status: cross_checked
+- id: CR-SRE-DEPLOY-003
+  text: Database migrations must be backward compatible with the previous application version — because during rolling deployments,
+    both old and new application versions run simultaneously against the same database. A migration that breaks the old version
+    causes failures during deployment.
+  why: 'Google''s release engineering (Chapter 8) treats database migrations as a special category of change because they
+    affect all application instances simultaneously and are difficult to rollback. During a rolling deployment: old version
+    (v1) and new version (v2) coexist for minutes to hours. Both connect to the same database. If v2 requires a migration
+    that renames column "name" to "full_name": v2 instances work fine, but v1 instances crash (column "name" doesn''t exist).
+    The entire deployment becomes a partial outage. Google''s approach: expand-and-contract migrations. Step 1 (expand): add
+    "full_name" column, deploy v2 that writes to both columns and reads from "full_name." Step 2 (contract, next deployment):
+    drop "name" column. Each step is backward-compatible.
+
+    '
+  how_to_do_right: '1. Never rename or delete columns in the same deployment as the code that uses them. Use expand-and-contract
+    over 2 deployments.
+
+    2. Expand: add new column, backfill data, deploy code that writes to both columns. Contract: (next deployment) remove
+    old column.
+
+    3. Never add NOT NULL columns without a default value. Old code inserting rows without the new column will fail.
+
+    4. Test migrations against the PREVIOUS version of the application: run v1''s test suite against the migrated schema.
+
+    5. Make migrations reversible: every UP migration should have a corresponding DOWN migration. Test both directions.
+
+    6. Run migrations BEFORE deploying new code (not after). The database must be ready for both old and new code before any
+    new code runs.
+
+    '
+  example_good: "# Expand-and-contract migration across 2 deployments\n# Migration 1 (EXPAND): safe with both v1 and v2 code\nALTER TABLE users ADD COLUMN full_name TEXT DEFAULT NULL;\n-- v1 code: reads 'name' (works, ignores 'full_name')\n-- v2 code: reads 'full_name', writes to BOTH columns\n\n# Application v2:\ndef update_user_name(conn, user_id: int, name: str) -> None:\n    conn.execute(\n        'UPDATE users SET name = %s, full_name = %s WHERE id = %s',\n        (name, name, user_id)  # dual-write\n    )\n\n# Backfill:\n# UPDATE users SET full_name = name WHERE full_name IS NULL;\n\n# Migration 2 (CONTRACT): after all instances run v2\nALTER TABLE users DROP COLUMN name;\n# Test v1 against migrated schema BEFORE applying migration 1\n"
+  example_bad: "# Single-step rename — breaks running v1 instances\nALTER TABLE users RENAME COLUMN name TO full_name;\n-- v1 (still running during rolling deploy): SELECT name FROM users\n-- ERROR: column 'name' does not exist\n-- Partial outage for duration of rolling deployment\n-- Rollback to v1 doesn't fix it — 'name' column is gone\n"
+  when_applies: "When performing database schema changes alongside rolling application deployments where old and new code versions coexist."
+  severity: critical
+  technologies:
+    lang: [general]
+    framework: [orm, sqlalchemy, web, django]
+    platform: [mysql, postgresql]
+  domains:
+    domain: [databases, deployment, reliability]
+    concern: [database_migrations, strategies]
+  sources:
+  - url: https://sre.google/sre-book/release-engineering/
+    title: 'Google SRE Book — Chapter 8: Release Engineering'
+  validation_status: cross_checked
+- id: CR-SRE-DEPLOY-004
+  text: Progressive delivery (canary → regional → global rollout) limits the blast radius of bad deployments. A bug that affects
+    1% of users for 15 minutes (canary) is an incident. The same bug affecting 100% of users for 2 hours (big-bang deployment)
+    is a catastrophe.
+  why: 'Google''s launch checklist (Chapter 27) mandates progressive rollouts because the cost of a bad deployment scales
+    with the affected population. Progressive delivery: deploy to 1% (canary) → if healthy, expand to 5% → 25% → 50% → 100%.
+    At each stage: run automated analysis, check metrics, verify no regression. If a problem is detected at any stage: stop
+    expansion and rollback. The maximum blast radius is the current stage percentage. This approach reduces MTTR (detected
+    earlier, rolled back faster) and reduces blast radius (fewer users affected). Google''s Borg uses similar progression:
+    deploy to a few tasks in one cell → expand to the full cell → expand to other cells → global.
+
+    '
+  how_to_do_right: '1. Stage 1 (1-5%): canary with automated analysis. Duration: 10-30 minutes. Auto-rollback on metric regression.
+
+    2. Stage 2 (25%): quarter of traffic. Duration: 30-60 minutes. Monitor business metrics in addition to technical metrics.
+
+    3. Stage 3 (50%): half of traffic. Duration: 1-2 hours. Watch for load-dependent bugs that only appear at scale.
+
+    4. Stage 4 (100%): full rollout. Continue monitoring for 24 hours for time-dependent bugs (cron jobs, daily patterns).
+
+    5. At EVERY stage: automated metric comparison. If any stage fails, rollback to previous stage (not to zero).
+
+    6. Multi-region: deploy to one region first, expand to others after 1-24 hours. A bug in one region is contained.
+
+    '
+  example_good: "# Progressive delivery: 1% -> 5% -> 25% -> 50% -> 100%\napiVersion: argoproj.io/v1alpha1\nkind: Rollout\nspec:\n  strategy:\n    canary:\n      steps:\n      - setWeight: 1            # Stage 1: 1% canary\n      - pause: {duration: 15m}  # automated analysis\n      - analysis:\n          templates: [{templateName: error-rate-check}]\n      - setWeight: 5            # Stage 2: 5%\n      - pause: {duration: 30m}\n      - analysis:\n          templates: [{templateName: full-metric-check}]\n      - setWeight: 25           # Stage 3: 25%\n      - pause: {duration: 60m}  # watch for load-dependent bugs\n      - setWeight: 50           # Stage 4: 50%\n      - pause: {duration: 120m}\n      - setWeight: 100          # Stage 5: full rollout\n      # Any stage failure -> automatic rollback to previous stage\n      # Max blast radius = current stage percentage\n"
+  example_bad: "# Big-bang deployment — 0% to 100% in one step\napiVersion: apps/v1\nkind: Deployment\nspec:\n  replicas: 10\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxSurge: 100%        # all pods replaced at once\n      maxUnavailable: 0\n  # No canary, no analysis, no progressive stages\n  # Bug affects 100% of users immediately\n  # Detection only after users complain (minutes to hours)\n"
+  when_applies: "When deploying changes to production services serving user traffic where the blast radius of a bad deployment must be minimized."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [deployment, kubernetes]
+  domains:
+    domain: [deployment, reliability]
+    concern: [strategies, progressive]
+  sources:
+  - url: https://sre.google/sre-book/reliable-product-launches/
+    title: 'Google SRE Book — Chapter 27: Reliable Product Launches at Scale'
+  validation_status: cross_checked
+- id: CR-SRE-DEPLOY-005
+  text: Pre-deployment validation must include smoke tests, integration tests, AND dependency health checks — not just "does
+    it start?" A service that starts but cannot connect to its database has passed health checks but will fail on the first
+    real request.
+  why: 'Google''s production readiness review (Chapter 32) requires comprehensive pre-deployment validation because "it starts"
+    is the lowest bar possible. A service can start and pass basic health checks while: the database connection pool is configured
+    incorrectly (will exhaust on real traffic), a required API key is expired (will fail on the first external call), a dependency
+    URL is wrong (will timeout on every request), or a feature flag service is unreachable (will use wrong defaults). Google''s
+    pre-deployment validation: start the service → verify liveness → verify readiness (all dependencies connected) → run smoke
+    tests (critical paths produce correct results) → run integration tests (cross-service flows work) → verify metrics emission
+    (Prometheus/monitoring receives data). Only after all checks pass does the service receive traffic.
+
+    '
+  how_to_do_right: '1. Liveness check: process started, port listening, event loop running. Takes < 1 second.
+
+    2. Readiness check: database connected, cache reachable, dependent services responsive, config loaded. Takes < 5 seconds.
+
+    3. Smoke tests: critical API paths return correct responses. POST /login, GET /health, GET /api/v1/users. Takes < 30 seconds.
+
+    4. Integration tests: cross-service flows work end-to-end. User registration → email sent → user can login. Takes < 5
+    minutes.
+
+    5. Metrics check: verify the service is emitting metrics to the monitoring system. A service without metrics is invisible.
+
+    6. Gate all deployments: if any pre-deployment check fails, the deployment stops and rolls back. No manual override without
+    explicit approval.
+
+    '
+  example_good: "# Comprehensive pre-deployment validation\nimport requests\nimport time\n\ndef pre_deploy_validation(service_url: str, db_url: str) -> dict:\n    results = {}\n    # 1. Liveness: process started\n    resp = requests.get(f'{service_url}/healthz', timeout=1)\n    results['liveness'] = resp.status_code == 200\n\n    # 2. Readiness: dependencies connected\n    resp = requests.get(f'{service_url}/readyz', timeout=5)\n    results['readiness'] = resp.status_code == 200\n\n    # 3. Smoke tests: critical paths work\n    resp = requests.post(f'{service_url}/api/v1/auth/login',\n                         json={'email': 'smoke@test.com', 'password': 'test'})\n    results['smoke_auth'] = resp.status_code in (200, 401)\n\n    resp = requests.get(f'{service_url}/api/v1/health/deep')\n    results['smoke_deep'] = resp.status_code == 200\n\n    # 4. Metrics emission check\n    resp = requests.get(f'{service_url}/metrics')\n    results['metrics_emitting'] = 'http_requests_total' in resp.text\n\n    all_passed = all(results.values())\n    return {'passed': all_passed, 'checks': results}\n\n# Gate: if not all_passed, rollback automatically\n"
+  example_bad: "# 'It starts' is the only validation\napiVersion: v1\nkind: Pod\nspec:\n  containers:\n  - name: api\n    livenessProbe:\n      httpGet:\n        path: /healthz  # only checks 'process is alive'\n        port: 8080\n    # No readiness probe (db connection not verified)\n    # No smoke tests (critical paths not tested)\n    # No metrics check (service is invisible to monitoring)\n    # Service starts, passes health check, receives traffic\n    # First real request: 500 (expired API key to payment provider)\n"
+  when_applies: "When configuring deployment pipelines and health checks for services that depend on databases, external APIs, or other infrastructure."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [deployment, kubernetes]
+  domains:
+    domain: [architecture, deployment, reliability, testing]
+    concern: [api_design, validation, strategies]
+  sources:
+  - url: https://sre.google/sre-book/evolving-sre-engagement-model/
+    title: 'Google SRE Book — Chapter 32: The Evolving SRE Engagement Model'
+  validation_status: cross_checked
+- id: CR-SRE-DEPLOY-006
+  text: Deployment freezes during high-traffic periods are a reliability practice, not a sign of weak deployment systems.
+    Black Friday, end-of-quarter, and elections are not the time to test your deployment pipeline. Freeze changes, maximize
+    available on-call staff, and save experiments for Tuesday.
+  why: 'Google''s launch and change management practices (Chapter 27) recognize that deployments are the #1 cause of outages.
+    During high-traffic periods, the blast radius of any deployment failure is maximized (affecting the most users during
+    the most critical time). The cost-benefit calculation changes: during normal traffic, a failed deployment affects 1000
+    users for 15 minutes (canary). During Black Friday, the same failure affects 100,000 users for 15 minutes. The deployment
+    might be fine — but if it''s not, the consequences are 100x worse. Google''s policy: code freeze during traffic peaks,
+    with exceptions only for critical hotfixes that require VP-level approval. This is not about lacking confidence in the
+    deployment system — it''s about risk management.
+
+    '
+  how_to_do_right: '1. Define freeze windows based on business calendar: shopping events, quarter-end, marketing campaigns,
+    elections.
+
+    2. Freeze ALL changes: code deployments, infrastructure changes, configuration updates, database migrations. Only hotfixes
+    with explicit approval.
+
+    3. Hotfix approval during freeze: requires both engineering lead and on-call lead sign-off. The hotfix must be pre-tested.
+
+    4. Staff up during high-traffic periods: more on-call engineers, more monitoring attention, pre-positioned rollback procedures.
+
+    5. Deploy and stabilize BEFORE the freeze: complete all planned changes at least 48 hours before the freeze window starts.
+
+    6. Communicate freeze windows in advance: all teams should know when freezes start/end. Include in the engineering calendar.
+
+    '
+  example_good: "# Deployment freeze policy with clear governance\nimport datetime\nfrom dataclasses import dataclass\n\n@dataclass\nclass FreezeWindow:\n    name: str\n    start: datetime.datetime\n    end: datetime.datetime\n    hotfix_approvers: list[str]  # VP-level for hotfixes\n\nFREEZE_WINDOWS = [\n    FreezeWindow('Black Friday', datetime.datetime(2024, 11, 27),\n                 datetime.datetime(2024, 12, 2), ['vp_eng', 'oncall_lead']),\n    FreezeWindow('Q4 Close', datetime.datetime(2024, 12, 28),\n                 datetime.datetime(2025, 1, 2), ['vp_eng', 'cto']),\n]\n\ndef can_deploy(now: datetime.datetime = None) -> tuple[bool, str]:\n    now = now or datetime.datetime.utcnow()\n    for fw in FREEZE_WINDOWS:\n        if fw.start <= now <= fw.end:\n            return False, f'Freeze: {fw.name}. Hotfix requires: {fw.hotfix_approvers}'\n    return True, 'Deployments allowed'\n\n# All changes frozen 48 hours before window start\n# Staff up on-call during freeze windows\n"
+  example_bad: "# No freeze policy — deploy on Black Friday 'because YOLO'\n# Friday 14:00: Engineer deploys a 'small refactor' to production\n# Friday 14:05: Payment processing breaks due to subtle type change\n# Friday 14:05-16:00: 100,000 users can't complete checkout\n# During the highest-traffic period of the year\n# Estimated revenue loss: $2M\n# The refactor could have waited until Monday\n"
+  when_applies: "When establishing change management policies for production systems during high-traffic or business-critical periods."
+  severity: medium
+  technologies:
+    lang: [general]
+  domains:
+    domain: [deployment, operations, reliability]
+    concern: [strategies, change_management]
+  sources:
+  - url: https://sre.google/sre-book/reliable-product-launches/
+    title: 'Google SRE Book — Chapter 27: Reliable Product Launches at Scale'
+  validation_status: cross_checked
+- id: CR-SRE-DEPLOY-007
+  text: GitOps — the entire system state is declared in git, and changes are applied by reconciling the actual state with
+    the declared state. No human runs kubectl apply, terraform apply, or any imperative command. The git repository IS the
+    source of truth for what should be running.
+  why: 'Google''s release engineering (Chapter 8) principle that "all changes are auditable and reversible" is most fully
+    realized by GitOps. Traditional deployment: engineer runs a command (kubectl apply, helm install) → the command modifies
+    the cluster → the change is not tracked anywhere (unless the engineer remembers to commit the config). GitOps: engineer
+    commits a change to git → an automated reconciler (ArgoCD, Flux) detects the change → the reconciler applies it to the
+    cluster → the cluster state matches the git state. Benefits: every change is tracked in git (who, what, when, why), rollback
+    is a git revert, drift is automatically corrected (reconciler re-applies the desired state), and the git history IS the
+    deployment history.
+
+    '
+  how_to_do_right: '1. All Kubernetes manifests, Terraform configs, and infrastructure declarations live in git. No ClickOps,
+    no imperative commands.
+
+    2. Use a GitOps reconciler (ArgoCD, Flux) that continuously compares git state with cluster state and applies changes
+    automatically.
+
+    3. Enable auto-sync with drift detection: if someone manually changes the cluster, the reconciler reverts the change to
+    match git.
+
+    4. Separate application repos from deployment repos: application code in one repo, deployment manifests in another. Decouples
+    build from deploy.
+
+    5. Use pull requests for all changes: the PR review process is your change management process. No direct pushes to main.
+
+    6. Protect the main branch: require approvals, CI checks, and policy validation before merge. A merge to main = a deployment.
+
+    '
+  example_good: "# GitOps: all state declared in git, reconciled by ArgoCD\n# k8s/api-server/deployment.yaml (committed to git)\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api-server\n  annotations:\n    app.kubernetes.io/managed-by: argocd  # GitOps-managed\nspec:\n  replicas: 5\n  template:\n    spec:\n      containers:\n      - name: api\n        image: myapp:abc123def  # SHA-tagged, traceable\n\n# ArgoCD Application\napiVersion: argoproj.io/v1alpha1\nkind: Application\nspec:\n  source:\n    repoURL: https://github.com/org/deploy-configs\n    path: k8s/api-server\n  syncPolicy:\n    automated:\n      selfHeal: true  # revert manual cluster changes\n      prune: true     # delete resources removed from git\n# Change = PR -> review -> merge -> ArgoCD auto-syncs\n# Rollback = git revert -> ArgoCD auto-syncs\n# Audit = git log (who, what, when, why)\n"
+  example_bad: "# Imperative deployment — no audit trail, no reproducibility\n# Engineer runs kubectl directly\nkubectl set image deployment/api api=myapp:latest  # which version?\n# Who deployed? When? What changed? No record.\n# Another engineer manually scales:\nkubectl scale deployment/api --replicas=3\n# Drift: cluster state != any git state\n# Incident: 'what is running in production?' -> nobody knows\n# Rollback: 'what was the previous state?' -> guess and pray\n"
+  when_applies: "When managing Kubernetes or infrastructure deployments where auditability, reproducibility, and automated drift correction are required."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [deployment, kubernetes, terraform]
+  domains:
+    domain: [deployment, reliability]
+    concern: [ci_cd, gitops, strategies]
+  sources:
+  - url: https://sre.google/sre-book/release-engineering/
+    title: 'Google SRE Book — Chapter 8: Release Engineering'
+  validation_status: cross_checked

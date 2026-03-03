@@ -1,0 +1,114 @@
+layer: rules
+technology: SRE
+domain: distributed_systems
+knowledge:
+- id: CR-SRE-CRON-001
+  text: Distributed cron is deceptively hard — "run this job every hour" requires solving leader election, idempotency, failure handling, and state persistence. A job that runs twice is often worse than
+    a job that doesn't run at all (double-charging users, sending duplicate emails).
+  why: 'Google''s Chapter 24 on Distributed Periodic Scheduling describes how a seemingly simple requirement ("run this cleanup job every hour") becomes a distributed systems problem at scale. On a single
+    machine, cron is trivial. On a cluster, you must solve: which machine runs the job (leader election), what happens if the machine dies mid-job (failure recovery), what happens if the job runs twice
+    due to failover (idempotency), and how to track whether the job succeeded (state persistence). Google built a distributed cron system (similar to Kubernetes CronJobs) that handles all of these, but
+    the key lesson is that most teams underestimate the complexity. A "simple cron job" deployed on Kubernetes without idempotency guards will eventually run twice during a pod restart — and the consequences
+    depend entirely on whether the job is idempotent.
+
+    '
+  how_to_do_right: '1. ALL scheduled jobs MUST be idempotent. Running the job twice must produce the same result as running it once.
+
+    2. Use distributed locking (etcd, ZooKeeper, Redis SETNX) to ensure at-most-once execution across the cluster.
+
+    3. Track job state (last successful run, current status) in persistent storage — not in the scheduler''s memory.
+
+    4. Handle partial completion: if a job crashes halfway, the next run must detect and handle the partial state.
+
+    5. In Kubernetes: use CronJob with concurrencyPolicy=Forbid (prevent overlapping runs) and startingDeadlineSeconds (skip missed runs instead of backfilling).
+
+    6. Monitor job execution: track success/failure rate, execution duration, and missed schedules. Alert on 2+ consecutive failures.
+
+    '
+  example_good: "# Idempotent cron job with distributed locking and state tracking\nimport redis\nimport hashlib\n\nclass DistributedCronJob:\n    def __init__(self, job_name: str, redis_client: redis.Redis):\n        self.job_name = job_name\n        self.redis = redis_client\n\n    def run(self):\n        # 1. Distributed lock — at-most-once execution\n        lock = self.redis.lock(f\"cron:{self.job_name}\", timeout=3600)\n        if not lock.acquire(blocking=False):\n            log.info(f\"{self.job_name} already running on another node\")\n            return\n        try:\n            # 2. Check last successful run\n            last_run = self.redis.get(f\"cron:{self.job_name}:last_success\")\n            if last_run and self._too_recent(last_run):\n                return  # Already ran recently\n            # 3. Execute idempotent work\n            self.do_work()  # Must be idempotent — safe to run twice\n            # 4. Record success\n            self.redis.set(f\"cron:{self.job_name}:last_success\", time.time())\n        finally:\n            lock.release()\n\n    def do_work(self):\n        \"\"\"Override this. MUST be idempotent.\"\"\"\n        # Use INSERT ... ON CONFLICT DO NOTHING, not INSERT\n        # Use PUT (upsert), not POST (create)\n        raise NotImplementedError\n"
+  example_bad: "# Non-idempotent cron job without locking\ndef cleanup_job():\n    # No distributed lock — runs on every pod in the cluster\n    users = db.query(\"SELECT * FROM users WHERE trial_expired = true\")\n    for user in users:\n        charge_user(user)       # Not idempotent! Charges TWICE if job runs twice\n        send_email(user, \"...\") # Duplicate emails during pod restart\n    # No state tracking — can't tell if job already ran\n    # Kubernetes restarts pod mid-job → job runs again → double charges\n"
+  when_applies: When implementing scheduled jobs on distributed infrastructure like Kubernetes where pod restarts, failovers, or concurrent scheduling can cause jobs to run multiple times.
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kubernetes, messaging]
+  domains:
+    domain: [architecture, operations, reliability]
+    concern: [data, pipelines, distributed_systems]
+  sources:
+  - url: https://sre.google/sre-book/distributed-periodic-scheduling/
+    title: 'Google SRE Book — Chapter 24: Distributed Periodic Scheduling'
+  validation_status: cross_checked
+- id: CR-SRE-PIPE-001
+  text: Data pipelines must be designed for failure recovery from the start — not retrofitted after the first data loss. Every pipeline stage must be resumable from its last checkpoint without reprocessing
+    the entire dataset.
+  why: 'Google''s Chapter 25 on Data Processing Pipelines describes a fundamental principle: data pipelines WILL fail. Machines die, networks partition, upstream data is corrupt, and processing bugs produce
+    wrong output. The question is not "will it fail?" but "how do we recover when it fails?" Without checkpointing, recovering from a pipeline failure means rerunning the ENTIRE pipeline from the beginning
+    — which for a pipeline processing petabytes of data can take days. Google''s pipelines checkpoint after every stage: stage 1 reads raw data and writes intermediate results, stage 2 reads intermediate
+    results and writes processed data, etc. When a failure occurs at stage 3, recovery starts from stage 3''s last checkpoint, not from the beginning. This transforms a multi-day recovery into a multi-hour
+    recovery.
+
+    '
+  how_to_do_right: '1. Checkpoint after EVERY pipeline stage. Write intermediate results to durable storage (S3, GCS, HDFS) before proceeding to the next stage.
+
+    2. Make each stage idempotent: re-running stage 3 with the same input must produce the same output.
+
+    3. Track pipeline progress in a metadata store: which stages completed, which are running, which failed, what was the input.
+
+    4. Implement dead-letter queues for items that fail processing. Don''t let one bad record block the entire pipeline.
+
+    5. Monitor end-to-end latency, not just per-stage latency. A pipeline that processes each stage in 1 hour but has 10 stages takes 10 hours end-to-end.
+
+    6. Test pipeline recovery: kill a stage mid-execution and verify that restart from checkpoint works correctly.
+
+    '
+  example_good: "# Pipeline with checkpointing and idempotent stages\nclass DataPipeline:\n    def __init__(self, checkpoint_store: str):\n        self.checkpoint = CheckpointStore(checkpoint_store)\n\n    def run(self, input_path: str):\n        # Stage 1: Extract — checkpoint after completion\n        if not self.checkpoint.is_complete(\"extract\"):\n            raw_data = self.extract(input_path)\n            self.save_intermediate(\"stage1_output\", raw_data)\n            self.checkpoint.mark_complete(\"extract\")\n\n        # Stage 2: Transform — resume from checkpoint if failed\n        if not self.checkpoint.is_complete(\"transform\"):\n            raw_data = self.load_intermediate(\"stage1_output\")\n            transformed = self.transform(raw_data)\n            self.save_intermediate(\"stage2_output\", transformed)\n            self.checkpoint.mark_complete(\"transform\")\n\n        # Stage 3: Load — idempotent upsert\n        if not self.checkpoint.is_complete(\"load\"):\n            transformed = self.load_intermediate(\"stage2_output\")\n            self.load_to_destination(transformed)  # Upsert, not insert\n            self.checkpoint.mark_complete(\"load\")\n\n    def recover(self):\n        \"\"\"Resume from last checkpoint — not from the beginning.\"\"\"\n        last_stage = self.checkpoint.last_complete_stage()\n        log.info(f\"Recovering from stage: {last_stage}\")\n        self.run(input_path=self.checkpoint.get_input())\n"
+  example_bad: "# Pipeline without checkpoints — full rerun on any failure\ndef run_pipeline(input_path: str):\n    # Stage 1: Extract (2 hours)\n    raw = extract_from_source(input_path)\n    # Stage 2: Transform (4 hours)\n    transformed = transform(raw)\n    # Stage 3: Load (2 hours)\n    load_to_destination(transformed)\n    # Total: 8 hours\n    # If Stage 3 fails: must rerun ALL 8 hours from scratch\n    # No intermediate checkpoints, no resume capability\n    # Petabyte pipelines: 8-hour rerun becomes 3-day rerun\n"
+  when_applies: When building data pipelines that process large datasets where failures at any stage should not require reprocessing the entire pipeline from the beginning.
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kubernetes, kafka]
+  domains:
+    domain: [architecture, reliability]
+    concern: [data, distributed_systems]
+  sources:
+  - url: https://sre.google/sre-book/data-processing-pipelines/
+    title: 'Google SRE Book — Chapter 25: Data Processing Pipelines'
+  validation_status: cross_checked
+- id: CR-SRE-PIPE-002
+  text: Big-data pipelines that use periodic batch processing (MapReduce, Spark) are inherently fragile because they have a fixed time budget. If the data grows 10% but the pipeline takes 12 hours of a
+    12-hour window, there is zero headroom. Prefer continuous/streaming pipelines that scale with data volume.
+  why: 'Google describes the "thundering herd" problem with batch pipelines: hundreds of pipelines all scheduled to run at midnight, competing for the same compute resources, with hard deadlines (the dashboard
+    must be ready by 8 AM). If one pipeline takes longer than expected (data grew, a dependency was slow), it delays every pipeline behind it in the queue. This creates a cascade where ALL morning dashboards
+    are late. Google''s migration from batch MapReduce to streaming (Millwheel/Dataflow) eliminated this problem because streaming pipelines process data continuously — there is no "start time" or "deadline."
+    Data arrives, is processed, and results are available with low latency. When data volume grows 10%, streaming latency increases 10% — not catastrophically like batch.
+
+    '
+  how_to_do_right: '1. Monitor pipeline runtime trends. If a 12-hour pipeline is taking 11 hours and data grows 5% per month, you have ~2 months before it breaks.
+
+    2. Set pipeline runtime alarms at 80% of the time budget. Don''t wait until it exceeds the budget to notice.
+
+    3. For critical pipelines, prefer streaming over batch: Kafka Streams, Flink, Spark Streaming, Dataflow.
+
+    4. If batch is necessary, provision headroom: a 12-hour pipeline in a 24-hour window has 50% headroom. In a 12-hour window, 0%.
+
+    5. Decouple pipelines: if pipeline B depends on pipeline A''s output, A''s delay cascades to B. Design for eventual consistency where possible.
+
+    6. Track data growth rate and pipeline runtime separately. If data grows faster than pipeline optimization, you are falling behind.
+
+    '
+  example_good: "# Monitor pipeline runtime and headroom proactively\nclass PipelineMonitor:\n    def check_headroom(self, pipeline: Pipeline):\n        budget_hours = pipeline.time_budget_hours  # e.g., 12 hours\n        actual_hours = pipeline.last_runtime_hours  # e.g., 10 hours\n        headroom_pct = (budget_hours - actual_hours) / budget_hours\n        data_growth_rate = pipeline.monthly_data_growth_rate  # e.g., 0.05 (5%)\n\n        months_until_breach = headroom_pct / data_growth_rate if data_growth_rate > 0 else float('inf')\n\n        metrics.observe(\"pipeline_headroom_pct\", headroom_pct, tags={\"pipeline\": pipeline.name})\n\n        if headroom_pct < 0.20:\n            alert(\n                f\"URGENT: {pipeline.name} has {headroom_pct:.0%} headroom. \"\n                f\"At {data_growth_rate:.0%}/month growth, breach in ~{months_until_breach:.0f} months. \"\n                f\"Consider migrating to streaming.\"\n            )\n\n    def recommend_architecture(self, pipeline: Pipeline) -> str:\n        if pipeline.is_critical and pipeline.headroom_pct < 0.30:\n            return \"STREAMING\"  # Kafka Streams, Flink, Spark Streaming\n        return \"BATCH\"  # Sufficient headroom\n"
+  example_bad: "# Batch pipeline with no headroom monitoring\ndef run_nightly_batch():\n    # Budget: 12 hours (midnight to noon)\n    # Current runtime: 11.5 hours\n    # Data growth: 5% per month\n    # In 1 month: runtime = 12.1 hours → EXCEEDS BUDGET\n    start = time.time()\n    process_all_data()  # Takes 11.5 hours and growing\n    elapsed = (time.time() - start) / 3600\n    # No monitoring of elapsed vs budget\n    # No tracking of data growth rate\n    # First indication of problem: morning dashboard is late\n    # All downstream pipelines cascade-delayed\n"
+  when_applies: When operating batch data pipelines with fixed time budgets where data growth can cause pipelines to exceed their processing windows and cascade delays to downstream consumers.
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kafka]
+  domains:
+    domain: [architecture, reliability]
+    concern: [data, distributed_systems]
+  sources:
+  - url: https://sre.google/sre-book/data-processing-pipelines/
+    title: 'Google SRE Book — Chapter 25: Data Processing Pipelines'
+  validation_status: cross_checked

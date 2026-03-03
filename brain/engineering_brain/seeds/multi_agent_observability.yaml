@@ -1,0 +1,1156 @@
+layer: rules
+domain: observability
+knowledge:
+- id: MAO-001
+  text: >
+    Structure every multi-agent pipeline call as a single Langfuse trace containing a
+    hierarchy of spans and generations: one root trace per user request, one span per
+    agent role (orchestrator, worker, critic), and one generation per LLM call within
+    that agent. Never create a flat list of independent traces for a single pipeline
+    execution — the hierarchy is the observability.
+  why: >
+    Without a trace hierarchy, you cannot answer "which agent caused this latency spike"
+    or "which LLM call produced the hallucination." Flat traces force you to manually
+    correlate timestamps across unrelated records — this fails at scale and during
+    incidents. Langfuse's data model (Session → Trace → Observation) was designed
+    precisely for nested agent calls; ignoring the nesting collapses the entire value
+    of the tool. In the Brains pipeline (CogniFarm, committee agents), each CrewAI
+    agent invocation must be a child span of the orchestrator span so cost and latency
+    can be attributed per role.
+  how_to_do_right: |
+    1. At pipeline entry: create root trace with langfuse.trace(name="pipeline_run",
+       metadata={"sprint_id": sprint_id, "phase": phase_name})
+    2. For each agent: create a child span with trace.span(name=agent_role,
+       metadata={"agent_id": agent_id, "model": model_name})
+    3. For each LLM call inside the agent: create a generation child with
+       span.generation(name="llm_call", model=model, input=messages,
+       usage={"input": input_tokens, "output": output_tokens})
+    4. Set parent_observation_id on each child to form the tree
+    5. End each span/generation explicitly (span.end(), generation.end())
+    6. Use langfuse.flush() or async equivalent before process exit
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langfuse, crewai, langgraph]
+  domains:
+    domain: [observability, architecture]
+    concern: [multi_agent, tracing, debugging]
+  example_good: |
+    from langfuse import Langfuse
+    langfuse = Langfuse()
+
+    # Root trace for the full pipeline run
+    trace = langfuse.trace(
+        name="pipeline_run",
+        metadata={"sprint_id": "S04", "phase": "spec_generation"},
+        tags=["production", "committee"]
+    )
+
+    # Orchestrator span
+    orch_span = trace.span(name="orchestrator", metadata={"role": "orchestrator"})
+
+    # Worker agent span (child of orchestrator)
+    worker_span = orch_span.span(name="spec_writer", metadata={"role": "worker"})
+
+    # LLM generation inside worker
+    gen = worker_span.generation(
+        name="spec_draft",
+        model="claude-opus-4",
+        input=[{"role": "user", "content": prompt}],
+        usage={"input": 1200, "output": 800}
+    )
+    response = call_llm(prompt)
+    gen.end(output=response)
+    worker_span.end()
+    orch_span.end()
+    trace.update(output=response)
+    langfuse.flush()
+  example_bad: |
+    # Anti-pattern: one independent trace per agent — no hierarchy
+    for agent_name, agent_fn in agents.items():
+        t = langfuse.trace(name=agent_name)  # disconnected traces
+        result = agent_fn()
+        t.update(output=result)
+    # Can't answer: which agent took longest? which caused cost spike?
+    # Each trace is an orphan — no parent-child relationship
+  when_applies: >
+    Any multi-agent or multi-step LLM pipeline where you need to attribute cost,
+    latency, or errors to a specific agent role. Mandatory when using CrewAI,
+    LangGraph, or any orchestrator framework in production.
+  sources:
+    - "Langfuse Data Model — Trace/Observation hierarchy: https://langfuse.com/docs/observability/data-model"
+    - "Langfuse Tracing Get Started: https://langfuse.com/docs/observability/get-started"
+    - "LangGraph + Langfuse tracing cookbook: https://langfuse.com/guides/cookbook/example_langgraph_agents"
+
+- id: MAO-002
+  text: >
+    Propagate a single trace ID across all agent handoffs using Langfuse's distributed
+    tracing API (W3C Trace Context). When Agent A hands off to Agent B — via Redis
+    message, HTTP call, or subprocess — pass the trace_id and parent_span_id as
+    explicit metadata. Agent B must create its span as a child of Agent A's span using
+    these IDs. Without explicit propagation, agent handoffs produce orphan traces.
+  why: >
+    In the Brains pipeline, the orchestrator may spawn worker agents as separate
+    processes or async tasks (e.g., via CrewAI task delegation). If the child process
+    starts a new Langfuse trace without linking to the parent, you lose the causal
+    chain. A 45-second latency spike becomes impossible to debug because you cannot
+    see that the spec_writer agent waited 40 seconds for the adversarial_agent to
+    finish its LLM call. Parent-child correlation is the minimum viable observability
+    for multi-process agent systems.
+  how_to_do_right: |
+    1. After creating the parent span, extract IDs:
+       trace_id = trace.id
+       parent_span_id = parent_span.id
+    2. Pass these in handoff payload:
+       payload = {"task": task, "_trace_ctx": {"trace_id": trace_id, "parent_span_id": parent_span_id}}
+    3. In the child agent, reconstruct context:
+       from langfuse import Langfuse
+       langfuse = Langfuse()
+       child_span = langfuse.trace(id=ctx["trace_id"]).span(
+           name="child_agent",
+           parent_observation_id=ctx["parent_span_id"]
+       )
+    4. For HTTP-based handoffs, use the as_baggage parameter to propagate
+       via W3C Trace Context HTTP headers (traceparent, tracestate)
+    5. Always validate that trace_id is a valid 32-char hex string before use
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langfuse, crewai, redis]
+  domains:
+    domain: [observability, architecture]
+    concern: [distributed_tracing, agent_handoff]
+  example_good: |
+    # Agent A: orchestrator
+    trace = langfuse.trace(name="pipeline")
+    orch_span = trace.span(name="orchestrator")
+
+    # Handoff payload includes trace context
+    task_payload = {
+        "task": task_definition,
+        "_trace_ctx": {
+            "trace_id": trace.id,
+            "parent_span_id": orch_span.id
+        }
+    }
+    redis_client.xadd("agent_tasks", task_payload)
+
+    # Agent B: worker (separate process)
+    msg = redis_client.xread(...)
+    ctx = msg["_trace_ctx"]
+
+    worker_langfuse = Langfuse()
+    # Create child span linked to parent
+    worker_span = worker_langfuse.trace(id=ctx["trace_id"]).span(
+        name="spec_writer",
+        parent_observation_id=ctx["parent_span_id"]
+    )
+    # All LLM calls now appear as children of orch_span in the trace tree
+  example_bad: |
+    # Agent B: worker starts a brand-new trace — orphan!
+    worker_langfuse = Langfuse()
+    new_trace = worker_langfuse.trace(name="spec_writer")  # no link to parent
+    # This trace appears disconnected in Langfuse dashboard
+    # You cannot see that spec_writer ran as part of the orchestrator's request
+  when_applies: >
+    Multi-process agent systems, async task queues (Redis, Celery), HTTP-based
+    agent communication, any architecture where agent B runs in a different
+    process or container than agent A.
+  sources:
+    - "Langfuse Trace IDs & Distributed Tracing: https://langfuse.com/docs/observability/features/trace-ids-and-distributed-tracing"
+    - "Langfuse SDK Advanced Features: https://langfuse.com/docs/observability/sdk/advanced-features"
+
+- id: MAO-003
+  text: >
+    Track cost per agent role by attaching structured metadata to every generation
+    and using Langfuse's model-based cost inference. Set the `model` parameter on
+    every generation so Langfuse can auto-calculate USD cost. Then use the Metrics
+    API filtered by agent_role metadata to answer: "How much did the adversarial
+    agent cost in Sprint S04 vs S05?" — without this attribution you cannot budget
+    agent committees or justify compute spend.
+  why: >
+    In a 10-agent committee, the adversarial agent may consume 40% of total tokens
+    because it re-runs every worker output through an LLM judge. Without per-role
+    cost tracking, you see only aggregate spend and cannot identify that switching
+    the adversarial agent from claude-opus-4 to claude-haiku would cut total cost
+    by 35% with negligible quality loss. Real-world data from Langfuse deployments
+    shows cost surprises almost always originate in one overlooked agent role.
+  how_to_do_right: |
+    1. On every generation, set model="claude-opus-4" (exact Langfuse model name)
+    2. Set metadata={"agent_role": "adversarial", "sprint_id": sprint_id}
+    3. Explicitly pass usage={"input": n, "output": m} if auto-detection is unreliable
+    4. For custom/fine-tuned models: define model pricing in Langfuse UI
+       (Settings → Models → Add Model) with input_cost and output_cost per token
+    5. Query cost per role via Metrics API:
+       GET /api/public/metrics/daily?tags=agent_role:adversarial&from=2025-01-01
+    6. Set up a weekly cost breakdown dashboard: group by metadata.agent_role
+    7. Alert if any single agent role exceeds 50% of trace total cost
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langfuse]
+  domains:
+    domain: [observability, architecture]
+    concern: [cost_tracking, token_attribution, budgeting]
+  example_good: |
+    # Worker agent generation with full cost attribution
+    gen = span.generation(
+        name="adversarial_critique",
+        model="claude-opus-4",          # Enables auto cost calculation
+        input=messages,
+        metadata={
+            "agent_role": "adversarial",
+            "sprint_id": "S04",
+            "task_type": "critique"
+        },
+        usage={
+            "input": prompt_tokens,
+            "output": completion_tokens,
+            "unit": "TOKENS"
+        }
+    )
+    # Langfuse will calculate USD cost automatically based on model pricing
+    # Queryable: GET /api/public/metrics?filter=metadata.agent_role=adversarial
+  example_bad: |
+    # Missing model parameter — no cost calculation possible
+    gen = span.generation(
+        name="adversarial_critique",
+        # model not set
+        input=messages,
+        # usage not set
+    )
+    # Langfuse shows: cost = null, tokens = null
+    # You have no idea this agent consumed $0.40 per pipeline run
+  when_applies: >
+    Any multi-agent system where you pay per token. Essential for committee-style
+    pipelines where different roles use different models and have different cost profiles.
+  sources:
+    - "Langfuse Token & Cost Tracking: https://langfuse.com/docs/observability/features/token-and-cost-tracking"
+    - "Langfuse Metrics API: https://langfuse.com/docs/metrics/features/metrics-api"
+
+- id: MAO-004
+  text: >
+    Attach structured metadata to every trace at creation time using a consistent
+    schema: sprint_id, phase, agent_role, run_id, and environment. Never use
+    free-form metadata keys — define a canonical set of metadata fields and validate
+    them. This metadata is the primary filter surface for all dashboards, alerts,
+    and cost analysis. Inconsistent metadata makes the entire observability layer
+    unreliable.
+  why: >
+    Langfuse's filtering and analytics operate on metadata fields. If one pipeline
+    run uses {"sprint": "S04"} and another uses {"sprint_id": "S04"}, they become
+    unfilterable as a group. In incident response, you need to filter "all traces
+    from sprint S04 that had latency > 30s" — this requires consistent key names
+    across every trace creation call. Teams that skip metadata standardization
+    typically spend 30-60% of incident time reconstructing context that should
+    have been captured automatically.
+  how_to_do_right: |
+    1. Define a canonical metadata schema as a Pydantic model:
+       class TraceMetadata(BaseModel):
+           sprint_id: str          # e.g., "S04"
+           phase: str              # e.g., "spec_generation", "qa_loop"
+           agent_role: str         # e.g., "orchestrator", "worker", "critic"
+           run_id: str             # UUID for the pipeline run
+           environment: str        # "production", "staging", "development"
+           product: str            # e.g., "cockpit", "humangr"
+    2. Validate before creating any trace: metadata = TraceMetadata(**raw_metadata).dict()
+    3. Apply to trace: langfuse.trace(name="...", metadata=metadata)
+    4. Apply consistent tags for fast filtering: tags=["production", sprint_id, agent_role]
+    5. Never add ad-hoc metadata keys outside the schema
+    6. Document the schema in the observability runbook
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langfuse, pydantic]
+  domains:
+    domain: [observability]
+    concern: [metadata, data_quality, debugging]
+  example_good: |
+    from pydantic import BaseModel
+    from langfuse import Langfuse
+
+    class TraceMetadata(BaseModel):
+        sprint_id: str
+        phase: str
+        agent_role: str
+        run_id: str
+        environment: str = "production"
+
+    langfuse = Langfuse()
+
+    def create_agent_trace(sprint_id: str, phase: str, role: str, run_id: str):
+        meta = TraceMetadata(
+            sprint_id=sprint_id,
+            phase=phase,
+            agent_role=role,
+            run_id=run_id
+        )
+        return langfuse.trace(
+            name=f"{role}_{phase}",
+            metadata=meta.model_dump(),
+            tags=["production", sprint_id, role]
+        )
+    # Dashboard filter: metadata.sprint_id = "S04" AND metadata.agent_role = "adversarial"
+  example_bad: |
+    # Inconsistent ad-hoc metadata keys across runs
+    # Run 1:
+    langfuse.trace(name="run", metadata={"sprint": "S04", "type": "spec"})
+    # Run 2:
+    langfuse.trace(name="run", metadata={"sprint_id": "S04", "phase": "spec_gen"})
+    # Run 3:
+    langfuse.trace(name="run", metadata={"s": "S04"})
+    # Langfuse cannot group these — three different filter keys for the same concept
+  when_applies: >
+    From day one of any LLM pipeline project. Retroactively standardizing metadata
+    is costly — schema must be defined before first production trace is created.
+  sources:
+    - "Langfuse Observability Overview: https://langfuse.com/docs/observability/overview"
+    - "Langfuse SDK Instrumentation: https://langfuse.com/docs/observability/sdk/instrumentation"
+
+- id: MAO-005
+  text: >
+    Use the Langfuse Scores API to record evaluation results per agent output, not
+    just at the end of the pipeline. Create one score per agent generation with name
+    matching the evaluation criterion (e.g., "correctness", "groundedness",
+    "adversarial_resistance"). Use NUMERIC type (0.0–1.0) for continuous quality
+    metrics and BOOLEAN for binary pass/fail gates. Scores enable per-agent quality
+    tracking over time — without them, you cannot detect which agent is degrading.
+  why: >
+    In the Brains pipeline, the QA loop applies multiple checks per agent output.
+    If you only record a final pipeline-level pass/fail, you cannot answer: "Did
+    the spec_writer quality drop after the LLM provider changed their model?" or
+    "Is the adversarial critic consistently scoring 0.4 for groundedness this week?"
+    Per-agent scoring creates a time-series of quality per role, enabling regression
+    detection before it reaches production. Langfuse's Score Analytics aggregates
+    these automatically into trend charts.
+  how_to_do_right: |
+    1. After each agent generation, evaluate the output with your evaluator LLM or rule
+    2. Post score linked to the specific observation_id (not just trace_id):
+       langfuse.create_score(
+           name="correctness",
+           value=score_value,          # 0.0–1.0 for NUMERIC
+           trace_id=trace.id,
+           observation_id=gen.id,      # Links to specific agent's generation
+           data_type="NUMERIC",
+           comment=f"Evaluated by {evaluator_model}: {reasoning[:200]}"
+       )
+    3. Use score names consistently across runs (same evaluator, same criterion)
+    4. For gate pass/fail: use BOOLEAN with value=1 (pass) or value=0 (fail)
+    5. Use configId to enforce score schema via Langfuse's score config API
+    6. In Score Analytics, monitor weekly mean scores per agent_role to detect drift
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langfuse]
+  domains:
+    domain: [observability, quality_assurance]
+    concern: [evaluation, agent_quality, drift_detection]
+  example_good: |
+    from langfuse import Langfuse
+    langfuse = Langfuse()
+
+    # After spec_writer generation
+    gen = worker_span.generation(name="spec_draft", model="claude-opus-4", ...)
+    spec_text = call_llm(prompt)
+    gen.end(output=spec_text)
+
+    # Evaluate quality
+    correctness = evaluate_correctness(spec_text)  # Returns 0.0-1.0
+    groundedness = evaluate_groundedness(spec_text, context)
+
+    # Score linked to THIS specific generation (not just the trace)
+    langfuse.create_score(
+        name="correctness",
+        value=correctness,
+        trace_id=trace.id,
+        observation_id=gen.id,     # Critical: links to spec_writer's output
+        data_type="NUMERIC",
+        comment=f"Auto-eval by judge model"
+    )
+    langfuse.create_score(
+        name="groundedness",
+        value=groundedness,
+        trace_id=trace.id,
+        observation_id=gen.id,
+        data_type="NUMERIC"
+    )
+  example_bad: |
+    # Only recording final pipeline result — no per-agent visibility
+    final_result = run_pipeline()
+    langfuse.create_score(
+        name="pipeline_passed",
+        value=1 if final_result.passed else 0,
+        trace_id=trace.id,
+        # observation_id not set — attached to whole trace, not any agent
+    )
+    # Cannot answer: which agent caused the failure?
+  when_applies: >
+    Any pipeline with multiple LLM agents where quality can degrade per-role.
+    Especially critical for pipelines with automated QA loops (G-BRAIN gate,
+    committee voting).
+  sources:
+    - "Langfuse Scores via SDK API: https://langfuse.com/docs/evaluation/evaluation-methods/scores-via-sdk"
+    - "Langfuse Score Analytics: https://langfuse.com/docs/evaluation/evaluation-methods/score-analytics"
+    - "Evaluating Agents with Langfuse (OpenAI Cookbook): https://cookbook.openai.com/examples/agents_sdk/evaluate_agents"
+
+- id: MAO-006
+  text: >
+    Attribute errors to the specific agent that caused them by catching exceptions
+    inside each agent span and calling span.update(level="ERROR", status_message=str(e))
+    before re-raising. Never let exceptions propagate silently through agent boundaries.
+    In multi-agent pipelines, an error caught at the orchestrator level appears as
+    "pipeline failed" — but the root cause might be a timeout in a specific worker
+    agent three levels deep. Span-level error attribution cuts mean-time-to-debug by 60%.
+  why: >
+    Without per-span error attribution, Langfuse shows the root trace as ERROR but
+    all intermediate spans as OK. In a 10-agent committee, you must inspect 10 spans
+    manually to find the failing one. This is exactly the problem that distributed
+    tracing solves, but only if you instrument error state correctly at every span.
+    In the Brains pipeline, the G-BRAIN gate failure investigation wasted hours
+    because errors were only recorded at the pipeline level, not at the agent
+    generation level where the actual LLM refusal occurred.
+  how_to_do_right: |
+    1. Wrap every agent execution in try/except:
+       try:
+           result = agent.run(task)
+           span.end(output=result)
+       except Exception as e:
+           span.update(
+               level="ERROR",
+               status_message=f"{type(e).__name__}: {str(e)}",
+               metadata={"error_type": type(e).__name__, "retryable": is_retryable(e)}
+           )
+           span.end()
+           raise
+    2. For LLM API errors: capture the HTTP status code and provider error code
+    3. For timeout errors: record the timeout threshold and actual elapsed time
+    4. For tool call errors: record which tool name failed and the input that caused it
+    5. Use level="WARNING" for soft failures (low confidence, fallback used)
+    6. Set level="DEFAULT" for successful completions (Langfuse default)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langfuse, crewai]
+  domains:
+    domain: [observability, reliability]
+    concern: [error_attribution, debugging, incident_response]
+  example_good: |
+    def run_agent_with_tracing(span, agent, task):
+        try:
+            result = agent.run(task)
+            span.update(level="DEFAULT", output=result)
+            return result
+        except TimeoutError as e:
+            span.update(
+                level="ERROR",
+                status_message=f"LLM timeout after {TIMEOUT_SECONDS}s",
+                metadata={
+                    "error_type": "TimeoutError",
+                    "timeout_threshold_s": TIMEOUT_SECONDS,
+                    "retryable": True
+                }
+            )
+            raise
+        except LLMRefusalError as e:
+            span.update(
+                level="ERROR",
+                status_message=f"LLM refused: {e.reason}",
+                metadata={"error_type": "LLMRefusal", "retryable": False}
+            )
+            raise
+        finally:
+            span.end()
+  example_bad: |
+    def run_pipeline():
+        trace = langfuse.trace(name="pipeline")
+        try:
+            for agent in agents:
+                agent.run()  # No per-span error attribution
+        except Exception as e:
+            trace.update(level="ERROR", status_message=str(e))
+            # Error shows on root trace — cannot tell which agent failed
+  when_applies: >
+    Every agent span in production. Non-negotiable for pipelines with 3+ agents
+    where manual debugging is cost-prohibitive.
+  sources:
+    - "Langfuse Observability Data Model: https://langfuse.com/docs/observability/data-model"
+    - "OpenTelemetry AI Agent Observability Blog: https://opentelemetry.io/blog/2025/ai-agent-observability/"
+
+- id: MAO-007
+  text: >
+    Measure and record latency breakdown per agent step using span timestamps, not
+    wall-clock time from pipeline start. In Langfuse, each span records start_time
+    and end_time automatically. Export per-agent p50/p95/p99 latency weekly via
+    the Metrics API. Alert if any agent's p95 latency exceeds 2x its baseline.
+    The goal is a latency profile per agent role that makes bottleneck identification
+    instantaneous.
+  why: >
+    In committee pipelines, total pipeline latency is dominated by the slowest agent
+    in the critical path. Without per-agent latency data, you cannot answer whether
+    a 90-second pipeline run is slow because (a) the spec_writer makes a 60-second
+    LLM call, (b) the adversarial agent re-runs critique 3 times, or (c) the
+    orchestrator serializes agents that could run in parallel. These have radically
+    different fixes. Langfuse captures span latency automatically — the value is
+    only realized if you export and act on it.
+  how_to_do_right: |
+    1. Langfuse auto-records latency for every span/generation (no extra code needed)
+    2. Export latency breakdown via Metrics API:
+       GET /api/public/metrics/daily?traceName=pipeline_run&groupBy=metadata.agent_role
+    3. Build weekly p50/p95 baseline per agent_role after first 100 traces
+    4. Alert rule: if p95_latency > 2 * baseline_p95 for any agent_role, page oncall
+    5. For agents with high variance: examine individual traces to find outliers
+    6. Identify parallelization opportunities: agents with no data dependency on each
+       other but serialized execution are prime candidates for concurrent dispatch
+    7. Record LLM API call latency separately from total agent latency to distinguish
+       LLM provider slowness from agent logic overhead
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langfuse]
+  domains:
+    domain: [observability, performance]
+    concern: [latency, bottleneck_analysis, capacity_planning]
+  example_good: |
+    import time
+    from langfuse import Langfuse
+    langfuse = Langfuse()
+
+    trace = langfuse.trace(name="pipeline_run", metadata={"sprint_id": "S04"})
+
+    # Each agent runs in its own span — latency auto-captured
+    for role, agent in agents.items():
+        span = trace.span(
+            name=role,
+            metadata={"agent_role": role, "sprint_id": "S04"}
+        )
+        result = agent.run()
+        span.end(output=result)
+        # Langfuse records: span.latency_ms = end_time - start_time automatically
+
+    # Query p95 latency per role after the run
+    # GET /api/public/metrics?groupBy=metadata.agent_role&metric=latency_p95
+  example_bad: |
+    import time
+    start = time.time()
+    for role, agent in agents.items():
+        agent.run()
+    total = time.time() - start
+    print(f"Total: {total}s")
+    # You know total time but cannot tell which agent was slow
+    # Each sprint's agents may have different latency characteristics — invisible
+  when_applies: >
+    Any production pipeline with total latency > 10 seconds. Immediate priority
+    for pipelines with SLA requirements (user-facing features).
+  sources:
+    - "Langfuse Metrics API: https://langfuse.com/docs/metrics/features/metrics-api"
+    - "Langfuse Open Source LLM Metrics: https://langfuse.com/docs/metrics/overview"
+
+- id: MAO-008
+  text: >
+    Use OpenTelemetry gen_ai.* semantic conventions as the canonical attribute
+    schema for any custom instrumentation or framework integration. The minimum
+    required attributes for every LLM span are: gen_ai.operation.name,
+    gen_ai.provider.name, gen_ai.request.model, gen_ai.usage.input_tokens,
+    gen_ai.usage.output_tokens. This is not optional when your observability
+    backend supports OTel (Datadog, Grafana, Honeycomb) — it enables vendor
+    portability and prevents proprietary lock-in.
+  why: >
+    The observability vendor landscape for LLMs is fragmented: Langfuse, LangSmith,
+    Phoenix, Datadog, Grafana all use slightly different attribute names. Without
+    OTel standardization, switching observability backends requires re-instrumenting
+    every LLM call in the codebase. The OpenTelemetry GenAI semantic conventions
+    (finalized 2024, production-ready 2025) define a vendor-neutral schema that all
+    major backends now support. Datadog natively maps gen_ai.* attributes to its LLM
+    Observability schema as of v1.37. Instrumenting once with OTel is a 10-year
+    investment; instrumenting with a proprietary SDK is a 2-year bet on a vendor.
+  how_to_do_right: |
+    1. Install: pip install opentelemetry-sdk opentelemetry-api
+    2. Required span attributes for every LLM call:
+       span.set_attribute("gen_ai.operation.name", "chat")
+       span.set_attribute("gen_ai.provider.name", "anthropic")
+       span.set_attribute("gen_ai.request.model", "claude-opus-4")
+       span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+       span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+    3. Optional but recommended:
+       span.set_attribute("gen_ai.request.temperature", temperature)
+       span.set_attribute("gen_ai.request.max_tokens", max_tokens)
+       span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
+       span.set_attribute("gen_ai.conversation.id", session_id)
+    4. For tool use: add gen_ai.tool.name, gen_ai.tool.call.arguments
+    5. Do NOT capture gen_ai.input.messages or gen_ai.output.messages by default
+       (privacy/size concern) — opt-in explicitly for dev/debug environments only
+    6. Export to OTel Collector → route to both Langfuse and Datadog simultaneously
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [opentelemetry, langfuse, datadog]
+  domains:
+    domain: [observability, architecture]
+    concern: [otel_standards, vendor_portability, instrumentation]
+  example_good: |
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+
+    tracer = trace.get_tracer("my_agent")
+
+    with tracer.start_as_current_span("llm_call") as span:
+        # Required OTel GenAI attributes
+        span.set_attribute("gen_ai.operation.name", "chat")
+        span.set_attribute("gen_ai.provider.name", "anthropic")
+        span.set_attribute("gen_ai.request.model", "claude-opus-4")
+
+        response = anthropic_client.messages.create(
+            model="claude-opus-4",
+            messages=messages
+        )
+
+        # Record usage from response
+        span.set_attribute("gen_ai.usage.input_tokens", response.usage.input_tokens)
+        span.set_attribute("gen_ai.usage.output_tokens", response.usage.output_tokens)
+        span.set_attribute("gen_ai.response.finish_reasons", [response.stop_reason])
+    # This span exports to any OTel backend unchanged — vendor-neutral
+  example_bad: |
+    # Proprietary SDK only — locks you to one vendor
+    from langsmith import Client
+    client = Client()
+    with client.trace("llm_call") as run:
+        response = call_llm(prompt)
+        run.end(outputs={"response": response})
+    # If you migrate from LangSmith to Langfuse, every trace call must be rewritten
+  when_applies: >
+    Any new LLM instrumentation code. Retrofitting existing Langfuse-only or
+    LangSmith-only instrumentation to OTel is worth the cost if you anticipate
+    changing observability vendors or running multiple backends.
+  sources:
+    - "OpenTelemetry Semantic Conventions for GenAI Spans: https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/"
+    - "OpenTelemetry AI Agent Observability (2025): https://opentelemetry.io/blog/2025/ai-agent-observability/"
+    - "Datadog OTel GenAI Support: https://www.datadoghq.com/blog/llm-otel-semantic-convention/"
+
+- id: MAO-009
+  text: >
+    Track confidence score propagation through the agent chain by attaching a
+    confidence field to every generation's output metadata and recording it as
+    a Langfuse score. When Agent A produces a claim with confidence=0.6 and
+    Agent B synthesizes from it, Agent B's output confidence is bounded by the
+    weakest input confidence. Never allow a downstream agent to report
+    confidence=0.9 when its inputs had confidence=0.4 — this creates false
+    certainty in final outputs.
+  why: >
+    In CogniFarm's committee architecture, multiple agents vote on a claim. If
+    the orchestrator aggregates votes without tracking individual confidence,
+    a 4-1 majority vote hides that 3 of the 4 "yes" votes had confidence < 0.5.
+    The aggregate result appears highly certain when it is actually marginally
+    supported. This false certainty propagates to downstream consumers. Recording
+    confidence as a Langfuse score per generation allows you to compute the
+    min/mean/max confidence path through the agent chain and flag outputs where
+    confidence degraded significantly between agent steps.
+  how_to_do_right: |
+    1. Instruct each agent to return structured output with explicit confidence:
+       {"result": "...", "confidence": 0.75, "reasoning": "..."}
+    2. Extract confidence from agent output and record as a score:
+       langfuse.create_score(
+           name="agent_confidence",
+           value=output["confidence"],  # 0.0-1.0
+           trace_id=trace.id,
+           observation_id=gen.id,
+           data_type="NUMERIC"
+       )
+    3. Before passing output to next agent, include min_input_confidence:
+       next_input["upstream_confidence_floor"] = min(input_confidences)
+    4. Final pipeline output: confidence = min(all agent confidences along critical path)
+    5. Alert if final confidence < 0.6 for any claim marked as "critical"
+    6. Dashboard: visualize confidence distribution per agent_role per sprint
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langfuse, crewai]
+  domains:
+    domain: [observability, quality_assurance]
+    concern: [confidence_tracking, epistemic_calibration]
+  example_good: |
+    # Structured output from each agent includes confidence
+    AGENT_PROMPT = """
+    Return JSON: {"result": "...", "confidence": 0.0-1.0, "reasoning": "..."}
+    Confidence: 1.0 = certain, 0.5 = uncertain, 0.0 = no basis.
+    """
+
+    output = call_llm_structured(AGENT_PROMPT)
+    gen.end(output=output)
+
+    # Record confidence as a traceable score
+    langfuse.create_score(
+        name="agent_confidence",
+        value=output["confidence"],
+        trace_id=trace.id,
+        observation_id=gen.id,
+        data_type="NUMERIC",
+        comment=output["reasoning"][:200]
+    )
+
+    # Propagate floor to next agent
+    next_context["confidence_floor"] = min(
+        current_confidence_floor,
+        output["confidence"]
+    )
+  example_bad: |
+    # Agent returns text only — no confidence tracking
+    output = call_llm("Analyze this claim: " + claim)
+    # Next agent synthesizes from this output with no idea how certain the source was
+    final_confidence = 0.9  # Fabricated — not derived from agent chain
+  when_applies: >
+    Multi-agent systems where outputs feed downstream consumers or make claims
+    about the world. Mandatory for fact-checking pipelines, committee voting,
+    and any system where a human acts on agent outputs.
+  sources:
+    - "Langfuse Scores API: https://langfuse.com/docs/evaluation/evaluation-methods/scores-via-sdk"
+    - "OpenTelemetry GenAI Spans spec: https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/"
+
+- id: MAO-010
+  text: >
+    Implement alert rules for three critical agent anomalies: (1) token spike —
+    any single agent generation exceeding 3x its p95 token count baseline,
+    (2) latency degradation — p95 agent latency exceeding 2x its 7-day baseline,
+    (3) evaluation score drop — any agent role's weekly mean score dropping > 15%
+    from prior week. Alert on the first occurrence, not on sustained patterns — the
+    first anomaly is almost always the cheapest to fix.
+  why: >
+    Token spikes in one agent (typically caused by prompt injection, runaway
+    chain-of-thought, or context window misconfiguration) can exhaust daily API
+    budgets in minutes. A single adversarial agent entering an infinite reasoning
+    loop at 100K tokens per call, firing 50 times per hour, can cost $500/hour
+    on claude-opus-4. Without a token spike alert, this runs until budget
+    exhaustion. The 3x threshold catches genuine anomalies while ignoring normal
+    variance (typical agent token counts vary ±50% based on input complexity).
+  how_to_do_right: |
+    1. Token spike alert via Langfuse webhook or Metrics API polling:
+       if generation.usage.total_tokens > agent_role_p95_baseline * 3:
+           alert(f"Token spike: {agent_role} used {total_tokens} tokens (baseline p95: {baseline})")
+    2. Establish baselines from first 50-100 traces per agent_role
+    3. Latency alert: export daily p95 per agent_role, compare with 7-day rolling mean
+    4. Score drop alert: weekly mean score per agent_role from Score Analytics API
+       if current_week_mean < prior_week_mean * 0.85: alert("Quality regression")
+    5. Page oncall for token spike (cost impact immediate)
+    6. Send Slack/email for latency and score degradation (less urgent)
+    7. Include in alert: sprint_id, agent_role, observed value, baseline, trace_id of
+       the triggering event for immediate investigation
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [langfuse]
+  domains:
+    domain: [observability, reliability]
+    concern: [alerting, anomaly_detection, cost_control]
+  example_good: |
+    # Alert function called after each generation
+    def check_token_spike_alert(gen_id: str, agent_role: str, total_tokens: int):
+        baseline_p95 = get_baseline_p95_tokens(agent_role)  # From historical data
+        if baseline_p95 and total_tokens > baseline_p95 * 3:
+            send_alert(
+                severity="critical",
+                message=f"Token spike in {agent_role}: {total_tokens} tokens "
+                        f"(baseline p95: {baseline_p95})",
+                context={
+                    "agent_role": agent_role,
+                    "tokens": total_tokens,
+                    "baseline_p95": baseline_p95,
+                    "ratio": total_tokens / baseline_p95,
+                    "langfuse_url": f"https://cloud.langfuse.com/trace/{trace_id}"
+                }
+            )
+  example_bad: |
+    # No alerting — discover issue via monthly billing shock
+    response = call_llm(prompt)
+    # Agent entered infinite reasoning loop
+    # 10,000 calls at 80K tokens each = 800M tokens = $4,800 in one day
+    # Discovered at end-of-month invoice
+  when_applies: >
+    Any LLM pipeline running in production with real API costs. Implement before
+    first production load, not after first cost incident.
+  sources:
+    - "Langfuse Token & Cost Tracking: https://langfuse.com/docs/observability/features/token-and-cost-tracking"
+    - "Langfuse Metrics API: https://langfuse.com/docs/metrics/features/metrics-api"
+
+- id: MAO-011
+  text: >
+    Enable A/B testing of agent configurations by routing 50% of traces to
+    variant A and 50% to variant B via tags, and comparing metric distributions
+    using the Langfuse Metrics API. Use this to test: different models (claude-haiku
+    vs claude-opus-4), different prompts (prompt_v1 vs prompt_v2), different
+    agent counts (3-agent vs 5-agent committee). Never use calendar-based comparison
+    ("last week vs this week") — confounds with data distribution changes.
+  why: >
+    In the Brains pipeline, changing the adversarial agent from claude-opus-4 to
+    claude-haiku reduced cost by 60% but the quality impact was unknown. A/B testing
+    via trace tags gives a statistical answer in 200-500 traces (typically 2-4 hours
+    of production traffic). Without this, configuration decisions are made on
+    intuition or small manual tests. Calendar-based comparison is unreliable because
+    task difficulty varies by day — Monday sprints may be harder than Friday sprints,
+    making cost/quality appear better on one variant due to data mix, not actual
+    improvement.
+  how_to_do_right: |
+    1. Assign variant at trace creation time using a deterministic hash:
+       variant = "A" if hash(run_id) % 2 == 0 else "B"
+       trace = langfuse.trace(name="pipeline", tags=[f"variant:{variant}"],
+                              metadata={"ab_variant": variant, "config_version": cfg_version})
+    2. Run both variants simultaneously — same time window, same workload mix
+    3. After 200+ traces per variant, query metrics:
+       GET /api/public/metrics?tags=variant:A → {mean_cost, p95_latency, mean_quality_score}
+       GET /api/public/metrics?tags=variant:B → {mean_cost, p95_latency, mean_quality_score}
+    4. Use Mann-Whitney U test for latency/cost (non-normal distributions)
+    5. Use proportion test for score pass rates (binary gates)
+    6. Declare winner only if p < 0.05 AND improvement > 10% (practical significance)
+    7. Graduate winner to 100% traffic; remove loser configuration
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langfuse]
+  domains:
+    domain: [observability, architecture]
+    concern: [ab_testing, configuration_optimization, quality_assurance]
+  example_good: |
+    import hashlib
+
+    def create_trace_with_ab_variant(run_id: str, config_a: dict, config_b: dict):
+        # Deterministic assignment — same run_id always gets same variant
+        variant = "A" if int(hashlib.md5(run_id.encode()).hexdigest(), 16) % 2 == 0 else "B"
+        config = config_a if variant == "A" else config_b
+
+        trace = langfuse.trace(
+            name="pipeline_run",
+            tags=[f"variant:{variant}", "ab_test:model_comparison"],
+            metadata={
+                "ab_variant": variant,
+                "model": config["model"],
+                "agent_count": config["agent_count"]
+            }
+        )
+        return trace, config
+  example_bad: |
+    # Calendar-based comparison — confounds A/B with temporal effects
+    # "Last week we used claude-haiku, this week claude-opus-4"
+    # Problem: last week had easier tasks, this week harder tasks
+    # Conclusion: "opus-4 is slower AND more expensive AND less accurate"
+    # Reality: the task distribution changed, not the model quality
+  when_applies: >
+    Any significant agent configuration change in production: model upgrade,
+    prompt rewrite, committee size change, retrieval strategy change.
+  sources:
+    - "Langfuse Score Analytics: https://langfuse.com/docs/evaluation/evaluation-methods/score-analytics"
+    - "Langfuse Metrics API: https://langfuse.com/docs/metrics/features/metrics-api"
+
+- id: MAO-012
+  text: >
+    Implement trace replay and root-cause debugging by storing the full input
+    context (messages array, retrieved documents, agent state) in each generation's
+    input field, capped at 10KB per generation. This enables exact reproduction of
+    any failing run from the Langfuse UI without access to production systems.
+    Never store only the final prompt — store the structured pre-prompt context
+    that produced it. Sensitive fields (PII, secrets) must be redacted before storage.
+  why: >
+    When a production trace shows a hallucination or logic error, the only way to
+    debug it is to reproduce the exact LLM call. If you stored only "LLM returned X"
+    without the input context, you cannot reproduce. You must reconstruct the exact
+    messages array, the exact retrieved documents, and the exact agent state from
+    logs — this reconstruction is error-prone and typically takes 4-8 hours. Storing
+    the input context at generation time costs negligible storage (Langfuse compresses
+    JSON) but reduces debugging time to 15 minutes: open trace, click generation,
+    click "replay", see the exact input that produced the bad output.
+  how_to_do_right: |
+    1. Structure generation input as the full messages array:
+       gen = span.generation(
+           name="spec_draft",
+           model="claude-opus-4",
+           input=[
+               {"role": "system", "content": system_prompt},
+               {"role": "user", "content": task_description},
+               # Include retrieved context as a user message
+               {"role": "user", "content": f"Context:\n{retrieved_docs[:5000]}"}
+           ]
+       )
+    2. Cap input size: truncate retrieved_docs if total input > 10KB
+    3. Redact PII before storage: replace emails, phone numbers, SSNs with [REDACTED]
+    4. Store agent state as metadata (not in input): metadata={"agent_state": state_dict}
+    5. Record output as the exact LLM response object, not a post-processed version
+    6. Enable Langfuse's "Replay" feature to re-execute the exact call from the UI
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langfuse]
+  domains:
+    domain: [observability, debugging]
+    concern: [trace_replay, root_cause_analysis, reproducibility]
+  example_good: |
+    # Full context stored for replay capability
+    gen = agent_span.generation(
+        name="spec_writer_draft",
+        model="claude-opus-4",
+        input=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": task},
+            {"role": "user", "content": f"Relevant context:\n{docs[:4000]}"}
+        ],
+        metadata={
+            "retrieved_doc_count": len(docs),
+            "agent_role": "spec_writer",
+            "sprint_id": sprint_id
+        }
+    )
+    result = call_llm(messages)
+    gen.end(output=result)
+    # From Langfuse UI: click trace → click generation → click Replay
+    # Sends exact same input to LLM — reproduces the bug in 2 minutes
+  example_bad: |
+    # Only final formatted prompt stored — loses context structure
+    final_prompt = format_prompt(system, task, docs)
+    gen = span.generation(
+        name="spec_draft",
+        input=final_prompt,  # Loses message structure, retrieved doc boundaries
+        model="claude-opus-4"
+    )
+    # Cannot replay: don't know where system ends and user content begins
+    # Cannot regenerate: retrieved docs are mixed into text, irreproducible
+  when_applies: >
+    All production LLM calls. The storage cost is ~1-5KB per generation; the
+    debugging value is hours saved per incident. Non-negotiable for pipelines
+    with complex retrieval or multi-turn state.
+  sources:
+    - "Langfuse SDK Instrumentation: https://langfuse.com/docs/observability/sdk/instrumentation"
+    - "Langfuse Get Started with Tracing: https://langfuse.com/docs/observability/get-started"
+
+- id: MAO-013
+  text: >
+    Close the human feedback loop by collecting agent output ratings from human
+    reviewers (pipeline QA, end users) and posting them as Langfuse scores within
+    24 hours. Use NUMERIC 1-5 rating for overall quality and CATEGORICAL for
+    failure mode classification ("hallucination", "incomplete", "correct"). This
+    human signal is the ground truth that calibrates automated evaluators and
+    reveals systematic biases in LLM judge models.
+  why: >
+    In the Brains pipeline, the HL (Human Layer) veto provides a signal that
+    automated G-BRAIN checks miss. Without capturing this signal as a Langfuse
+    score, the pipeline cannot learn from human feedback — each pipeline run starts
+    from scratch without the accumulated wisdom of previous human reviews. Over 100
+    runs, human feedback scores allow you to: (1) identify which agent outputs
+    consistently fail human review (systematic failure), (2) calibrate LLM judge
+    thresholds against human ground truth, (3) detect when automated scores
+    diverge from human scores (judge drift). CogniFarm's memory system depends on
+    this feedback to close the learning loop.
+  how_to_do_right: |
+    1. After human review, post score to the relevant generation:
+       langfuse.create_score(
+           name="human_quality_rating",
+           value=human_rating,         # 1-5
+           trace_id=run_trace_id,
+           observation_id=reviewed_gen_id,
+           data_type="NUMERIC",
+           comment=reviewer_notes
+       )
+    2. For failure classification:
+       langfuse.create_score(
+           name="failure_mode",
+           value="hallucination",
+           trace_id=run_trace_id,
+           observation_id=reviewed_gen_id,
+           data_type="CATEGORICAL"
+       )
+    3. Weekly: compare human_quality_rating vs automated correctness scores
+    4. Recalibrate automated evaluator prompt if correlation drops below 0.7
+    5. Use Langfuse Score Analytics to track: mean human rating per agent_role,
+       failure mode distribution per sprint, human vs automated score correlation
+    6. Export disagreement traces to a labeled dataset for fine-tuning
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langfuse]
+  domains:
+    domain: [observability, quality_assurance]
+    concern: [human_feedback, evaluation_calibration, learning_loop]
+  example_good: |
+    # After human QA review in the pipeline dashboard
+    def record_human_review(trace_id: str, gen_id: str, rating: int, notes: str,
+                            failure_mode: str | None = None):
+        langfuse.create_score(
+            name="human_quality_rating",
+            value=rating,               # 1=terrible, 3=acceptable, 5=excellent
+            trace_id=trace_id,
+            observation_id=gen_id,
+            data_type="NUMERIC",
+            comment=notes
+        )
+        if failure_mode:
+            langfuse.create_score(
+                name="failure_mode",
+                value=failure_mode,     # "hallucination"|"incomplete"|"off_task"
+                trace_id=trace_id,
+                observation_id=gen_id,
+                data_type="CATEGORICAL"
+            )
+        # Both scores appear in Score Analytics → trend charts per agent role
+  example_bad: |
+    # Human feedback recorded in a separate spreadsheet
+    # spreadsheet: run_id, timestamp, reviewer_name, rating
+    # No link to Langfuse traces
+    # Cannot correlate with token counts, model versions, or agent configurations
+    # Human signal is siloed — pipeline learns nothing from it
+  when_applies: >
+    Any pipeline with human-in-the-loop review. Mandatory when human review
+    is part of a quality gate (G-BRAIN, HL veto). Start collecting from first
+    production run — retroactive collection is nearly impossible.
+  sources:
+    - "Langfuse Scores via SDK: https://langfuse.com/docs/evaluation/evaluation-methods/scores-via-sdk"
+    - "Evaluating Agents with Langfuse: https://langfuse.com/guides/cookbook/example_evaluating_openai_agents"
+
+- id: MAO-014
+  text: >
+    Design the multi-agent observability dashboard with four views: (1) real-time
+    agent health (latency and error rate per agent_role, refreshed every 60s),
+    (2) cost breakdown (daily spend per agent_role and model, 7-day chart),
+    (3) quality trend (weekly mean scores per agent_role, 4-week sparklines),
+    (4) trace explorer (search by sprint_id, error status, score range). The
+    dashboard is the primary operational interface — design it before writing
+    agent code, not after.
+  why: >
+    Dashboard design determines what questions you can answer during incidents.
+    If you design the dashboard after deploying agents, you typically find it
+    cannot answer the questions you need (e.g., "which model version introduced
+    this regression?"). The four views above map to the four most common
+    operational questions: is anything broken right now? how much did yesterday
+    cost? is quality trending up or down? what happened in this specific run?
+    Teams that design dashboards after deployment typically spend 2-3 months
+    retroactively adding metadata fields to enable the queries they wish they
+    had from the start.
+  how_to_do_right: |
+    1. Define dashboard queries BEFORE instrumentation:
+       - Health view: traces grouped by metadata.agent_role, error rate, p95 latency
+       - Cost view: sum(generation.cost) grouped by metadata.agent_role, by model
+       - Quality view: mean(scores.correctness) grouped by metadata.agent_role, weekly
+       - Trace explorer: filter by metadata.sprint_id, tags, score thresholds
+    2. Verify each query is satisfiable by your metadata schema (MAO-004)
+    3. Build a Langfuse dashboard for each view using the Metrics API and Explore UI
+    4. Set refresh intervals: health = 60s, cost = 5min, quality = daily
+    5. Share dashboard URL with all team members before launch
+    6. Conduct a "dashboard fire drill": simulate an agent failure, verify dashboard
+       surfaces the issue within 60 seconds
+  severity: low
+  technologies:
+    lang: [python]
+    framework: [langfuse]
+  domains:
+    domain: [observability]
+    concern: [dashboard_design, operational_readiness]
+  example_good: |
+    # Pre-instrumentation dashboard specification
+    DASHBOARD_QUERIES = {
+        "health": {
+            "query": "SELECT agent_role, error_rate, p95_latency FROM traces "
+                     "WHERE timestamp > NOW() - INTERVAL 1 HOUR "
+                     "GROUP BY metadata.agent_role",
+            "alert_if": "error_rate > 0.05 OR p95_latency > 30s"
+        },
+        "cost": {
+            "query": "SELECT agent_role, model, SUM(cost_usd) FROM generations "
+                     "WHERE timestamp > NOW() - INTERVAL 7 DAYS "
+                     "GROUP BY metadata.agent_role, model ORDER BY cost DESC",
+            "alert_if": "daily_total > $50"
+        },
+        "quality": {
+            "query": "SELECT agent_role, AVG(score) FROM scores "
+                     "WHERE name = 'correctness' GROUP BY metadata.agent_role, week",
+            "alert_if": "week_over_week_change < -0.15"
+        }
+    }
+    # Verify all GROUP BY fields exist in TraceMetadata schema (MAO-004)
+    # Only then write instrumentation code
+  example_bad: |
+    # Dashboard designed after 6 months of production data
+    # Discovery: "We never recorded agent_role in metadata"
+    # All 50,000 traces are unattributable by role
+    # Must re-instrument and run for another 6 months before dashboard is useful
+    # Cost spike last month: still unattributed because metadata was missing
+  when_applies: >
+    Before writing any production LLM agent code. Dashboard design is a
+    prerequisite for instrumentation design, not a follow-on activity.
+  sources:
+    - "Langfuse Metrics API: https://langfuse.com/docs/metrics/features/metrics-api"
+    - "Langfuse Score Analytics: https://langfuse.com/docs/evaluation/evaluation-methods/score-analytics"
+
+- id: MAO-015
+  text: >
+    Instrument LangGraph agent pipelines using Langfuse's native LangGraph
+    integration to automatically capture the graph execution as a trace hierarchy.
+    Use the LangGraph graph-view feature (released February 2025) to visualize
+    the DAG structure alongside execution traces. For CrewAI, use the
+    langfuse_callback_handler. Never manually re-implement trace creation for
+    frameworks that have first-class Langfuse integrations — manual reimplementation
+    diverges from the framework's internal span model and produces misleading traces.
+  why: >
+    LangGraph's graph execution model (nodes, edges, conditional routing) maps
+    directly to Langfuse's span hierarchy. The automatic integration captures
+    node name, inputs/outputs, and execution order without any manual span creation.
+    The February 2025 graph-view feature renders the DAG structure as a visual
+    map alongside spans, making conditional routing (e.g., "which branch executed
+    in this run?") instantly visible. Manual trace implementation for LangGraph
+    typically produces incorrect hierarchies because developers mismap LangGraph's
+    internal checkpointing model to Langfuse spans, resulting in out-of-order
+    or duplicate spans.
+  how_to_do_right: |
+    1. Install: pip install langfuse
+    2. For LangGraph integration:
+       from langfuse.callback import CallbackHandler
+       langfuse_handler = CallbackHandler()
+       # Pass to graph invocation:
+       result = graph.invoke(input_data, config={"callbacks": [langfuse_handler]})
+    3. Enable graph-view in Langfuse UI: Traces → select trace → "Graph View" tab
+    4. For CrewAI:
+       from langfuse.callback import CallbackHandler
+       langfuse_handler = CallbackHandler()
+       crew = Crew(agents=agents, tasks=tasks, callbacks=[langfuse_handler])
+    5. Augment automatic traces with custom metadata using langfuse.update_current_trace():
+       langfuse.update_current_trace(metadata={"sprint_id": sprint_id})
+    6. Do NOT create manual spans around LangGraph nodes — they conflict with auto-instrumentation
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [langgraph, langfuse, crewai]
+  domains:
+    domain: [observability, architecture]
+    concern: [framework_integration, auto_instrumentation]
+  example_good: |
+    from langchain_anthropic import ChatAnthropic
+    from langgraph.graph import StateGraph
+    from langfuse.callback import CallbackHandler
+
+    # LangGraph pipeline
+    workflow = StateGraph(AgentState)
+    workflow.add_node("spec_writer", spec_writer_node)
+    workflow.add_node("adversarial", adversarial_node)
+    workflow.add_edge("spec_writer", "adversarial")
+    graph = workflow.compile()
+
+    # Single callback handler — automatic full trace hierarchy
+    langfuse_handler = CallbackHandler(
+        public_key="pk-lf-...",
+        secret_key="sk-lf-..."
+    )
+
+    result = graph.invoke(
+        {"task": task_input},
+        config={"callbacks": [langfuse_handler],
+                "metadata": {"sprint_id": "S04", "run_id": run_id}}
+    )
+    # Langfuse shows: full DAG graph view + execution trace with all LLM calls
+  example_bad: |
+    # Manual span creation for LangGraph — conflicts with auto-instrumentation
+    trace = langfuse.trace(name="langgraph_run")
+    for node_name, node_fn in graph.nodes.items():
+        span = trace.span(name=node_name)  # Manual spans
+        node_fn(state)                      # LangGraph also creates spans internally
+        span.end()
+    # Result: duplicate spans, incorrect parent-child hierarchy, confusing trace view
+  when_applies: >
+    Any LangGraph or CrewAI pipeline in the Brains system. Check Langfuse's
+    integrations page before manually implementing tracing for any new framework.
+  sources:
+    - "Langfuse LangGraph Tracing Cookbook: https://langfuse.com/guides/cookbook/example_langgraph_agents"
+    - "Langfuse Graph View for LangGraph Traces (Feb 2025): https://langfuse.com/changelog/2025-02-14-trace-graph-view"
+    - "Langfuse LangChain/LangGraph Integration: https://langfuse.com/integrations/frameworks/langchain"

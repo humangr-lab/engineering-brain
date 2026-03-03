@@ -1,0 +1,801 @@
+layer: rules
+domain: agent_orchestration
+knowledge:
+- id: DSPY-001
+  text: >
+    Define DSPy signatures as classes with typed input/output fields and a docstring instruction.
+    The class name and docstring are the "prompt" — they must be precise. Use type annotations
+    (str, int, list[str], bool) on all fields. Vague signature names produce vague LLM behavior.
+  why: >
+    DSPy signatures are compiled by the optimizer into actual prompts — the class name, field
+    names, field descriptions, and docstring all shape the generated prompt. A signature named
+    "Process" with field "input" and "output" produces a generic prompt that fails. A signature
+    named "ExtractStructuredSupportTicket" with fields "raw_email: str" and "ticket: SupportTicket"
+    produces a precise extraction prompt. Field names are injected directly into the prompt —
+    they must be as descriptive as they would be in a prompt you'd write by hand.
+  how_to_do_right: |
+    1. Name signatures after the transformation: "ClassifyIntent", "ExtractEntities", "SummarizeDocument".
+    2. Use descriptive field names: "customer_complaint" not "input", "resolution_steps" not "output".
+    3. Add DSPy field-level descriptions: dspy.InputField(desc="The full customer email text, unmodified")
+    4. Docstring specifies constraints: "Extract exactly 3 action items. Items must be in the imperative mood."
+    5. Use Pydantic models as field types for structured output:
+       ticket: Annotated[SupportTicket, dspy.OutputField(desc="Parsed ticket")]
+    6. Run dspy.inspect_history() after the first call to see what prompt was generated.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [dspy]
+  domains:
+    domain: [agent_orchestration, llm_prompting]
+    concern: [signature_design, prompt_engineering, type_safety]
+  example_good: |
+    import dspy
+    from pydantic import BaseModel
+    from typing import Literal
+
+    class SupportTicket(BaseModel):
+        category: Literal["billing", "technical", "general", "refund"]
+        priority: Literal["low", "medium", "high", "critical"]
+        summary: str  # 1 sentence
+        action_items: list[str]  # 2-5 concrete action items
+
+    class ExtractSupportTicket(dspy.Signature):
+        """
+        Analyze a customer support email and extract a structured ticket.
+        The summary must be a single sentence under 50 words.
+        Action items must be actionable and in the imperative mood (e.g., "Check the billing portal").
+        Priority is 'critical' only if the customer mentions data loss, legal action, or security breach.
+        """
+        raw_email: str = dspy.InputField(desc="The full, unmodified customer email text")
+        ticket: SupportTicket = dspy.OutputField(desc="Structured support ticket extracted from the email")
+
+    extractor = dspy.Predict(ExtractSupportTicket)
+    result = extractor(raw_email="I was charged twice this month and need a refund immediately...")
+    print(result.ticket.category)  # "billing"
+    print(result.ticket.priority)  # "high"
+  example_bad: |
+    import dspy
+
+    class Process(dspy.Signature):
+        """Process the input."""  # Vague docstring — no constraints
+        input: str = dspy.InputField()   # Generic name
+        output: str = dspy.OutputField() # Generic name
+        # The LLM has no idea what "Process" means or what format "output" should have
+        # Optimizer will have almost nothing to work with here
+  when_applies: All DSPy programs — signature quality is the biggest predictor of output quality
+  sources:
+    - "https://dspy.ai/learn/programming/signatures/"
+    - "https://dspy.ai/cheatsheet/"
+
+- id: DSPY-002
+  text: >
+    Use dspy.ChainOfThought for reasoning tasks where intermediate steps matter.
+    ChainOfThought automatically adds a "reasoning" field that captures the LLM's thinking
+    before the final answer. Access it via result.reasoning for debugging.
+    Use dspy.Predict for extraction and classification tasks that don't need step-by-step reasoning.
+  why: >
+    ChainOfThought adds "Let's think step by step" to the prompt and captures the reasoning
+    trace. For math, logic, and multi-step inference, this improves accuracy by 5–30%
+    (Wei et al., 2022 — Chain-of-Thought Prompting paper). For simple extraction (pull a
+    date from text), ChainOfThought wastes tokens on unnecessary reasoning. The developer
+    who uses ChainOfThought for everything doubles token cost with no benefit on simple tasks;
+    the developer who never uses it gets wrong answers on complex reasoning chains.
+  how_to_do_right: |
+    1. Use dspy.Predict for: classification, entity extraction, formatting, translation.
+    2. Use dspy.ChainOfThought for: math, logical reasoning, multi-step inference, code analysis.
+    3. Access reasoning trace: result = cot_module(input); print(result.reasoning)
+    4. In evaluations, inspect result.reasoning to understand failure modes — not just the answer.
+    5. ChainOfThought adds ~50–200 tokens per call — factor into cost estimates.
+    6. For structured output with reasoning: ChainOfThought wraps any Signature — add it around
+       your Pydantic-typed signature to get both structure and reasoning.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [dspy]
+  domains:
+    domain: [agent_orchestration, llm_prompting]
+    concern: [chain_of_thought, reasoning, module_selection]
+  example_good: |
+    import dspy
+
+    dspy.configure(lm=dspy.LM("anthropic/claude-sonnet-4-6"))
+
+    # Simple extraction — Predict is correct, no reasoning needed
+    class ExtractDate(dspy.Signature):
+        """Extract the date mentioned in the text. Return in ISO 8601 format (YYYY-MM-DD)."""
+        text: str = dspy.InputField()
+        date: str = dspy.OutputField(desc="ISO 8601 date, e.g. 2025-03-15")
+
+    extract_date = dspy.Predict(ExtractDate)  # No CoT — simple pattern matching
+
+    # Complex reasoning — ChainOfThought is correct
+    class AnalyzeCodeBug(dspy.Signature):
+        """
+        Analyze the code and identify the root cause of the bug described.
+        Trace through the execution path step by step before identifying the root cause.
+        """
+        code: str = dspy.InputField(desc="Python code with a bug")
+        bug_description: str = dspy.InputField(desc="Description of the observed incorrect behavior")
+        root_cause: str = dspy.OutputField(desc="Root cause of the bug in 1-2 sentences")
+        fix: str = dspy.OutputField(desc="Corrected code snippet")
+
+    analyze_bug = dspy.ChainOfThought(AnalyzeCodeBug)  # CoT — needs multi-step reasoning
+    result = analyze_bug(code="...", bug_description="...")
+    print(result.reasoning)  # Debug: see the reasoning chain
+    print(result.root_cause)
+  example_bad: |
+    import dspy
+
+    # Using ChainOfThought for simple extraction — wastes tokens
+    class ExtractCountry(dspy.Signature):
+        """Extract the country name."""
+        text: str = dspy.InputField()
+        country: str = dspy.OutputField()
+
+    # This adds 100+ tokens of reasoning for "The country mentioned is France."
+    # A simple Predict would work perfectly and cost half as much
+    extract = dspy.ChainOfThought(ExtractCountry)
+  when_applies: Any DSPy module selection decision — match module complexity to task complexity
+  sources:
+    - "https://dspy.ai/learn/programming/modules/"
+    - "https://dspy.ai/cheatsheet/"
+    - "Wei et al. (2022). Chain-of-Thought Prompting Elicits Reasoning in Large Language Models — https://arxiv.org/abs/2201.11903"
+
+- id: DSPY-003
+  text: >
+    Use dspy.ReAct for agents that need to reason AND act in a loop (tool use).
+    Provide tools as Python functions with complete docstrings — the docstring is injected
+    into the ReAct prompt. Set max_iters to limit reasoning loops; default is 5.
+    Increase only for provably complex tasks — every additional iteration costs tokens.
+  why: >
+    ReAct implements the Reason → Act → Observe loop: the LLM reasons about what to do,
+    calls a tool, observes the result, and iterates. Without max_iters, a confused agent
+    can loop indefinitely. Without good tool docstrings, the ReAct agent calls tools with
+    wrong arguments or picks the wrong tool. The original ReAct paper (Yao et al., 2023)
+    shows that this pattern outperforms chain-of-thought alone on multi-step tasks requiring
+    external lookups, but requires carefully specified tools to perform well.
+  how_to_do_right: |
+    1. Define tools as Python functions with complete docstrings (Args + Returns sections).
+    2. Type-hint all tool parameters — DSPy uses them for schema generation.
+    3. Set max_iters based on task: simple Q&A=3, multi-hop research=7, max=10.
+    4. Return structured data from tools (dict/str) — not complex objects.
+    5. Log ReAct trajectories during development: dspy.inspect_history(n=1) shows the full loop.
+    6. If agent loops back to the same tool with the same args, it is stuck — reduce max_iters
+       and improve the tool's return format to provide clearer signals.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [dspy]
+  domains:
+    domain: [agent_orchestration, llm_prompting, tool_use]
+    concern: [react_pattern, tool_design, reasoning_loops]
+  example_good: |
+    import dspy
+
+    dspy.configure(lm=dspy.LM("anthropic/claude-sonnet-4-6"))
+
+    # Well-documented tools for ReAct
+    def search_documents(query: str, max_results: int = 3) -> dict:
+        """
+        Search the knowledge base for documents relevant to the query.
+
+        Args:
+            query: Natural language search query
+            max_results: Number of results to return (1-10)
+
+        Returns:
+            dict with keys:
+              - 'results': list of dicts, each with 'title' (str) and 'content' (str)
+              - 'total_found': int — total matching documents
+        """
+        results = vector_db.search(query, limit=max_results)
+        return {
+            "results": [{"title": r.title, "content": r.content[:300]} for r in results],
+            "total_found": len(results),
+        }
+
+    def get_document_full(document_title: str) -> str:
+        """
+        Retrieve the full content of a document by exact title.
+
+        Args:
+            document_title: Exact title of the document (from search_documents results)
+
+        Returns:
+            Full document text as a string, or error message if not found.
+        """
+        doc = vector_db.get_by_title(document_title)
+        return doc.content if doc else f"Document '{document_title}' not found"
+
+    class AnswerFromDocs(dspy.Signature):
+        """Answer the question using only information found in the knowledge base."""
+        question: str = dspy.InputField()
+        answer: str = dspy.OutputField(desc="Comprehensive answer based on retrieved documents")
+
+    react_agent = dspy.ReAct(AnswerFromDocs, tools=[search_documents, get_document_full], max_iters=5)
+    result = react_agent(question="What is our refund policy for annual subscriptions?")
+    print(result.answer)
+  example_bad: |
+    import dspy
+
+    def search(q): return db.search(q)  # No docstring — agent doesn't know what this does
+    def get(t): return db.get(t)        # No type hints, no return description
+
+    class Q(dspy.Signature):
+        """Answer."""  # Vague
+        q: str = dspy.InputField()
+        a: str = dspy.OutputField()
+
+    # max_iters not set — defaults to 5, but for a simple Q&A this is too high
+    # Poor tools + vague signature = agent calls search() 5 times and gives up
+    agent = dspy.ReAct(Q, tools=[search, get])
+  when_applies: Any task requiring tool use, external lookups, or multi-step reasoning with actions
+  sources:
+    - "https://dspy.ai/api/modules/ReAct/"
+    - "https://dspy.ai/tutorials/rag/"
+    - "Yao et al. (2023). ReAct: Synergizing Reasoning and Acting in Language Models — https://arxiv.org/abs/2210.03629"
+
+- id: DSPY-004
+  text: >
+    Optimize DSPy programs with BootstrapFewShot first (cheap, no LLM calls for prompt generation),
+    then MIPROv2 for production (jointly optimizes instructions and few-shot examples via
+    Bayesian search). Never run optimization on the full dataset — use 20% for training,
+    held-out 20% for validation, final 60% for test.
+  why: >
+    BootstrapFewShot generates few-shot demonstrations by running your program on training
+    examples and keeping successful traces — it costs only inference tokens, not
+    optimization LLM calls. MIPROv2 (Bayesian optimization over instruction candidates)
+    can yield 10–30% relative improvement on complex tasks but costs 10–50x more tokens.
+    Running optimization on the full dataset causes data leakage: the optimized prompt
+    has memorized the test set. Always use held-out validation to select the best prompt,
+    and final test to report performance.
+  how_to_do_right: |
+    1. Split data: train=20%, dev/val=20%, test=60% (never seen during optimization).
+    2. Start with BootstrapFewShot — fast, low cost, often sufficient.
+    3. Evaluate on dev set before running MIPROv2 — if BootstrapFewShot achieves target, stop.
+    4. MIPROv2 config: num_candidates=10 (instruction variants), num_trials=15 (Bayesian rounds).
+    5. Save compiled module: optimized.save("compiled_module.json").
+    6. Load in production: module.load("compiled_module.json") — zero optimization cost at runtime.
+    7. Re-optimize when: model changes, data distribution shifts >10%, accuracy drops >5%.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [dspy]
+  domains:
+    domain: [agent_orchestration, llm_prompting, optimization]
+    concern: [teleprompter, few_shot_optimization, prompt_optimization]
+  example_good: |
+    import dspy
+    from dspy.teleprompt import BootstrapFewShot, MIPROv2
+    from dspy.evaluate import Evaluate
+    import random
+
+    dspy.configure(lm=dspy.LM("anthropic/claude-sonnet-4-6"))
+
+    # Load and split data (NEVER use full dataset for optimization)
+    all_data = load_dataset()  # list of dspy.Example
+    random.shuffle(all_data)
+    n = len(all_data)
+    train = all_data[:int(n * 0.2)]
+    dev   = all_data[int(n * 0.2):int(n * 0.4)]
+    test  = all_data[int(n * 0.4):]  # Never touched during optimization
+
+    # Define metric
+    def exact_match(gold: dspy.Example, pred, trace=None) -> bool:
+        return gold.answer.lower().strip() == pred.answer.lower().strip()
+
+    # Phase 1: BootstrapFewShot (cheap)
+    program = MyDSPyProgram()
+    bootstrap = BootstrapFewShot(metric=exact_match, max_bootstrapped_demos=4, max_labeled_demos=8)
+    compiled_basic = bootstrap.compile(program, trainset=train)
+
+    # Evaluate on dev set
+    evaluator = Evaluate(devset=dev, metric=exact_match, num_threads=4)
+    basic_score = evaluator(compiled_basic)
+    print(f"BootstrapFewShot dev accuracy: {basic_score:.2%}")
+
+    if basic_score < 0.85:  # Only run expensive MIPROv2 if basic is insufficient
+        mipro = MIPROv2(metric=exact_match, num_candidates=10, num_trials=15, verbose=True)
+        compiled_mipro = mipro.compile(program, trainset=train, valset=dev)
+        mipro_score = evaluator(compiled_mipro)
+        print(f"MIPROv2 dev accuracy: {mipro_score:.2%}")
+        compiled_mipro.save("compiled_program_mipro.json")
+    else:
+        compiled_basic.save("compiled_program_basic.json")
+  example_bad: |
+    import dspy
+    from dspy.teleprompt import MIPROv2
+
+    # Running MIPROv2 on full dataset — data leakage + extreme cost
+    all_data = load_dataset()
+    mipro = MIPROv2(metric=lambda gold, pred, trace=None: True, num_candidates=20, num_trials=30)
+    compiled = mipro.compile(program, trainset=all_data)  # No train/val split — memorizes test data
+    # Reports 95% "accuracy" — actually just memorized the examples
+    # Production performance: 60%
+  when_applies: Any DSPy program going to production — optimization before deployment is essential
+  sources:
+    - "https://dspy.ai/learn/optimization/optimizers/"
+    - "https://dspy.ai/api/optimizers/BootstrapFewShot/"
+    - "https://dspy.ai/api/optimizers/MIPROv2/"
+
+- id: DSPY-005
+  text: >
+    Save and load compiled DSPy modules with module.save() / module.load() to avoid
+    re-running optimization on every deployment. Store compiled files in version control
+    or artifact storage. Never re-optimize at runtime in production — it is non-deterministic
+    and costs orders of magnitude more than inference.
+  why: >
+    DSPy compilation (optimization) can cost $5–$50 in API tokens and take 30–90 minutes
+    for a complex program. Running this at server startup in production is catastrophic.
+    Compiled modules capture the optimized few-shot demonstrations and instruction variants
+    as JSON — they load in milliseconds and cost zero optimization tokens.
+    Developers who re-optimize on every deployment introduce non-determinism: the "same"
+    code might produce different behavior on different deployments based on random seeds
+    in the optimizer.
+  how_to_do_right: |
+    1. Run optimization in CI/CD pipeline (offline, not at runtime).
+    2. Save compiled module: compiled_program.save("artifacts/compiled_v1.json").
+    3. Commit compiled JSON to version control (or artifact registry).
+    4. In production: load the compiled file at app startup.
+    5. Version compiled files alongside model version: compiled_claude3_v2.json.
+    6. When switching LLM providers, re-run optimization (compiled demonstrations may not transfer).
+    7. Set DSPY_CACHEDIR for local inference caching during development (avoids redundant API calls).
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [dspy, fastapi]
+  domains:
+    domain: [agent_orchestration, deployment, llm_prompting]
+    concern: [module_compilation, deployment, cost_control]
+  example_good: |
+    import dspy
+    import os
+    from pathlib import Path
+
+    # In CI/CD pipeline (runs once per model version update)
+    def run_optimization_pipeline():
+        dspy.configure(lm=dspy.LM("anthropic/claude-sonnet-4-6"))
+        program = MyDSPyProgram()
+        compiled = run_bootstrap_and_mipro(program, train_data, dev_data)
+        compiled.save("artifacts/compiled_claude_sonnet4.json")
+        print("Saved compiled module to artifacts/")
+
+    # In FastAPI app startup (loads in <100ms, zero optimization cost)
+    _compiled_program: MyDSPyProgram | None = None
+
+    def get_compiled_program() -> MyDSPyProgram:
+        global _compiled_program
+        if _compiled_program is None:
+            dspy.configure(lm=dspy.LM("anthropic/claude-sonnet-4-6"))
+            artifact_path = Path(os.getenv("DSPY_ARTIFACT_PATH", "artifacts/compiled_claude_sonnet4.json"))
+            if not artifact_path.exists():
+                raise RuntimeError(f"Compiled DSPy module not found at {artifact_path}. Run optimization pipeline first.")
+            program = MyDSPyProgram()
+            program.load(str(artifact_path))
+            _compiled_program = program
+        return _compiled_program
+
+    # Usage in endpoint
+    @app.post("/answer")
+    async def answer(question: str):
+        result = get_compiled_program()(question=question)
+        return {"answer": result.answer}
+  example_bad: |
+    from dspy.teleprompt import MIPROv2
+    import dspy
+
+    # Optimizing at every app startup — catastrophic
+    @app.on_event("startup")
+    async def startup():
+        global program
+        # This runs MIPROv2 every time the server starts
+        # Cost: $20 in API tokens, 45 minutes runtime, non-deterministic output
+        mipro = MIPROv2(metric=my_metric)
+        program = mipro.compile(MyDSPyProgram(), trainset=load_data())
+  when_applies: All DSPy programs in production — compilation must be an offline, versioned artifact
+  sources:
+    - "https://dspy.ai/cheatsheet/"
+    - "https://github.com/stanfordnlp/dspy"
+
+- id: DSPY-006
+  text: >
+    Use dspy.Assert for hard constraints (must be true or retry) and dspy.Suggest for soft
+    constraints (preferred but not blocking). In DSPy 2.6+, use dspy.Refine and dspy.BestofN
+    as replacements. Constraints are Python boolean functions — keep them fast (<10ms).
+  why: >
+    Without assertions, DSPy programs accept any LLM output including hallucinated content
+    that fails validation. dspy.Assert triggers automatic retry with a backtrack message
+    explaining the failure — the LLM gets a second chance to produce valid output.
+    However, each assertion failure doubles token cost (retry). Assertions that run expensive
+    validation (database lookups, API calls) cause cascading cost explosions. The upgrade
+    to dspy.Refine/BestofN in 2.6 provides better control: Refine retries with feedback,
+    BestofN generates N candidates and picks the best.
+  how_to_do_right: |
+    1. Check DSPy version first: if version >= 2.6, use dspy.Refine / dspy.BestofN.
+    2. Assertions must be boolean Python functions — no side effects, no I/O.
+    3. Limit retry budget: max 2 retries per assertion (cost scales linearly).
+    4. Hard constraints (Assert/Refine): structural validity (JSON parseable, length, regex).
+    5. Soft constraints (Suggest/BestofN): style, tone, specificity — nice to have.
+    6. Wrap assertion-heavy programs: dspy.assert_transform_module(program, backtrack_handler).
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [dspy]
+  domains:
+    domain: [agent_orchestration, llm_prompting, validation]
+    concern: [assertions, output_validation, retry_logic]
+  example_good: |
+    import dspy
+
+    dspy.configure(lm=dspy.LM("anthropic/claude-sonnet-4-6"))
+
+    class GenerateSummary(dspy.Signature):
+        """Summarize the document in 2-4 sentences. Must be factual."""
+        document: str = dspy.InputField()
+        summary: str = dspy.OutputField()
+
+    # Fast, pure boolean validators
+    def is_length_valid(summary: str) -> bool:
+        sentences = [s.strip() for s in summary.split('.') if s.strip()]
+        return 2 <= len(sentences) <= 4
+
+    def has_no_hallucination_markers(summary: str) -> bool:
+        # Simple heuristic — not perfect, but fast
+        bad_phrases = ["it is known that", "experts say", "studies show"]
+        return not any(p in summary.lower() for p in bad_phrases)
+
+    class SummarizeProgram(dspy.Module):
+        def __init__(self):
+            self.summarize = dspy.ChainOfThought(GenerateSummary)
+
+        def forward(self, document: str) -> dspy.Prediction:
+            result = self.summarize(document=document)
+            # Hard constraint: retry if length is wrong
+            dspy.Assert(
+                is_length_valid(result.summary),
+                f"Summary must be 2-4 sentences, got: '{result.summary[:50]}...'"
+            )
+            # Soft constraint: suggest but don't retry if hallucination markers found
+            dspy.Suggest(
+                has_no_hallucination_markers(result.summary),
+                "Avoid unverifiable claims. Use only information from the document."
+            )
+            return result
+
+    # Wrap with assertion transformer for automatic retry on Assert failures
+    from dspy.primitives.assertions import assert_transform_module, backtrack_handler
+    wrapped = assert_transform_module(SummarizeProgram(), backtrack_handler)
+  example_bad: |
+    import dspy
+
+    class BadSummarizeProgram(dspy.Module):
+        def forward(self, document: str):
+            result = self.summarize(document=document)
+            # Expensive assertion — calls the database on every prediction
+            # If the LLM retries 2x, this runs 3 database queries per request
+            dspy.Assert(
+                is_claim_in_database(result.summary),  # Slow I/O in assertion!
+                "Summary must reference known facts"
+            )
+            return result
+  when_applies: Any DSPy program where output format or factual constraints must be enforced
+  sources:
+    - "https://dspy.ai/learn/programming/modules/"
+    - "https://github.com/stanfordnlp/dspy"
+
+- id: DSPY-007
+  text: >
+    Build RAG with DSPy by composing a retrieval step and a generation step in a Module.
+    Use dspy.Retrieve for retrieval (backed by any vector store) or a custom retrieval function.
+    Optimize the full RAG pipeline — not just the generation — so few-shot examples teach
+    the model how to use retrieved context effectively.
+  why: >
+    Naive RAG (retrieve top-k, paste into prompt, generate) has two failure modes: poor
+    retrieval (wrong context retrieved) and poor generation (context present but not used).
+    DSPy's RAG pattern optimizes both jointly: the optimizer can discover few-shot examples
+    showing good retrieval queries and correct extraction from context. Stanford's DSPy
+    paper shows 10% relative improvement on HotPotQA over non-optimized RAG. Multi-hop
+    RAG (retrieve → reason → retrieve again) requires the ReAct module, not simple Retrieve.
+  how_to_do_right: |
+    1. Configure retriever: dspy.configure(rm=dspy.ColBERTv2(url="...")) or custom function.
+    2. For single-hop: dspy.Retrieve(k=3) + dspy.ChainOfThought for generation.
+    3. For multi-hop: use dspy.ReAct with search_documents tool (see DSPY-003).
+    4. Optimize the FULL pipeline including retrieval, not just generation.
+    5. Evaluation metric must check both relevance and faithfulness — not just answer accuracy.
+    6. Log retrieved passages for each failure case — retrieval quality is often the bottleneck.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [dspy, qdrant]
+  domains:
+    domain: [agent_orchestration, rag, llm_prompting]
+    concern: [rag_pipeline, retrieval, multi_hop_reasoning]
+  example_good: |
+    import dspy
+    from qdrant_client import QdrantClient
+    from sentence_transformers import SentenceTransformer
+
+    dspy.configure(lm=dspy.LM("anthropic/claude-sonnet-4-6"))
+
+    # Custom retriever backed by Qdrant
+    class QdrantRetriever(dspy.Retrieve):
+        def __init__(self, collection_name: str, k: int = 3):
+            super().__init__(k=k)
+            self.client = QdrantClient(host="localhost", port=6333)
+            self.encoder = SentenceTransformer("all-mpnet-base-v2")
+            self.collection = collection_name
+
+        def forward(self, query: str, k: int = None) -> dspy.Prediction:
+            k = k or self.k
+            embedding = self.encoder.encode(query).tolist()
+            results = self.client.query_points(
+                collection_name=self.collection,
+                query=embedding,
+                limit=k,
+            ).points
+            passages = [dspy.Prediction(long_text=r.payload["content"], score=r.score) for r in results]
+            return dspy.Prediction(passages=passages)
+
+    # RAG pipeline as a DSPy Module
+    class GenerateWithContext(dspy.Signature):
+        """Answer the question using the provided context. Be faithful — only use information from context."""
+        context: list[str] = dspy.InputField(desc="Retrieved passages from the knowledge base")
+        question: str = dspy.InputField()
+        answer: str = dspy.OutputField(desc="Concise, faithful answer based only on the provided context")
+
+    class RAGPipeline(dspy.Module):
+        def __init__(self, collection_name: str):
+            self.retrieve = QdrantRetriever(collection_name=collection_name, k=3)
+            self.generate = dspy.ChainOfThought(GenerateWithContext)
+
+        def forward(self, question: str) -> dspy.Prediction:
+            passages = self.retrieve(query=question).passages
+            context = [p.long_text for p in passages]
+            return self.generate(context=context, question=question)
+
+    rag = RAGPipeline(collection_name="product_docs")
+    result = rag(question="What is the maximum file size for uploads?")
+    print(result.answer)
+  example_bad: |
+    import dspy
+
+    # Naive RAG — no retrieval optimization, no faithful generation constraint
+    class BadRAG(dspy.Module):
+        def __init__(self):
+            self.generate = dspy.Predict("question -> answer")  # No context field!
+
+        def forward(self, question: str):
+            # Retrieves separately, pastes into question string — optimizer can't learn retrieval
+            docs = vector_db.search(question)
+            context = "\n".join(d.content for d in docs)
+            return self.generate(question=f"{context}\n\nQ: {question}")
+            # Optimizer sees only one field "question" — can't distinguish query from context
+  when_applies: Any application with a knowledge base that needs question answering
+  sources:
+    - "https://dspy.ai/tutorials/rag/"
+    - "https://github.com/stanfordnlp/dspy"
+
+- id: DSPY-008
+  text: >
+    Define evaluation metrics as Python functions returning float (0.0–1.0) or bool.
+    Use task-specific metrics (exact match, F1, semantic similarity) not generic LLM judges
+    for optimization. Use LLM-as-judge only for final human-aligned evaluation —
+    never as the optimization target (Goodhart's Law).
+  why: >
+    Goodhart's Law: "When a measure becomes a target, it ceases to be a good measure."
+    Optimizing against an LLM judge causes the program to learn to "game" the judge —
+    producing outputs that score well on the judge's rubric but fail in production.
+    This is analogous to overfitting, but for prompts. Fast, deterministic metrics
+    (exact match, regex, JSON validity) are cheap and reproducible — they provide reliable
+    optimization signals. Reserve expensive LLM judges for held-out human evaluation.
+  how_to_do_right: |
+    1. For classification: accuracy = float(predicted_label == gold_label)
+    2. For extraction: F1 over tokens (set overlap / union)
+    3. For generation: keep it task-specific — ROUGE, BERTScore, or custom domain metrics.
+    4. Metric function signature: (gold: dspy.Example, pred: dspy.Prediction, trace=None) -> float
+    5. The trace argument is populated during BootstrapFewShot — use it to filter demos
+       (e.g., only keep demos where the full reasoning trace led to the correct answer).
+    6. Normalize metrics to [0, 1] — optimizers assume higher=better.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [dspy]
+  domains:
+    domain: [agent_orchestration, llm_prompting, evaluation]
+    concern: [metric_design, optimization_target, evaluation]
+  example_good: |
+    import dspy
+    import re
+
+    # Classification metric — fast, deterministic
+    def intent_accuracy(gold: dspy.Example, pred: dspy.Prediction, trace=None) -> float:
+        return float(gold.intent.lower() == pred.intent.lower())
+
+    # Entity extraction metric — token F1
+    def entity_f1(gold: dspy.Example, pred: dspy.Prediction, trace=None) -> float:
+        gold_entities = set(gold.entities)
+        pred_entities = set(pred.entities) if hasattr(pred, 'entities') else set()
+        if not gold_entities and not pred_entities:
+            return 1.0
+        if not gold_entities or not pred_entities:
+            return 0.0
+        tp = len(gold_entities & pred_entities)
+        precision = tp / len(pred_entities)
+        recall = tp / len(gold_entities)
+        if precision + recall == 0:
+            return 0.0
+        return 2 * precision * recall / (precision + recall)  # F1
+
+    # Structured output metric — check schema validity
+    def valid_json_schema(gold: dspy.Example, pred: dspy.Prediction, trace=None) -> float:
+        try:
+            SupportTicket(**pred.ticket.dict())  # Pydantic validation
+            return 1.0
+        except Exception:
+            return 0.0
+  example_bad: |
+    import dspy
+
+    # LLM judge as optimization target — Goodhart's Law violation
+    def llm_judge_metric(gold: dspy.Example, pred: dspy.Prediction, trace=None) -> float:
+        judge = dspy.Predict("answer, gold_answer -> quality_score")
+        result = judge(answer=pred.answer, gold_answer=gold.answer)
+        # The optimizer will learn to produce answers that fool the judge
+        # not answers that are actually correct
+        return float(result.quality_score) / 10.0  # Normalized 0-1
+  when_applies: Every DSPy optimization run — the metric function is the most important decision
+  sources:
+    - "https://dspy.ai/learn/optimization/optimizers/"
+    - "https://dspy.ai/cheatsheet/"
+
+- id: DSPY-009
+  text: >
+    Write unit tests for DSPy modules by testing with fixed few-shot demonstrations
+    (deterministic) rather than live LLM calls. Use dspy.settings.configure(lm=dspy.utils.DummyLM([]))
+    for unit tests. Integration tests should use the cheapest available model (claude-haiku, gpt-4o-mini).
+  why: >
+    DSPy programs using live LLM calls in unit tests are: slow (1–10 seconds per test),
+    expensive ($0.01–$1 per test run), and non-deterministic (different runs produce
+    different outputs). DummyLM returns fixed strings from a list — perfect for testing
+    program structure, assertion logic, and error handling. Integration tests should use
+    the cheapest capable model: testing with claude-opus in CI wastes money without
+    testing anything that the haiku model wouldn't catch.
+  how_to_do_right: |
+    1. Unit tests: use dspy.utils.DummyLM(["fixed_response_1", "fixed_response_2"]).
+    2. Test that assertions fire correctly (not LLM output quality).
+    3. Test that multi-hop programs call the right tools in the right order.
+    4. Integration tests: use cheap model (claude-haiku or gpt-4o-mini).
+    5. Evaluation runs (accuracy measurement): use target production model.
+    6. Optimization runs (bootstrap/MIPRO): use target production model.
+    7. Mark integration tests with @pytest.mark.integration — run separately from unit tests.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [dspy, pytest]
+  domains:
+    domain: [agent_orchestration, testing, llm_prompting]
+    concern: [unit_testing, integration_testing, deterministic_tests]
+  example_good: |
+    import dspy
+    import pytest
+    from dspy.utils import DummyLM
+
+    # Unit test — deterministic, no API calls, fast
+    class TestExtractSupportTicket:
+        def test_valid_extraction(self):
+            # DummyLM returns fixed strings for each LLM call
+            dspy.configure(lm=DummyLM([
+                # ChainOfThought reasoning
+                '{"reasoning": "The email is about billing", "category": "billing", "priority": "high", "summary": "Double charge reported", "action_items": ["Check payment history", "Issue refund"]}'
+            ]))
+            extractor = dspy.Predict(ExtractSupportTicket)
+            result = extractor(raw_email="I was charged twice this month")
+            # Test structure, not LLM intelligence
+            assert hasattr(result, 'ticket')
+
+        def test_assertion_fires_on_invalid_category(self):
+            dspy.configure(lm=DummyLM(['{"category": "INVALID_CATEGORY", "priority": "high"}']))
+            extractor = AssertingExtractor()
+            with pytest.raises(dspy.primitives.assertions.DSPyAssertionError):
+                extractor(raw_email="...")
+
+    # Integration test — uses cheapest model, marked as integration
+    @pytest.mark.integration
+    class TestExtractSupportTicketIntegration:
+        def test_real_email_extraction(self):
+            dspy.configure(lm=dspy.LM("anthropic/claude-haiku-3"))  # Cheapest capable model
+            extractor = dspy.Predict(ExtractSupportTicket)
+            result = extractor(raw_email="My account was locked after I changed my password...")
+            assert result.ticket.category == "technical"
+  example_bad: |
+    import dspy
+
+    # Unit tests with live LLM — slow, expensive, non-deterministic
+    class TestSummarizer:
+        def test_summary_length(self):
+            dspy.configure(lm=dspy.LM("anthropic/claude-opus-4-6"))  # Most expensive model in unit test!
+            # This test: takes 3-10 seconds, costs $0.05, may fail due to LLM variability
+            summarizer = dspy.ChainOfThought(GenerateSummary)
+            result = summarizer(document="Long document text...")
+            assert len(result.summary) > 10
+  when_applies: All DSPy programs that will be maintained over time — testability is non-negotiable
+  sources:
+    - "https://dspy.ai/faqs/"
+    - "https://github.com/stanfordnlp/dspy"
+
+- id: DSPY-010
+  text: >
+    Configure DSPy globally once at application startup with dspy.configure().
+    Never call dspy.configure() inside module forward() methods or per-request handlers.
+    For multi-model programs (different LLMs for different steps), use dspy.context(lm=...).
+  why: >
+    dspy.configure() sets global state using Python's contextvars. Calling it inside a
+    FastAPI request handler causes race conditions in async code: two concurrent requests
+    calling configure with different models will corrupt each other's settings.
+    dspy.context(lm=...) is the correct thread-safe way to override the LLM for a
+    specific block of code — it uses Python context managers (with statement) and is
+    safe for concurrent execution.
+  how_to_do_right: |
+    1. Call dspy.configure(lm=...) once at module load time or app startup — never in request handlers.
+    2. For per-step model overrides: use `with dspy.context(lm=cheap_model):` block.
+    3. For async FastAPI: use asyncio-safe patterns — dspy.context() is context-var-based and safe.
+    4. Set a global default model, override only where a different model is needed.
+    5. Configure caching: dspy.configure(cache_turn_on=True) for development (saves token costs).
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [dspy, fastapi]
+  domains:
+    domain: [agent_orchestration, deployment, llm_prompting]
+    concern: [global_configuration, thread_safety, multi_model]
+  example_good: |
+    import dspy
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+    # Configure once at startup — not in request handlers
+    SONNET = dspy.LM("anthropic/claude-sonnet-4-6")
+    HAIKU  = dspy.LM("anthropic/claude-haiku-3")  # Cheap model for simple steps
+
+    @app.on_event("startup")
+    async def startup():
+        dspy.configure(lm=SONNET)  # Global default
+
+    # Per-step model override using dspy.context — thread-safe
+    class MultiModelPipeline(dspy.Module):
+        def __init__(self):
+            self.classify = dspy.Predict(ClassifyIntent)   # Will use HAIKU via context
+            self.generate = dspy.ChainOfThought(Generate)  # Will use SONNET (global default)
+
+        def forward(self, text: str) -> dspy.Prediction:
+            # Use cheap model for simple classification
+            with dspy.context(lm=HAIKU):
+                intent = self.classify(text=text)
+
+            # Use powerful model for complex generation (uses global default: SONNET)
+            return self.generate(intent=intent.category, text=text)
+
+    pipeline = MultiModelPipeline()
+
+    @app.post("/process")
+    async def process(text: str):
+        result = pipeline(text=text)
+        return {"result": result.answer}
+  example_bad: |
+    from fastapi import FastAPI
+    import dspy
+
+    app = FastAPI()
+
+    @app.post("/process")
+    async def process(text: str, model: str = "claude-sonnet-4-6"):
+        # WRONG: configures global state per-request
+        # Two concurrent requests with different 'model' values corrupt each other
+        dspy.configure(lm=dspy.LM(f"anthropic/{model}"))
+        program = dspy.Predict("text -> result")
+        return program(text=text)
+  when_applies: Any DSPy program used in a web API or multi-threaded/async context
+  sources:
+    - "https://dspy.ai/cheatsheet/"
+    - "https://dspy.ai/"

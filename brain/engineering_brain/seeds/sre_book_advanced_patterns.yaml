@@ -1,0 +1,645 @@
+layer: rules
+technology: SRE
+domain: distributed_systems
+knowledge:
+- id: CR-SRE-ADV-001
+  text: Deadline propagation — pass the remaining time budget with every RPC call. If the client has 5 seconds left and the
+    first downstream call takes 3 seconds, the second downstream call should know it only has 2 seconds, not the default 30
+    seconds.
+  why: 'Google''s gRPC framework implements deadline propagation natively because without it, downstream services waste resources
+    processing requests that will never be seen by the original caller. The sequence: client sets a 5-second deadline. The
+    request reaches service A, which calls service B (taking 3 seconds), then calls service C. Without deadline propagation,
+    C uses its default timeout (30 seconds) — but the client will timeout in 2 seconds. If C takes 10 seconds, it has done
+    10 seconds of work for a response that nobody will read. With deadline propagation, C knows it has 2 seconds remaining
+    and can either complete quickly or fail fast. This prevents wasted work and reduces load on overloaded systems because
+    requests that cannot complete in time are rejected early.
+
+    '
+  how_to_do_right: '1. Propagate deadlines through the entire call chain. In gRPC, this is automatic via context. In HTTP,
+    use a custom header (e.g., X-Request-Deadline).
+
+    2. At each service boundary, check remaining deadline before starting expensive operations. If deadline < minimum processing
+    time, reject immediately.
+
+    3. Subtract estimated processing time from the deadline before forwarding. If 3 seconds remain and local processing takes
+    1 second, forward with 2-second deadline.
+
+    4. Log deadline violations: requests that exceed their deadline are wasted work. Track these to identify slow dependencies.
+
+    5. Set a minimum useful deadline: if remaining time is < 100ms, reject rather than attempt (the result will arrive too
+    late anyway).
+
+    6. Combine with circuit breakers: if a downstream service consistently causes deadline violations, open the circuit.
+
+    '
+  example_good: "import time\nfrom contextvars import ContextVar\n\nrequest_deadline = ContextVar('request_deadline', default=None)\n\ndef set_deadline(timeout_seconds: float):\n    request_deadline.set(time.monotonic() + timeout_seconds)\n\ndef remaining_deadline() -> float:\n    deadline = request_deadline.get()\n    if deadline is None:\n        return float('inf')\n    return max(0, deadline - time.monotonic())\n\ndef call_downstream(service: str, payload: dict) -> dict:\n    remaining = remaining_deadline()\n    if remaining < 0.1:  # Less than 100ms left — fail fast\n        raise TimeoutError(f'Deadline expired before calling {service}')\n    # Subtract estimated local processing time\n    downstream_timeout = remaining - 0.05  # Reserve 50ms for response handling\n    return http_client.post(\n        f'http://{service}/api',\n        json=payload,\n        timeout=downstream_timeout,\n        headers={'X-Request-Deadline': str(request_deadline.get())},\n    )\n"
+  example_bad: "def call_downstream(service: str, payload: dict) -> dict:\n    # Each service uses its own default timeout (30s)\n    # Client has 5s left, but downstream doesn't know that\n    # Downstream spends 10s processing a request nobody will read\n    return http_client.post(\n        f'http://{service}/api',\n        json=payload,\n        timeout=30,  # Hardcoded default, ignores caller's deadline\n    )\n"
+  when_applies: "When building any service that makes downstream RPC calls in a request chain, especially in microservice architectures."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [grpc, http, load_balancer]
+  domains:
+    domain: [architecture, performance, reliability]
+    concern: [distributed_systems, latency, resilience]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-ADV-002
+  text: Canary analysis must be automated and statistical, not manual and visual. Human judgment comparing two dashboards
+    is unreliable, slow, and doesn't scale. Use automated canary analysis that compares metrics between canary and baseline
+    populations with statistical significance tests.
+  why: 'Google''s Canary Analysis Service (CAS) automates the comparison between canary and baseline metrics because manual
+    comparison is unreliable. An engineer looking at two latency graphs will miss a 5% regression that is statistically significant
+    but visually subtle. They will also flag a 20% spike that is actually normal variance. Automated analysis applies statistical
+    tests (Kolmogorov-Smirnov, Mann-Whitney U) to compare the distributions of canary vs baseline for every metric: latency,
+    error rate, CPU usage, memory. If ANY metric shows a statistically significant regression, the canary is automatically
+    rolled back. This catches regressions that humans miss and avoids false alarms that humans would trigger.
+
+    '
+  how_to_do_right: '1. Collect the same metrics from canary and baseline populations. Populations must be comparable (same
+    traffic mix, same time period).
+
+    2. Use statistical comparison (not visual): Mann-Whitney U test or Kolmogorov-Smirnov test for distribution comparison.
+
+    3. Compare multiple metrics automatically: latency (P50, P99), error rate, CPU, memory, custom business metrics.
+
+    4. Define pass/fail thresholds: P99 latency regression > 10% = FAIL, error rate increase > 0.1% = FAIL.
+
+    5. Minimum canary duration: 30 minutes for quick validation, 24 hours for comprehensive (captures diurnal traffic patterns).
+
+    6. Automate the entire cycle: deploy canary → collect metrics → compare → pass/fail → promote or rollback.
+
+    '
+  example_good: "from scipy import stats\nimport numpy as np\n\nclass CanaryAnalyzer:\n    def compare(self, canary_metrics: list, baseline_metrics: list) -> dict:\n        \"\"\"Automated statistical canary analysis.\"\"\"\n        results = {}\n        for metric_name in ['latency_p99', 'error_rate', 'cpu_usage']:\n            canary = np.array([m[metric_name] for m in canary_metrics])\n            baseline = np.array([m[metric_name] for m in baseline_metrics])\n            # Mann-Whitney U test — non-parametric, no normality assumption\n            stat, p_value = stats.mannwhitneyu(canary, baseline, alternative='greater')\n            regression = p_value < 0.05  # Statistically significant regression\n            results[metric_name] = {\n                'canary_mean': float(canary.mean()),\n                'baseline_mean': float(baseline.mean()),\n                'p_value': float(p_value),\n                'regression_detected': regression,\n            }\n        passed = not any(r['regression_detected'] for r in results.values())\n        return {'passed': passed, 'metrics': results}\n\n    def run_canary(self, feature: str, duration_minutes: int = 30):\n        deploy_canary(feature)\n        time.sleep(duration_minutes * 60)\n        result = self.compare(get_canary_metrics(), get_baseline_metrics())\n        if not result['passed']:\n            rollback_canary(feature)\n            raise RuntimeError(f'Canary failed: {result}')\n        promote_canary(feature)\n"
+  example_bad: "def check_canary(feature: str):\n    # Manual visual comparison of two dashboards\n    print('Check Grafana dashboard for canary vs baseline')\n    print('If latency looks similar, promote the canary')\n    # Human misses 5% regression that is statistically significant\n    # Human flags 20% spike that is normal variance\n    # No automated rollback — engineer must notice and act\n    input('Press Enter to promote canary...')\n    promote_canary(feature)\n"
+  when_applies: "When deploying any change through a canary process — automated statistical comparison replaces unreliable visual inspection."
+  severity: high
+  technologies:
+    platform: [deployment, kubernetes, istio]
+  domains:
+    domain: [operations, deployment, mathematics, reliability, testing]
+    concern: [statistics]
+  sources:
+  - url: https://sre.google/sre-book/reliable-product-launches/
+    title: 'Google SRE Book — Chapter 27: Reliable Product Launches at Scale'
+  validation_status: cross_checked
+- id: CR-SRE-ADV-003
+  text: The thundering herd problem — when many clients simultaneously retry or reconnect after a failure, the burst of traffic
+    overwhelms the recovering server. Add jitter to ALL retry timers, reconnection timers, and cache expiration times to spread
+    the load.
+  why: 'Google identifies the thundering herd as one of the most common patterns in cascading failures. It occurs in multiple
+    scenarios: server restarts (all clients reconnect simultaneously), cache expiration (all clients query the database for
+    the same expired key), retry storms (all clients retry failed requests at the same interval), and cron jobs (all instances
+    trigger the same job at midnight). The common element: synchronized behavior from independent clients creates a traffic
+    spike that exceeds the server''s capacity. The universal solution: add randomized jitter to any time-based operation that
+    clients perform independently. If 1000 clients all retry after exactly 5 seconds, the server receives 1000 requests at
+    T+5. If they retry after 5±2 seconds (uniformly random), the requests spread over a 4-second window — reducing peak by
+    60%.
+
+    '
+  how_to_do_right: '1. Add jitter to retry timers: instead of "retry in 5 seconds," use "retry in 5 ± random(0, 2.5) seconds."
+
+    2. Add jitter to reconnection timers: when a connection is lost, reconnect after random(0, reconnection_interval), not
+    immediately.
+
+    3. Add jitter to cache TTLs: instead of TTL=300s for all keys, use TTL=300±random(0,60)s to spread expiration across a
+    60-second window.
+
+    4. Add jitter to cron jobs: instead of running at exactly 00:00, run at 00:00 + random(0, 300) seconds.
+
+    5. The jitter should be at least 20% of the base interval. Less than 20% doesn''t spread load enough.
+
+    6. Use decorrelated jitter (min(cap, random(base, prev_wait*3))) for retry backoff — more spread than equal jitter.
+
+    '
+  example_good: "import random\nimport time\n\ndef retry_with_jitter(func, max_retries=5, base_delay=1.0, cap=60.0):\n    \"\"\"Exponential backoff with decorrelated jitter.\"\"\"\n    delay = base_delay\n    for attempt in range(max_retries):\n        try:\n            return func()\n        except Exception as e:\n            if attempt == max_retries - 1:\n                raise\n            # Decorrelated jitter: more spread than equal jitter\n            delay = min(cap, random.uniform(base_delay, delay * 3))\n            time.sleep(delay)\n\ndef cache_with_jittered_ttl(key: str, value: str, base_ttl: int = 300):\n    \"\"\"Set cache with jittered TTL to prevent stampede on expiry.\"\"\"\n    jitter = random.randint(0, int(base_ttl * 0.2))  # 20% jitter\n    redis_client.setex(key, base_ttl + jitter, value)\n\ndef reconnect_with_jitter(base_interval: float = 5.0):\n    \"\"\"Reconnect after random delay to avoid thundering herd.\"\"\"\n    jitter = random.uniform(0, base_interval)\n    time.sleep(jitter)\n    return create_connection()\n"
+  example_bad: "def retry(func, max_retries=5):\n    for attempt in range(max_retries):\n        try:\n            return func()\n        except Exception:\n            if attempt == max_retries - 1:\n                raise\n            time.sleep(5)  # All 1000 clients retry at exactly T+5\n            # At T+5, server receives 1000 simultaneous requests\n\ndef cache_set(key, value):\n    redis_client.setex(key, 300, value)  # All keys expire at the same time\n    # When they expire, all clients query the database simultaneously\n"
+  when_applies: "When implementing any retry logic, cache TTLs, reconnection timers, or scheduled jobs — add jitter to prevent synchronized load spikes."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [redis, grpc, http]
+  domains:
+    domain: [architecture, performance, reliability]
+    concern: [distributed_systems, caching, resilience]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-ADV-004
+  text: The "swiss cheese model" of reliability — no single defense is perfect. Each layer (monitoring, testing, code review,
+    canary, circuit breaker) has holes. Stack enough layers that the holes never align. This is why defense in depth is not
+    redundancy — it is complementary coverage.
+  why: 'Google applies James Reason''s Swiss Cheese Model (from aviation safety) to software reliability. Each safety mechanism
+    is like a slice of Swiss cheese — it blocks most failures but has holes (blind spots). Monitoring catches performance
+    regressions but not logical bugs. Code review catches logical bugs but not race conditions. Testing catches race conditions
+    but not capacity issues. Canary catches capacity issues but not slow-building failures. Each layer has different holes.
+    By stacking enough layers, the probability that a failure passes through ALL holes approaches zero. The key insight: layers
+    must be INDEPENDENT. Two layers that both rely on the same metric (e.g., error rate) have correlated holes — when one
+    misses a failure, the other misses it too. True defense in depth uses diverse mechanisms: monitoring + testing + code
+    review + canary + chaos engineering + postmortem learning.
+
+    '
+  how_to_do_right: '1. List your safety layers: code review, unit tests, integration tests, staging, canary, monitoring, alerting,
+    circuit breakers, rollback.
+
+    2. For each layer, identify its blind spots: code review misses timing bugs, unit tests miss integration issues, monitoring
+    misses logical corruption.
+
+    3. Verify that layers are independent: if layer A and layer B both check the same metric, they are NOT independent defenses.
+
+    4. After every production incident, trace which layers the failure passed through and WHY each one missed it.
+
+    5. Add new layers specifically to cover blind spots revealed by incidents. Don''t add another monitoring rule — add a
+    different TYPE of defense.
+
+    6. Accept that no layer is perfect. The goal is not perfect layers — it is enough imperfect layers that failures cannot
+    pass through all of them.
+
+    '
+  example_good: "from dataclasses import dataclass\nfrom typing import List, Dict\n\n@dataclass\nclass SafetyLayer:\n    name: str\n    type: str  # monitoring, testing, review, runtime\n    blind_spots: List[str]\n\nclass SwissCheeseAudit:\n    def __init__(self):\n        self.layers: List[SafetyLayer] = [\n            SafetyLayer('code_review', 'review', ['timing bugs', 'race conditions']),\n            SafetyLayer('unit_tests', 'testing', ['integration issues', 'scale-dependent bugs']),\n            SafetyLayer('integration_tests', 'testing', ['production data patterns', 'capacity']),\n            SafetyLayer('canary_deployment', 'runtime', ['slow-building failures', 'rare edge cases']),\n            SafetyLayer('monitoring_alerting', 'monitoring', ['logical corruption', 'semantic errors']),\n            SafetyLayer('circuit_breakers', 'runtime', ['slow degradation', 'partial failures']),\n        ]\n\n    def check_independence(self) -> List[str]:\n        \"\"\"Verify layers use different detection mechanisms.\"\"\"\n        warnings = []\n        types_used = {}\n        for layer in self.layers:\n            if layer.type in types_used:\n                warnings.append(f'{layer.name} and {types_used[layer.type]} are same type — correlated holes')\n            types_used[layer.type] = layer.name\n        return warnings\n\n    def post_incident_trace(self, incident: str, layers_passed: List[str]) -> str:\n        return f'Incident {incident} passed through: {layers_passed}. Add new layer type to cover gap.'\n"
+  example_bad: "# Only one type of defense: monitoring\n# All layers check the same metric (error rate)\ndef check_health():\n    error_rate = get_error_rate()\n    if error_rate > 0.01:\n        alert('High error rate')  # Layer 1: alert\n        rollback()                # Layer 2: rollback based on same metric\n    # Both layers have the same blind spot:\n    # Logical corruption with 200 OK responses has 0% error rate\n    # Neither layer detects it\n"
+  when_applies: "When designing the reliability strategy for a system — ensure safety layers are independent and cover each other's blind spots."
+  severity: high
+  technologies:
+    lang: [general]
+  domains:
+    domain: [architecture, reliability]
+    concern: [resilience]
+  sources:
+  - url: https://sre.google/sre-book/testing-reliability/
+    title: 'Google SRE Book — Chapter 17: Testing for Reliability'
+  validation_status: cross_checked
+- id: CR-SRE-ADV-005
+  text: Capacity planning must account for correlated failures — not just individual server failures. When a network switch
+    dies, ALL servers behind it die simultaneously. When a datacenter loses power, ALL services in it fail. N+1 redundancy
+    across correlated failure domains is meaningless.
+  why: 'Google''s capacity planning accounts for failure domains because individual server failures and correlated failures
+    have completely different blast radii. Individual failure: 1 of 100 servers dies, 99 handle the load. Correlated failure:
+    a rack switch dies, 20 of 100 servers (all in the same rack) become unreachable simultaneously. The remaining 80 must
+    handle 125% load. If the system was provisioned for N+1 (101 servers for 100 servers of load), losing 20 servers exceeds
+    capacity and cascades. Google provisions for N+2 at the FAILURE DOMAIN level: the system must survive the loss of the
+    2 largest failure domains (2 racks, 2 availability zones, etc.) without degradation. This is dramatically more capacity
+    than N+1 at the individual server level.
+
+    '
+  how_to_do_right: '1. Map failure domains: which servers share a rack switch? Which services share an availability zone?
+    Which dependencies share a region?
+
+    2. Provision for N+2 at the failure domain level: can you lose 2 racks (or 2 AZs) and still serve peak traffic?
+
+    3. Spread replicas across failure domains: 3 replicas in 3 different racks (or AZs), not 3 replicas in the same rack.
+
+    4. Test correlated failures: simulate a rack failure (not just a single server failure) and verify the system survives.
+
+    5. Include cloud provider outages in planning: AWS us-east-1 has had multi-AZ outages. If your service requires 3 AZs
+    and only 2 are up, what happens?
+
+    6. Track the "blast radius" of each failure domain: how many users are affected if this rack/AZ/region goes down?
+
+    '
+  example_good: "from dataclasses import dataclass\nfrom typing import List\n\n@dataclass\nclass FailureDomain:\n    name: str\n    type: str  # rack, az, region\n    servers: int\n    services: List[str]\n\nclass CapacityPlanner:\n    def __init__(self, peak_traffic_qps: int, failure_domains: List[FailureDomain]):\n        self.peak_qps = peak_traffic_qps\n        self.domains = sorted(failure_domains, key=lambda d: d.servers, reverse=True)\n\n    def check_n_plus_2(self) -> dict:\n        \"\"\"Verify system survives loss of 2 largest failure domains.\"\"\"\n        total_servers = sum(d.servers for d in self.domains)\n        lost_servers = self.domains[0].servers + self.domains[1].servers\n        remaining = total_servers - lost_servers\n        capacity_per_server = self.peak_qps / total_servers\n        remaining_capacity = remaining * capacity_per_server\n        survives = remaining_capacity >= self.peak_qps\n        return {\n            'survives_n_plus_2': survives,\n            'total_servers': total_servers,\n            'lost_in_worst_case': lost_servers,\n            'remaining_capacity_pct': (remaining_capacity / self.peak_qps) * 100,\n        }\n\nplanner = CapacityPlanner(\n    peak_traffic_qps=10000,\n    failure_domains=[\n        FailureDomain('rack-A', 'rack', 20, ['api', 'db']),\n        FailureDomain('rack-B', 'rack', 20, ['api', 'db']),\n        FailureDomain('rack-C', 'rack', 20, ['api', 'cache']),\n        FailureDomain('rack-D', 'rack', 20, ['api', 'cache']),\n        FailureDomain('rack-E', 'rack', 20, ['api', 'search']),\n    ],\n)\nresult = planner.check_n_plus_2()\n"
+  example_bad: "# N+1 at individual server level — ignores correlated failures\ntotal_servers = 101  # 100 servers of load + 1 spare\n# When a rack switch dies, 20 servers go down simultaneously\n# 81 remaining servers can't handle 100 servers of load\n# Cascade begins\n"
+  when_applies: "When planning capacity for any distributed system — must account for correlated failures at the failure domain level, not individual servers."
+  severity: critical
+  technologies:
+    platform: [aws, azure, gcp, kubernetes]
+  domains:
+    domain: [architecture, reliability, planning]
+    concern: [distributed_systems, capacity]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-ADV-006
+  text: Idempotency is the most important property of any distributed operation. In a world where networks drop packets, servers
+    crash mid-request, and retries are inevitable, every operation must produce the same result whether executed once or N
+    times.
+  why: 'Google mandates idempotency because distributed systems fundamentally cannot guarantee exactly-once delivery. A client
+    sends a request, the server processes it, but the response is lost in the network. The client retries. Now the server
+    receives the request twice. Without idempotency: create_order() creates two orders, transfer_money() transfers twice,
+    send_email() sends two emails. With idempotency: the second execution detects the first and returns the same result without
+    side effects. Google achieves this with idempotency keys (client-generated unique IDs attached to each request — the server
+    checks if it has already processed this ID) and naturally idempotent operations (setting a value is idempotent; incrementing
+    is not). Google''s advice: design operations to be idempotent from the start. Retrofitting idempotency into a non-idempotent
+    system is extremely difficult.
+
+    '
+  how_to_do_right: '1. Every mutating API must accept an idempotency key (client-generated UUID). The server stores processed
+    keys and returns cached results for duplicates.
+
+    2. Prefer SET over INCREMENT: "set balance to $100" is idempotent, "add $10 to balance" is not.
+
+    3. Use conditional writes: "UPDATE x SET value=new WHERE value=old" — fails silently if already applied.
+
+    4. Idempotency key storage must survive server restarts. Use a database or distributed cache with TTL.
+
+    5. TTL for idempotency keys: at least 24 hours. Clients may retry hours after the original request.
+
+    6. Test idempotency: send the same request twice with the same idempotency key and verify the second is a no-op.
+
+    '
+  example_good: "import uuid\nimport json\nfrom typing import Optional\n\nclass IdempotentAPI:\n    def __init__(self, db, cache):\n        self.db = db\n        self.cache = cache  # Redis with 24h TTL\n\n    def create_payment(self, idempotency_key: str, amount: float, recipient: str) -> dict:\n        \"\"\"Idempotent payment creation using client-generated key.\"\"\"\n        # Check if already processed\n        cached = self.cache.get(f'idem:{idempotency_key}')\n        if cached:\n            return json.loads(cached)  # Return original response\n\n        # Process the payment\n        payment_id = str(uuid.uuid4())\n        with self.db.transaction() as tx:\n            # DB-level uniqueness constraint as backup\n            tx.execute(\n                'INSERT INTO payments (id, idempotency_key, amount, recipient) '\n                'VALUES (%s, %s, %s, %s) ON CONFLICT (idempotency_key) DO NOTHING',\n                (payment_id, idempotency_key, amount, recipient)\n            )\n\n        result = {'payment_id': payment_id, 'status': 'created', 'amount': amount}\n        # Cache for 24h for duplicate detection\n        self.cache.setex(f'idem:{idempotency_key}', 86400, json.dumps(result))\n        return result\n"
+  example_bad: "def create_payment(amount: float, recipient: str) -> dict:\n    # No idempotency key — retries create duplicate payments\n    payment_id = str(uuid.uuid4())\n    db.execute('INSERT INTO payments (id, amount, recipient) VALUES (%s, %s, %s)',\n               (payment_id, amount, recipient))\n    return {'payment_id': payment_id}\n    # Client sends request, response is lost in network\n    # Client retries → second payment created → user charged twice\n"
+  when_applies: "When designing any mutating API operation in a distributed system where network failures and retries are inevitable."
+  severity: critical
+  technologies:
+    lang: [general]
+    platform: [postgresql, grpc, http]
+  domains:
+    domain: [architecture, reliability]
+    concern: [api_design, distributed_systems, data_integrity]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-ADV-007
+  text: The bulkhead pattern — isolate failure domains within a single service using separate thread pools, connection pools,
+    and memory allocations for different workloads. A slow database query on one endpoint should not block requests to other
+    endpoints.
+  why: 'The bulkhead pattern (from ship design — compartments that prevent a hull breach from sinking the entire ship) is
+    critical in Google''s services. Without bulkheads, all request types share the same resources: thread pool, connection
+    pool, memory. A slow query that exhausts the database connection pool blocks ALL requests — even those that don''t use
+    the database. A memory-intensive endpoint that triggers GC pauses degrades ALL endpoints. Google isolates resources: separate
+    thread pools for different request types, separate connection pools for different databases, separate memory budgets for
+    different workloads. When one compartment fails, the others continue operating. This is the difference between "endpoint
+    /heavy is slow" and "the entire service is down."
+
+    '
+  how_to_do_right: '1. Separate thread pools for different request categories: user-facing requests, background jobs, health
+    checks should not share a thread pool.
+
+    2. Separate connection pools per downstream dependency: database A gets 20 connections, database B gets 10, cache gets
+    50. One slow dependency doesn''t starve others.
+
+    3. Set per-endpoint rate limits: /api/search can use at most 60% of CPU, /api/export can use at most 20%.
+
+    4. Use separate process/container for heavy workloads: run batch processing in a dedicated container, not in the same
+    container as the API.
+
+    5. Monitor each bulkhead independently: thread pool A utilization, connection pool B utilization. Alert when any approaches
+    saturation.
+
+    6. Test isolation: make one downstream dependency slow and verify that other endpoints continue serving normally.
+
+    '
+  example_good: "from concurrent.futures import ThreadPoolExecutor\nimport threading\n\nclass BulkheadService:\n    \"\"\"Isolated thread pools per workload type.\"\"\"\n\n    def __init__(self):\n        # Separate thread pools prevent cross-contamination\n        self.user_pool = ThreadPoolExecutor(max_workers=20, thread_name_prefix='user')\n        self.background_pool = ThreadPoolExecutor(max_workers=5, thread_name_prefix='bg')\n        self.health_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='health')\n\n        # Separate connection pools per dependency\n        self.db_pool = create_pool(max_connections=20)   # Database\n        self.cache_pool = create_pool(max_connections=50) # Cache\n        self.search_pool = create_pool(max_connections=10) # Search\n\n    def handle_user_request(self, request):\n        \"\"\"User requests use the user pool — isolated from background jobs.\"\"\"\n        future = self.user_pool.submit(self._process_user_request, request)\n        return future.result(timeout=5.0)\n\n    def handle_background_job(self, job):\n        \"\"\"Background jobs use separate pool — can't starve user requests.\"\"\"\n        future = self.background_pool.submit(self._process_background_job, job)\n        return future.result(timeout=60.0)\n\n    def health_check(self):\n        \"\"\"Health checks always have capacity — independent pool.\"\"\"\n        future = self.health_pool.submit(self._check_health)\n        return future.result(timeout=1.0)\n"
+  example_bad: "from concurrent.futures import ThreadPoolExecutor\n\n# Single shared thread pool for everything\npool = ThreadPoolExecutor(max_workers=20)\n\ndef handle_request(request):\n    # User requests, background jobs, and health checks share the same pool\n    # A slow batch export consumes 18 threads\n    # Only 2 threads left for user requests\n    # Health checks can't run → load balancer marks instance as dead\n    # Instance receives no traffic → other instances overloaded → cascade\n    return pool.submit(process, request)\n"
+  when_applies: "When a service handles multiple workload types or depends on multiple downstream services that could fail independently."
+  severity: high
+  technologies:
+    lang: [general, go, java, python]
+    platform: [kubernetes]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, resilience]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-ADV-008
+  text: Monitoring cardinality explosion kills monitoring systems. Every unique combination of labels is a separate time series.
+    A label with 10,000 unique values (user_id, request_id) creates 10,000 time series PER metric — which is 100,000+ series
+    total and will crash your monitoring system.
+  why: 'Google''s Chapter 10 warns about monitoring cardinality because it is the most common cause of monitoring system failures.
+    Prometheus, Borgmon, and every time-series database have a practical limit on the number of active time series. A single
+    metric with labels {method, endpoint, status_code} has moderate cardinality: ~100 combinations. But adding user_id as
+    a label creates 1M+ combinations per metric. Monitoring systems that try to store this many series either run out of memory
+    (crash), become extremely slow (queries take minutes), or drop data silently. The result: your monitoring system fails
+    under the load of monitoring — losing visibility precisely when you need it most. Google''s rule: labels must have bounded,
+    low cardinality. High-cardinality data (user IDs, request IDs) goes into logging/tracing systems, not metrics.
+
+    '
+  how_to_do_right: '1. NEVER use unbounded values as metric labels: user_id, request_id, email, IP address, trace_id. These
+    belong in logs, not metrics.
+
+    2. Keep label cardinality below 100 per label: method=[GET,POST,PUT,DELETE], status=[2xx,3xx,4xx,5xx], endpoint=[top 50
+    paths].
+
+    3. Use label bucketing for continuous values: latency_bucket=[<10ms, <100ms, <1s, <10s, >10s], not latency_exact_ms.
+
+    4. Monitor your monitoring: track active time series count. Alert when it grows unexpectedly.
+
+    5. Use Prometheus recording rules to pre-aggregate high-cardinality metrics into low-cardinality summaries.
+
+    6. For per-user or per-request analysis, use distributed tracing (Jaeger, Zipkin) or structured logging (ELK, Loki) —
+    not metrics.
+
+    '
+  example_good: "from prometheus_client import Counter, Histogram\n\n# GOOD: Low-cardinality labels — bounded, known values\nhttp_requests = Counter(\n    'http_requests_total',\n    'Total HTTP requests',\n    labelnames=['method', 'endpoint_group', 'status_class'],\n    # method: GET, POST, PUT, DELETE (4 values)\n    # endpoint_group: /api/users, /api/orders, /health (< 50 values)\n    # status_class: 2xx, 3xx, 4xx, 5xx (4 values)\n    # Total cardinality: 4 * 50 * 4 = 800 time series — manageable\n)\n\nlatency_histogram = Histogram(\n    'http_request_duration_seconds',\n    'Request latency in seconds',\n    labelnames=['method', 'endpoint_group'],\n    buckets=[0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0],\n)\n\ndef track_request(method: str, path: str, status: int, duration: float):\n    endpoint_group = normalize_path(path)  # /api/users/123 → /api/users/:id\n    status_class = f'{status // 100}xx'\n    http_requests.labels(method=method, endpoint_group=endpoint_group, status_class=status_class).inc()\n    latency_histogram.labels(method=method, endpoint_group=endpoint_group).observe(duration)\n"
+  example_bad: "from prometheus_client import Counter\n\n# BAD: High-cardinality labels — unbounded values\nhttp_requests = Counter(\n    'http_requests_total',\n    'Total HTTP requests',\n    labelnames=['method', 'path', 'status', 'user_id', 'request_id'],\n    # user_id: 1M+ unique values\n    # request_id: infinite unique values\n    # path: /api/users/123 (unique per user ID in path)\n    # Total cardinality: MILLIONS of time series\n    # Prometheus runs out of memory and crashes\n)\n"
+  when_applies: "When defining Prometheus metrics or any time-series monitoring — labels must have bounded, low cardinality to prevent monitoring system failure."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [database, grafana, prometheus]
+  domains:
+    domain: [observability, reliability]
+    concern: [monitoring]
+  sources:
+  - url: https://sre.google/sre-book/practical-alerting/
+    title: 'Google SRE Book — Chapter 10: Practical Alerting from Time-Series Data'
+  validation_status: cross_checked
+- id: CR-SRE-ADV-009
+  text: Error budgets must be SPENT, not hoarded. The purpose of an error budget is to enable velocity — if you're at 99.99%
+    availability and your target is 99.9%, you have budget to spend on risky deployments, experiments, and migrations. Not
+    spending error budget means you're moving too slowly.
+  why: 'Google''s error budget concept (Chapter 3) is frequently misunderstood as "minimize errors." The correct interpretation
+    is: the error budget is the PLANNED rate of failure. If your SLO is 99.9% (43 minutes of downtime per month), and you''ve
+    had zero downtime for 6 months, you have accumulated budget that SHOULD be spent on velocity: deploying risky features,
+    running chaos experiments, performing infrastructure migrations, upgrading dependencies. An SRE team that hoards error
+    budget is over-investing in reliability at the expense of feature velocity. Google uses error budget consumption as a
+    decision-making tool: if budget is depleted, freeze risky changes and focus on reliability. If budget is healthy, approve
+    risky changes and push for velocity. This creates a data-driven balance between reliability and speed.
+
+    '
+  how_to_do_right: '1. Calculate error budget consumption weekly: (actual errors / budgeted errors) * 100%. If < 50%, velocity
+    can increase. If > 80%, slow down.
+
+    2. When error budget is healthy (< 50% consumed), approve riskier deployments, experiments, and migrations.
+
+    3. When error budget is depleted (> 100% consumed), freeze non-essential changes. Focus all engineering on reliability.
+
+    4. Track error budget by cause: deployment failures, infrastructure issues, dependency failures. Invest in the largest
+    contributor.
+
+    5. Share error budget status with product teams monthly. It is THEIR budget too — they should know when to push features
+    vs. invest in reliability.
+
+    6. Never set SLOs tighter than needed. A 99.999% SLO when users are satisfied at 99.9% wastes engineering effort on unnecessary
+    reliability.
+
+    '
+  example_good: "from datetime import datetime, timedelta\n\nclass ErrorBudgetTracker:\n    def __init__(self, slo_target: float, window_days: int = 30):\n        self.slo_target = slo_target  # e.g., 0.999\n        self.window_days = window_days\n        self.budget_minutes = (1 - slo_target) * window_days * 24 * 60  # 43.2 min for 99.9%\n\n    def consumption_pct(self, actual_downtime_minutes: float) -> float:\n        return (actual_downtime_minutes / self.budget_minutes) * 100\n\n    def recommend_action(self, consumption_pct: float) -> str:\n        if consumption_pct < 50:\n            return 'VELOCITY: Budget healthy — approve risky deployments and experiments'\n        elif consumption_pct < 80:\n            return 'CAUTION: Budget moderate — proceed with normal changes, avoid experiments'\n        elif consumption_pct <= 100:\n            return 'SLOW DOWN: Budget nearly depleted — only critical fixes, no risky changes'\n        else:\n            return 'FREEZE: Budget exhausted — freeze all non-essential changes, focus on reliability'\n\ntracker = ErrorBudgetTracker(slo_target=0.999)\npct = tracker.consumption_pct(actual_downtime_minutes=20)\nprint(f'Budget consumed: {pct:.1f}% — {tracker.recommend_action(pct)}')\n"
+  example_bad: "# Error budget hoarded — team moves too slowly\n# SLO: 99.9% (43 min/month budget)\n# Actual: 99.99% (4 min/month downtime)\n# 39 minutes of budget WASTED — could have been spent on:\n# - Risky feature deployments\n# - Infrastructure migrations\n# - Chaos experiments\n# Team is over-investing in reliability at the expense of velocity\n# No data-driven decision framework\n"
+  when_applies: "When managing the balance between reliability and feature velocity — error budgets provide a data-driven framework for deployment risk decisions."
+  severity: high
+  technologies:
+    lang: [general]
+  domains:
+    domain: [mathematics, reliability]
+    concern: [cost_modeling]
+  sources:
+  - url: https://sre.google/sre-book/embracing-risk/
+    title: 'Google SRE Book — Chapter 3: Embracing Risk'
+  validation_status: cross_checked
+- id: CR-SRE-ADV-010
+  text: Chaos engineering is not random destruction — it is hypothesis-driven experimentation. "We believe the system will
+    survive the loss of one database replica. Let's test this hypothesis." Without a hypothesis, chaos is just vandalism.
+  why: 'Google''s approach to resilience testing (described across Chapters 13, 17, and 22) is explicitly scientific. Engineers
+    form a hypothesis about system behavior under failure, design an experiment that tests the hypothesis, define success
+    and failure criteria BEFORE running the experiment, run the experiment in a controlled environment with monitoring, and
+    analyze whether the results confirm or refute the hypothesis. This is fundamentally different from "randomly killing pods
+    and seeing what happens." Random destruction is unpredictable, unrepeatable, and doesn''t build understanding. Hypothesis-driven
+    experiments are targeted, repeatable, and produce concrete knowledge: "The system DOES survive one replica loss but does
+    NOT survive two replica losses — we need to fix failover for the N-2 case."
+
+    '
+  how_to_do_right: '1. Start with a hypothesis: "If we lose one availability zone, latency will increase by < 50% and error
+    rate will stay below 1%."
+
+    2. Define success/failure criteria BEFORE the experiment. If you define criteria after seeing results, you are rationalizing,
+    not testing.
+
+    3. Start in staging, not production. Graduate to production only after staging experiments consistently pass.
+
+    4. Limit blast radius: affect one zone, not all. Affect 1% of traffic, not 100%. Use kill switches to abort if things
+    go wrong.
+
+    5. Document results: "Hypothesis confirmed — latency increased 30% (below 50% threshold), error rate stayed at 0.3%."
+
+    6. If the hypothesis is REFUTED, this is the most valuable outcome. You found a real vulnerability before it caused a
+    real outage.
+
+    '
+  example_good: "from dataclasses import dataclass\nfrom typing import Optional\nfrom datetime import datetime\n\n@dataclass\nclass ChaosExperiment:\n    hypothesis: str\n    success_criteria: dict\n    failure_criteria: dict\n    blast_radius: str  # '1_az', '1_pod', '10pct_traffic'\n    kill_switch: str   # Command to abort experiment\n    environment: str   # 'staging' or 'production'\n\n    def validate_before_run(self):\n        assert self.hypothesis, 'Hypothesis required'\n        assert self.success_criteria, 'Success criteria must be defined BEFORE experiment'\n        assert self.failure_criteria, 'Failure criteria must be defined BEFORE experiment'\n        if self.environment == 'production':\n            assert self.blast_radius in ('1_pod', '1pct_traffic'), \\\n                'Production experiments must have minimal blast radius'\n\nexperiment = ChaosExperiment(\n    hypothesis='System survives loss of 1 AZ with latency increase < 50% and error rate < 1%',\n    success_criteria={'latency_increase_pct': 50, 'error_rate_max': 0.01},\n    failure_criteria={'latency_increase_pct': 100, 'error_rate_max': 0.05},\n    blast_radius='1_az',\n    kill_switch='kubectl label az us-east-1a chaos=false',\n    environment='staging',\n)\nexperiment.validate_before_run()\n"
+  example_bad: "# 'Chaos engineering' without hypothesis or criteria\ndef chaos_test():\n    # Randomly kill pods and see what happens\n    import random\n    pods = kubectl_get_pods()\n    victim = random.choice(pods)\n    kubectl_delete_pod(victim)\n    # No hypothesis — what are we testing?\n    # No success/failure criteria — how do we know if it passed?\n    # No blast radius control — could kill a critical pod\n    # Not repeatable — random selection means different results each time\n    print('Pod killed. Check dashboard.')\n"
+  when_applies: "When planning resilience testing or chaos experiments — every experiment must be hypothesis-driven with predefined success/failure criteria."
+  severity: high
+  technologies:
+    lang: [general]
+    library: [quality, testing]
+    platform: [kubernetes]
+  domains:
+    domain: [reliability, testing]
+    concern: [resilience, chaos_engineering]
+  sources:
+  - url: https://sre.google/sre-book/testing-reliability/
+    title: 'Google SRE Book — Chapter 17: Testing for Reliability'
+  validation_status: cross_checked
+- id: CR-SRE-ADV-011
+  text: Connection pools must have a maximum size, a minimum idle count, and health checks on idle connections. Unbounded
+    connection pools cause resource exhaustion during traffic spikes. Stale connections in pools cause intermittent errors
+    that are infuriatingly hard to debug.
+  why: 'Google identifies connection pool misconfiguration as a frequent contributor to production incidents. Common failures:
+    unbounded pool size — during a traffic spike, the pool grows to 10,000 connections, exhausting database max_connections
+    or file descriptors. No minimum idle — during traffic spikes, new connections must be established (adding 10-50ms latency
+    for TCP+TLS handshake). Stale connections — a connection sits idle for 10 minutes, the database closes it, but the pool
+    still considers it valid. The next request using this connection receives a "connection reset" error. No health check
+    — connections that are technically open but functionally dead (half-open TCP) are handed to requests, which then fail.
+    Google''s connection pools validate connections before use and periodically check idle connections.
+
+    '
+  how_to_do_right: '1. Set maximum pool size based on: min(downstream max_connections / number_of_clients, reasonable_per_instance_limit).
+
+    2. Set minimum idle connections to handle steady-state traffic without establishing new connections.
+
+    3. Validate connections before use: send a lightweight query (SELECT 1) before handing a connection to a request.
+
+    4. Remove idle connections that haven''t been used in > 5 minutes. Re-create them when needed.
+
+    5. Set connection lifetime: recycle connections after 30-60 minutes to prevent stale TCP state.
+
+    6. Monitor pool utilization: if active connections consistently > 80% of max, increase max or investigate why connections
+    aren''t being returned.
+
+    '
+  example_good: "from contextlib import contextmanager\nimport time\n\nclass ConnectionPool:\n    def __init__(self, max_size: int = 20, min_idle: int = 5,\n                 max_idle_seconds: int = 300, max_lifetime_seconds: int = 1800):\n        self.max_size = max_size\n        self.min_idle = min_idle\n        self.max_idle_seconds = max_idle_seconds\n        self.max_lifetime_seconds = max_lifetime_seconds\n        self._pool = []\n\n    @contextmanager\n    def get_connection(self):\n        conn = self._acquire()\n        try:\n            # Validate before use\n            if not self._is_healthy(conn):\n                conn = self._create_new()\n            yield conn\n        finally:\n            self._release(conn)\n\n    def _is_healthy(self, conn) -> bool:\n        \"\"\"Validate connection before handing to request.\"\"\"\n        try:\n            conn.execute('SELECT 1')  # Lightweight health check\n            # Check lifetime — recycle old connections\n            if time.monotonic() - conn.created_at > self.max_lifetime_seconds:\n                conn.close()\n                return False\n            return True\n        except Exception:\n            return False\n\n    def _evict_idle(self):\n        \"\"\"Remove connections idle for too long.\"\"\"\n        now = time.monotonic()\n        self._pool = [\n            c for c in self._pool\n            if now - c.last_used < self.max_idle_seconds or len(self._pool) <= self.min_idle\n        ]\n"
+  example_bad: "# Unbounded connection pool with no health checks\nclass BadPool:\n    def __init__(self):\n        self._pool = []  # No max size!\n\n    def get_connection(self):\n        if self._pool:\n            return self._pool.pop()  # No health check — could be stale\n        return create_connection()   # No limit — can exhaust DB max_connections\n\n    def release(self, conn):\n        self._pool.append(conn)  # Never evicts idle connections\n        # Connection sits for 10 minutes, DB closes it silently\n        # Next request gets 'connection reset' error\n"
+  when_applies: "When configuring database or service connection pools — must have bounded size, health checks, idle eviction, and lifetime limits."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [mysql, postgresql, redis, grpc]
+  domains:
+    domain: [architecture, databases, reliability]
+    concern: [distributed_systems]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-ADV-012
+  text: Distributed tracing is the ONLY way to debug latency in microservice architectures. Logs tell you what happened in
+    one service. Metrics tell you aggregate behavior. Only traces show the full request path across all services, with latency
+    at every hop.
+  why: 'Google''s Dapper paper (the foundation of distributed tracing) was motivated by a specific pain point: when a user-facing
+    request traverses 20+ services, and the response is slow, logs and metrics cannot tell you WHERE the latency was introduced.
+    Logs from each service show local processing time, but not the time spent waiting for downstream calls. Metrics show aggregate
+    latency per service, but not which specific request path is slow. Only a distributed trace — a tree of spans showing the
+    parent-child relationship between RPCs, with timing for each — reveals the full picture: "The user request took 500ms.
+    400ms was spent in service X, which spent 350ms waiting for database Y, which was slow because of a missing index." Without
+    tracing, debugging latency in microservices is guesswork.
+
+    '
+  how_to_do_right: '1. Instrument ALL service-to-service calls with trace propagation (OpenTelemetry is the standard). Trace
+    context (trace_id, span_id) must propagate through every RPC, queue message, and database call.
+
+    2. Sample traces intelligently: 100% of errors, 100% of slow requests (P99+), 1% of normal requests.
+
+    3. Include trace_id in ALL log lines. This enables correlating logs with traces without duplicating data.
+
+    4. Set up trace-based alerting: alert when P99 latency of any span exceeds its threshold.
+
+    5. Use trace visualization (Jaeger, Zipkin, Tempo) to identify the "critical path" — the sequence of spans that determines
+    end-to-end latency.
+
+    6. Add custom spans for expensive operations within a service: database queries, cache lookups, serialization. Without
+    these, the trace shows inter-service time but not intra-service time.
+
+    '
+  example_good: "from opentelemetry import trace\nfrom opentelemetry.trace import StatusCode\nimport logging\n\ntracer = trace.get_tracer(__name__)\nlogger = logging.getLogger(__name__)\n\nclass OrderService:\n    def create_order(self, user_id: str, items: list) -> dict:\n        with tracer.start_as_current_span('create_order') as span:\n            span.set_attribute('user_id', user_id)\n            span.set_attribute('item_count', len(items))\n            trace_id = span.get_span_context().trace_id\n\n            # Include trace_id in all log lines\n            logger.info('Creating order', extra={'trace_id': trace_id, 'user_id': user_id})\n\n            # Custom spans for expensive operations\n            with tracer.start_as_current_span('validate_inventory'):\n                self.inventory_service.check(items)\n\n            with tracer.start_as_current_span('process_payment'):\n                payment = self.payment_service.charge(user_id, total)\n\n            with tracer.start_as_current_span('db_insert_order'):\n                order = self.db.insert_order(user_id, items, payment.id)\n\n            return {'order_id': order.id, 'trace_id': hex(trace_id)}\n\n# Sampling strategy: 100% errors, 100% slow (P99+), 1% normal\nfrom opentelemetry.sdk.trace.sampling import TraceIdRatioBased\nsampler = TraceIdRatioBased(0.01)  # 1% of normal requests\n"
+  example_bad: "class OrderService:\n    def create_order(self, user_id: str, items: list) -> dict:\n        # No tracing — when request is slow, no way to find WHERE\n        self.inventory_service.check(items)\n        payment = self.payment_service.charge(user_id, total)\n        order = self.db.insert_order(user_id, items, payment.id)\n        return {'order_id': order.id}\n        # User reports: 'Order creation took 5 seconds'\n        # Debug: Was it inventory? Payment? DB? All look fine in aggregate metrics.\n        # Without a trace showing the request path, debugging is guesswork.\n"
+  when_applies: "When operating any microservice architecture where requests traverse multiple services — tracing is the only way to debug cross-service latency."
+  severity: high
+  technologies:
+    platform: [load_balancer, jaeger, opentelemetry]
+  domains:
+    domain: [architecture, observability, reliability]
+    concern: [distributed_systems, microservices]
+  sources:
+  - url: https://sre.google/sre-book/practical-alerting/
+    title: 'Google SRE Book — Chapter 10: Practical Alerting from Time-Series Data'
+  validation_status: cross_checked
+- id: CR-SRE-ADV-013
+  text: Dependency injection for infrastructure — services should receive their dependencies (database connections, cache
+    clients, configuration) as parameters, not create them internally. This enables testing, failure injection, and gradual
+    migration without code changes.
+  why: 'Google''s SRE engineering practices (Chapter 18) emphasize that operability starts with code design. A service that
+    hardcodes its database connection string cannot be tested with a different database, cannot be pointed to a read replica
+    during an emergency, and cannot be gradually migrated to a new database. A service that receives its database client as
+    a constructor parameter can be: tested with a mock database, pointed to any database via configuration, migrated incrementally
+    (10% of requests to new DB, 90% to old), and failed over without code changes. This principle applies to every infrastructure
+    dependency: database, cache, message queue, external API, configuration source. Dependency injection is not just a testing
+    convenience — it is an operational necessity.
+
+    '
+  how_to_do_right: '1. Every infrastructure dependency (database, cache, queue, external API) should be injected as a parameter,
+    not created internally.
+
+    2. Use interfaces/protocols: depend on "a thing that stores data" not "PostgreSQL specifically." This enables swapping
+    implementations.
+
+    3. Configuration should be injectable: the same code should work with different configs for dev, staging, production,
+    and testing.
+
+    4. During incidents, DI enables rapid remediation: point traffic to a read replica, switch to a backup cache, disable
+    an external API — all without code changes.
+
+    5. Test with injected fakes that simulate failures: a database client that returns errors after N requests, a cache that
+    randomly misses.
+
+    6. Use DI frameworks sparingly. Constructor injection is simple and sufficient. Complex DI frameworks add more complexity
+    than they solve.
+
+    '
+  example_good: "from abc import ABC, abstractmethod\nfrom typing import Protocol\n\nclass DataStore(Protocol):\n    \"\"\"Interface — depend on abstraction, not concrete implementation.\"\"\"\n    def get(self, key: str) -> dict: ...\n    def put(self, key: str, value: dict) -> None: ...\n\nclass UserService:\n    def __init__(self, db: DataStore, cache: DataStore, config: dict):\n        \"\"\"All infrastructure dependencies injected as parameters.\"\"\"\n        self.db = db\n        self.cache = cache\n        self.config = config\n\n    def get_user(self, user_id: str) -> dict:\n        cached = self.cache.get(f'user:{user_id}')\n        if cached:\n            return cached\n        user = self.db.get(user_id)\n        self.cache.put(f'user:{user_id}', user)\n        return user\n\n# Production: real PostgreSQL and Redis\nservice = UserService(db=PostgresStore(), cache=RedisStore(), config=prod_config)\n\n# Testing: in-memory fakes\nservice = UserService(db=InMemoryStore(), cache=InMemoryStore(), config=test_config)\n\n# Emergency: point to read replica\nservice = UserService(db=PostgresStore(host='replica'), cache=RedisStore(), config=prod_config)\n"
+  example_bad: "class UserService:\n    def __init__(self):\n        # Hardcoded dependencies — cannot swap for testing or emergencies\n        self.db = psycopg2.connect('postgresql://prod-db:5432/users')\n        self.cache = redis.Redis(host='prod-redis', port=6379)\n\n    def get_user(self, user_id: str) -> dict:\n        # Cannot test without real PostgreSQL and Redis\n        # Cannot point to read replica during emergency\n        # Cannot migrate to new database without code changes\n        return self.db.execute('SELECT * FROM users WHERE id = %s', (user_id,))\n"
+  when_applies: "When building any service with infrastructure dependencies — inject them as parameters to enable testing, failover, and migration without code changes."
+  severity: medium
+  technologies:
+    lang: [general, go, java, javascript, typescript, python]
+  domains:
+    domain: [architecture, reliability, testing]
+  sources:
+  - url: https://sre.google/sre-book/software-engineering-in-sre/
+    title: 'Google SRE Book — Chapter 18: Software Engineering in SRE'
+  validation_status: cross_checked
+- id: CR-SRE-ADV-014
+  text: Log sampling is mandatory at scale — logging every request creates a firehose that is expensive to store, slow to
+    search, and impossible to analyze. Log 100% of errors, 100% of slow requests, and a random sample of successful requests.
+  why: 'Google processes billions of requests per second. Logging every request at that scale would require petabytes of storage
+    per day and make log search unusable. But logging zero successful requests means you cannot debug subtle issues that only
+    affect specific request patterns. The solution is stratified sampling: log ALL errors (they are rare and important), ALL
+    slow requests (above P95 — they indicate problems), and a RANDOM sample of successful requests (1-10% — enough to reconstruct
+    normal behavior). This reduces log volume by 90%+ while preserving the ability to debug any class of issue. At smaller
+    scale, you can log more — but the principle holds: not all events are equally important, and your logging strategy should
+    reflect this.
+
+    '
+  how_to_do_right: '1. Always log: errors (status >= 400), slow requests (latency > P95 threshold), authentication failures,
+    data mutations.
+
+    2. Sample log: successful requests at 1-10% (configurable). Include the sample rate in the log entry for accurate volume
+    estimation.
+
+    3. Use structured logging (JSON): { "trace_id": "abc", "method": "GET", "path": "/api/users", "status": 200, "latency_ms":
+    45, "sampled": true }.
+
+    4. Dynamically adjust sample rate: during debugging, temporarily increase to 100%. During normal operation, reduce to
+    1%.
+
+    5. Include trace_id in every log entry (sampled or not). This enables finding the full trace even for sampled requests.
+
+    6. Set log retention policies: errors = 90 days, sampled success = 30 days, debug logs = 7 days.
+
+    '
+  example_good: "import logging\nimport random\nimport json\nimport time\n\nlogger = logging.getLogger(__name__)\n\nSAMPLE_RATE = 0.01  # 1% of successful requests\nSLOW_THRESHOLD_MS = 500  # P95 threshold\n\ndef log_request(method: str, path: str, status: int, latency_ms: float, trace_id: str):\n    \"\"\"Stratified log sampling: 100% errors, 100% slow, 1% normal.\"\"\"\n    log_entry = {\n        'trace_id': trace_id,\n        'method': method,\n        'path': path,\n        'status': status,\n        'latency_ms': latency_ms,\n        'timestamp': time.time(),\n    }\n\n    if status >= 400:  # Always log errors\n        log_entry['sampled_reason'] = 'error'\n        logger.error(json.dumps(log_entry))\n    elif latency_ms > SLOW_THRESHOLD_MS:  # Always log slow requests\n        log_entry['sampled_reason'] = 'slow'\n        logger.warning(json.dumps(log_entry))\n    elif random.random() < SAMPLE_RATE:  # Sample normal requests\n        log_entry['sampled_reason'] = 'random'\n        log_entry['sample_rate'] = SAMPLE_RATE\n        logger.info(json.dumps(log_entry))\n    # Else: not logged (but trace_id still available for on-demand lookup)\n"
+  example_bad: "import logging\n\nlogger = logging.getLogger(__name__)\n\ndef log_request(method, path, status, latency_ms):\n    # Log EVERY request — at 10K RPS this is 864M log lines per day\n    logger.info(f'{method} {path} {status} {latency_ms}ms')\n    # Unstructured text — hard to search and analyze\n    # No trace_id — can't correlate with traces\n    # No sampling — log storage costs explode\n    # Log search becomes unusably slow\n"
+  when_applies: "When implementing request logging for any service handling more than a few hundred requests per second — sample strategically to control volume."
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [grafana]
+  domains:
+    domain: [observability, reliability]
+    concern: [logging]
+  sources:
+  - url: https://sre.google/sre-book/practical-alerting/
+    title: 'Google SRE Book — Chapter 10: Practical Alerting from Time-Series Data'
+  validation_status: cross_checked
+- id: CR-SRE-ADV-015
+  text: Multi-region architectures are the only way to achieve > 99.99% availability. A single region has too many correlated
+    failure modes (power, network, cooling, human error) to reliably exceed four nines. Active-active across 2+ regions is
+    required.
+  why: 'Google operates in multiple regions because single-region availability has a ceiling around 99.95-99.99%. Regional
+    failures include: power grid outages (affect all datacenters in the region), network backbone failures (isolate the region
+    from the internet), cooling system failures (thermal shutdown of all servers), and regional configuration pushes (a bad
+    config affects all instances in the region). Multi-region active-active eliminates all of these: when region A fails,
+    regions B and C continue serving. The challenge is data: synchronous replication across regions adds latency (10-100ms
+    per write), while asynchronous replication risks data loss during failover. Google uses a combination of Spanner (synchronous
+    global replication for critical data) and regional databases with async replication for latency-sensitive but less critical
+    data.
+
+    '
+  how_to_do_right: '1. For > 99.99% availability, deploy in at least 2 regions with active-active serving.
+
+    2. Choose data replication strategy per dataset: synchronous (strong consistency, higher latency) vs asynchronous (lower
+    latency, risk of data loss on failover).
+
+    3. Test regional failover quarterly: drain one region completely and verify the other handles 100% of traffic.
+
+    4. Use DNS-based global load balancing to direct users to the nearest healthy region. TTL should be short (30-60s) for
+    fast failover.
+
+    5. Design for "region-local" access patterns: a user''s data should be in their nearest region for low latency. Cross-region
+    reads should be rare.
+
+    6. Track RPO (Recovery Point Objective: max data loss on failover) and RTO (Recovery Time Objective: max failover time)
+    per region and test them.
+
+    '
+  example_good: "from dataclasses import dataclass\nfrom typing import Dict\n\n@dataclass\nclass RegionConfig:\n    region: str\n    is_active: bool\n    replication_mode: str  # 'synchronous' or 'asynchronous'\n    rpo_seconds: int  # Recovery Point Objective\n    rto_seconds: int  # Recovery Time Objective\n\nclass MultiRegionService:\n    regions = [\n        RegionConfig('us-east-1', is_active=True, replication_mode='synchronous', rpo_seconds=0, rto_seconds=30),\n        RegionConfig('us-west-2', is_active=True, replication_mode='synchronous', rpo_seconds=0, rto_seconds=30),\n        RegionConfig('eu-west-1', is_active=True, replication_mode='asynchronous', rpo_seconds=60, rto_seconds=120),\n    ]\n\n    def failover(self, failed_region: str):\n        \"\"\"Drain failed region, redistribute to healthy regions.\"\"\"\n        healthy = [r for r in self.regions if r.region != failed_region and r.is_active]\n        assert len(healthy) >= 1, 'No healthy regions available'\n        dns_update(failed_region, weight=0)\n        for r in healthy:\n            dns_update(r.region, weight=100 // len(healthy))\n\n    def quarterly_failover_test(self):\n        \"\"\"Test: drain one region, verify others handle 100% traffic.\"\"\"\n        for region in self.regions:\n            self.failover(region.region)\n            assert all_health_checks_passing()\n            assert p99_latency() < self.slo_latency_ms * 1.5\n            self.restore_all()\n"
+  example_bad: "# Single-region deployment — ceiling of ~99.95% availability\nclass SingleRegionService:\n    region = 'us-east-1'\n    # Regional power outage → service down for hours\n    # Regional network failure → service completely unreachable\n    # Regional config push → all instances affected simultaneously\n    # No failover possible — there's nowhere to fail over TO\n"
+  when_applies: "When availability requirements exceed 99.99% — single-region deployments have too many correlated failure modes to achieve four nines."
+  severity: high
+  technologies:
+    platform: [aws, azure, gcp, spanner, postgresql, kubernetes]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, availability]
+  sources:
+  - url: https://sre.google/sre-book/managing-critical-state/
+    title: 'Google SRE Book — Chapter 23: Managing Critical State: Distributed Consensus for Reliability'
+  validation_status: cross_checked

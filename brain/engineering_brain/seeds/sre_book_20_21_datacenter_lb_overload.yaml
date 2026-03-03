@@ -1,0 +1,223 @@
+layer: rules
+technology: SRE
+domain: load_balancing
+knowledge:
+- id: CR-SRE-DCLB-001
+  text: Round-robin load balancing is almost always wrong for backend services. It ignores server health, capacity differences, and request cost. Use least-loaded or weighted algorithms that account for
+    real-time server state.
+  why: 'Google''s Chapter 20 explains why simple round-robin fails at scale. In theory, round-robin distributes requests evenly. In practice, servers differ: some are newer (faster CPUs), some are running
+    background tasks (less available capacity), some have warm caches (faster for certain requests), and some are about to be drained for maintenance. Round-robin sends equal traffic to all, overloading
+    slow servers while underutilizing fast ones. Google''s backend load balancing uses "least loaded" algorithms that consider current server utilization, pending request count, and recent error rates.
+    The improvement is dramatic: least-loaded routing reduced P99 latency by 30-50% compared to round-robin in Google''s production measurements, because it stopped sending requests to servers that were
+    already struggling.
+
+    '
+  how_to_do_right: '1. Use weighted round-robin at minimum — assign weights based on server capacity (CPU, memory, instance type).
+
+    2. Better: use least-connections or least-loaded algorithms that consider real-time server state.
+
+    3. Best: use a "power of two choices" algorithm — pick 2 random backends, send the request to the less loaded one. Near-optimal with minimal overhead.
+
+    4. Include error rate in load balancing decisions: a server returning 50% errors should receive less traffic, not equal traffic.
+
+    5. Support "subsetting" — each client connects to a subset of backends, not all backends. This reduces connection overhead at scale.
+
+    6. Test load balancing under failure: when one backend dies, does traffic distribute cleanly to survivors or does it cascade?
+
+    '
+  example_good: "# Least-loaded backend selection with power-of-two-choices\nimport random\n\nclass SmartLoadBalancer:\n    def select_backend(self, backends: list[Backend]) -> Backend:\n        \"\"\"Power of two choices: near-optimal with minimal overhead.\"\"\"\n        healthy = [b for b in backends if b.is_healthy]\n        if len(healthy) < 2:\n            return healthy[0] if healthy else None\n        # Pick 2 random backends, choose the less loaded one\n        a, b = random.sample(healthy, 2)\n        if a.pending_requests <= b.pending_requests:\n            return a\n        return b\n\n    def should_include(self, backend: Backend) -> bool:\n        \"\"\"Include error rate in LB decisions.\"\"\"\n        if backend.error_rate > 0.50:\n            return False  # 50%+ errors → remove from pool\n        return True\n"
+  example_bad: "# Simple round-robin ignoring server state\nclass RoundRobinLB:\n    def __init__(self, backends):\n        self.backends = backends\n        self.index = 0\n\n    def select_backend(self):\n        backend = self.backends[self.index % len(self.backends)]\n        self.index += 1\n        return backend\n        # Ignores: server health, capacity, load, error rate\n        # Sends equal traffic to a server with 95% CPU and one with 10% CPU\n        # P99 latency dominated by the slowest server\n"
+  when_applies: When implementing backend load balancing for services where servers have different capacities, utilization levels, or health states that make round-robin distribution suboptimal.
+  severity: high
+  technologies:
+    platform: [kubernetes, grpc, load_balancer]
+  domains:
+    domain: [architecture, performance, reliability]
+    concern: [distributed_systems, scaling, horizontal]
+  sources:
+  - url: https://sre.google/sre-book/load-balancing-datacenter/
+    title: 'Google SRE Book — Chapter 20: Load Balancing in the Datacenter'
+  validation_status: cross_checked
+- id: CR-SRE-DCLB-002
+  text: Implement flow control between services — every client should track the health of each backend independently and avoid sending requests to backends that are failing. Client-side health tracking
+    (not just load balancer health checks) catches failures faster.
+  why: 'Google''s backend load balancing includes client-side health tracking because centralized health checks have a fundamental latency problem. A load balancer health check runs every 10 seconds. If
+    a backend fails immediately after a health check, the load balancer won''t notice for 10 seconds — during which it sends hundreds of requests to a dead server. Client-side tracking is faster: each client
+    observes the responses from each backend and independently detects failures within 1-2 requests. Google''s client libraries track per-backend error rates, latency, and pending request counts. When a
+    backend''s metrics degrade, the client reduces traffic to that backend before the centralized health check even notices. This creates a two-layer defense: fast client-side detection plus authoritative
+    load-balancer-side health checks.
+
+    '
+  how_to_do_right: '1. Client libraries should track per-backend: success rate, P99 latency, pending request count.
+
+    2. When a backend''s error rate exceeds a threshold (e.g., > 50%), the client should stop sending new requests to it.
+
+    3. Use circuit breaker pattern: after N consecutive failures, mark the backend as "open" (no traffic) for a cooldown period.
+
+    4. Implement slow-start: when a backend recovers, send a trickle of traffic first, then gradually increase — don''t hammer it with full load immediately.
+
+    5. Client-side tracking should be automatic (in the RPC framework), not manual. Engineers should not need to implement this per-service.
+
+    6. Log circuit breaker events for debugging: "Backend X circuit opened at 12:34 due to 5 consecutive timeouts."
+
+    '
+  example_good: "# Client-side health tracking with circuit breaker\nclass ClientSideHealthTracker:\n    def __init__(self, backends: list[str]):\n        self.stats = {b: BackendStats() for b in backends}\n\n    def record_response(self, backend: str, latency_ms: float, success: bool):\n        stats = self.stats[backend]\n        stats.record(latency_ms, success)\n        if stats.error_rate > 0.50:\n            stats.circuit_state = \"OPEN\"  # Stop sending traffic\n            log.warning(f\"Circuit OPEN for {backend}: error_rate={stats.error_rate:.0%}\")\n\n    def select_backend(self) -> str:\n        healthy = [b for b, s in self.stats.items() if s.circuit_state != \"OPEN\"]\n        if not healthy:\n            # All circuits open — try half-open on least-bad backend\n            return min(self.stats, key=lambda b: self.stats[b].error_rate)\n        return min(healthy, key=lambda b: self.stats[b].pending_requests)\n\n    def try_half_open(self, backend: str):\n        \"\"\"After cooldown, send 1 request to check recovery.\"\"\"\n        self.stats[backend].circuit_state = \"HALF_OPEN\"\n"
+  example_bad: "# No client-side health tracking — rely only on LB health checks\ndef call_backend(request):\n    backend = load_balancer.get_backend()  # LB checks every 10 seconds\n    response = http.post(backend, request)\n    # If backend failed right after LB health check:\n    # LB won't notice for 10 seconds\n    # Hundreds of requests sent to dead backend\n    # No circuit breaker, no per-backend tracking\n    return response\n"
+  when_applies: When building client libraries or service meshes that need to detect backend failures faster than centralized load balancer health checks can provide.
+  severity: high
+  technologies:
+    platform: [kubernetes, grpc, load_balancer, istio]
+  domains:
+    domain: [architecture, performance, reliability]
+    concern: [distributed_systems, scaling, horizontal]
+  sources:
+  - url: https://sre.google/sre-book/load-balancing-datacenter/
+    title: 'Google SRE Book — Chapter 20: Load Balancing in the Datacenter'
+  validation_status: cross_checked
+- id: CR-SRE-OVER-001
+  text: When overloaded, return errors FAST rather than serving requests SLOWLY. A server that queues requests during overload consumes resources holding those requests in memory and eventually returns
+    them late — when the client has already timed out and retried, doubling the load.
+  why: 'Google''s Chapter 21 (Handling Overload) contains one of the most counterintuitive but critical principles in distributed systems. When a server is overloaded, the natural instinct is to accept
+    all requests and process them as fast as possible. But this causes a catastrophic feedback loop: requests queue up, latency increases, clients time out, clients retry, the server now has 2x the load
+    (original + retries), latency increases further, more timeouts, more retries, and the server collapses. The correct behavior is the opposite: when overloaded, REJECT excess requests immediately with
+    an error (HTTP 503, gRPC RESOURCE_EXHAUSTED). The client receives a fast error, backs off, and the server maintains acceptable latency for the requests it does serve. A server at 80% capacity serving
+    all requests with 100ms latency is far better than a server at 100% capacity where every request takes 10 seconds and 90% time out anyway.
+
+    '
+  how_to_do_right: '1. Set a maximum concurrent request limit per server. When reached, immediately return 503/RESOURCE_EXHAUSTED for new requests.
+
+    2. Set a maximum queue depth. Requests waiting longer than the client''s timeout should be dropped — they will be retried anyway.
+
+    3. Use admission control: when CPU > 80%, start rejecting low-priority requests while continuing to serve high-priority ones.
+
+    4. Return errors with Retry-After header telling clients how long to wait before retrying.
+
+    5. Monitor rejection rate as a key metric. If > 10%, you need more capacity, not better overload handling.
+
+    6. Never buffer requests that will exceed the client''s timeout. The client will retry, and you''ll process the original AND the retry.
+
+    '
+  example_good: "# Fast rejection under overload — maintain latency for served requests\nfrom fastapi import FastAPI, HTTPException\nimport asyncio\n\napp = FastAPI()\nMAX_CONCURRENT = 100\nsemaphore = asyncio.Semaphore(MAX_CONCURRENT)\n\n@app.middleware(\"http\")\nasync def admission_control(request, call_next):\n    acquired = semaphore._value > 0  # Check without blocking\n    if not acquired:\n        # FAST rejection — don't queue, don't wait\n        raise HTTPException(\n            status_code=503,\n            detail=\"Server overloaded\",\n            headers={\"Retry-After\": \"5\"},\n        )\n    async with semaphore:\n        response = await call_next(request)\n        return response\n"
+  example_bad: "# Accept all requests under overload — queue indefinitely\nfrom fastapi import FastAPI\n\napp = FastAPI()\n\n@app.post(\"/api/process\")\nasync def process(request):\n    # No admission control — accept everything\n    # Under overload: requests queue, latency grows to 30s\n    # Clients timeout at 10s and retry\n    # Server now has 2x load (original + retries)\n    # Latency grows to 60s, more timeouts, more retries\n    # Server collapses under Nx load\n    return await slow_processing(request)\n"
+  when_applies: When a server approaches capacity and must choose between queuing requests (increasing latency for all) or rejecting excess requests (maintaining quality for served requests).
+  severity: critical
+  technologies:
+    lang: [general]
+    platform: [kubernetes, grpc, http, load_balancer]
+  domains:
+    domain: [architecture, performance, reliability]
+    concern: [distributed_systems, scaling, horizontal, fault_tolerance]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-OVER-002
+  text: Client-side retry logic is the most dangerous code in a distributed system. Without jitter, backoff, and retry budgets, retries during an outage turn a partial failure into a total collapse by multiplying
+    load on struggling servers.
+  why: 'Google calls this the "retry storm" or "thundering herd" problem and considers it one of the most common causes of cascading failures. When a service becomes partially overloaded, some requests
+    fail. Clients retry those requests. Now the service has 1.5x the load (original + retries). More requests fail. More retries. The service has 2x, then 3x, then Nx the load. Within minutes, a service
+    that could handle 80% of traffic is receiving 500% of normal load from retries alone and serving 0%. Google''s solution is aggressive: per-request retry budgets (maximum 3 retries per request), per-client
+    retry budgets (if > 10% of recent requests were retries, stop retrying), exponential backoff with jitter (don''t retry all at once), and server-side pushback (503 with Retry-After).
+
+    '
+  how_to_do_right: '1. Per-request retry budget: maximum 3 attempts (1 original + 2 retries). After that, return an error to the caller.
+
+    2. Per-client retry budget: if > 10% of requests in the last minute were retries, stop retrying and fail fast. The backend is overloaded.
+
+    3. Exponential backoff: retry after 100ms, then 200ms, then 400ms, then 800ms — not 100ms, 100ms, 100ms.
+
+    4. Add jitter: randomize the backoff by +/- 25% so all clients don''t retry simultaneously.
+
+    5. Respect Retry-After headers: if the server says "retry in 30 seconds," wait 30 seconds, not your default 100ms.
+
+    6. Log all retries with context. If retries exceed 5% of traffic, investigate the root cause — retries are a symptom, not normal.
+
+    '
+  example_good: "# Safe retry with exponential backoff, jitter, and budgets\nimport random\nimport time\n\nclass RetryPolicy:\n    MAX_RETRIES = 2  # 1 original + 2 retries = 3 total\n    BASE_DELAY_MS = 100\n    JITTER_FACTOR = 0.25\n    CLIENT_RETRY_BUDGET = 0.10  # Max 10% of requests can be retries\n\n    def __init__(self):\n        self.total_requests = 0\n        self.retry_requests = 0\n\n    def execute_with_retry(self, fn, *args):\n        self.total_requests += 1\n        for attempt in range(self.MAX_RETRIES + 1):\n            try:\n                return fn(*args)\n            except RetryableError as e:\n                if attempt >= self.MAX_RETRIES:\n                    raise\n                # Check client retry budget\n                if self.retry_requests / max(self.total_requests, 1) > self.CLIENT_RETRY_BUDGET:\n                    raise OverloadError(\"Retry budget exhausted — backend is overloaded\")\n                self.retry_requests += 1\n                delay = self.BASE_DELAY_MS * (2 ** attempt)  # Exponential\n                jitter = delay * self.JITTER_FACTOR * random.uniform(-1, 1)\n                time.sleep((delay + jitter) / 1000)\n"
+  example_bad: "# Retry immediately, no backoff, no budget — causes retry storms\ndef call_with_retry(fn, *args, max_retries=10):\n    for attempt in range(max_retries):\n        try:\n            return fn(*args)\n        except Exception:\n            time.sleep(0.1)  # Fixed 100ms delay, no backoff\n            # All clients retry at the same time (no jitter)\n            # 10 retries per request (no budget)\n            # Server at 80% → some failures → retries → 160% → more failures\n            # → more retries → 500% → complete collapse\n            continue\n    raise Exception(\"All retries failed\")\n"
+  when_applies: When implementing client-side retry logic for distributed service calls, especially during partial outages where uncontrolled retries can turn a partial failure into a complete collapse.
+  severity: critical
+  technologies:
+    lang: [general, go, java, python]
+    platform: [grpc, http]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, fault_tolerance, resilience]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-OVER-003
+  text: Implement graceful degradation — serve degraded responses instead of no response. A search engine that returns cached results from 1 hour ago is better than one that returns a 503 error. Users prefer
+    slow or stale over broken.
+  why: 'Google''s approach to overload includes multiple degradation levels, not just "working" and "error." When Gmail is overloaded, it can: serve the full experience (normal), serve a basic HTML version
+    (degraded), serve a cached read-only version (heavily degraded), or return an error page (failed). Each level reduces resource consumption while maintaining some user value. This is dramatically better
+    than a binary system that works perfectly at 99% capacity and completely fails at 101%. Google designs degradation paths into every critical service: what can we turn off (less important features),
+    what can we cache (expensive computations), what can we simplify (reduce response quality), before we return errors? The key insight: users tolerate degradation much better than failure. A page that
+    loads in 5 seconds is annoying; a page that returns "Service Unavailable" is unacceptable.
+
+    '
+  how_to_do_right: '1. Define 3-4 degradation levels for each service: full, degraded, minimal, error. Document what each level looks like.
+
+    2. Implement automatic degradation triggers: when CPU > 70%, enable caching. When CPU > 85%, disable non-essential features. When CPU > 95%, return errors for low-priority requests.
+
+    3. Cache aggressively during overload: serve stale data rather than computing fresh data that you can''t afford.
+
+    4. Prioritize requests: authenticated users > anonymous users, paid users > free users, critical paths > nice-to-have features.
+
+    5. Test each degradation level. If you''ve never triggered "minimal mode" in production, it probably doesn''t work.
+
+    6. Communicate degradation to users: "Some features are temporarily limited due to high demand" is better than silently broken features.
+
+    '
+  example_good: "# Graceful degradation with multiple levels\nclass DegradationManager:\n    def get_degradation_level(self, cpu_pct: float) -> str:\n        if cpu_pct < 70:\n            return \"FULL\"         # All features enabled\n        elif cpu_pct < 85:\n            return \"DEGRADED\"     # Disable non-essential features\n        elif cpu_pct < 95:\n            return \"MINIMAL\"      # Serve cached/stale responses\n        else:\n            return \"ERROR\"        # Reject low-priority requests\n\n    def serve_request(self, request, level: str):\n        if level == \"FULL\":\n            return self.full_response(request)\n        elif level == \"DEGRADED\":\n            return self.response_without_recommendations(request)\n        elif level == \"MINIMAL\":\n            return self.cached_response(request)  # Stale but fast\n        else:\n            if request.priority < Priority.CRITICAL:\n                raise HTTPException(503, \"Service under high load\")\n            return self.minimal_response(request)\n"
+  example_bad: "# Binary: works perfectly or crashes completely\ndef serve_request(request):\n    # No degradation levels — 100% features or 503 error\n    recommendations = compute_recommendations(request)  # Expensive\n    analytics = compute_analytics(request)              # Expensive\n    personalization = compute_personalization(request)   # Expensive\n    # At 99% CPU: all three compute, latency = 10s, users see timeout\n    # At 101% CPU: server crashes, 503 for everyone\n    # Could have served cached recommendations and skipped analytics\n    return full_response(recommendations, analytics, personalization)\n"
+  when_applies: When designing services that should maintain partial functionality under high load rather than failing completely, serving degraded but useful responses instead of errors.
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [cloud, kubernetes]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, fault_tolerance, resilience]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-OVER-004
+  text: Criticality-based request handling — not all requests are equal. Tag every request with a priority level and shed low-priority requests first during overload. A background batch job should NEVER
+    compete with a user-facing request for the same server resources.
+  why: 'Google assigns criticality levels to every request, and the request processing pipeline respects these levels during overload. A user-facing search request is CRITICAL_PLUS. A background indexing
+    job is SHEDDABLE. When the server is at capacity, SHEDDABLE requests are rejected first, then SHEDDABLE_PLUS, then CRITICAL, and only if the system is failing do CRITICAL_PLUS requests get rejected.
+    This prevents a common anti-pattern: a background batch job (indexing, reporting, analytics) consumes all available capacity, and user-facing requests fail — even though the batch job could easily be
+    delayed by hours without impact. Without explicit criticality, the server treats all requests equally, and the most important requests compete with the least important ones.
+
+    '
+  how_to_do_right: '1. Define criticality levels: CRITICAL_PLUS (user-facing, revenue-impacting), CRITICAL (user-facing, non-revenue), SHEDDABLE_PLUS (background, time-sensitive), SHEDDABLE (background,
+    delay-tolerant).
+
+    2. Tag EVERY request with criticality at the entry point. No untagged requests — untagged defaults to the lowest priority.
+
+    3. Configure admission control to shed requests in priority order: SHEDDABLE first, CRITICAL_PLUS last.
+
+    4. Separate capacity for different priorities: reserve 70% of capacity for CRITICAL+, allow SHEDDABLE to use only surplus capacity.
+
+    5. Monitor shedding by priority level: if CRITICAL requests are being shed, the system needs more capacity urgently.
+
+    6. Background jobs should be designed to tolerate rejection: queue with retry, not fail permanently.
+
+    '
+  example_good: "# Request criticality tagging with priority-based shedding\nfrom enum import IntEnum\n\nclass Criticality(IntEnum):\n    CRITICAL_PLUS = 4  # User-facing, revenue-impacting\n    CRITICAL = 3       # User-facing, non-revenue\n    SHEDDABLE_PLUS = 2 # Background, time-sensitive\n    SHEDDABLE = 1      # Background, delay-tolerant\n\nclass AdmissionController:\n    def should_admit(self, request, cpu_pct: float) -> bool:\n        criticality = request.metadata.get(\"criticality\", Criticality.SHEDDABLE)\n        if cpu_pct < 70:\n            return True  # Accept all\n        elif cpu_pct < 85:\n            return criticality >= Criticality.SHEDDABLE_PLUS\n        elif cpu_pct < 95:\n            return criticality >= Criticality.CRITICAL\n        else:\n            return criticality >= Criticality.CRITICAL_PLUS\n\n# Tag at entry point\ndef handle_user_request(request):\n    request.metadata[\"criticality\"] = Criticality.CRITICAL_PLUS\n\ndef handle_batch_job(request):\n    request.metadata[\"criticality\"] = Criticality.SHEDDABLE\n"
+  example_bad: "# All requests treated equally — batch jobs compete with users\ndef process_request(request):\n    # Background indexing job and user checkout use same queue\n    # No priority, no criticality tags\n    queue.put(request)  # FIFO — batch job blocks user request\n    # During overload: batch jobs consume all capacity\n    # User-facing requests fail because indexing job is ahead in queue\n    # A job that could be delayed by hours blocks a user paying money\n"
+  when_applies: When operating services that handle both user-facing and background requests, where load shedding during overload must prioritize user-facing traffic over batch processing.
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [kubernetes, grpc, load_balancer]
+  domains:
+    domain: [architecture, reliability]
+    concern: [distributed_systems, fault_tolerance]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked

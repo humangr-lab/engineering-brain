@@ -1,0 +1,492 @@
+layer: rules
+technology: TimescaleDB
+domain: database
+knowledge:
+- id: CR-TS-HYP-001
+  text: Convert time-series tables to hypertables immediately — create_hypertable() enables automatic time partitioning, chunk
+    exclusion, and time-series optimizations that a regular PostgreSQL table cannot provide.
+  why: 'A regular PostgreSQL table storing time-series data grows into a single massive table. Indexes become bloated, VACUUM
+    takes hours, and queries scanning a time range must traverse the entire B-tree. TimescaleDB''s create_hypertable() transparently
+    partitions the table into time-based chunks (default: 7 days). The query planner automatically excludes chunks that do
+    not match the time filter (chunk exclusion), reducing I/O by orders of magnitude. A query for ''last 24 hours'' on a 1-year
+    table scans 1 chunk instead of 52 chunks. Inserting into the current chunk is local and fast. Old chunks can be individually
+    compressed, moved to cold storage, or dropped — all transparently.'
+  how_to_do_right: 'Create a regular table with a timestamptz column, then call SELECT create_hypertable(''table_name'', by_range(''time_column'')).
+    Set chunk_time_interval based on your data volume: if you ingest 100M rows/day, use 1 day. If 1M rows/day, use 7 days
+    (default). Ensure every query includes a time filter in WHERE for chunk exclusion. Monitor chunk sizes with timescaledb_information.chunks
+    — target 1-10GB per chunk.'
+  severity: critical
+  technologies:
+    platform: [timescaledb, postgresql]
+  domains:
+    domain: [architecture]
+    concern: [data, database, time_series]
+  example_good: "-- Create table with time column\nCREATE TABLE sensor_data (\n  time        TIMESTAMPTZ NOT NULL,\n  sensor_id\
+    \   INT NOT NULL,\n  temperature DOUBLE PRECISION,\n  humidity    DOUBLE PRECISION,\n  pressure    DOUBLE PRECISION\n\
+    );\n\n-- Convert to hypertable with 1-day chunks (high volume)\nSELECT create_hypertable('sensor_data', by_range('time',\n\
+    \  INTERVAL '1 day'));\n\n-- Create indexes (applied per-chunk automatically)\nCREATE INDEX idx_sensor_time ON sensor_data\
+    \ (sensor_id, time DESC);\n\n-- Query with time filter — chunk exclusion kicks in\nEXPLAIN ANALYZE\nSELECT * FROM sensor_data\n\
+    WHERE time > now() - INTERVAL '1 hour' AND sensor_id = 42;\n-- Scans 1 chunk out of 365 (99.7% chunks excluded)\n\n--\
+    \ Monitor chunk health\nSELECT hypertable_name,\n       chunk_name,\n       range_start, range_end,\n       pg_size_pretty(total_bytes)\
+    \ AS size\nFROM timescaledb_information.chunks\nWHERE hypertable_name = 'sensor_data'\nORDER BY range_start DESC\nLIMIT\
+    \ 10;\n"
+  example_bad: "-- Regular PostgreSQL table for time-series — no partitioning\nCREATE TABLE sensor_data (\n  time TIMESTAMPTZ\
+    \ NOT NULL,\n  sensor_id INT,\n  temperature DOUBLE PRECISION\n);\n-- After 1 year: 1 monolithic table with 36B rows\n\
+    -- B-tree index: 80GB, VACUUM: 6 hours\n-- Query for last hour scans entire index tree\n\n-- Hypertable without time filter\
+    \ in queries — no chunk exclusion\nSELECT avg(temperature) FROM sensor_data WHERE sensor_id = 42;\n-- Scans ALL chunks\
+    \ (no time filter) — same as unpartitioned table\n"
+  when_applies: Any project using TimescaleDB time-series data or PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using TimescaleDB
+    or PostgreSQL
+  sources: ["https://docs.timescale.com/use-timescale/latest/hypertables/create/"]
+- id: CR-TS-HYP-002
+  text: Tune the chunk_time_interval based on your ingest rate — the optimal chunk size is 1-10GB, which balances write performance,
+    compression ratio, and query speed.
+  why: Chunk interval determines how much data goes into each chunk. Too short (1 hour at 1M rows/day) creates tiny chunks
+    — excessive metadata overhead, poor compression (small samples), and planner overhead scanning many chunks. Too long (1
+    month at 100M rows/day) creates massive chunks — each chunk is 300GB, losing the benefits of chunk exclusion for sub-month
+    queries, and compression/decompression operates on 300GB units. The sweet spot is chunks of 1-10GB. TimescaleDB's query
+    planner, compression, and retention policies all operate at chunk granularity — chunk size determines the efficiency of
+    every operation.
+  how_to_do_right: 'Calculate: (daily_rows * avg_row_size * desired_chunk_days). Target 1-10GB per chunk. For 10M rows/day
+    at 100 bytes/row = 1GB/day → 7-day chunks = 7GB (good). For 100M rows/day at 200 bytes/row = 20GB/day → 1-day chunks =
+    20GB (acceptable). For 1M rows/day at 100 bytes/row = 100MB/day → 14-day chunks = 1.4GB (good). Adjust with set_chunk_time_interval()
+    as data patterns change. Monitor actual chunk sizes.'
+  severity: high
+  technologies:
+    platform: [timescaledb, postgresql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, time_series]
+  example_good: "-- Calculate optimal chunk interval\n-- Daily data: 50M rows × 200 bytes = 10GB/day\n-- Target: 10GB chunks\
+    \ → 1-day interval\n\nSELECT create_hypertable('metrics', by_range('time',\n  INTERVAL '1 day'));\n\n-- Lower-volume table:\
+    \ 500K rows/day × 150 bytes = 75MB/day\n-- Target: 1GB chunks → 14-day interval\nSELECT create_hypertable('daily_reports',\
+    \ by_range('time',\n  INTERVAL '14 days'));\n\n-- Adjust chunk interval as data volume grows\nSELECT set_chunk_time_interval('metrics',\
+    \ INTERVAL '12 hours');\n-- Only affects NEW chunks — existing chunks keep their interval\n\n-- Verify chunk sizes\nSELECT\n\
+    \  hypertable_name,\n  avg(total_bytes)::bigint AS avg_chunk_bytes,\n  pg_size_pretty(avg(total_bytes)::bigint) AS avg_chunk_size,\n\
+    \  count(*) AS num_chunks\nFROM timescaledb_information.chunks\nGROUP BY hypertable_name;\n"
+  example_bad: "-- Default 7-day interval for high-volume data\n-- 100M rows/day × 200 bytes × 7 days = 140GB per chunk\n\
+    SELECT create_hypertable('events', by_range('time'));  -- Default 7 days\n-- Each chunk is 140GB — too large\n-- Compression\
+    \ operates on 140GB units — slow\n-- Chunk exclusion for 1-day queries still reads 140GB\n\n-- 1-hour interval for low-volume\
+    \ data\nSELECT create_hypertable('daily_summary', by_range('time',\n  INTERVAL '1 hour'));\n-- 1000 rows/hour → 24 tiny\
+    \ chunks per day → 8760 chunks/year\n-- Planner overhead scanning 8760 chunk metadata\n-- Compression yields minimal benefit\
+    \ on tiny chunks\n"
+  when_applies: Projects using TimescaleDB time-series data or PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using TimescaleDB
+    or PostgreSQL
+  sources: ["https://docs.timescale.com/use-timescale/latest/hypertables/change-chunk-intervals/"]
+- id: CR-TS-HYP-003
+  text: Enable native compression on hypertable chunks older than your write window — TimescaleDB achieves 90-95% compression
+    on time-series data while keeping it queryable.
+  why: 'Time-series data is highly compressible: timestamps are monotonically increasing (delta encoding), sensor readings
+    are similar (gorilla encoding), and string columns have low cardinality (dictionary encoding). TimescaleDB''s native compression
+    applies column-specific codecs, achieving 10-20x compression on typical IoT/metrics data. A 1TB hypertable compresses
+    to 50-100GB. Compressed chunks are still queryable — the planner transparently decompresses only the requested columns
+    and rows. Without compression, storage costs grow linearly with retention period. With compression, you can retain 10x
+    more history at the same cost.'
+  how_to_do_right: Enable compression with ALTER TABLE ... SET (timescaledb.compress). Define segmentby (columns for grouped
+    access, like sensor_id) and orderby (the time column). Create a compression policy to auto-compress chunks older than
+    your write window (e.g., 7 days). Verify compression ratio with hypertable_compression_stats(). Understand that compressed
+    chunks support read queries but not single-row updates — updates require decompression first.
+  severity: high
+  technologies:
+    platform: [timescaledb, postgresql]
+  domains:
+    domain: [architecture]
+    concern: [data, database, time_series, cost-optimization]
+  example_good: "-- Enable compression on hypertable\nALTER TABLE sensor_data SET (\n  timescaledb.compress,\n  timescaledb.compress_segmentby\
+    \ = 'sensor_id',\n  timescaledb.compress_orderby = 'time DESC'\n);\n\n-- Auto-compress chunks older than 7 days\nSELECT\
+    \ add_compression_policy('sensor_data', INTERVAL '7 days');\n\n-- Verify compression ratio\nSELECT\n  hypertable_name,\n\
+    \  pg_size_pretty(before_compression_total_bytes) AS before,\n  pg_size_pretty(after_compression_total_bytes) AS after,\n\
+    \  round(\n    (1 - after_compression_total_bytes::numeric /\n         before_compression_total_bytes) * 100, 1\n  ) AS\
+    \ compression_pct\nFROM hypertable_compression_stats('sensor_data');\n-- before: 450 GB, after: 38 GB, compression: 91.6%\n\
+    \n-- Manual compression for immediate effect\nSELECT compress_chunk(c.chunk_name)\nFROM timescaledb_information.chunks\
+    \ c\nWHERE c.hypertable_name = 'sensor_data'\n  AND c.range_end < now() - INTERVAL '7 days'\n  AND NOT c.is_compressed;\n"
+  example_bad: "-- No compression — linear storage growth\n-- 1TB per month × 12 months = 12TB per year\n-- With compression:\
+    \ 12TB → 1.2TB (90% savings)\n-- Storage cost: $2400/month → $240/month\n\n-- Compressing chunks still being written to\n\
+    SELECT add_compression_policy('sensor_data', INTERVAL '0 days');\n-- Current chunk gets compressed → new inserts decompress\
+    \ it\n-- Compress-decompress cycle on every insert → massive overhead\n\n-- Wrong segmentby — queries must decompress\
+    \ entire chunk\nALTER TABLE sensor_data SET (\n  timescaledb.compress,\n  timescaledb.compress_segmentby = ''  -- No segmentby!\n\
+    );\n-- Query for sensor_id = 42 must decompress ALL sensor data in chunk\n-- With segmentby = 'sensor_id': only sensor\
+    \ 42's segment decompressed\n"
+  when_applies: Projects using TimescaleDB time-series data or PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using TimescaleDB
+    or PostgreSQL
+  sources: ["https://docs.timescale.com/use-timescale/latest/compression/"]
+- id: CR-TS-QRY-001
+  text: Use time_bucket() for fixed-interval aggregations — it aligns timestamps to uniform intervals for consistent time-series
+    grouping and is optimized for chunk-aware execution.
+  why: PostgreSQL's date_trunc() rounds to calendar boundaries (start of hour, day, month), but time_bucket() supports arbitrary
+    intervals (5 minutes, 15 minutes, 4 hours) and aligns to a configurable origin. For time-series dashboards, 5-minute buckets
+    are standard. Without time_bucket, you need complex expressions (date_trunc + floor + interval arithmetic) that the planner
+    cannot optimize. time_bucket is a TimescaleDB extension function that the planner recognizes for chunk exclusion — it
+    knows that time_bucket('1 hour', time) WHERE time > now() - '2 hours' only needs the last 3 chunks.
+  how_to_do_right: Use time_bucket('interval', time_column) in GROUP BY for consistent time-series aggregation. Combine with
+    time_bucket_gapfill() to fill missing intervals with NULL, interpolate, or locf (last observation carried forward). Always
+    include a time range in WHERE for chunk exclusion. Use time_bucket in continuous aggregates for pre-computed rollups.
+  severity: high
+  technologies:
+    platform: [timescaledb, postgresql]
+  domains:
+    domain: [architecture]
+    concern: [data, database, time_series, analytics]
+  example_good: "-- 5-minute temperature averages for last 24 hours\nSELECT\n  time_bucket('5 minutes', time) AS bucket,\n\
+    \  sensor_id,\n  avg(temperature) AS avg_temp,\n  min(temperature) AS min_temp,\n  max(temperature) AS max_temp,\n  count(*)\
+    \ AS readings\nFROM sensor_data\nWHERE time > now() - INTERVAL '24 hours'\n  AND sensor_id = 42\nGROUP BY bucket, sensor_id\n\
+    ORDER BY bucket DESC;\n\n-- Gap-filling: fill missing intervals with interpolation\nSELECT\n  time_bucket_gapfill('1 hour',\
+    \ time) AS hour,\n  sensor_id,\n  interpolate(avg(temperature)) AS temp_interpolated,\n  locf(avg(humidity)) AS humidity_last_known\n\
+    FROM sensor_data\nWHERE time > now() - INTERVAL '7 days'\n  AND time < now()\n  AND sensor_id = 42\nGROUP BY hour, sensor_id\n\
+    ORDER BY hour;\n-- Generates rows for every hour even when no data exists\n-- interpolate: linear interpolation between\
+    \ known values\n-- locf: carries forward the last known value\n"
+  example_bad: "-- date_trunc only supports calendar boundaries\nSELECT date_trunc('hour', time) AS hour, avg(temperature)\n\
+    FROM sensor_data GROUP BY hour;\n-- Cannot do 5-minute, 15-minute, or 4-hour buckets with date_trunc\n\n-- Manual bucket\
+    \ calculation — error-prone and not optimized\nSELECT\n  to_timestamp(\n    floor(extract(epoch FROM time) / 300) * 300\n\
+    \  ) AS bucket,\n  avg(temperature)\nFROM sensor_data\nGROUP BY bucket;\n-- Planner cannot optimize this expression for\
+    \ chunk exclusion\n-- Complex, hard to read, and easy to get wrong\n"
+  when_applies: Projects using TimescaleDB time-series data or PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using TimescaleDB
+    or PostgreSQL
+  sources: ["https://docs.timescale.com/use-timescale/latest/time-buckets/"]
+- id: CR-TS-QRY-002
+  text: Use first() and last() for the most recent or oldest value per group — they are optimized to avoid sorting the entire
+    group.
+  why: Getting the latest reading per sensor in standard SQL requires a subquery with ROW_NUMBER() OVER (PARTITION BY ...
+    ORDER BY time DESC) or DISTINCT ON — both require sorting all rows per partition. TimescaleDB's last(value, time) returns
+    the value associated with the maximum time in the group using a single pass without sorting. For 1000 sensors with 1M
+    readings each, DISTINCT ON sorts 1B rows (O(N log N)), while last() scans 1B rows once (O(N)) — 10x faster. first() is
+    the counterpart for the minimum time. Combined with time_bucket, they enable downsampling (latest value per 5-minute window).
+  how_to_do_right: 'Use last(value_column, time_column) to get the value at the latest time per group. Use first(value_column,
+    time_column) for the earliest time. Combine with time_bucket() for periodic downsampling. These functions work in continuous
+    aggregates for pre-computed latest values. Note: first/last return the value column, not the time — use max(time) if you
+    also need the timestamp.'
+  severity: medium
+  technologies:
+    platform: [timescaledb, postgresql]
+  domains:
+    domain: [architecture]
+    concern: [data, database, time_series, analytics]
+  example_good: "-- Latest reading per sensor (single-pass, no sort)\nSELECT\n  sensor_id,\n  last(temperature, time) AS latest_temp,\n\
+    \  last(humidity, time) AS latest_humidity,\n  max(time) AS last_seen\nFROM sensor_data\nWHERE time > now() - INTERVAL\
+    \ '1 hour'\nGROUP BY sensor_id;\n-- O(N) scan — no sort needed\n\n-- Downsample: one reading per hour per sensor\nSELECT\n\
+    \  time_bucket('1 hour', time) AS hour,\n  sensor_id,\n  first(temperature, time) AS open_temp,\n  last(temperature, time)\
+    \ AS close_temp,\n  min(temperature) AS low_temp,\n  max(temperature) AS high_temp\nFROM sensor_data\nWHERE time > now()\
+    \ - INTERVAL '7 days'\nGROUP BY hour, sensor_id\nORDER BY hour DESC;\n-- OHLC-style data (open, high, low, close) for\
+    \ sensor readings\n"
+  example_bad: "-- DISTINCT ON — requires sort per partition\nSELECT DISTINCT ON (sensor_id) sensor_id, temperature, time\n\
+    FROM sensor_data\nORDER BY sensor_id, time DESC;\n-- Must sort ALL rows by (sensor_id, time DESC)\n-- For 1B rows: O(N\
+    \ log N) sort = minutes\n\n-- Subquery with ROW_NUMBER — even slower\nSELECT * FROM (\n  SELECT *, ROW_NUMBER() OVER (PARTITION\
+    \ BY sensor_id ORDER BY time DESC) AS rn\n  FROM sensor_data\n) t WHERE rn = 1;\n-- Computes row_number for ALL rows,\
+    \ then filters = O(N log N) + O(N)\n"
+  when_applies: Projects using TimescaleDB time-series data or PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using TimescaleDB
+    or PostgreSQL
+  sources: ["https://docs.timescale.com/api/latest/hyperfunctions/first/", "https://docs.timescale.com/api/latest/hyperfunctions/last/"]
+- id: CR-TS-LIF-001
+  text: Use retention policies to automatically drop old chunks — add_retention_policy() removes expired data instantly without
+    DELETE overhead or VACUUM bloat.
+  why: Deleting time-series data with DELETE creates dead tuples that VACUUM must reclaim — on a 1TB table, this means hours
+    of VACUUM work, index bloat, and degraded performance during cleanup. TimescaleDB's retention policy calls drop_chunks()
+    on a schedule, which drops entire chunks (PostgreSQL table files) instantly — no dead tuples, no VACUUM, no bloat. Dropping
+    a 10GB chunk takes <100ms regardless of row count. Without a retention policy, time-series tables grow indefinitely until
+    disk fills — which in production causes database shutdown and data corruption.
+  how_to_do_right: 'Add a retention policy with add_retention_policy(''table'', INTERVAL ''N days''). The policy runs on a
+    background schedule (default: every 24 hours). For critical systems, combine retention with compression: compress after
+    7 days, drop after 90 days. Verify with timescaledb_information.jobs. Test manually first with SELECT drop_chunks(''table'',
+    older_than => INTERVAL ''90 days'').'
+  severity: critical
+  technologies:
+    platform: [timescaledb, postgresql]
+  domains:
+    domain: [architecture, operations]
+    concern: [data, database, time_series]
+  example_good: "-- Add retention policy: auto-drop chunks older than 90 days\nSELECT add_retention_policy('sensor_data',\
+    \ INTERVAL '90 days');\n\n-- Combined lifecycle: compress after 7 days, drop after 90 days\nSELECT add_compression_policy('sensor_data',\
+    \ INTERVAL '7 days');\nSELECT add_retention_policy('sensor_data', INTERVAL '90 days');\n-- Day 1-7: uncompressed (fast\
+    \ writes)\n-- Day 7-90: compressed (90% smaller, still queryable)\n-- Day 90+: dropped (instant, zero overhead)\n\n--\
+    \ Monitor policies\nSELECT * FROM timescaledb_information.jobs\nWHERE hypertable_name = 'sensor_data';\n\n-- Manual test\
+    \ before enabling policy\nSELECT drop_chunks('sensor_data', older_than => INTERVAL '90 days');\n-- Shows which chunks\
+    \ would be dropped\n\n-- Verify retention is working\nSELECT\n  min(range_start) AS oldest_chunk,\n  max(range_end) AS\
+    \ newest_chunk,\n  count(*) AS total_chunks\nFROM timescaledb_information.chunks\nWHERE hypertable_name = 'sensor_data';\n"
+  example_bad: '-- DELETE for data expiration — creates massive bloat
+
+    DELETE FROM sensor_data WHERE time < now() - INTERVAL ''90 days'';
+
+    -- Deletes 300M rows → 300M dead tuples
+
+    -- VACUUM runs for 4 hours to reclaim space
+
+    -- During VACUUM: degraded query performance + table bloat
+
+
+    -- No retention at all — disk fills up
+
+    -- 1TB/month × 12 months = 12TB → disk full → database crash
+
+    -- Emergency fix: DROP TABLE (lose everything) or emergency VACUUM (hours of downtime)
+
+    '
+  when_applies: Any project using TimescaleDB time-series data or PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using TimescaleDB
+    or PostgreSQL
+  sources: ["https://docs.timescale.com/use-timescale/latest/data-retention/"]
+- id: CR-TS-LIF-002
+  text: Use continuous aggregates for pre-computed rollups that refresh automatically — they materialize time_bucket queries
+    and incrementally update only the changed time ranges.
+  why: A dashboard query aggregating 30 days of sensor data across 1000 sensors executes the full aggregation on every page
+    load — scanning billions of rows. Continuous aggregates materialize the query result and incrementally refresh only the
+    time ranges where new data was inserted. A refresh that would scan 30 days of data only re-computes the last few hours
+    (since the last refresh). Query time drops from 30 seconds (full scan) to <100ms (reading pre-materialized result). Unlike
+    PostgreSQL materialized views that require full refresh, continuous aggregates know which time ranges are stale and only
+    refresh those.
+  how_to_do_right: Create a continuous aggregate with CREATE MATERIALIZED VIEW ... WITH (timescaledb.continuous). Add a refresh
+    policy with add_continuous_aggregate_policy() specifying the refresh window. Use real-time aggregation (materialized_only
+    => false) to combine materialized data with recent un-materialized data for up-to-the-second results. Stack continuous
+    aggregates (hourly on top of raw, daily on top of hourly) for multi-resolution dashboards.
+  severity: high
+  technologies:
+    platform: [timescaledb, postgresql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, time_series]
+  example_good: "-- Continuous aggregate: hourly metrics per sensor\nCREATE MATERIALIZED VIEW sensor_hourly\nWITH (timescaledb.continuous)\
+    \ AS\nSELECT\n  time_bucket('1 hour', time) AS bucket,\n  sensor_id,\n  avg(temperature) AS avg_temp,\n  min(temperature)\
+    \ AS min_temp,\n  max(temperature) AS max_temp,\n  count(*) AS sample_count\nFROM sensor_data\nGROUP BY bucket, sensor_id\n\
+    WITH NO DATA;  -- Don't backfill immediately\n\n-- Auto-refresh: update every hour, refresh last 3 hours\nSELECT add_continuous_aggregate_policy('sensor_hourly',\n\
+    \  start_offset    => INTERVAL '3 hours',  -- Re-compute last 3h (for late data)\n  end_offset      => INTERVAL '1 hour',\
+    \   -- Don't refresh current hour (incomplete)\n  schedule_interval => INTERVAL '1 hour'   -- Run every hour\n);\n\n--\
+    \ Backfill historical data\nCALL refresh_continuous_aggregate('sensor_hourly', '2025-01-01', '2026-02-15');\n\n-- Query\
+    \ the aggregate (milliseconds, not seconds)\nSELECT * FROM sensor_hourly\nWHERE bucket > now() - INTERVAL '30 days'\n\
+    \  AND sensor_id = 42\nORDER BY bucket DESC;\n-- Reads ~720 pre-computed rows instead of scanning 100M raw rows\n\n--\
+    \ Real-time aggregation: combines materialized + recent data\nALTER MATERIALIZED VIEW sensor_hourly SET (\n  timescaledb.materialized_only\
+    \ = false\n);\n-- Now includes un-materialized recent data transparently\n"
+  example_bad: '-- PostgreSQL materialized view — full refresh only
+
+    CREATE MATERIALIZED VIEW sensor_hourly AS
+
+    SELECT time_bucket(''1 hour'', time) AS bucket, sensor_id, avg(temperature)
+
+    FROM sensor_data GROUP BY bucket, sensor_id;
+
+    REFRESH MATERIALIZED VIEW sensor_hourly;
+
+    -- Must refresh ENTIRE view — re-scans all data every time
+
+    -- 1TB table refresh: 45 minutes
+
+    -- Continuous aggregate refresh: 2 seconds (only stale ranges)
+
+
+    -- No continuous aggregate — query raw data on every dashboard load
+
+    SELECT time_bucket(''1 hour'', time) AS bucket, avg(temperature)
+
+    FROM sensor_data
+
+    WHERE time > now() - INTERVAL ''30 days''
+
+    GROUP BY bucket;
+
+    -- 100M rows scanned per dashboard load
+
+    -- 30 seconds per query × 100 users = 3000 seconds of DB time/refresh
+
+    '
+  when_applies: Projects using TimescaleDB time-series data or PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using TimescaleDB
+    or PostgreSQL
+  sources: ["https://docs.timescale.com/use-timescale/latest/continuous-aggregates/"]
+- id: CR-TS-PERF-001
+  text: Leverage chunk exclusion by always including time filters in queries — without a time predicate, TimescaleDB scans
+    all chunks just like a regular PostgreSQL table.
+  why: 'Chunk exclusion is TimescaleDB''s primary performance advantage: the query planner examines the WHERE clause for time
+    predicates and only scans chunks whose time range overlaps the query''s time range. A query for ''last 24 hours'' on a
+    1-year hypertable with daily chunks scans 2 out of 365 chunks — 99.5% reduction. But if the query omits the time filter
+    (e.g., WHERE sensor_id = 42 without time range), ALL 365 chunks must be scanned because the planner cannot exclude any
+    chunk. This is the most common TimescaleDB performance mistake: writing queries that technically work but miss chunk exclusion.'
+  how_to_do_right: 'Always include the hypertable''s time column in WHERE clauses. For application queries, add a reasonable
+    time bound even if not strictly necessary: WHERE time > now() - INTERVAL ''30 days'' AND sensor_id = 42. Verify chunk
+    exclusion with EXPLAIN: look for ''Chunks excluded during runtime: N'' or count the chunks in the plan. Create composite
+    indexes with time as the first or second column. For non-time queries, consider adding a secondary hypertable dimension.'
+  severity: critical
+  technologies:
+    platform: [timescaledb, postgresql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, time_series]
+  example_good: '-- Time filter enables chunk exclusion
+
+    EXPLAIN ANALYZE
+
+    SELECT avg(temperature) FROM sensor_data
+
+    WHERE time > now() - INTERVAL ''24 hours'' AND sensor_id = 42;
+
+    -- Append on sensor_data
+
+    --   Chunks excluded during runtime: 363 of 365 (99.5%)
+
+    --   -> Index Scan on _hyper_1_365_chunk (actual time=0.1..0.8)
+
+    --   -> Index Scan on _hyper_1_364_chunk (actual time=0.1..0.3)
+
+
+    -- Always add time bounds even for "all data" queries
+
+    SELECT DISTINCT sensor_id FROM sensor_data
+
+    WHERE time > now() - INTERVAL ''7 days'';
+
+    -- Scans 7 chunks instead of 365
+
+
+    -- Composite index: sensor_id + time for targeted queries
+
+    CREATE INDEX idx_sensor_time ON sensor_data (sensor_id, time DESC);
+
+    '
+  example_bad: '-- No time filter — scans ALL chunks
+
+    SELECT avg(temperature) FROM sensor_data WHERE sensor_id = 42;
+
+    -- Chunks excluded: 0 of 365 — full hypertable scan
+
+    -- 365 chunk scans × 10M rows each = 3.65B rows examined
+
+    -- Adding "AND time > now() - ''24h''" would scan only 20M rows
+
+
+    -- Computed time column — planner cannot match to partition column
+
+    SELECT * FROM sensor_data
+
+    WHERE date_trunc(''day'', time) = ''2026-02-15'';
+
+    -- date_trunc wraps the column — chunk exclusion DISABLED
+
+    -- Use: WHERE time >= ''2026-02-15'' AND time < ''2026-02-16''
+
+    '
+  when_applies: Any project using TimescaleDB time-series data or PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using TimescaleDB
+    or PostgreSQL
+  sources: ["https://docs.timescale.com/use-timescale/latest/hypertables/about-hypertables/#chunk-exclusion"]
+- id: CR-TS-PERF-002
+  text: Use multi-node TimescaleDB or space partitioning for multi-tenant workloads — add a space dimension to distribute
+    data across chunks by tenant for query isolation.
+  why: A single-dimension hypertable (time only) stores all tenants' data in the same chunks. A query for tenant A's data
+    must scan the entire chunk even though tenant B's data is irrelevant. Adding a space dimension (e.g., sensor_id or tenant_id)
+    creates chunks partitioned by BOTH time AND space. Now tenant A's query only scans chunks containing tenant A's data —
+    combining time-based and space-based chunk exclusion. For multi-tenant IoT platforms with 1000 tenants, this reduces query
+    scope from 'all data in time range' to 'one tenant's data in time range' — potentially 1000x reduction.
+  how_to_do_right: Add a space dimension with add_dimension(). Choose a column with moderate cardinality (10-1000 values).
+    Set number_partitions to 2-8x your typical concurrent query count. Combine with time partitioning for two-dimensional
+    chunk exclusion. For multi-node TimescaleDB, space dimensions determine which data node stores each chunk.
+  severity: high
+  technologies:
+    platform: [timescaledb, postgresql]
+  domains:
+    domain: [architecture]
+    concern: [data, database, time_series, multi-tenant]
+  example_good: "-- Create hypertable with space partitioning by tenant\nCREATE TABLE sensor_data (\n  time        TIMESTAMPTZ\
+    \ NOT NULL,\n  tenant_id   INT NOT NULL,\n  sensor_id   INT NOT NULL,\n  temperature DOUBLE PRECISION,\n  humidity   \
+    \ DOUBLE PRECISION\n);\n\nSELECT create_hypertable('sensor_data', by_range('time', INTERVAL '1 day'));\n-- Add space dimension:\
+    \ 4 partitions by tenant_id\nSELECT add_dimension('sensor_data', by_hash('tenant_id', 4));\n\n-- Now chunks are partitioned\
+    \ by (time_range, tenant_id_hash)\n-- Query for tenant 42 in last 24 hours:\nEXPLAIN ANALYZE\nSELECT * FROM sensor_data\n\
+    WHERE time > now() - INTERVAL '24 hours' AND tenant_id = 42;\n-- Time exclusion: 2 of 365 time ranges\n-- Space exclusion:\
+    \ 1 of 4 hash partitions\n-- Total: 2 chunks scanned out of 1460 (99.86% excluded)\n"
+  example_bad: '-- Time-only partitioning for multi-tenant — no tenant isolation
+
+    SELECT create_hypertable(''sensor_data'', by_range(''time''));
+
+    -- Query for tenant 42:
+
+    SELECT * FROM sensor_data
+
+    WHERE time > now() - ''24h'' AND tenant_id = 42;
+
+    -- Scans 2 time chunks BUT each chunk contains ALL tenants'' data
+
+    -- Must filter 1000 tenants'' data to find tenant 42
+
+    '
+  when_applies: Projects using TimescaleDB time-series data or PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using TimescaleDB
+    or PostgreSQL
+  sources: ["https://docs.timescale.com/use-timescale/latest/hypertables/about-hypertables/#space-partitioning"]
+- id: CR-TS-PERF-003
+  text: Use skip scan for efficient DISTINCT queries on low-cardinality columns — TimescaleDB's skip scan jumps between distinct
+    values instead of scanning every row.
+  why: Standard PostgreSQL DISTINCT on a column requires scanning all rows and deduplicating them — O(N). For finding all
+    unique sensor IDs in a table with 1B rows, this scans 1B rows to return 1000 values. TimescaleDB's skip scan optimization
+    uses the index to jump from one distinct value to the next — O(K * log N) where K is the number of distinct values. For
+    1000 sensors in 1B rows, skip scan performs ~1000 index seeks instead of 1B row scans — a 1,000,000x improvement. This
+    optimization activates automatically when the planner detects a DISTINCT or GROUP BY on an indexed column with low cardinality
+    relative to the table size.
+  how_to_do_right: Create an index on the column used in DISTINCT or GROUP BY. Ensure the column has significantly fewer distinct
+    values than total rows (at least 100:1 ratio). Use EXPLAIN ANALYZE to verify 'Skip Scan' appears in the plan. Skip scan
+    works with both B-tree and hypertable chunk-aware indexes. For compound DISTINCT (sensor_id, metric_name), create a composite
+    index.
+  severity: medium
+  technologies:
+    platform: [timescaledb, postgresql]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, time_series]
+  example_good: '-- Create index for skip scan
+
+    CREATE INDEX idx_sensor_id ON sensor_data (sensor_id);
+
+
+    -- DISTINCT with skip scan — milliseconds on billion-row table
+
+    EXPLAIN ANALYZE
+
+    SELECT DISTINCT sensor_id FROM sensor_data;
+
+    -- Skip Scan using idx_sensor_id
+
+    -- actual time=0.1..12.5 rows=1000 loops=1
+
+    -- 1000 index seeks instead of 1B row scans
+
+
+    -- Compound DISTINCT with composite index
+
+    CREATE INDEX idx_sensor_metric ON sensor_data (sensor_id, metric_name);
+
+    SELECT DISTINCT sensor_id, metric_name FROM sensor_data;
+
+    -- Skip Scan on composite index
+
+
+    -- Combined with time filter for bounded scope
+
+    SELECT DISTINCT sensor_id FROM sensor_data
+
+    WHERE time > now() - INTERVAL ''7 days'';
+
+    -- Chunk exclusion + skip scan = scans only 7 chunks with skip scan
+
+    '
+  example_bad: '-- No index — full sequential scan for DISTINCT
+
+    SELECT DISTINCT sensor_id FROM sensor_data;
+
+    -- Seq Scan: 1B rows examined to return 1000 distinct values
+
+    -- Time: 45 seconds
+
+
+    -- DISTINCT on high-cardinality column — skip scan not beneficial
+
+    SELECT DISTINCT session_id FROM events;
+
+    -- 50M distinct values — skip scan does 50M index seeks
+
+    -- Not much better than sequential scan on this cardinality
+
+    '
+  when_applies: Projects using TimescaleDB time-series data or PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using TimescaleDB
+    or PostgreSQL
+  sources: ["https://docs.timescale.com/use-timescale/latest/query-data/skipscan/"]

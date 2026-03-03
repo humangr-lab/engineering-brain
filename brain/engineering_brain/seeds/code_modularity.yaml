@@ -1,0 +1,1510 @@
+layer: rules
+domain: architecture
+knowledge:
+- id: MOD-001
+  text: >
+    Use the src layout for any Python package that will be installed or distributed.
+    Place all importable source code under src/<package_name>/, never at the repo root.
+  why: >
+    The flat layout silently imports from the working directory instead of the installed
+    package during development. This means tests can pass locally against uninstalled
+    source while the installed artifact behaves differently — a category of CI-green /
+    production-broken bugs that is extremely hard to diagnose. The src layout forces
+    installation (pip install -e .) before import, guaranteeing tests exercise the same
+    code path that end users get. Python Packaging Authority recommends src layout for
+    all distributable libraries as of 2024.
+  how_to_do_right: |
+    1. Create directory structure: src/<pkg>/__init__.py, tests/, pyproject.toml
+    2. In pyproject.toml set: [tool.setuptools.packages.find] where = ["src"]
+    3. Install editable: pip install -e ".[dev]" — tests now import installed package
+    4. PYTHONPATH=src is acceptable for scripts/CLI tools that are NOT distributed
+    5. Never do PYTHONPATH=. (root) — this re-introduces the flat-layout ambiguity
+    6. For monorepos: src/pkg_a/, src/pkg_b/ — each with its own pyproject.toml
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [setuptools, poetry, hatch, flit]
+  domains:
+    domain: [architecture, packaging]
+    concern: [modularity, reproducibility]
+  example_good: |
+    # Correct src layout
+    myproject/
+    ├── src/
+    │   └── mypackage/
+    │       ├── __init__.py
+    │       ├── core.py
+    │       └── utils.py
+    ├── tests/
+    │   └── test_core.py
+    └── pyproject.toml
+
+    # pyproject.toml
+    [tool.setuptools.packages.find]
+    where = ["src"]
+
+    # tests/test_core.py — imports the INSTALLED package, not local dir
+    from mypackage.core import MyClass
+  example_bad: |
+    # Flat layout — tests silently import from working directory
+    myproject/
+    ├── mypackage/          # Root-level, shadowed by cwd
+    │   ├── __init__.py
+    │   └── core.py
+    ├── tests/
+    │   └── test_core.py   # import mypackage.core — WHICH ONE? Ambiguous.
+    └── setup.py
+
+    # Failure mode: pip install mypackage && python -m pytest
+    # Test passes. But installed package is stale. Users get old behaviour.
+  when_applies: Any Python package intended for pip install, internal PyPI, or distribution.
+  sources:
+    - "https://packaging.python.org/en/latest/discussions/src-layout-vs-flat-layout/"
+    - "https://realpython.com/ref/best-practices/project-layout/"
+
+- id: MOD-002
+  text: >
+    Design __init__.py as the explicit public API surface of a package.
+    Only export symbols that are part of the public contract; hide internal modules
+    with underscore prefix or by omitting them from __init__.py.
+  why: >
+    When __init__.py imports everything from submodules unconditionally, any import
+    of the package triggers the entire module graph. A FastAPI app at a major
+    fintech had 4-second startup times because an innocuous `from mylib import helper`
+    transitively loaded ML model weights, DB connections, and config parsers.
+    Explicit public API also prevents accidental reliance on private internals —
+    a semver breaking-change trap teams routinely fall into.
+  how_to_do_right: |
+    1. Define __all__ = ["ClassA", "func_b"] in every public module
+    2. __init__.py imports only symbols users are expected to use directly
+    3. Use lazy imports for heavy optional dependencies (see importlib trick below)
+    4. Internal modules: prefix with _ (e.g., _helpers.py) or place under _internal/
+    5. Validate: run `python -c "import <pkg>; print(dir(<pkg>))"` — nothing surprising
+    6. Document the public API contract in docstrings, not just in __init__.py
+  severity: medium
+  technologies:
+    lang: [python]
+  domains:
+    domain: [architecture]
+    concern: [api_design, performance, maintainability]
+  example_good: |
+    # src/mylib/__init__.py — explicit, minimal public surface
+    from mylib.client import Client
+    from mylib.models import Request, Response
+    from mylib.exceptions import MyLibError
+
+    __all__ = ["Client", "Request", "Response", "MyLibError"]
+
+    # Heavy optional: only imported when accessed
+    def __getattr__(name: str):
+        if name == "MLPredictor":
+            from mylib._ml import MLPredictor  # Loaded on first access only
+            return MLPredictor
+        raise AttributeError(f"module 'mylib' has no attribute {name!r}")
+  example_bad: |
+    # src/mylib/__init__.py — star import hell
+    from mylib.client import *        # Pulls in 40 symbols
+    from mylib._helpers import *      # Exposes private internals
+    from mylib.ml_model import *      # Loads 2GB model weight on import
+    from mylib.db_pool import *       # Opens DB connections at import time
+    # Any `import mylib` now takes seconds and may fail without DB
+  when_applies: >
+    Any package with more than 3 submodules or any import performance concern.
+  sources:
+    - "https://docs.python.org/3/reference/simple_stmts.html#the-import-statement"
+    - "https://martinfowler.com/bliki/PublishedInterface.html"
+
+- id: MOD-003
+  text: >
+    Resolve circular imports by extracting shared types/interfaces into a dedicated
+    types.py or interfaces.py module that neither cycle participant imports from.
+    This is the Interface Extraction strategy — the most architecturally sound fix.
+  why: >
+    Circular imports are symptoms of bidirectional coupling. Late imports (import
+    inside functions) patch the symptom but leave the coupling. Over time, late
+    imports accumulate, making import order and initialization sequence invisible.
+    Extraction of shared types breaks the cycle permanently and is detectable by
+    static tools (mypy, pyright) without runtime surprises. Teams that rely
+    exclusively on late imports routinely hit `partially initialized module` errors
+    when code is reorganized.
+  how_to_do_right: |
+    1. Identify what A needs from B and B needs from A
+    2. If they only need each other's TYPES: move type-only imports under
+       `if TYPE_CHECKING:` block — zero runtime cost, full type safety
+    3. If they need each other's runtime objects: extract shared interfaces
+       to a third module C (types.py / interfaces.py / protocols.py)
+    4. A imports from C, B imports from C — the cycle is severed
+    5. Run: python -c "import yourpackage" — must complete in <50ms
+    6. Validate with: python -X importtime -c "import yourpackage" 2>&1 | sort -k2 -rn
+  severity: high
+  technologies:
+    lang: [python]
+  domains:
+    domain: [architecture]
+    concern: [modularity, coupling, circular_imports]
+  example_good: |
+    # interfaces.py — shared types, imports nothing from the package
+    from __future__ import annotations
+    from typing import Protocol, runtime_checkable
+
+    @runtime_checkable
+    class OrderRepository(Protocol):
+        def get(self, order_id: str) -> "Order": ...
+        def save(self, order: "Order") -> None: ...
+
+    # order.py — imports from interfaces only
+    from myapp.interfaces import OrderRepository
+    class Order:
+        def __init__(self, repo: OrderRepository): ...
+
+    # sql_repo.py — imports from interfaces only
+    from myapp.interfaces import OrderRepository
+    class SqlOrderRepository:
+        def get(self, order_id: str) -> "Order": ...
+        def save(self, order: "Order") -> None: ...
+    # Zero circular import — neither order.py nor sql_repo.py imports the other
+  example_bad: |
+    # order.py
+    from myapp.sql_repo import SqlOrderRepository  # needs type hint
+
+    # sql_repo.py
+    from myapp.order import Order  # needs to return Order
+
+    # Result: ImportError: cannot import name 'Order' from partially initialized module
+    # "Fix": move import inside function body — kicks the problem down the road
+  when_applies: >
+    Whenever two modules import each other, directly or transitively.
+  sources:
+    - "https://www.datacamp.com/tutorial/python-circular-import"
+    - "https://docs.python.org/3/library/typing.html#typing.TYPE_CHECKING"
+
+- id: MOD-004
+  text: >
+    Use `if TYPE_CHECKING:` blocks for type-hint-only imports to eliminate circular
+    import errors caused purely by type annotations, with zero runtime overhead.
+  why: >
+    A significant proportion of circular imports exist only to satisfy type checkers.
+    At runtime, the types are never used — they appear only in function signatures.
+    Wrapping these imports in `if TYPE_CHECKING:` makes mypy/pyright happy while
+    preventing any runtime import of the circular dependency. This pattern is
+    endorsed by PEP 563 (`from __future__ import annotations`) and used extensively
+    in CPython's own stdlib.
+  how_to_do_right: |
+    1. Add `from __future__ import annotations` at top of file (makes all annotations
+       strings, evaluated lazily — no forward reference errors)
+    2. Place circular import under `if TYPE_CHECKING:` block
+    3. Use string literals for annotations that still need forward references
+       without __future__ import: def process(self, item: "Item") -> None
+    4. Never put non-type-hint logic inside `if TYPE_CHECKING:` block
+    5. mypy and pyright both respect TYPE_CHECKING — full static analysis preserved
+  severity: medium
+  technologies:
+    lang: [python]
+  domains:
+    domain: [architecture]
+    concern: [typing, circular_imports, performance]
+  example_good: |
+    # engine.py
+    from __future__ import annotations
+    from typing import TYPE_CHECKING
+
+    if TYPE_CHECKING:
+        from myapp.pipeline import Pipeline  # Only for type checker, not runtime
+
+    class Engine:
+        def run(self, pipeline: Pipeline) -> None:  # Annotation is a string at runtime
+            pipeline.execute(self)
+
+    # pipeline.py — imports Engine at runtime (no cycle!)
+    from myapp.engine import Engine
+
+    class Pipeline:
+        def __init__(self, engine: Engine) -> None:
+            self.engine = engine
+        def execute(self, engine: Engine) -> None:
+            engine.run(self)
+  example_bad: |
+    # engine.py — runtime circular import just for type hint
+    from myapp.pipeline import Pipeline  # ImportError if pipeline.py imports engine.py
+
+    class Engine:
+        def run(self, pipeline: Pipeline) -> None:
+            pipeline.execute(self)
+    # Fix: the TYPE_CHECKING guard above costs 0 lines and 0 runtime overhead
+  when_applies: >
+    Any time a module imports another module exclusively for use in type annotations.
+  sources:
+    - "https://docs.python.org/3/library/typing.html#typing.TYPE_CHECKING"
+    - "https://peps.python.org/pep-0563/"
+
+- id: MOD-005
+  text: >
+    Apply Dependency Inversion when two modules need each other at runtime: make
+    both depend on an abstract interface (Protocol or ABC) defined in a third module,
+    and inject the concrete implementation at the composition root — never let
+    modules instantiate their own dependencies.
+  why: >
+    The hardest circular import bugs arise when module A calls module B at runtime,
+    and module B imports module A to use one of its classes. This cannot be fixed
+    with TYPE_CHECKING alone. Dependency Inversion removes the runtime coupling
+    entirely: A receives an interface-typed collaborator through its constructor and
+    never references B's concrete class. This also makes unit testing trivially
+    easy — inject a mock without patching anything.
+  how_to_do_right: |
+    1. Define Protocol/ABC in interfaces.py (or protocols.py)
+    2. High-level module A: __init__ accepts Interface, never imports concrete B
+    3. Low-level module B: implements Interface, imports from interfaces only
+    4. Composition root (main.py / app factory): creates B(), passes to A(b)
+    5. Wire dependencies at app startup, not scattered across modules
+    6. Validate: grep -r "from myapp.concrete_b import" myapp/high_level/ → zero results
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, django, flask]
+  domains:
+    domain: [architecture]
+    concern: [coupling, testability, circular_imports]
+  example_good: |
+    # interfaces.py
+    from typing import Protocol
+    class Notifier(Protocol):
+        def send(self, message: str) -> None: ...
+
+    # order_service.py — high level, never imports EmailNotifier
+    from myapp.interfaces import Notifier
+    class OrderService:
+        def __init__(self, notifier: Notifier) -> None:
+            self._notifier = notifier
+        def complete_order(self, order_id: str) -> None:
+            # ... process
+            self._notifier.send(f"Order {order_id} completed")
+
+    # email_notifier.py — low level, never imports OrderService
+    class EmailNotifier:
+        def send(self, message: str) -> None:
+            print(f"Email: {message}")
+
+    # main.py — composition root
+    from myapp.order_service import OrderService
+    from myapp.email_notifier import EmailNotifier
+    service = OrderService(notifier=EmailNotifier())
+  example_bad: |
+    # order_service.py — high level imports low level directly (DIP violation)
+    from myapp.email_notifier import EmailNotifier  # Circular if EmailNotifier imports Order
+    class OrderService:
+        def __init__(self):
+            self._notifier = EmailNotifier()  # Can't test without real email
+  when_applies: >
+    Any time two modules need each other's runtime objects, not just types.
+  sources:
+    - "https://python-dependency-injector.ets-labs.org/introduction/di_in_python.html"
+    - "https://dev.to/markoulis/from-dependency-inversion-to-dependency-injection-in-python-2h70"
+
+- id: MOD-006
+  text: >
+    Design module interfaces using typing.Protocol for structural typing when
+    implementations live in different packages or may be mocked in tests.
+    Use ABC when you want enforced inheritance and template method patterns.
+  why: >
+    Protocol (PEP 544, Python 3.8+) enables duck typing without inheritance — a
+    third-party library class can satisfy your interface without knowing it.
+    This eliminates awkward ABC inheritance chains that couple your abstraction
+    to third-party code. Teams that use ABC for all interfaces repeatedly hit the
+    "diamond inheritance" problem in test fixtures and mock objects. Protocol
+    enables the lighter-weight path: if it walks like a duck, it is a duck,
+    verified by mypy at type-check time.
+  how_to_do_right: |
+    1. Use Protocol when: implementations are in separate packages, third-party
+       objects must satisfy the interface, or you want zero-inheritance coupling
+    2. Use ABC when: you need enforced method signatures with NotImplementedError,
+       you use template method pattern (base class calls abstract methods), or you
+       need isinstance() checks at runtime (add @runtime_checkable to Protocol too)
+    3. Add @runtime_checkable to Protocol only when isinstance() checks are needed
+    4. Name protocols as nouns: Repository, Notifier, Serializer (not IRepository)
+    5. Keep protocols narrow: one Protocol per coherent capability, not one mega-Protocol
+  severity: medium
+  technologies:
+    lang: [python]
+  domains:
+    domain: [architecture]
+    concern: [interface_design, testability, typing]
+  example_good: |
+    from typing import Protocol, runtime_checkable
+
+    # Narrow, focused Protocol — structural typing
+    @runtime_checkable
+    class VectorStore(Protocol):
+        def upsert(self, vectors: list[tuple[str, list[float]]]) -> None: ...
+        def search(self, query: list[float], top_k: int) -> list[str]: ...
+
+    # Works with Qdrant, Pinecone, in-memory mock — zero inheritance required
+    class InMemoryVectorStore:
+        def __init__(self): self._store = {}
+        def upsert(self, vectors): self._store.update(dict(vectors))
+        def search(self, query, top_k): return list(self._store)[:top_k]
+
+    assert isinstance(InMemoryVectorStore(), VectorStore)  # True — no inheritance
+
+    # ABC pattern — use when template method is needed
+    from abc import ABC, abstractmethod
+    class BaseProcessor(ABC):
+        def process(self, data: dict) -> dict:  # template method
+            data = self.validate(data)
+            data = self.transform(data)
+            return self.output(data)
+        @abstractmethod
+        def validate(self, data: dict) -> dict: ...
+        @abstractmethod
+        def transform(self, data: dict) -> dict: ...
+        def output(self, data: dict) -> dict: return data  # default, overridable
+  example_bad: |
+    # Mega-interface Protocol — violates Interface Segregation Principle
+    class GodStoreProtocol(Protocol):
+        def upsert(self, ...): ...
+        def search(self, ...): ...
+        def delete(self, ...): ...
+        def backup(self, ...): ...
+        def restore(self, ...): ...
+        def migrate(self, ...): ...
+    # Now every mock must implement 6 methods even when only search() is needed
+  when_applies: >
+    When defining module contracts that multiple implementations or test doubles
+    must satisfy.
+  sources:
+    - "https://peps.python.org/pep-0544/"
+    - "https://docs.python.org/3/library/typing.html#typing.Protocol"
+    - "https://medium.com/@hmufraggi/building-robust-python-projects-mastering-dependency-injection-protocols-and-abstract-base-f66b136fb255"
+
+- id: MOD-007
+  text: >
+    Use manual constructor injection (passing dependencies via __init__ parameters)
+    for small-to-medium projects. Adopt dependency-injector or FastAPI's Depends
+    only when the dependency graph exceeds ~15 distinct services.
+  why: >
+    Manual DI is transparent — a reader can trace the full dependency graph by
+    reading the composition root. Frameworks add indirection that makes stack traces
+    harder to read and debugging more opaque. The tipping point (around 15 services)
+    is where manual wiring becomes error-prone and repetitive. FastAPI's Depends
+    is excellent specifically for HTTP scope (request-lifetime dependencies);
+    dependency-injector covers application-scope services. Mixing both is common
+    in FastAPI applications with DB sessions, cache clients, and auth services.
+  how_to_do_right: |
+    1. Start with: class MyService: def __init__(self, repo: Repo, cache: Cache)
+    2. Composition root: app.py creates all concrete objects and wires them
+    3. When manual wiring repeats >3 times, introduce a factory function
+    4. FastAPI: use Depends for request-scoped (DB session, current user, etc.)
+    5. dependency-injector: use for application-scoped singletons (config, clients)
+    6. Never use global module-level singletons as implicit dependencies — inject them
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [fastapi, dependency-injector]
+  domains:
+    domain: [architecture]
+    concern: [dependency_injection, testability, design]
+  example_good: |
+    # Manual DI — composition root
+    # app/main.py
+    from myapp.db import PostgresRepo
+    from myapp.cache import RedisCache
+    from myapp.service import OrderService
+
+    def create_app() -> FastAPI:
+        app = FastAPI()
+        repo = PostgresRepo(dsn=settings.DATABASE_URL)
+        cache = RedisCache(url=settings.REDIS_URL)
+        service = OrderService(repo=repo, cache=cache)
+        app.state.order_service = service
+        return app
+
+    # FastAPI Depends — for request-scoped dependencies
+    from fastapi import Depends
+    from sqlalchemy.orm import Session
+
+    def get_db() -> Generator[Session, None, None]:
+        db = SessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    @router.get("/orders/{order_id}")
+    def get_order(order_id: str, db: Session = Depends(get_db)):
+        return OrderService(repo=SqlRepo(db)).get(order_id)
+  example_bad: |
+    # Global module-level singleton — implicit dependency, untestable
+    # services/order.py
+    from myapp.db import db_conn  # module-level global connection
+    from myapp.cache import cache_client  # another global
+
+    class OrderService:
+        def get(self, order_id: str):
+            return db_conn.query(...)  # untestable without monkeypatching globals
+  when_applies: >
+    All production Python applications; composition root wiring at startup.
+  sources:
+    - "https://python-dependency-injector.ets-labs.org/introduction/di_in_python.html"
+    - "https://www.glukhov.org/post/2025/12/dependency-injection-in-python/"
+
+- id: MOD-008
+  text: >
+    Implement plugin architectures using Python's importlib.metadata entry_points
+    for distribution-time registration, or ABC-based registries for in-process
+    plugin registration. Never hardcode plugin lists in core modules.
+  why: >
+    Hardcoding plugin lists couples the core to every plugin, requiring a core
+    release for every new plugin. Entry_points allow third-party packages to
+    register themselves — the core discovers them at runtime without modification.
+    This is how pytest discovers plugins, Django discovers apps, and click discovers
+    command groups. An order-processing system that hardcoded payment processor
+    names required a 2-week release cycle every time a new payment provider was
+    onboarded — entry_points reduced this to zero core changes.
+  how_to_do_right: |
+    1. Define entry_point group name: "myapp.processors"
+    2. Core: importlib.metadata.entry_points(group="myapp.processors") at startup
+    3. Plugin package pyproject.toml: [project.entry-points."myapp.processors"]
+       stripe = "myapp_stripe:StripeProcessor"
+    4. For in-process registration: ABC with class-level registry dict
+    5. Always validate plugin interface at load time (isinstance check or Protocol)
+    6. Log all discovered plugins on startup for observability
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [setuptools, importlib]
+  domains:
+    domain: [architecture]
+    concern: [extensibility, plugin_system, modularity]
+  example_good: |
+    # core/discovery.py — no knowledge of concrete plugins
+    from importlib.metadata import entry_points
+    from myapp.interfaces import PaymentProcessor
+
+    def load_processors() -> dict[str, PaymentProcessor]:
+        processors = {}
+        for ep in entry_points(group="myapp.payment_processors"):
+            cls = ep.load()
+            if not issubclass(cls, PaymentProcessor):
+                raise TypeError(f"{ep.name}: {cls} does not implement PaymentProcessor")
+            processors[ep.name] = cls()
+            print(f"Loaded processor: {ep.name}")
+        return processors
+
+    # myapp_stripe/pyproject.toml — zero changes to core
+    # [project.entry-points."myapp.payment_processors"]
+    # stripe = "myapp_stripe.processor:StripeProcessor"
+
+    # ABC-based in-process registry pattern
+    class BaseProcessor(ABC):
+        _registry: dict[str, type] = {}
+
+        def __init_subclass__(cls, name: str = "", **kwargs):
+            super().__init_subclass__(**kwargs)
+            if name:
+                BaseProcessor._registry[name] = cls
+
+    class StripeProcessor(BaseProcessor, name="stripe"):
+        pass  # Auto-registered on class definition
+  example_bad: |
+    # core/factory.py — hardcoded plugin list (OCP violation)
+    def get_processor(name: str) -> PaymentProcessor:
+        if name == "stripe": return StripeProcessor()
+        elif name == "paypal": return PayPalProcessor()
+        elif name == "apple_pay": return ApplePayProcessor()
+        # Adding a new processor requires editing this core file
+        else: raise ValueError(f"Unknown processor: {name}")
+  when_applies: >
+    Any extensible system where third parties or separate repos provide implementations.
+  sources:
+    - "https://docs.python.org/3/library/importlib.metadata.html#entry-points"
+    - "https://setuptools.pypa.io/en/latest/userguide/entry_point.html"
+
+- id: MOD-009
+  text: >
+    Measure module cohesion using Lack of Cohesion of Methods (LCOM) and target
+    LCOM4 < 2 per class. Measure package cohesion with relational cohesion (H):
+    target H in [1.5, 4.0]. Values outside range indicate splitting or merging.
+  why: >
+    LCOM quantifies how many "feature clusters" exist within a class — LCOM4 >= 2
+    means the class does two unrelated things and should be split. Relational
+    cohesion H = (relations + 1) / classes measures how interconnected package
+    members are; too low means the package is just a namespace for unrelated classes,
+    too high means it's a monolithic ball. These metrics, from Robert Martin's
+    Agile Principles book, predict maintainability: teams tracking LCOM report
+    50% fewer "shotgun surgery" incidents after splitting high-LCOM classes.
+  how_to_do_right: |
+    1. Tool: radon cc -a src/ — cyclomatic complexity (proxy for LCOM awareness)
+    2. Tool: wily build src/ && wily rank src/ mi — maintainability index
+    3. Manual LCOM4: draw method-attribute bipartite graph; count connected components
+       LCOM4 >= 2 → split class along component boundaries
+    4. Relational cohesion H = (internal_relations + 1) / class_count per package
+       H < 1.5 → package too large, split it
+       H > 4.0 → package too small, merge with related package
+    5. Automate in CI: radon cc src/ --min B --show-complexity --average > 10 → fail
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [radon, wily]
+  domains:
+    domain: [architecture]
+    concern: [cohesion, metrics, refactoring]
+  example_good: |
+    # High cohesion: all methods use the same core data
+    class OrderPricer:
+        def __init__(self, discount_rules: list[Rule]):
+            self._rules = discount_rules
+
+        def calculate_base_price(self, items: list[Item]) -> Decimal:
+            return sum(i.price * i.quantity for i in items)
+
+        def apply_discounts(self, base: Decimal) -> Decimal:
+            for rule in self._rules:
+                base = rule.apply(base)
+            return base
+
+        def calculate_final(self, items: list[Item]) -> Decimal:
+            return self.apply_discounts(self.calculate_base_price(items))
+        # LCOM4 = 1: all 3 methods form a single connected component
+
+    # radon check
+    # $ radon cc -a src/order_pricer.py
+    # OrderPricer - A (2)  <- complexity 2, grade A
+  example_bad: |
+    # Low cohesion: two unrelated clusters in one class — LCOM4 = 2
+    class OrderManager:
+        def calculate_price(self, items): ...   # uses self._prices
+        def apply_discount(self, price): ...    # uses self._prices
+        # ---- unrelated cluster below ----
+        def send_email(self, address): ...      # uses self._smtp
+        def format_template(self, data): ...    # uses self._smtp
+    # Fix: split into OrderPricer + EmailNotifier
+  when_applies: >
+    Code reviews, refactoring planning, and periodic quality audits of any module
+    with more than 5 public methods.
+  sources:
+    - "Robert C. Martin (2002). Agile Software Development: Principles, Patterns, and Practices. Prentice Hall."
+    - "https://radon.readthedocs.io/en/latest/commandline.html"
+
+- id: MOD-010
+  text: >
+    Measure package coupling with afferent (Ca) and efferent (Ce) couplings.
+    Compute Instability I = Ce / (Ca + Ce). Target: stable packages have I < 0.3,
+    unstable/leaf packages have I > 0.7. Enforce Stable Dependencies Principle:
+    packages must only depend on packages more stable than themselves.
+  why: >
+    A domain model package with I = 0.9 (mostly depended-upon by nothing, depends
+    on many things) will break constantly — a change anywhere in the dependency
+    chain ripples into it. The Stable Dependencies Principle from Robert Martin
+    prevents this: the most stable packages (core domain, interfaces) should have
+    the lowest instability, meaning other packages depend on them but they depend
+    on few. Teams that ignored this metric watched a "utility" package become a
+    dependency of 30 modules, making any change to it a two-week regression risk.
+  how_to_do_right: |
+    1. Calculate: Ca = count of external packages that import this package
+                  Ce = count of external packages this package imports
+                  I  = Ce / (Ca + Ce)  [0=stable, 1=unstable]
+    2. Core domain/interfaces: target I < 0.2 (stable, depended-upon)
+    3. Application/use-case layer: target I 0.3–0.6
+    4. Infrastructure/adapters: target I > 0.7 (leaf nodes, depend on domain)
+    5. Enforce in CI with: pyproject-graph, pydeps, or custom import analysis
+    6. Red flag: a "utils" or "helpers" package with Ca > 20 and Ce > 5 — split it
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pydeps]
+  domains:
+    domain: [architecture]
+    concern: [coupling, metrics, dependency_management]
+  example_good: |
+    # Correct dependency flow (arrows point from unstable to stable)
+    #
+    # infrastructure/ (I=0.85) ──► domain/      (I=0.05)
+    # infrastructure/ (I=0.85) ──► interfaces/  (I=0.10)
+    # application/    (I=0.50) ──► domain/      (I=0.05)
+    # application/    (I=0.50) ──► interfaces/  (I=0.10)
+    #
+    # domain/ is stable: many depend on it, it depends on almost nothing
+    # infrastructure/ is unstable: nothing depends on it, it depends on everything
+
+    # Validate with pydeps
+    # pydeps src/myapp --max-bacon=2 --show-cycles
+    # Expected: zero cycles shown
+  example_bad: |
+    # domain/ depends on infrastructure/ — domain is now as unstable as infrastructure
+    # src/domain/order.py
+    from myapp.infrastructure.db import session  # VIOLATION: stable depends on unstable
+    # Any DB change now forces domain model changes
+    # Instability I(domain) was 0.05, now 0.70 — impossible to change safely
+  when_applies: >
+    Architecture reviews, when adding any new cross-package dependency,
+    and when planning package splits or merges.
+  sources:
+    - "Robert C. Martin (2002). Agile Software Development: Principles, Patterns, and Practices. Prentice Hall."
+    - "https://www.jcheng.org/post/python-and-the-src-vs-flat-layout-debate/"
+
+- id: MOD-011
+  text: >
+    Apply Extract Method when a function exceeds 40 lines or has cognitive complexity
+    above 15 (per Sonar). The extracted method must have a name that describes its
+    intent, not its mechanism. Never extract methods smaller than 3 lines unless
+    they represent a meaningful named concept.
+  why: >
+    Functions exceeding 40 lines statistically correlate with defect density —
+    a Microsoft Research study (Nagappan et al.) found methods over 200 lines
+    had 4x more bugs per LOC than methods under 50 lines. Cognitive complexity
+    (Sonar metric) penalizes nesting depth more than cyclomatic complexity,
+    matching human comprehension limits better. The 3-line minimum prevents
+    over-extraction into meaningless single-expression methods that obscure
+    rather than clarify.
+  how_to_do_right: |
+    1. Tool: ruff check --select C901 (cyclomatic) and sonar-python (cognitive)
+    2. Identify cohesive sub-steps in the long function (comment blocks are a signal)
+    3. Extract each sub-step into a private method named after what it achieves:
+       _validate_payment_limits(), _calculate_tax_region(), not _do_step_2()
+    4. The original function becomes a sequence of named steps — readable as English
+    5. Each extracted method should be independently testable
+    6. Threshold: cognitive complexity <= 15, cyclomatic <= 10, lines <= 40
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [ruff, sonar]
+  domains:
+    domain: [architecture]
+    concern: [refactoring, maintainability, readability]
+  example_good: |
+    # After Extract Method — reads like business logic, not code
+    def process_subscription_renewal(self, subscription: Subscription) -> RenewalResult:
+        self._validate_subscription_is_active(subscription)
+        charge_result = self._charge_renewal_fee(subscription)
+        self._extend_subscription_period(subscription, charge_result)
+        self._send_renewal_confirmation(subscription)
+        return RenewalResult(success=True, new_period_end=subscription.period_end)
+
+    def _validate_subscription_is_active(self, sub: Subscription) -> None:
+        if sub.status != SubscriptionStatus.ACTIVE:
+            raise InvalidStateError(f"Cannot renew {sub.status} subscription")
+
+    def _charge_renewal_fee(self, sub: Subscription) -> ChargeResult:
+        return self._payment_gateway.charge(
+            amount=sub.plan.price, token=sub.payment_token
+        )
+  example_bad: |
+    # 50-line function doing everything — high cognitive complexity
+    def process_subscription_renewal(self, subscription):
+        if subscription.status != "active":
+            if subscription.trial_end and datetime.now() < subscription.trial_end:
+                if subscription.payment_method:
+                    # ... 40 more nested lines
+                    pass
+        # Impossible to test individual steps in isolation
+  when_applies: >
+    Any function exceeding 40 lines or cognitive complexity 15.
+    Any function body that contains comment headers labeling sections.
+  sources:
+    - "Martin Fowler (2018). Refactoring, 2nd Edition. Addison-Wesley."
+    - "https://martinfowler.com/books/refactoring.html"
+    - "https://docs.sonarsource.com/sonarqube/latest/user-guide/code-metrics/metrics-definition/"
+
+- id: MOD-012
+  text: >
+    Replace type-dispatching conditionals (if isinstance / if type == / if kind ==)
+    with polymorphism via Protocol or ABC subclasses. The conditional is a signal
+    that behavior should be delegated to the type itself.
+  why: >
+    Every time you add a new type to the system, you must find and update every
+    isinstance chain. Miss one, and the default branch silently handles the new type
+    incorrectly — this failure mode produces no error, just wrong output. A billing
+    system that dispatched on payment_type string had 11 isinstance chains across
+    8 files — adding Bitcoin support required touching all 11, and the QA team
+    found 3 were missed only in production. Polymorphism means adding a new type
+    adds zero changes to existing code.
+  how_to_do_right: |
+    1. Identify the behavior that varies by type (the switch cases)
+    2. Define a Protocol/ABC with that behavior as an abstract method
+    3. Move each case into a class that implements the Protocol
+    4. Replace the conditional with: obj.behavior()
+    5. Use a registry/factory to map type strings to classes (for deserialization)
+    6. Validate: grep -r "isinstance.*PaymentType\|if.*type ==" src/ → zero results
+  severity: high
+  technologies:
+    lang: [python]
+  domains:
+    domain: [architecture]
+    concern: [refactoring, polymorphism, extensibility]
+  example_good: |
+    from typing import Protocol
+    from decimal import Decimal
+
+    class PaymentMethod(Protocol):
+        def authorize(self, amount: Decimal) -> str: ...
+        def capture(self, auth_id: str) -> bool: ...
+
+    class StripePayment:
+        def authorize(self, amount: Decimal) -> str:
+            return stripe.PaymentIntent.create(amount=int(amount * 100))["id"]
+        def capture(self, auth_id: str) -> bool:
+            return stripe.PaymentIntent.capture(auth_id)["status"] == "succeeded"
+
+    class CryptoPayment:
+        def authorize(self, amount: Decimal) -> str:
+            return self._blockchain.lock_escrow(amount)
+        def capture(self, auth_id: str) -> bool:
+            return self._blockchain.release_escrow(auth_id)
+
+    # Zero conditionals — adding BitcoinPayment adds zero changes to checkout
+    def checkout(payment: PaymentMethod, amount: Decimal) -> bool:
+        auth_id = payment.authorize(amount)
+        return payment.capture(auth_id)
+  example_bad: |
+    def checkout(payment_type: str, amount: Decimal, token: str) -> bool:
+        if payment_type == "stripe":
+            auth = stripe.PaymentIntent.create(...)
+            return stripe.PaymentIntent.capture(auth["id"])
+        elif payment_type == "paypal":
+            return paypal.checkout(amount, token)
+        # Adding crypto: must find all 11 isinstance chains across 8 files
+  when_applies: >
+    Any function or method with 3+ branches dispatching on an object's type or kind.
+  sources:
+    - "Martin Fowler (2018). Refactoring, 2nd Edition — 'Replace Conditional with Polymorphism'. Addison-Wesley."
+    - "https://martinfowler.com/books/refactoring.html"
+
+- id: MOD-013
+  text: >
+    Introduce Parameter Object when a function or method receives more than 4
+    parameters, especially if several parameters always travel together across
+    multiple call sites.
+  why: >
+    Functions with 5+ parameters are hard to call correctly — callers confuse
+    positional argument order, and adding a new parameter requires updating every
+    call site. Python's keyword arguments mitigate order confusion but not the
+    proliferation of call-site changes. Groups of parameters that always travel
+    together (start_date + end_date + timezone, user_id + session_token + ip_address)
+    have implicit cohesion that the Parameter Object makes explicit. After the
+    refactor, adding a new field to the group touches only the class definition
+    and the single call site that constructs it.
+  how_to_do_right: |
+    1. Identify clusters of parameters that appear together in 3+ functions
+    2. Create a dataclass or Pydantic model grouping them
+    3. Update function signatures: accept the object, destructure internally if needed
+    4. Add validation to the parameter object's __post_init__ or validator
+    5. The object becomes a named concept in the domain vocabulary
+    6. Threshold: >= 4 parameters OR parameters repeated across 3+ functions
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [pydantic, dataclasses]
+  domains:
+    domain: [architecture]
+    concern: [refactoring, api_design, maintainability]
+  example_good: |
+    from dataclasses import dataclass
+    from datetime import datetime, timezone
+
+    @dataclass(frozen=True)
+    class DateRange:
+        start: datetime
+        end: datetime
+        tz: str = "UTC"
+
+        def __post_init__(self):
+            if self.start >= self.end:
+                raise ValueError(f"start {self.start} must be before end {self.end}")
+
+    # Clean signatures throughout codebase
+    def get_orders(user_id: str, period: DateRange) -> list[Order]: ...
+    def get_revenue(period: DateRange) -> Decimal: ...
+    def export_report(period: DateRange, format: str) -> bytes: ...
+
+    # Adding timezone_offset to DateRange: ONE change, zero call-site updates
+    period = DateRange(start=datetime(2025, 1, 1, tzinfo=timezone.utc),
+                       end=datetime(2025, 12, 31, tzinfo=timezone.utc))
+  example_bad: |
+    # start, end, tz repeated across 10 functions — synchronized change nightmare
+    def get_orders(user_id, start_date, end_date, timezone): ...
+    def get_revenue(start_date, end_date, timezone): ...
+    def export_report(start_date, end_date, timezone, format): ...
+    # Adding "fiscal_year" parameter: 10 function signatures + 10+ call sites changed
+  when_applies: >
+    Functions with 4+ parameters, especially when parameter groups appear at 3+
+    call sites together.
+  sources:
+    - "Martin Fowler (2018). Refactoring, 2nd Edition — 'Introduce Parameter Object'. Addison-Wesley."
+    - "https://martinfowler.com/books/refactoring.html"
+
+- id: MOD-014
+  text: >
+    Use vulture to detect dead code (unused functions, classes, imports) with a
+    minimum confidence threshold of 80%. Augment with coverage.py branch coverage
+    to identify unreachable branches. Never ship code with confidence-80+ dead code.
+  why: >
+    Dead code misleads maintainers into thinking it's necessary, leading to cargo-cult
+    preservation. It inflates test surface requirements, confuses new team members,
+    and occasionally contains security vulnerabilities in unused but still-loaded code
+    paths. A legacy fintech codebase had an unused admin endpoint (never wired to
+    routing) that contained a SQL injection — dead to the router, alive to a directory-
+    traversal attacker who found it through source inspection. Regular dead code removal
+    is a hygiene practice as critical as dependency updates.
+  how_to_do_right: |
+    1. Install: pip install vulture coverage
+    2. Run: vulture src/ --min-confidence 80 --exclude "migrations/,tests/"
+    3. Review each finding — some "dead" code is dynamically called (register in whitelist)
+    4. Create whitelist.py with `obj.method_name` for intentionally kept dead code
+    5. Run: coverage run -m pytest && coverage report --fail-under=90 --show-missing
+    6. Unreachable branches (0 hits in coverage) are candidates for deletion
+    7. Integrate in CI: vulture exit code 0 == clean
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [vulture, coverage]
+  domains:
+    domain: [architecture]
+    concern: [dead_code, maintainability, security]
+  example_good: |
+    # vulture whitelist.py — explicit declaration of dynamically used code
+    from myapp.plugins import BasePlugin
+
+    # These are called via importlib.metadata entry_points — not direct calls
+    BasePlugin.register
+    BasePlugin.execute
+    BasePlugin.teardown
+
+    # CI step — fails if dead code found at 80%+ confidence
+    # .github/workflows/quality.yml
+    # - run: vulture src/ --min-confidence 80 whitelist.py
+
+    # After running vulture:
+    # vulture src/myapp/old_feature.py: unused function 'migrate_old_schema' (80%)
+    # → Delete old_feature.py entirely, update any soft references
+  example_bad: |
+    # src/utils/legacy.py — 400 lines, nobody imports it
+    def old_calculate_fee(amount, rate, multiplier, offset):  # vulture: 80% confidence
+        """Old fee calculation from 2021 — replaced by FeeCalculator class"""
+        return (amount * rate + offset) * multiplier
+
+    # Never deleted because "it might be needed someday"
+    # Contains: division by zero when multiplier=0, no tests exist for it
+  when_applies: >
+    Monthly in active projects, before major releases, and whenever onboarding new
+    engineers who would otherwise study dead code thinking it matters.
+  sources:
+    - "https://github.com/jendrikseipp/vulture"
+    - "https://coverage.readthedocs.io/en/stable/"
+
+- id: MOD-015
+  text: >
+    Enforce cyclomatic complexity <= 10 and cognitive complexity <= 15 per function.
+    Set method length limit to 40 lines. Fail CI on any function exceeding these
+    thresholds in new code. Legacy code gets a warning, not a failure.
+  why: >
+    Cyclomatic complexity (McCabe 1976) counts independent paths through code —
+    each path needs a test case. CC > 10 means 10+ test cases just for basic coverage,
+    which teams rarely write. Cognitive complexity (Sonar, 2018) better models
+    human comprehension: nested loops and conditions compound the reader's mental load
+    multiplicatively. Empirical data from SonarSource analysis of 10,000+ projects
+    showed functions with cognitive complexity > 25 had 3x the bug rate of functions
+    under 10. The 40-line limit is a forcing function: it prevents the "just one more
+    condition" accumulation that makes functions unreadable.
+  how_to_do_right: |
+    1. ruff.toml: [lint] select = ["C901"] and mccabe.max-complexity = 10
+    2. For cognitive complexity: pip install cognitive-complexity
+    3. Pre-commit hook:
+       ruff check --select C901 src/ || exit 1
+    4. Differentiate legacy vs new: use per-file-ignores for legacy paths
+    5. When refactoring triggered by CC: use Extract Method, early returns,
+       and guard clauses to reduce nesting
+    6. Guard clause pattern reduces nesting by 1 per condition:
+       if not valid: return/raise  (instead of wrapping body in if valid:)
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [ruff, sonar, radon]
+  domains:
+    domain: [architecture]
+    concern: [complexity, maintainability, testability]
+  example_good: |
+    # Guard clauses reduce cognitive complexity
+    def process_payment(order: Order, payment: Payment) -> Receipt:
+        if not order.is_active:         # Guard — early return, no nesting
+            raise OrderInactiveError(order.id)
+        if payment.amount <= 0:         # Guard
+            raise InvalidAmountError(payment.amount)
+        if not payment.is_valid():      # Guard
+            raise InvalidPaymentError(payment.id)
+
+        # Happy path: no nesting, reads sequentially
+        charge = self._gateway.charge(payment)
+        order.mark_paid(charge.id)
+        return Receipt.create(order, charge)
+
+    # ruff check result: C901 complexity=3, well under threshold of 10
+  example_bad: |
+    def process_payment(order, payment):
+        if order.is_active:           # Nesting +1
+            if payment.amount > 0:    # Nesting +2
+                if payment.is_valid():  # Nesting +3
+                    if not self._gateway.is_busy():  # Nesting +4
+                        # ... 30 more lines deeply nested
+                        pass
+    # Cognitive complexity ≈ 18, ruff C901 flags it at complexity > 10
+  when_applies: >
+    All new code in CI. Legacy code: track trend, enforce on any modified function.
+  sources:
+    - "https://docs.astral.sh/ruff/rules/complex-structure/"
+    - "https://docs.sonarsource.com/sonarqube/latest/user-guide/code-metrics/metrics-definition/"
+    - "McCabe, T.J. (1976). A Complexity Measure. IEEE Transactions on Software Engineering."
+
+- id: MOD-016
+  text: >
+    In monorepo setups, enforce strict module boundaries between packages using
+    import-linter or similar tools. No package should import from a sibling package's
+    internal modules (src/<pkg>/_internal/). Only public APIs (exposed in __init__.py)
+    are cross-package importable.
+  why: >
+    Monorepos without enforced boundaries become "distributed monoliths" — nominally
+    separate packages that are tightly coupled via internal imports. When team A's
+    package refactors an internal module, it breaks team B's code silently if they
+    import internals. A fintech monorepo with 12 packages had 340 cross-package
+    internal imports discovered by import-linter — making any internal refactor
+    a company-wide coordination problem. import-linter enforces the contract at CI time.
+  how_to_do_right: |
+    1. pip install import-linter
+    2. .importlinter config:
+       [importlinter]
+       root_package = mymonorepo
+       [[importlinter:contract:no-cross-internals]]
+       type = forbidden
+       source_modules = mymonorepo.pkg_a
+       forbidden_modules = mymonorepo.pkg_b._internal
+    3. Run: lint-imports → zero violations required
+    4. Public API rule: if not in pkg.__init__.__all__, it's private
+    5. Use implicit namespace packages (no __init__.py) for boundary clarity
+    6. Document the dependency DAG: pkg_a → pkg_b (allowed), pkg_b → pkg_a (forbidden)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [import-linter]
+  domains:
+    domain: [architecture]
+    concern: [modularity, monorepo, coupling]
+  example_good: |
+    # .importlinter
+    [importlinter]
+    root_packages = pkg_orders, pkg_payments, pkg_notifications
+
+    [[importlinter:contract:layer-contract]]
+    type = layers
+    layers =
+        pkg_orders
+        pkg_payments
+        pkg_notifications
+    # pkg_orders can import pkg_payments (higher depends on lower)
+    # pkg_payments CANNOT import pkg_orders (lower cannot depend on higher)
+
+    # Enforce in CI:
+    # - run: lint-imports
+    #   working-directory: .
+  example_bad: |
+    # pkg_orders/services.py — crosses boundary into internal module
+    from pkg_payments._internal.fee_calculator import _calculate_vat  # VIOLATION
+    # When pkg_payments refactors _calculate_vat, pkg_orders breaks
+    # lint-imports flags this immediately:
+    # "pkg_orders → pkg_payments._internal: forbidden import detected"
+  when_applies: >
+    Any Python monorepo with 2+ distinct packages that have separate ownership or
+    separate release cycles.
+  sources:
+    - "https://import-linter.readthedocs.io/en/stable/"
+    - "https://packaging.python.org/en/latest/discussions/src-layout-vs-flat-layout/"
+
+- id: MOD-017
+  text: >
+    Implement the Service Layer pattern: controllers/routes call services, services
+    implement business logic, repositories handle data access. No SQL in services,
+    no business logic in repositories, no business logic in routes.
+  why: >
+    Mixing concerns makes every layer harder to test in isolation. A route that
+    contains SQL forces you to set up a real database to test HTTP parsing logic.
+    A service that builds SQL queries makes it impossible to swap the database without
+    touching business logic. The three-layer discipline (route → service → repository)
+    keeps each layer independently testable with mocks at each boundary. FastAPI
+    projects without this pattern routinely have 1000-line router files that take
+    minutes to load in test suite setup.
+  how_to_do_right: |
+    1. Routes: parse HTTP, validate input (Pydantic), call service, return response
+       Zero: SQL, business rules, conditional logic beyond input validation
+    2. Services: orchestrate business logic, call repositories, enforce invariants
+       Zero: SQL queries, HTTP concepts (request/response), framework imports
+    3. Repositories: CRUD operations using ORM/raw SQL
+       Zero: business rules, HTTP, service orchestration
+    4. Test each layer independently:
+       - Routes: TestClient with mocked service
+       - Services: unit test with mocked repo
+       - Repos: integration test with real DB (or SQLite in-memory)
+    5. Service methods map 1:1 to use cases (not CRUD)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, django, sqlalchemy]
+  domains:
+    domain: [architecture]
+    concern: [layered_architecture, separation_of_concerns, testability]
+  example_good: |
+    # Route: HTTP only
+    @router.post("/orders", status_code=201)
+    async def create_order(
+        body: CreateOrderBody,
+        service: OrderService = Depends(get_order_service),
+    ) -> OrderResponse:
+        order = await service.place_order(body.customer_id, body.items)
+        return OrderResponse.from_domain(order)
+
+    # Service: business logic only
+    class OrderService:
+        def __init__(self, repo: OrderRepository, inventory: InventoryService):
+            self._repo = repo
+            self._inventory = inventory
+
+        async def place_order(self, customer_id: str, items: list[Item]) -> Order:
+            await self._inventory.reserve(items)  # Business rule: reserve first
+            order = Order.create(customer_id, items)
+            await self._repo.save(order)
+            return order
+
+    # Repository: data access only
+    class SqlOrderRepository:
+        async def save(self, order: Order) -> None:
+            self._session.add(OrderModel.from_domain(order))
+            await self._session.commit()
+  example_bad: |
+    @router.post("/orders")
+    async def create_order(body: dict, db: Session = Depends(get_db)):
+        # Business logic in route
+        if not body.get("items"):
+            raise HTTPException(400, "items required")
+        # SQL in route
+        row = db.execute("SELECT * FROM inventory WHERE sku = :sku", ...)
+        if row["stock"] < body["quantity"]:
+            raise HTTPException(409, "insufficient stock")
+        db.execute("INSERT INTO orders ...", ...)
+        db.commit()
+        return {"status": "created"}
+  when_applies: >
+    Any application with more than 5 routes or business rules that span multiple
+    data sources.
+  sources:
+    - "https://martinfowler.com/eaaCatalog/serviceLayer.html"
+    - "Martin Fowler (2002). Patterns of Enterprise Application Architecture. Addison-Wesley."
+
+- id: MOD-018
+  text: >
+    Implement the Repository pattern to abstract data access: define a Repository
+    Protocol, provide a SQL/ORM implementation, and ensure services never import
+    SQLAlchemy, pymongo, or any data access library directly.
+  why: >
+    Direct ORM imports in services couple business logic to the persistence mechanism.
+    Switching from PostgreSQL to DynamoDB — or from synchronous to async SQLAlchemy —
+    requires modifying every service. Repository abstraction means that change is
+    isolated to the infrastructure layer. Additionally, in-memory repositories for
+    tests run orders of magnitude faster than database-backed tests: a suite of 500
+    service tests runs in 0.3s with in-memory repos vs 45s with real PostgreSQL.
+  how_to_do_right: |
+    1. Define Repository Protocol with domain-language methods (not CRUD):
+       find_by_customer_id(), save(), delete() — not execute_query()
+    2. SQL implementation: import SQLAlchemy/psycopg only here
+    3. InMemory implementation: dict-backed, for unit tests
+    4. Services receive Repository via constructor injection
+    5. Never use generic base repositories (Repository[T]) — each aggregate root
+       gets a specific repository that reflects its access patterns
+    6. Repository methods operate on domain objects, not ORM models
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy, fastapi]
+  domains:
+    domain: [architecture]
+    concern: [repository_pattern, testability, separation_of_concerns]
+  example_good: |
+    from typing import Protocol
+
+    class OrderRepository(Protocol):
+        async def find_by_id(self, order_id: str) -> Order | None: ...
+        async def find_by_customer(self, customer_id: str) -> list[Order]: ...
+        async def save(self, order: Order) -> None: ...
+
+    # SQL implementation (infrastructure layer only)
+    class SqlAlchemyOrderRepository:
+        def __init__(self, session: AsyncSession):
+            self._session = session
+
+        async def find_by_id(self, order_id: str) -> Order | None:
+            row = await self._session.get(OrderModel, order_id)
+            return row.to_domain() if row else None
+
+        async def save(self, order: Order) -> None:
+            model = OrderModel.from_domain(order)
+            self._session.add(model)
+            await self._session.flush()
+
+    # In-memory for tests — 500 test cases run in 0.3s
+    class InMemoryOrderRepository:
+        def __init__(self): self._store: dict[str, Order] = {}
+        async def find_by_id(self, order_id: str) -> Order | None:
+            return self._store.get(order_id)
+        async def save(self, order: Order) -> None:
+            self._store[order.id] = order
+  example_bad: |
+    # Service directly using SQLAlchemy — untestable without DB
+    class OrderService:
+        def __init__(self, session: AsyncSession):  # SQLAlchemy in service!
+            self._session = session
+
+        async def get_order(self, order_id: str) -> Order:
+            result = await self._session.execute(
+                select(OrderModel).where(OrderModel.id == order_id)
+            )
+            return result.scalar_one().to_domain()
+  when_applies: >
+    Any application with persistent storage and business logic that must be
+    independently testable.
+  sources:
+    - "https://martinfowler.com/eaaCatalog/repository.html"
+    - "Martin Fowler (2002). Patterns of Enterprise Application Architecture. Addison-Wesley."
+
+- id: MOD-019
+  text: >
+    Manage configuration using pydantic-settings with environment variables as
+    the source of truth (12-factor app). Never hardcode environment-specific values;
+    never use os.environ.get() with inline defaults scattered across modules.
+  why: >
+    Scattered os.environ.get("DB_URL", "sqlite:///dev.db") calls create invisible
+    configuration dependencies. When a value is missing in production, the default
+    silently activates — SQLite runs in production instead of PostgreSQL, caching is
+    disabled, and debug logging streams to stdout. A single pydantic-settings class
+    makes ALL configuration requirements explicit, validates types and constraints
+    at startup, and fails fast with a clear error if a required variable is absent.
+    The alternative — missing required config discovered at 2AM during a production
+    incident — is not acceptable.
+  how_to_do_right: |
+    1. pip install pydantic-settings
+    2. Create settings.py with Settings(BaseSettings) class
+    3. Declare ALL config as typed fields with validators
+    4. Required fields: no default (missing = startup failure with clear message)
+    5. Optional fields: explicit default with documentation in Field(description=...)
+    6. Load once at startup: settings = Settings() in app factory
+    7. Pass settings to constructors, never import globally inside modules
+    8. Never call os.environ.get() outside of settings.py
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [pydantic-settings, fastapi]
+  domains:
+    domain: [architecture]
+    concern: [configuration, twelve_factor, security]
+  example_good: |
+    from pydantic import Field, AnyUrl, SecretStr, field_validator
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+
+    class Settings(BaseSettings):
+        model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
+        # Required — startup fails immediately if missing
+        database_url: AnyUrl
+        redis_url: AnyUrl
+        secret_key: SecretStr
+
+        # Optional with validated defaults
+        debug: bool = False
+        max_connections: int = Field(default=10, ge=1, le=100)
+        api_timeout_ms: int = Field(default=5000, ge=100, le=30000)
+
+        @field_validator("database_url")
+        @classmethod
+        def reject_sqlite_in_production(cls, v: AnyUrl, info) -> AnyUrl:
+            if not info.data.get("debug") and str(v).startswith("sqlite"):
+                raise ValueError("SQLite not allowed in production (debug=False)")
+            return v
+
+    # Load once
+    settings = Settings()  # Raises ValidationError immediately if config invalid
+  example_bad: |
+    # Scattered os.environ.get() — configuration hidden across 20 files
+    # db.py
+    DB_URL = os.environ.get("DATABASE_URL", "sqlite:///app.db")  # SQLite default!
+    # cache.py
+    REDIS_URL = os.environ.get("REDIS_URL", "")  # Empty string → cache silently disabled
+    # auth.py
+    SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-key")  # DEV KEY IN PRODUCTION
+  when_applies: >
+    All applications deployed to more than one environment (dev/staging/prod).
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/pydantic_settings/"
+    - "https://12factor.net/config"
+
+- id: MOD-020
+  text: >
+    Use Move Method refactoring when a method uses more data from another class
+    than from its own class. The method belongs where its data is. This is Fowler's
+    most commonly needed refactoring in object-heavy codebases.
+  why: >
+    A method that constantly calls self.order.items, self.order.customer,
+    self.order.payment is really an Order method that happens to be in the wrong class.
+    Feature Envy (Fowler's code smell) causes excessive getter chains, exposes internals
+    unnecessarily, and violates Tell Don't Ask — you're asking an object for its data
+    to do something it should do itself. Teams that leave Feature Envy unaddressed
+    end up with anemic domain models: 300-line service classes orchestrating dumb data
+    containers, every business rule in the service rather than in the domain object.
+  how_to_do_right: |
+    1. Identify methods that reference external object more than self
+    2. Count: references to self.X vs references to other.X in the method body
+    3. If other.X > self.X: move method to other's class
+    4. The moved method may need to accept parameters for data it previously
+       accessed from the original class
+    5. Update all callers: old_class.method(order) → order.method()
+    6. Result: richer domain objects, thinner services
+  severity: medium
+  technologies:
+    lang: [python]
+  domains:
+    domain: [architecture]
+    concern: [refactoring, domain_model, cohesion]
+  example_good: |
+    # Before: feature envy — OrderService knows too much about Order internals
+    class OrderService:
+        def calculate_total(self, order: Order) -> Decimal:  # Feature Envy
+            subtotal = sum(i.price * i.qty for i in order.items)
+            tax = subtotal * order.tax_rate
+            discount = order.coupon.discount if order.coupon else Decimal(0)
+            return subtotal + tax - discount
+
+    # After: Move Method to Order — tell, don't ask
+    class Order:
+        def calculate_total(self) -> Decimal:
+            subtotal = sum(i.price * i.qty for i in self.items)
+            tax = subtotal * self.tax_rate
+            discount = self.coupon.discount if self.coupon else Decimal(0)
+            return subtotal + tax - discount
+
+    class OrderService:
+        def process(self, order: Order) -> Receipt:
+            total = order.calculate_total()  # Clean — just calls the domain
+            return self._repo.create_receipt(order, total)
+  example_bad: |
+    class InvoiceGenerator:
+        def generate(self, order: Order) -> Invoice:
+            # 15 references to order.X, 0 references to self.X
+            line_items = [{"sku": i.sku, "qty": i.qty, "price": i.price}
+                          for i in order.items]
+            total = sum(i["price"] * i["qty"] for i in line_items)
+            # This entire method belongs in Order or a value object on Order
+            return Invoice(items=line_items, total=total, customer=order.customer.name)
+  when_applies: >
+    When a method references another object's attributes/methods more than its own.
+    During domain model design phase and during service-layer thinning refactors.
+  sources:
+    - "Martin Fowler (2018). Refactoring, 2nd Edition — 'Move Method'. Addison-Wesley."
+    - "https://martinfowler.com/books/refactoring.html"
+
+- id: MOD-021
+  text: >
+    Use namespace packages (PEP 420 / implicit namespace packages — directories
+    without __init__.py) for cross-organization package namespacing. Use regular
+    packages (with __init__.py) for all other cases.
+  why: >
+    Namespace packages allow multiple distributions to contribute to the same
+    top-level package namespace — e.g., myorg.auth installed from one repo and
+    myorg.payments from another, both importable as `from myorg.auth import ...`.
+    Regular packages with __init__.py block this: installing a second distribution
+    that also has __init__.py for the same namespace will shadow the first.
+    Mistakenly using regular packages for organization-wide namespaces is a
+    common error that causes "package installed but not importable" bugs when
+    two distributions share a top-level name.
+  how_to_do_right: |
+    1. Top-level namespace package (myorg/): no __init__.py — namespace package
+    2. Each sub-package (myorg/auth/, myorg/payments/): has __init__.py — regular
+    3. pyproject.toml: [tool.setuptools.packages.find] namespaces = true
+    4. Test: install both distributions, verify both are importable
+    5. Avoid: mixing namespace and regular packages at same level (undefined behavior)
+    6. When NOT to use: internal mono-repo where you control all packages — use
+       regular packages for simplicity and explicit import control
+  severity: low
+  technologies:
+    lang: [python]
+    framework: [setuptools]
+  domains:
+    domain: [architecture, packaging]
+    concern: [namespace_packages, modularity]
+  example_good: |
+    # Repo 1: myorg-auth
+    myorg/              # NO __init__.py — namespace package
+    └── auth/
+        ├── __init__.py  # Regular package
+        └── client.py
+
+    # Repo 2: myorg-payments (separate distribution)
+    myorg/              # NO __init__.py — namespace package
+    └── payments/
+        ├── __init__.py
+        └── gateway.py
+
+    # After installing both:
+    from myorg.auth import Client      # Works
+    from myorg.payments import Gateway # Works — namespace merging
+
+    # pyproject.toml (both repos)
+    [tool.setuptools.packages.find]
+    where = ["src"]
+    namespaces = true
+  example_bad: |
+    # Repo 1: adds __init__.py to top-level namespace
+    myorg/__init__.py   # BLOCKS namespace packages!
+    myorg/auth/__init__.py
+
+    # Installing Repo 2 with the same myorg/__init__.py shadows Repo 1:
+    # from myorg.auth import Client  →  ModuleNotFoundError (shadowed)
+  when_applies: >
+    Multi-repository organizations sharing a top-level package namespace.
+    Not needed for monorepo or single-distribution packages.
+  sources:
+    - "https://setuptools.pypa.io/en/latest/userguide/package_discovery.html"
+    - "https://packaging.python.org/en/latest/guides/packaging-namespace-packages/"
+
+- id: MOD-022
+  text: >
+    Apply the Mediator pattern to resolve runtime circular dependencies between
+    modules that cannot be solved by restructuring: both modules register handlers
+    with a central mediator, sending messages by name instead of calling each
+    other directly.
+  why: >
+    Some circular dependencies are genuinely architectural — bidirectional
+    event flows where A must notify B and B must notify A. Restructuring to remove
+    the cycle would eliminate a required feature. The Mediator (or event bus) breaks
+    the runtime dependency: A.publish("order_placed", data) and B.subscribe("order_placed")
+    without either module knowing the other exists. This is the pattern used by
+    Django signals, Flask's blinker, and most event-driven architectures. It comes
+    at the cost of indirection — harder to trace execution flow.
+  how_to_do_right: |
+    1. Identify the bidirectional communication need (A calls B, B calls A)
+    2. Define event names as constants in a shared events.py (no circular import)
+    3. A publishes events; B subscribes to events — neither imports the other
+    4. Mediator can be synchronous (blinker.signal) or async (Redis Streams, asyncio)
+    5. Log all published events for debuggability (the indirection is costly if hidden)
+    6. Use mediator only when restructuring is genuinely impossible — it's a last resort
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [blinker, redis]
+  domains:
+    domain: [architecture]
+    concern: [circular_imports, event_driven, coupling]
+  example_good: |
+    # events.py — shared constants, no circular import
+    ORDER_PLACED = "order_placed"
+    INVENTORY_RESERVED = "inventory_reserved"
+
+    # order_service.py — publishes, never imports InventoryService
+    from blinker import signal
+    from myapp.events import ORDER_PLACED
+
+    order_placed = signal(ORDER_PLACED)
+
+    class OrderService:
+        def place_order(self, order: Order) -> None:
+            self._repo.save(order)
+            order_placed.send(self, order=order)  # No import of InventoryService
+
+    # inventory_service.py — subscribes, never imports OrderService
+    from blinker import signal
+    from myapp.events import ORDER_PLACED
+
+    class InventoryService:
+        def __init__(self):
+            signal(ORDER_PLACED).connect(self._on_order_placed)
+
+        def _on_order_placed(self, sender, order: Order, **kwargs):
+            self._reserve_items(order.items)
+  example_bad: |
+    # Trying to solve bidirectional need with late imports — hidden, fragile
+    class OrderService:
+        def place_order(self, order: Order) -> None:
+            self._repo.save(order)
+            from myapp.inventory_service import InventoryService  # Late import: anti-pattern
+            InventoryService().reserve(order.items)
+  when_applies: >
+    Bidirectional runtime communication requirements where architectural restructuring
+    is not feasible. Use only after confirming Interface Extraction and DIP cannot solve it.
+  sources:
+    - "https://martinfowler.com/eaaDev/EventSourcing.html"
+    - "https://blinker.readthedocs.io/en/stable/"
+
+- id: MOD-023
+  text: >
+    Apply the Restructuring strategy as the permanent fix for circular imports
+    caused by poor package boundaries: merge tightly coupled modules into one,
+    or extract a new package that both original modules depend on.
+  why: >
+    When modules A and B are so tightly coupled that they need each other's runtime
+    objects AND share a coherent concept, they should be one module. The circular
+    import is the compiler's way of telling you your mental model has a boundary
+    in the wrong place. Alternatively, if A and B both need a concept C that neither
+    currently owns, C should become its own module. Both strategies eliminate the
+    cycle at the root, unlike all patching approaches (late imports, TYPE_CHECKING,
+    mediator) which manage the symptom.
+  how_to_do_right: |
+    1. Map the actual coupling: draw a graph of what A imports from B and vice versa
+    2. Decision rule: if A and B form a single coherent concept, merge into one module
+    3. Decision rule: if A and B both depend on concept C that neither owns,
+       extract C as a new module; A and B both depend on C
+    4. Decision rule: if the coupling is only for types, use TYPE_CHECKING (MOD-004)
+    5. Decision rule: if runtime bidirectional call is genuinely needed, use Mediator (MOD-022)
+    6. After restructuring: run full test suite + vulture to find newly dead code
+  severity: high
+  technologies:
+    lang: [python]
+  domains:
+    domain: [architecture]
+    concern: [circular_imports, package_design, restructuring]
+  example_good: |
+    # Before: circular between order.py and payment.py
+    # order.py: from payment import Payment (needs Payment type at runtime)
+    # payment.py: from order import Order (needs Order to validate amount)
+
+    # Analysis: both need "money amount" concept → extract it
+    # After restructuring:
+    # money.py — new module, depends on nothing
+    from decimal import Decimal
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class Money:
+        amount: Decimal
+        currency: str
+
+        def __add__(self, other: "Money") -> "Money":
+            if self.currency != other.currency:
+                raise ValueError(f"Cannot add {self.currency} + {other.currency}")
+            return Money(self.amount + other.amount, self.currency)
+
+    # order.py — imports Money, not Payment
+    from myapp.money import Money
+    class Order:
+        total: Money
+
+    # payment.py — imports Money, not Order
+    from myapp.money import Money
+    class Payment:
+        amount: Money
+        # Zero circular import — both depend on money.py, which depends on nothing
+  example_bad: |
+    # "Fix" by adding late import — circular dependency persists, now invisible
+    # order.py
+    class Order:
+        def get_payment(self):
+            from myapp.payment import Payment  # Late import hides circular coupling
+            return Payment(self.total)
+    # The structural problem remains; restructuring is the only real fix
+  when_applies: >
+    When circular imports cannot be resolved with TYPE_CHECKING, Interface Extraction,
+    or DIP — indicating a genuine package boundary error.
+  sources:
+    - "https://medium.com/@denis.volokh/the-circular-import-trap-in-python-and-how-to-escape-it-9fb22925dab6"
+    - "Martin Fowler (2018). Refactoring, 2nd Edition. Addison-Wesley."

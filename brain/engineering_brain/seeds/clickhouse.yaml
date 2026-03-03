@@ -1,0 +1,578 @@
+layer: rules
+technology: ClickHouse
+domain: analytics
+knowledge:
+- id: CR-CH-ENG-001
+  text: Use MergeTree as the default table engine for analytics — it provides columnar storage, sparse indexing, data compression,
+    and is the foundation for all other MergeTree-family engines.
+  why: MergeTree stores data in sorted order by the ORDER BY key, uses columnar storage for compression (10-40x typical),
+    and builds sparse primary indexes (one entry per ~8192 rows by default) for fast range scans. Non-MergeTree engines (Memory,
+    Log, TinyLog) lack replication, indexing, or persistence guarantees. The MergeTree family (Replacing, Aggregating, Collapsing)
+    all extend MergeTree with specific merge behaviors. Choosing the wrong engine means missing compression (10x storage cost),
+    missing indexing (full scans), or missing merge semantics (incorrect query results). Every production ClickHouse table
+    should use a MergeTree-family engine.
+  how_to_do_right: Use MergeTree for append-only analytics. Use ReplacingMergeTree when you need deduplication by version.
+    Use AggregatingMergeTree for pre-aggregated rollups. Use CollapsingMergeTree for mutable data with row versioning. Always
+    specify ORDER BY (determines physical sort and primary index). Choose partition key based on common query filters (usually
+    date). Set index_granularity to 8192 (default) unless benchmarks show otherwise.
+  severity: critical
+  technologies:
+    platform: [clickhouse]
+  domains:
+    domain: [architecture]
+    concern: [data, analytics, database]
+  example_good: "-- MergeTree for append-only event analytics\nCREATE TABLE events (\n  event_date Date,\n  event_time DateTime,\n\
+    \  user_id UInt64,\n  event_type LowCardinality(String),\n  page_url String,\n  duration_ms UInt32,\n  properties Map(String,\
+    \ String)\n)\nENGINE = MergeTree()\nPARTITION BY toYYYYMM(event_date)       -- Monthly partitions\nORDER BY (event_type,\
+    \ user_id, event_time)  -- Sort for common queries\nTTL event_date + INTERVAL 90 DAY DELETE  -- Auto-delete after 90 days\n\
+    SETTINGS index_granularity = 8192;\n\n-- Verify compression ratio\nSELECT\n  table,\n  formatReadableSize(sum(data_compressed_bytes))\
+    \ AS compressed,\n  formatReadableSize(sum(data_uncompressed_bytes)) AS uncompressed,\n  round(sum(data_uncompressed_bytes)\
+    \ / sum(data_compressed_bytes), 2) AS ratio\nFROM system.columns\nWHERE database = currentDatabase() AND table = 'events'\n\
+    GROUP BY table;\n-- Typical: 15-30x compression ratio\n"
+  example_bad: '-- Memory engine — no persistence, data lost on restart
+
+    CREATE TABLE events (...) ENGINE = Memory;
+
+    -- Server restart = all data gone
+
+    -- No disk storage = limited by RAM
+
+
+    -- Log engine — no indexes, no replication
+
+    CREATE TABLE events (...) ENGINE = Log;
+
+    -- Full scan for every query — no sparse index
+
+    -- Cannot replicate — no HA
+
+
+    -- MergeTree without ORDER BY optimization
+
+    CREATE TABLE events (...) ENGINE = MergeTree() ORDER BY tuple();
+
+    -- No meaningful sort order → no index benefit
+
+    -- Every query is a full scan through all granules
+
+    '
+  when_applies: Any project using ClickHouse analytics queries
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using ClickHouse
+  sources: ["https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree"]
+- id: CR-CH-ENG-002
+  text: Use ReplacingMergeTree for deduplication — it keeps the latest version of each row (by the ORDER BY key) during background
+    merges, but always query with FINAL or GROUP BY to ensure deduplicated results.
+  why: 'ClickHouse inserts data into new data parts without checking for existing rows. Duplicate inserts (retries, at-least-once
+    delivery) create duplicate rows. ReplacingMergeTree marks old versions for removal during background merges, keeping only
+    the row with the highest version column value. However, merges are asynchronous — at any point in time, multiple versions
+    of the same row may exist in different parts. Without FINAL or explicit GROUP BY deduplication in queries, you get duplicate
+    rows in results. This is the most common ClickHouse correctness mistake: assuming ReplacingMergeTree automatically deduplicates
+    at query time.'
+  how_to_do_right: 'Use ReplacingMergeTree(version_column) where version_column is a UInt32/DateTime that increases with each
+    update. For correct reads: use SELECT ... FINAL (forces merge at query time, slower) or use GROUP BY on the ORDER BY key
+    with argMax() to pick the latest version (more flexible, more efficient). For critical queries, use FINAL. For dashboards
+    where slight staleness is acceptable, schedule OPTIMIZE TABLE periodically.'
+  severity: critical
+  technologies:
+    platform: [clickhouse]
+  domains:
+    domain: [architecture]
+    concern: [data, analytics, database, data-quality]
+  example_good: "-- ReplacingMergeTree with version column\nCREATE TABLE user_profiles (\n  user_id UInt64,\n  name String,\n\
+    \  email String,\n  updated_at DateTime,\n  version UInt32\n)\nENGINE = ReplacingMergeTree(version)\nORDER BY user_id\n\
+    PARTITION BY toYYYYMM(updated_at);\n\n-- Method 1: FINAL keyword (correct, simple, slower on large tables)\nSELECT * FROM\
+    \ user_profiles FINAL WHERE user_id = 12345;\n\n-- Method 2: GROUP BY with argMax (more efficient for analytics)\nSELECT\n\
+    \  user_id,\n  argMax(name, version) AS name,\n  argMax(email, version) AS email,\n  max(updated_at) AS last_updated\n\
+    FROM user_profiles\nGROUP BY user_id;\n\n-- Method 3: Periodic background optimization\nOPTIMIZE TABLE user_profiles FINAL;\
+    \  -- Force merge all parts\n"
+  example_bad: '-- Querying ReplacingMergeTree without FINAL or dedup
+
+    SELECT * FROM user_profiles WHERE user_id = 12345;
+
+    -- May return MULTIPLE rows for the same user_id!
+
+    -- Row from part_1: {user_id: 12345, name: ''Alice'', version: 1}
+
+    -- Row from part_2: {user_id: 12345, name: ''Alice B.'', version: 2}
+
+    -- Both returned because parts haven''t merged yet
+
+
+    -- Assuming OPTIMIZE runs automatically
+
+    -- Background merges happen eventually, but no timing guarantee
+
+    -- Critical reports MUST use FINAL or GROUP BY dedup
+
+    '
+  when_applies: Any project using ClickHouse analytics queries
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using ClickHouse
+  sources: ["https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/replacingmergetree"]
+- id: CR-CH-ENG-003
+  text: Use AggregatingMergeTree with materialized views for pre-computed rollups — it merges partial aggregation states,
+    reducing query time from minutes to milliseconds on billion-row tables.
+  why: 'Querying raw event data for aggregated metrics (daily active users, hourly revenue) scans billions of rows every time.
+    AggregatingMergeTree stores intermediate aggregation states (partial sums, HyperLogLog sketches, quantile states) that
+    are merged during background merges and at query time. A materialized view triggers on INSERT, computing the partial aggregate
+    and inserting it into the AggregatingMergeTree table. A query on the rollup table reads pre-aggregated data — scanning
+    thousands of rows instead of billions. This is ClickHouse''s answer to OLAP cubes: real-time, incremental, and storage-efficient.'
+  how_to_do_right: Create the target table with AggregatingMergeTree. Use AggregateFunction(func, type) columns for state
+    storage. Create a materialized view with -State combinators (sumState, uniqState, quantileState) that writes to the target
+    table on every INSERT to the source table. Query with -Merge combinators (sumMerge, uniqMerge, quantileMerge). GROUP BY
+    the aggregation key + FINAL or use the appropriate combinators.
+  severity: high
+  technologies:
+    platform: [clickhouse]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, analytics, database]
+  example_good: "-- Source table: raw events (billions of rows)\nCREATE TABLE events (\n  event_date Date,\n  user_id UInt64,\n\
+    \  event_type String,\n  revenue Decimal(10,2)\n) ENGINE = MergeTree()\nPARTITION BY toYYYYMM(event_date)\nORDER BY (event_date,\
+    \ event_type, user_id);\n\n-- Rollup table: pre-aggregated daily metrics\nCREATE TABLE daily_metrics (\n  event_date Date,\n\
+    \  event_type LowCardinality(String),\n  revenue_sum AggregateFunction(sum, Decimal(10,2)),\n  user_count AggregateFunction(uniq,\
+    \ UInt64),\n  event_count AggregateFunction(count)\n) ENGINE = AggregatingMergeTree()\nORDER BY (event_date, event_type);\n\
+    \n-- Materialized view: auto-populates rollup on INSERT\nCREATE MATERIALIZED VIEW daily_metrics_mv TO daily_metrics AS\n\
+    SELECT\n  event_date,\n  event_type,\n  sumState(revenue) AS revenue_sum,\n  uniqState(user_id) AS user_count,\n  countState()\
+    \ AS event_count\nFROM events\nGROUP BY event_date, event_type;\n\n-- Query rollup (milliseconds instead of minutes)\n\
+    SELECT\n  event_date,\n  event_type,\n  sumMerge(revenue_sum) AS total_revenue,\n  uniqMerge(user_count) AS unique_users,\n\
+    \  countMerge(event_count) AS total_events\nFROM daily_metrics\nWHERE event_date >= '2026-01-01'\nGROUP BY event_date,\
+    \ event_type\nORDER BY event_date;\n"
+  example_bad: "-- Querying raw table for every dashboard refresh\nSELECT\n  event_date,\n  event_type,\n  sum(revenue),\n\
+    \  uniqExact(user_id),\n  count()\nFROM events  -- 10 billion rows\nWHERE event_date >= '2026-01-01'\nGROUP BY event_date,\
+    \ event_type;\n-- Scans billions of rows every time\n-- 45 seconds per dashboard refresh\n-- With AggregatingMergeTree:\
+    \ 15ms (3000x faster)\n"
+  when_applies: Projects using ClickHouse analytics queries
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using ClickHouse
+  sources: ["https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/aggregatingmergetree"]
+- id: CR-CH-SCH-001
+  text: The ORDER BY key determines physical data layout and primary index — choose it based on your most common query filters,
+    not just any unique identifier.
+  why: ClickHouse's sparse primary index stores one entry per granule (8192 rows by default). It can only efficiently skip
+    granules when the query filter matches a prefix of the ORDER BY key. ORDER BY (user_id, event_time) efficiently handles
+    queries filtering by user_id or (user_id AND event_time), but NOT by event_time alone (must scan all granules). This is
+    unlike traditional B-tree indexes that can be created on any column independently. The ORDER BY key is the ONLY indexing
+    mechanism for data skipping in ClickHouse — getting it wrong means full scans for your primary query patterns.
+  how_to_do_right: 'Analyze your top 5 query patterns. Put the most frequently filtered column first in ORDER BY. Order by
+    cardinality: low cardinality first (event_type: 20 values), then higher cardinality (user_id: 1M values), then time. This
+    maximizes data skipping because granules with the same low-cardinality value are contiguous. If you need different sort
+    orders for different queries, use projections (secondary sort orders stored alongside the main data).'
+  severity: critical
+  technologies:
+    platform: [clickhouse]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, analytics, database]
+  example_good: "-- ORDER BY optimized for common queries\n-- Most queries filter by: event_type, then user_id, then time\
+    \ range\nCREATE TABLE events (\n  event_date Date,\n  event_time DateTime,\n  event_type LowCardinality(String),\n  user_id\
+    \ UInt64,\n  payload String\n)\nENGINE = MergeTree()\nPARTITION BY toYYYYMM(event_date)\nORDER BY (event_type, user_id,\
+    \ event_time);\n\n-- This ORDER BY enables efficient data skipping for:\n-- WHERE event_type = 'click'               \
+    \              (skips ~95% of granules)\n-- WHERE event_type = 'click' AND user_id = 123           (skips ~99.9%)\n--\
+    \ WHERE event_type = 'click' AND user_id = 123 AND time  (skips ~99.99%)\n\n-- Projection for queries that filter by time\
+    \ first\nALTER TABLE events ADD PROJECTION events_by_time (\n  SELECT * ORDER BY (event_date, event_time, event_type)\n\
+    );\nALTER TABLE events MATERIALIZE PROJECTION events_by_time;\n-- Now: WHERE event_date = '2026-02-15' also skips efficiently\n"
+  example_bad: '-- ORDER BY only on high-cardinality column
+
+    CREATE TABLE events (...) ENGINE = MergeTree() ORDER BY user_id;
+
+    -- Queries on event_type scan ALL granules (not in ORDER BY prefix)
+
+    -- WHERE event_type = ''click'' → full scan of all data
+
+
+    -- ORDER BY tuple() — no ordering at all
+
+    CREATE TABLE events (...) ENGINE = MergeTree() ORDER BY tuple();
+
+    -- No data skipping for ANY query filter — every query is a full scan
+
+    '
+  when_applies: Any project using ClickHouse analytics queries
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using ClickHouse
+  sources: ["https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree#primary-keys-and-indexes-in-queries"]
+- id: CR-CH-SCH-002
+  text: Use the PARTITION BY key for data management (drop/move operations), NOT for query performance — partition pruning
+    supplements, not replaces, ORDER BY-based data skipping.
+  why: 'Partitioning in ClickHouse creates separate data directories per partition value. Its primary purpose is data lifecycle
+    management: DROP PARTITION instantly removes old data, MOVE PARTITION relocates data between disks/tables. Query-time
+    partition pruning is a secondary benefit — the planner skips entire partitions that do not match the WHERE clause. However,
+    too many partitions (e.g., partition by day + event_type = 365 * 20 = 7300 partitions) create excessive file handles,
+    metadata overhead, and slower merges. The ORDER BY key handles query performance via granule skipping — partitions handle
+    data management.'
+  how_to_do_right: 'Partition by month (toYYYYMM) for most time-series data. For very high-volume data (>1TB/day), partition
+    by day or week. Never partition by high-cardinality columns (user_id, session_id). Keep total partitions under 1000 per
+    table. Use TTL for automatic data expiration instead of manual DROP PARTITION when possible. Verify partition pruning
+    with EXPLAIN: ''Selected X/Y parts'' shows how many parts were pruned.'
+  severity: high
+  technologies:
+    platform: [clickhouse]
+  domains:
+    domain: [architecture, operations]
+    concern: [data, analytics, database]
+  example_good: "-- Partition by month — balanced lifecycle management\nCREATE TABLE events (\n  event_date Date,\n  event_time\
+    \ DateTime,\n  user_id UInt64,\n  event_type String,\n  payload String\n)\nENGINE = MergeTree()\nPARTITION BY toYYYYMM(event_date)\n\
+    ORDER BY (event_type, user_id, event_time);\n\n-- Instant data deletion — no scan, no vacuum\nALTER TABLE events DROP\
+    \ PARTITION 202501;  -- Removes Jan 2025 instantly\n\n-- TTL for automatic lifecycle\nALTER TABLE events MODIFY TTL event_date\
+    \ + INTERVAL 90 DAY;\n-- Old data automatically deleted during merges\n\n-- Move cold data to cheaper storage\nALTER TABLE\
+    \ events MOVE PARTITION 202506 TO DISK 's3_cold';\n"
+  example_bad: '-- Too many partitions — performance degradation
+
+    CREATE TABLE events (...)
+
+    ENGINE = MergeTree()
+
+    PARTITION BY (toYYYYMMDD(event_date), event_type);
+
+    -- 365 days × 20 event types = 7300 partitions per year
+
+    -- Each partition has its own data parts → excessive file handles
+
+    -- Background merges compete across 7300 partitions → slow
+
+
+    -- Partitioning by high-cardinality column
+
+    PARTITION BY user_id
+
+    -- 1M users = 1M partitions → filesystem collapse
+
+    -- Each partition has tiny data parts → no compression benefit
+
+    '
+  when_applies: Projects using ClickHouse analytics queries
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using ClickHouse
+  sources: ["https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/custom-partitioning-key"]
+- id: CR-CH-QRY-001
+  text: Use PREWHERE instead of WHERE for column-pruning filters — PREWHERE reads only the filter column first, then reads
+    remaining columns only for matching rows.
+  why: ClickHouse stores data in columnar format — each column is a separate file. A regular WHERE reads all columns for all
+    granules, then filters. PREWHERE reads only the PREWHERE column(s) first, identifies matching granules, and then reads
+    the remaining columns only for those granules. For a query selecting 10 columns but filtering on 1 column that eliminates
+    99% of rows, PREWHERE reads 1 column fully + 10 columns for 1% of rows = ~1.1 columns of I/O. Regular WHERE reads all
+    10 columns fully = 10 columns of I/O. This 10x I/O reduction directly translates to 10x faster queries. ClickHouse automatically
+    moves appropriate conditions to PREWHERE, but understanding when to force it helps.
+  how_to_do_right: 'ClickHouse moves lightweight filter conditions to PREWHERE automatically (optimize_move_to_prewhere =
+    1, default). Manually use PREWHERE when: (1) you have a highly selective filter on a small column, (2) automatic PREWHERE
+    is not triggered (complex expressions). Do NOT PREWHERE on columns that match most rows (not selective) or on heavy columns
+    (String, Array) — reading the full column twice (PREWHERE + remaining) is slower. Use EXPLAIN to verify PREWHERE is applied.'
+  severity: high
+  technologies:
+    platform: [clickhouse]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, analytics]
+  example_good: '-- PREWHERE on selective, small column
+
+    SELECT user_id, event_type, payload, properties
+
+    FROM events
+
+    PREWHERE event_type = ''purchase''  -- Filters 99% of rows
+
+    WHERE event_date >= ''2026-01-01''
+
+    -- Reads: event_type column fully (small, LowCardinality)
+
+    -- Then: user_id, payload, properties ONLY for ''purchase'' rows (1%)
+
+    -- I/O: ~1.03 columns instead of 4 columns
+
+
+    -- Verify with EXPLAIN
+
+    EXPLAIN
+
+    SELECT * FROM events WHERE event_type = ''purchase'' AND user_id = 123;
+
+    -- Should show: PREWHERE event_type = ''purchase''
+
+    -- Then: WHERE user_id = 123
+
+
+    -- Automatic PREWHERE (enabled by default)
+
+    SET optimize_move_to_prewhere = 1;  -- Default
+
+    '
+  example_bad: '-- PREWHERE on non-selective column
+
+    SELECT * FROM events PREWHERE status != ''deleted''
+
+    -- status != ''deleted'' matches 99.5% of rows
+
+    -- Reads status column fully, then reads ALL other columns for 99.5%
+
+    -- No benefit — actually slightly slower than WHERE (reads status twice)
+
+
+    -- PREWHERE on heavy column
+
+    SELECT * FROM events PREWHERE payload LIKE ''%error%''
+
+    -- payload is a large String column — reading it fully is expensive
+
+    -- Better as WHERE: let ClickHouse read all columns in parallel
+
+    '
+  when_applies: Projects using ClickHouse analytics queries
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using ClickHouse
+  sources: ["https://clickhouse.com/docs/en/sql-reference/statements/select/prewhere"]
+- id: CR-CH-QRY-002
+  text: Use approximate functions (uniqHLL, quantileTDigest, quantileDDSketch) for analytics dashboards — they are 10-100x
+    faster than exact counterparts with <1% error.
+  why: Exact COUNT(DISTINCT user_id) on 1 billion rows requires storing all unique values in a hash set — gigabytes of memory
+    and minutes of computation. uniqHLL12 (HyperLogLog) uses 2.5KB of memory per counter and provides cardinality estimates
+    with <1% error. Exact quantile computation requires sorting all values — O(N log N). quantileTDigest uses a compact data
+    structure with bounded memory and <1% error for common percentiles. For dashboards and monitoring where exact values are
+    unnecessary, approximate functions reduce query time from minutes to milliseconds while using orders of magnitude less
+    memory.
+  how_to_do_right: 'Use uniq() (default: HyperLogLog) instead of uniqExact() for unique counts. Use quantile() (default: quantileTDigest)
+    instead of quantileExact(). For pre-aggregation in AggregatingMergeTree, use uniqState/uniqMerge. The error bounds: uniq
+    = ±2-3%, uniqCombined = ±1%, uniqHLL12 = ±1.6%. For reporting with <0.5% error requirement, use uniqCombined64. Always
+    document which queries use approximations.'
+  severity: medium
+  technologies:
+    platform: [clickhouse]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, analytics]
+  example_good: "-- Approximate unique users (HyperLogLog, ~1% error)\nSELECT\n  event_date,\n  uniq(user_id) AS unique_users,\
+    \            -- ~1-3% error, 10x faster\n  quantile(0.95)(response_time) AS p95,     -- TDigest, <1% error\n  quantile(0.99)(response_time)\
+    \ AS p99\nFROM events\nWHERE event_date >= '2026-01-01'\nGROUP BY event_date\nORDER BY event_date;\n-- 500ms on 10B rows\
+    \ (approximate)\n-- vs 45s with uniqExact + quantileExact\n\n-- When you need higher precision\nSELECT uniqCombined64(user_id)\
+    \ AS unique_users  -- <0.5% error\nFROM events;\n\n-- When you need exact (batch reports, billing)\nSELECT uniqExact(user_id)\
+    \ AS exact_unique_users\nFROM events\nWHERE event_date = '2026-02-15';  -- Small date range = affordable\n"
+  example_bad: "-- Exact functions on large datasets for dashboards\nSELECT\n  event_date,\n  uniqExact(user_id) AS unique_users,\n\
+    \  quantileExact(0.95)(response_time) AS p95\nFROM events\nWHERE event_date >= '2025-01-01'\nGROUP BY event_date;\n--\
+    \ 45 seconds, 8GB memory\n-- For a dashboard that refreshes every 30 seconds = always stale\n\n-- Using COUNT(DISTINCT)\
+    \ — alias for uniqExact in ClickHouse\nSELECT COUNT(DISTINCT user_id) FROM events;\n-- Same as uniqExact — slow and memory-intensive\n"
+  when_applies: Projects using ClickHouse analytics queries
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using ClickHouse
+  sources: ["https://clickhouse.com/docs/en/sql-reference/aggregate-functions/reference/uniq"]
+- id: CR-CH-OPS-001
+  text: Use ReplicatedMergeTree with ClickHouse Keeper (or ZooKeeper) for production — non-replicated tables lose data on
+    node failure.
+  why: Non-replicated MergeTree stores data only on the local node. If that node's disk fails or the node is decommissioned,
+    all data is lost. ReplicatedMergeTree synchronizes data across replicas through a coordination service (ClickHouse Keeper
+    or ZooKeeper). Inserts are written to one replica and asynchronously replicated to others. If one replica fails, others
+    have the data. ClickHouse Keeper is the recommended coordinator (built-in, lighter than ZooKeeper). Without replication,
+    a single disk failure can lose terabytes of irreplaceable analytics data.
+  how_to_do_right: Deploy ClickHouse Keeper on 3 dedicated nodes (odd number for consensus). Use ReplicatedMergeTree for all
+    production tables. Configure 2-3 replicas per shard. Use ON CLUSTER for DDL to apply changes to all replicas. Monitor
+    replication lag with system.replicas. Use insert_quorum for critical data (waits for N replicas to confirm).
+  severity: critical
+  technologies:
+    platform: [clickhouse]
+  domains:
+    domain: [architecture, reliability, operations]
+    concern: [data, analytics]
+  example_good: "-- ClickHouse Keeper configuration (keeper_server.xml)\n<!-- Deploy on 3 dedicated nodes -->\n<!--\n<keeper_server>\n\
+    \  <tcp_port>9181</tcp_port>\n  <server_id>1</server_id>\n  <raft_configuration>\n    <server><id>1</id><hostname>keeper-1</hostname><port>9234</port></server>\n\
+    \    <server><id>2</id><hostname>keeper-2</hostname><port>9234</port></server>\n    <server><id>3</id><hostname>keeper-3</hostname><port>9234</port></server>\n\
+    \  </raft_configuration>\n</keeper_server>\n-->\n\n-- ReplicatedMergeTree for all production tables\nCREATE TABLE events\
+    \ ON CLUSTER '{cluster}' (\n  event_date Date,\n  event_time DateTime,\n  user_id UInt64,\n  event_type String\n)\nENGINE\
+    \ = ReplicatedMergeTree('/clickhouse/tables/{shard}/events', '{replica}')\nPARTITION BY toYYYYMM(event_date)\nORDER BY\
+    \ (event_type, user_id, event_time);\n\n-- Monitor replication health\nSELECT\n  database, table, is_leader, total_replicas,\
+    \ active_replicas,\n  inserts_in_queue, merges_in_queue, last_queue_update\nFROM system.replicas\nWHERE active_replicas\
+    \ < total_replicas;\n"
+  example_bad: '-- Non-replicated table in production
+
+    CREATE TABLE events (...)
+
+    ENGINE = MergeTree()  -- No replication!
+
+    -- Node disk failure = ALL data lost
+
+    -- No automatic recovery — must re-ingest from source
+
+
+    -- ReplicatedMergeTree without enough Keeper nodes
+
+    -- Only 1 Keeper node deployed
+
+    -- Keeper node failure = cluster cannot coordinate
+
+    -- No inserts, no merges, no DDL — complete stall
+
+    '
+  when_applies: Any project using ClickHouse analytics queries
+  when_not_applies: projects not using ClickHouse
+  sources: ["https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/replication"]
+- id: CR-CH-OPS-002
+  text: Batch small inserts into larger blocks — ClickHouse is optimized for bulk inserts of 10K-1M rows, and frequent tiny
+    inserts cause part proliferation and merge storms.
+  why: 'Each INSERT creates a new data part on disk. ClickHouse background merges combine small parts into larger parts. If
+    you insert 1 row per second (86,400 parts/day), the merge thread cannot keep up — parts accumulate, file handles exhaust,
+    and the ''too many parts'' error (code 252) shuts down the table. ClickHouse is designed for bulk analytics inserts: one
+    INSERT with 100,000 rows creates one data part. The internal merge mechanism is efficient when dealing with a few large
+    parts, not thousands of tiny parts. The sweet spot is 1 INSERT per second with 10K-100K rows each.'
+  how_to_do_right: Buffer inserts in your application and flush every 1-5 seconds or every 10K-100K rows (whichever comes
+    first). Use the Buffer table engine as a transparent write buffer in front of MergeTree. Use async_insert (ClickHouse
+    22.1+) to let the server batch small inserts automatically. Monitor system.parts for part count per partition — stay under
+    300 active parts. If parts accumulate, check merge thread health with system.merges.
+  severity: critical
+  technologies:
+    platform: [clickhouse]
+  domains:
+    domain: [architecture, operations, performance]
+    concern: [data, analytics]
+  example_good: "-- Application-side batching (Python)\nimport clickhouse_connect\n\nclient = clickhouse_connect.get_client(host='localhost')\n\
+    buffer = []\nBATCH_SIZE = 50000\n\ndef insert_event(event: dict):\n    buffer.append(event)\n    if len(buffer) >= BATCH_SIZE:\n\
+    \        flush_buffer()\n\ndef flush_buffer():\n    if buffer:\n        client.insert('events',\n            [list(e.values())\
+    \ for e in buffer],\n            column_names=list(buffer[0].keys())\n        )\n        buffer.clear()\n\n-- Server-side\
+    \ async_insert (ClickHouse 22.1+)\nSET async_insert = 1;\nSET wait_for_async_insert = 0;\nSET async_insert_max_data_size\
+    \ = 10000000;  -- 10MB buffer\nSET async_insert_busy_timeout_ms = 1000;     -- Flush every 1s\n\n-- Buffer table engine\
+    \ (transparent batching)\nCREATE TABLE events_buffer AS events\nENGINE = Buffer(currentDatabase(), events,\n  16,    \
+    \   -- num_layers\n  10, 100,  -- min/max time (seconds)\n  10000, 100000,  -- min/max rows\n  10000000, 100000000  --\
+    \ min/max bytes\n);\n-- INSERT INTO events_buffer (small inserts → automatically batched)\n\n-- Monitor part count\nSELECT\
+    \ partition, count() AS parts\nFROM system.parts\nWHERE database = currentDatabase() AND table = 'events' AND active\n\
+    GROUP BY partition\nHAVING parts > 100\nORDER BY parts DESC;\n"
+  example_bad: "-- Single-row inserts — part proliferation\nfor event in stream:\n    client.command(f\"INSERT INTO events\
+    \ VALUES ({event})\")\n-- 86,400 parts per day (1 per second)\n-- After 3 hours: \"DB::Exception: Too many parts (600)\"\
+    \n-- Table becomes read-only, inserts rejected\n\n-- Large batch without error handling\nclient.insert('events', million_rows)\
+    \  -- 1M rows, one INSERT\n-- If connection drops at 80%: entire batch lost, must retry all\n-- Better: batch in 50K-100K\
+    \ row chunks with individual retries\n"
+  when_applies: Any project using ClickHouse analytics queries
+  when_not_applies: projects not using ClickHouse
+  sources: ["https://clickhouse.com/docs/en/optimize/asynchronous-inserts"]
+- id: CR-CH-QRY-003
+  text: Use LowCardinality(String) for columns with fewer than ~10,000 distinct values — it provides dictionary encoding that
+    dramatically reduces memory usage and speeds up GROUP BY operations.
+  why: 'String columns in ClickHouse store each value inline, even if 99% of rows contain the same 20 values (status, country,
+    browser). LowCardinality wraps any type (usually String) with dictionary encoding: unique values are stored once in a
+    dictionary, and each row stores only a small integer index. For a column with 20 distinct values across 1B rows, dictionary
+    encoding reduces storage from ~20GB (avg 20 bytes × 1B) to ~1GB (4-byte indexes × 1B + 20 dictionary entries). GROUP BY
+    on LowCardinality is faster because comparison is on integer indexes, not string values.'
+  how_to_do_right: 'Use LowCardinality(String) for columns with <10K distinct values: status, country, browser, device_type,
+    event_type, error_code. Do NOT use LowCardinality for high-cardinality columns (user_id, session_id, URL) — the dictionary
+    grows as large as the data. ClickHouse automatically disables dictionary optimization when cardinality exceeds a threshold.
+    Check actual cardinality with SELECT uniq(col) FROM table before deciding.'
+  severity: high
+  technologies:
+    platform: [clickhouse]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, analytics]
+  example_good: "-- LowCardinality for low-cardinality string columns\nCREATE TABLE events (\n  event_date Date,\n  event_time\
+    \ DateTime,\n  user_id UInt64,\n  event_type LowCardinality(String),    -- ~50 distinct values\n  country LowCardinality(String),\
+    \        -- ~200 distinct values\n  browser LowCardinality(String),        -- ~30 distinct values\n  os LowCardinality(String),\
+    \             -- ~15 distinct values\n  page_url String,                        -- High cardinality — regular String\n\
+    \  session_id String                       -- High cardinality — regular String\n)\nENGINE = MergeTree()\nORDER BY (event_type,\
+    \ country, event_date);\n\n-- Check cardinality before deciding\nSELECT\n  uniq(event_type) AS event_type_card,   -- 47\
+    \ → LowCardinality\n  uniq(country) AS country_card,          -- 195 → LowCardinality\n  uniq(page_url) AS url_card  \
+    \            -- 2.3M → regular String\nFROM events;\n\n-- GROUP BY on LowCardinality is ~3x faster\nSELECT country, count()\
+    \ FROM events GROUP BY country;\n-- Compares integer dictionary indexes, not full strings\n"
+  example_bad: "-- Regular String for low-cardinality column — wasted space\nCREATE TABLE events (\n  event_type String, \
+    \ -- Only 50 distinct values\n  country String       -- Only 200 distinct values\n);\n-- Each row stores full string:\
+    \ \"page_view\" (9 bytes) × 1B rows = 9GB\n-- With LowCardinality: 4-byte index × 1B rows + tiny dictionary = 4GB\n\n\
+    -- LowCardinality on high-cardinality column — no benefit\nCREATE TABLE events (\n  user_id LowCardinality(String)  --\
+    \ 10M distinct values!\n);\n-- Dictionary holds 10M entries = same as raw storage\n-- Extra overhead of dictionary lookup\
+    \ with no space savings\n"
+  when_applies: Projects using ClickHouse analytics queries
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using ClickHouse
+  sources: ["https://clickhouse.com/docs/en/sql-reference/data-types/lowcardinality"]
+- id: CR-CH-OPS-003
+  text: Use Distributed tables for cross-shard queries — they provide a unified view over sharded data while each local table
+    handles its shard's data.
+  why: ClickHouse sharding distributes data across multiple servers for horizontal scalability. Each shard stores a portion
+    of the data in local ReplicatedMergeTree tables. Without Distributed tables, applications must know which shard holds
+    each piece of data and route queries manually. Distributed tables provide a virtual layer that routes queries to all shards,
+    collects results, and merges them — the application queries a single table name. Writes to a Distributed table are automatically
+    routed to the correct shard based on the sharding key. Cross-shard aggregations (total unique users across all shards)
+    are handled transparently.
+  how_to_do_right: Create local ReplicatedMergeTree tables on each shard with identical schemas. Create a Distributed table
+    on every node referencing the local tables via cluster name. Choose a sharding key that distributes writes evenly (e.g.,
+    sipHash64(user_id) for user-based data). Use internal_replication=true in the cluster config so ClickHouse handles replication,
+    not the Distributed table. Always INSERT into the Distributed table (not local) to ensure proper routing.
+  severity: high
+  technologies:
+    platform: [clickhouse]
+  domains:
+    domain: [architecture, performance, operations]
+    concern: [data, analytics, scalability]
+  example_good: "-- Local table on each shard (with replication)\nCREATE TABLE events_local ON CLUSTER '{cluster}' (\n  event_date\
+    \ Date,\n  user_id UInt64,\n  event_type String,\n  payload String\n)\nENGINE = ReplicatedMergeTree(\n  '/clickhouse/tables/{shard}/events',\n\
+    \  '{replica}'\n)\nPARTITION BY toYYYYMM(event_date)\nORDER BY (event_type, user_id);\n\n-- Distributed table — unified\
+    \ view across all shards\nCREATE TABLE events_distributed ON CLUSTER '{cluster}' AS events_local\nENGINE = Distributed('{cluster}',\
+    \ currentDatabase(), events_local,\n  sipHash64(user_id)  -- Sharding key: distribute by user\n);\n\n-- Application queries\
+    \ Distributed table — transparent cross-shard\nSELECT event_type, uniq(user_id) AS unique_users\nFROM events_distributed\n\
+    WHERE event_date >= '2026-02-01'\nGROUP BY event_type;\n-- Executes on all shards in parallel, merges results\n\n-- Insert\
+    \ via Distributed table — auto-routes to correct shard\nINSERT INTO events_distributed VALUES\n  ('2026-02-15', 12345,\
+    \ 'click', '{}');\n"
+  example_bad: '-- Querying local tables directly — misses other shards
+
+    SELECT count() FROM events_local;
+
+    -- Only returns count for THIS shard (1/N of total data)
+
+
+    -- Manual routing in application — fragile
+
+    shard = hash(user_id) % num_shards
+
+    client = shard_clients[shard]
+
+    client.execute("INSERT INTO events_local VALUES ...")
+
+    -- Adding a shard requires resharding all data
+
+    -- Application must know cluster topology
+
+    '
+  when_applies: Projects using ClickHouse analytics queries
+  when_not_applies: projects not using ClickHouse
+  sources: ["https://clickhouse.com/docs/en/engines/table-engines/special/distributed"]
+- id: CR-CH-ENG-004
+  text: Use CollapsingMergeTree for mutable data that needs update/delete semantics — it uses a sign column (+1/-1) to cancel
+    out old versions during merge.
+  why: 'ClickHouse is designed for append-only analytics. MergeTree has no UPDATE or DELETE at the row level (ALTER TABLE
+    DELETE is a heavy mutation). CollapsingMergeTree provides update/delete semantics by inserting ''cancellation'' rows with
+    sign=-1 that cancel out the original row (sign=+1) during background merges. To update a row: insert a cancellation row
+    (old values, sign=-1) and a new row (new values, sign=+1). Queries must use SUM(sign * value) or COUNT() * sign to get
+    correct results before merges complete. This is the standard pattern for CDC (change data capture) pipelines feeding ClickHouse
+    from transactional databases.'
+  how_to_do_right: 'Create a CollapsingMergeTree with a sign column (Int8, values +1 or -1). For inserts: sign=+1. For deletes:
+    insert exact duplicate with sign=-1. For updates: insert old row with sign=-1, then new row with sign=+1. Queries must
+    aggregate with sign: SUM(value * sign), COUNT() filter sign=1. Use VersionedCollapsingMergeTree if insert order is not
+    guaranteed (adds a version column for correct out-of-order collapsing).'
+  severity: high
+  technologies:
+    platform: [clickhouse]
+  domains:
+    domain: [architecture]
+    concern: [data, analytics, database, cdc]
+  example_good: "-- CollapsingMergeTree for mutable session data\nCREATE TABLE user_sessions (\n  user_id UInt64,\n  session_start\
+    \ DateTime,\n  page_views UInt32,\n  duration_sec UInt32,\n  sign Int8  -- +1 = active row, -1 = cancellation\n)\nENGINE\
+    \ = CollapsingMergeTree(sign)\nORDER BY (user_id, session_start);\n\n-- Insert new session\nINSERT INTO user_sessions\
+    \ VALUES (123, '2026-02-15 10:00:00', 5, 300, 1);\n\n-- Update session (cancel old + insert new)\nINSERT INTO user_sessions\
+    \ VALUES\n  (123, '2026-02-15 10:00:00', 5, 300, -1),    -- Cancel old\n  (123, '2026-02-15 10:00:00', 12, 720, 1);  \
+    \   -- Insert updated\n\n-- Query with sign-aware aggregation (correct before merge)\nSELECT\n  user_id,\n  sum(page_views\
+    \ * sign) AS total_pages,\n  sum(duration_sec * sign) AS total_duration\nFROM user_sessions\nGROUP BY user_id\nHAVING\
+    \ sum(sign) > 0;  -- Exclude fully cancelled rows\n"
+  example_bad: '-- Using MergeTree for mutable data — no update mechanism
+
+    CREATE TABLE user_sessions (...) ENGINE = MergeTree() ORDER BY user_id;
+
+    -- ALTER TABLE user_sessions DELETE WHERE user_id = 123;
+
+    -- Mutation: rewrites entire data part containing user 123
+
+    -- Heavy I/O, async, no transactional guarantee
+
+
+    -- Querying CollapsingMergeTree without sign aggregation
+
+    SELECT user_id, page_views FROM user_sessions WHERE user_id = 123;
+
+    -- Returns BOTH the original row (+1) and updated row (+1)
+
+    -- Plus cancellation row (-1) if merge hasn''t happened yet
+
+    -- Must use: sum(page_views * sign) for correct result
+
+    '
+  when_applies: Projects using ClickHouse analytics queries
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using ClickHouse
+  sources: ["https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/collapsingmergetree"]

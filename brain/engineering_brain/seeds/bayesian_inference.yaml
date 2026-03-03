@@ -1,0 +1,1298 @@
+layer: rules
+technology: Python
+domain: mathematics
+knowledge:
+  - id: "MATH-BAYES-001"
+    text: "Bayes' theorem computes the posterior probability of a hypothesis H given evidence E: P(H|E) = P(E|H) * P(H) / P(E), where P(E) = sum(P(E|H_i) * P(H_i)) over all hypotheses. In code, always work in log-space: log P(H|E) = log P(E|H) + log P(H) - log P(E). This prevents underflow when multiplying many small probabilities. Normalize at the end by subtracting log-sum-exp of all hypotheses."
+    why: "Direct multiplication of probabilities causes floating-point underflow when combining more than ~20 pieces of evidence — the product rounds to 0.0 and all posterior probabilities become NaN or 0/0. In production LLM evaluation pipelines, knowledge graph scoring, and spam filters, evidence chains of 50-100 features are routine. Working in log-space converts products to sums, maintaining numerical precision across arbitrarily long evidence chains. The log-sum-exp trick for normalization prevents overflow when exponentiating back."
+    how_to_do_right: |
+      1. Define log_prior for each hypothesis: log_prior[i] = log(P(H_i)).
+      2. For each evidence item, compute log_likelihood: log P(E_j | H_i).
+      3. Accumulate: log_joint[i] += log_likelihood for each evidence item.
+      4. Add prior: log_unnormalized[i] = log_joint[i] + log_prior[i].
+      5. Normalize with log-sum-exp: log_Z = logsumexp(log_unnormalized). Then log_posterior[i] = log_unnormalized[i] - log_Z.
+      6. Convert back: posterior[i] = exp(log_posterior[i]). Verify sum ~ 1.0.
+      7. Handle edge case: if ALL log_unnormalized are -inf, no hypothesis explains the data — flag as anomaly.
+    severity: "critical"
+    technologies: [python, scipy, numpy]
+    domains: [mathematics, statistics, bayesian_inference, machine_learning]
+    example_good: |
+      import numpy as np
+      from scipy.special import logsumexp
+
+      # Medical test: disease prevalence 1%, sensitivity 95%, specificity 90%
+      # P(disease) = 0.01, P(positive | disease) = 0.95, P(positive | healthy) = 0.10
+
+      # Log-space computation
+      log_prior_disease = np.log(0.01)
+      log_prior_healthy = np.log(0.99)
+      log_lik_pos_disease = np.log(0.95)
+      log_lik_pos_healthy = np.log(0.10)
+
+      # Unnormalized log-posteriors
+      log_unnorm = np.array([
+          log_prior_disease + log_lik_pos_disease,  # disease & positive
+          log_prior_healthy + log_lik_pos_healthy,   # healthy & positive
+      ])
+
+      # Normalize via log-sum-exp
+      log_Z = logsumexp(log_unnorm)
+      log_posterior = log_unnorm - log_Z
+      posterior = np.exp(log_posterior)
+
+      print(f"P(disease | positive) = {posterior[0]:.4f}")  # 0.0876
+      print(f"P(healthy | positive) = {posterior[1]:.4f}")  # 0.9124
+      print(f"Sum = {posterior.sum():.6f}")                  # 1.000000
+
+      # Sequential update: second independent positive test
+      log_unnorm2 = log_posterior + np.array([log_lik_pos_disease, log_lik_pos_healthy])
+      log_Z2 = logsumexp(log_unnorm2)
+      posterior2 = np.exp(log_unnorm2 - log_Z2)
+      print(f"After 2 positives: P(disease) = {posterior2[0]:.4f}")  # 0.4789
+    example_bad: |
+      # BAD: Direct probability multiplication
+      prior_disease = 0.01
+      lik = 0.95
+      # After 100 evidence items:
+      product = 0.95 ** 100  # = 5.92e-03 — still OK
+      product = 0.01 ** 100  # = 1e-200 — underflow!
+
+      # Even worse with more evidence:
+      product = 0.001 ** 400  # = 0.0 (underflow to exactly zero)
+      # Now P(H|E) = 0.0 / 0.0 = NaN
+
+      # BAD: Forgetting to normalize
+      unnorm_disease = 0.01 * 0.95  # 0.0095
+      unnorm_healthy = 0.99 * 0.10  # 0.099
+      # Reporting 0.0095 as "probability of disease" without dividing by sum
+      # Actual answer is 0.0095 / (0.0095 + 0.099) = 0.0876
+    when_applies: "When computing posterior probabilities from prior beliefs and observed evidence, when building classifiers, when scoring hypotheses in knowledge systems, when implementing any Bayesian update loop."
+    sources:
+      - "https://en.wikipedia.org/wiki/Bayes%27_theorem"
+      - "https://www.pymc.io/projects/docs/en/stable/learn.html"
+      - "https://www.probabilitycourse.com/"
+
+  - id: "MATH-BAYES-002"
+    text: "When estimating the probability p of a binary event (success/failure) from observed data, use the Beta-Binomial conjugate pair. Prior: Beta(alpha, beta). After observing s successes and f failures, the posterior is Beta(alpha+s, beta+f) — no numerical integration required. Start with Beta(1,1) for uniform ignorance, Beta(0.5,0.5) for Jeffreys prior, or Beta(2,2) for weak center bias. The posterior mean is (alpha+s)/(alpha+beta+s+f) and the posterior mode is (alpha+s-1)/(alpha+beta+s+f-2) when alpha,beta > 1."
+    why: "The Beta-Binomial conjugate is the workhorse of production Bayesian systems because the posterior has a closed-form solution — no MCMC, no optimization, no convergence issues. CogniLoom's Thompson Sampling (adaptive_weights.py), source credibility scoring, and adaptive promotion all depend on Beta posteriors. Getting the parameterization wrong — using mode when alpha < 1 (division by zero), confusing alpha/beta ordering, or using flat priors when domain knowledge exists — leads to overconfident scores early and slow convergence later."
+    how_to_do_right: |
+      1. Choose prior based on domain knowledge:
+         - No knowledge: Beta(1,1) — uniform on [0,1].
+         - Minimal information: Beta(0.5,0.5) — Jeffreys (U-shaped, concentrates near 0 and 1).
+         - Expect ~50%: Beta(2,2) — mild hump at center.
+         - Expect ~80%: Beta(8,2) — mean=0.8, moderate confidence.
+      2. Update: posterior = Beta(alpha + successes, beta + failures).
+      3. Point estimate: use MEAN = (a+s)/(a+b+s+f), not mode (undefined for a,b < 1).
+      4. 95% credible interval: scipy.stats.beta.ppf([0.025, 0.975], alpha_post, beta_post).
+      5. For decision-making: P(p > threshold | data) = 1 - beta.cdf(threshold, alpha_post, beta_post).
+      6. Effective sample size of prior = alpha + beta. A Beta(10,10) prior is as strong as 20 observations.
+    severity: "critical"
+    technologies: [python, scipy, numpy]
+    domains: [mathematics, statistics, bayesian_inference, knowledge_graphs]
+    example_good: |
+      import numpy as np
+      from scipy import stats
+
+      # Knowledge source reliability: observed 23 correct, 7 incorrect
+      # Prior: Beta(2, 2) — mild center bias (effective sample size = 4)
+      alpha_prior, beta_prior = 2, 2
+      successes, failures = 23, 7
+
+      alpha_post = alpha_prior + successes  # 25
+      beta_post = beta_prior + failures     # 9
+
+      # Posterior statistics
+      dist = stats.beta(alpha_post, beta_post)
+      print(f"Mean     = {dist.mean():.4f}")                    # 0.7353
+      print(f"Mode     = {(alpha_post-1)/(alpha_post+beta_post-2):.4f}")  # 0.7500
+      print(f"Std      = {dist.std():.4f}")                     # 0.0744
+      ci = dist.ppf([0.025, 0.975])
+      print(f"95% CI   = [{ci[0]:.4f}, {ci[1]:.4f}]")          # [0.5803, 0.8651]
+
+      # Decision: is this source reliable (p > 0.6)?
+      p_reliable = 1 - dist.cdf(0.6)
+      print(f"P(p > 0.6) = {p_reliable:.4f}")  # 0.9506 — 95% chance it's reliable
+
+      # Compare: same data but with strong skeptical prior Beta(20, 20)
+      dist2 = stats.beta(20 + successes, 20 + failures)
+      print(f"\nWith skeptical prior Beta(20,20):")
+      print(f"Mean = {dist2.mean():.4f}")  # 0.6143 — much more conservative
+      ci2 = dist2.ppf([0.025, 0.975])
+      print(f"95% CI = [{ci2[0]:.4f}, {ci2[1]:.4f}]")  # [0.4901, 0.7310]
+
+      # Sequential update: 10 more observations (8 correct, 2 incorrect)
+      alpha_post2 = alpha_post + 8   # 33
+      beta_post2 = beta_post + 2     # 11
+      dist3 = stats.beta(alpha_post2, beta_post2)
+      print(f"\nAfter 40 total observations: mean = {dist3.mean():.4f}")  # 0.7500
+      print(f"95% CI = [{dist3.ppf(0.025):.4f}, {dist3.ppf(0.975):.4f}]")  # narrower
+    example_bad: |
+      from scipy import stats
+
+      # BAD: Using mode when alpha or beta < 1
+      alpha, beta_param = 0.5, 0.5  # Jeffreys prior
+      # Mode = (0.5-1)/(0.5+0.5-2) = -0.5 / -1.0 = 0.5 — mathematically wrong!
+      # The true mode of Beta(0.5, 0.5) is at 0 AND 1 (bimodal)
+
+      # BAD: Ignoring effective sample size of prior
+      # Beta(100, 100) means "I've already seen 200 observations"
+      # 10 new successes barely move it:
+      prior_mean = 100 / 200  # 0.5
+      post_mean = 110 / 210   # 0.524 — prior dominates!
+      # If you didn't intend such a strong prior, use Beta(1,1) or Beta(2,2)
+
+      # BAD: Using p_hat = s/n instead of posterior mean
+      s, n = 0, 0
+      # p_hat = 0/0  -> ZeroDivisionError
+      # Even with s=1, n=1: p_hat = 1.0 (100% confident after 1 observation!)
+    when_applies: "When estimating success probabilities from binary observations, when implementing Thompson Sampling for exploration-exploitation, when scoring source reliability in knowledge graphs, when building credibility systems that update incrementally."
+    sources:
+      - "https://en.wikipedia.org/wiki/Beta-binomial_distribution"
+      - "https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.beta.html"
+      - "https://www.pymc.io/projects/docs/en/stable/learn.html"
+
+  - id: "MATH-BAYES-003"
+    text: "When estimating the mean mu of a Normal distribution with known variance sigma^2 from data, use the Normal-Normal conjugate pair. Prior: mu ~ N(mu_0, sigma_0^2). After observing n data points with sample mean x_bar, the posterior is mu ~ N(mu_post, sigma_post^2) where: sigma_post^2 = 1/(n/sigma^2 + 1/sigma_0^2) and mu_post = sigma_post^2 * (n*x_bar/sigma^2 + mu_0/sigma_0^2). The posterior precision (1/variance) is the SUM of prior precision and data precision — information adds linearly."
+    why: "The Normal-Normal conjugate gives closed-form posteriors for mean estimation, avoiding expensive MCMC. The precision-addition property is the key insight: each observation adds exactly 1/sigma^2 of precision, so you can predict exactly how many observations you need to achieve a desired posterior width. This is essential for experiment design (how many samples to collect), online learning (incremental updates), and multi-source fusion (combining estimates with different uncertainties)."
+    how_to_do_right: |
+      1. Set prior: mu_0 (prior mean), sigma_0 (prior std). Prior precision tau_0 = 1/sigma_0^2.
+      2. Compute data precision: tau_data = n / sigma^2 (sigma is the known data std).
+      3. Posterior precision: tau_post = tau_0 + tau_data.
+      4. Posterior variance: sigma_post^2 = 1 / tau_post.
+      5. Posterior mean: mu_post = (tau_0 * mu_0 + tau_data * x_bar) / tau_post.
+      6. 95% credible interval: mu_post +/- 1.96 * sigma_post.
+      7. Special case: if sigma is UNKNOWN, use Normal-InverseGamma conjugate instead (more complex).
+    severity: "high"
+    technologies: [python, scipy, numpy]
+    domains: [mathematics, statistics, bayesian_inference, online_learning]
+    example_good: |
+      import numpy as np
+      from scipy import stats
+
+      # Estimating average response time of a service
+      # Prior: expect ~200ms based on similar services, uncertainty sigma_0=50ms
+      mu_0 = 200.0       # prior mean
+      sigma_0 = 50.0     # prior std
+      sigma_known = 30.0  # known observation noise
+
+      # Observed 15 requests with mean 185ms
+      n = 15
+      x_bar = 185.0
+
+      # Posterior (precision formulation)
+      tau_0 = 1.0 / sigma_0**2         # 0.0004
+      tau_data = n / sigma_known**2     # 0.01667
+      tau_post = tau_0 + tau_data       # 0.01707
+
+      sigma_post = np.sqrt(1.0 / tau_post)  # 7.655
+      mu_post = (tau_0 * mu_0 + tau_data * x_bar) / tau_post  # 185.35
+
+      print(f"Prior:     mu={mu_0:.1f}, sigma={sigma_0:.1f}")
+      print(f"Data:      x_bar={x_bar:.1f}, n={n}, sigma={sigma_known:.1f}")
+      print(f"Posterior: mu={mu_post:.2f}, sigma={sigma_post:.2f}")
+      # Posterior: mu=185.35, sigma=7.66
+
+      ci = (mu_post - 1.96 * sigma_post, mu_post + 1.96 * sigma_post)
+      print(f"95% CI: [{ci[0]:.2f}, {ci[1]:.2f}]")  # [170.34, 200.37]
+
+      # Weight of prior vs data:
+      weight_prior = tau_0 / tau_post
+      weight_data = tau_data / tau_post
+      print(f"Prior weight: {weight_prior:.3f}")  # 0.023 (prior is weak)
+      print(f"Data weight:  {weight_data:.3f}")   # 0.977 (data dominates)
+
+      # Sequential: 10 more observations, mean 190ms
+      n2 = 10
+      x_bar2 = 190.0
+      tau_data2 = n2 / sigma_known**2
+      tau_post2 = tau_post + tau_data2   # previous posterior becomes new prior
+      sigma_post2 = np.sqrt(1.0 / tau_post2)
+      mu_post2 = (tau_post * mu_post + tau_data2 * x_bar2) / tau_post2
+      print(f"\nAfter 25 total: mu={mu_post2:.2f}, sigma={sigma_post2:.2f}")
+    example_bad: |
+      import numpy as np
+
+      # BAD: Averaging prior and data mean without weighting by precision
+      mu_0, x_bar = 200, 185
+      mu_wrong = (mu_0 + x_bar) / 2  # 192.5 — ignores sample size and uncertainties!
+      # With n=15 observations, data should dominate. Equal weighting is wrong.
+
+      # BAD: Using sigma_0 = 0 (infinite confidence in prior)
+      # tau_0 = 1/0 = infinity -> mu_post = mu_0 regardless of data!
+      # This means no amount of evidence can change the estimate.
+
+      # BAD: Confusing sigma (observation noise) with sigma_0 (prior uncertainty)
+      # If you use sigma_known as sigma_0, you're saying your prior uncertainty
+      # equals one observation's noise — usually way too tight.
+    when_applies: "When estimating a mean from noisy observations with a prior belief, when doing online/incremental learning, when fusing estimates from multiple sources with different precisions, when designing experiments to determine required sample sizes."
+    sources:
+      - "https://en.wikipedia.org/wiki/Conjugate_prior#When_likelihood_function_is_a_continuous_distribution"
+      - "https://www.stat.columbia.edu/~gelman/book/"
+      - "https://docs.scipy.org/doc/scipy/reference/stats.html"
+
+  - id: "MATH-BAYES-004"
+    text: "When estimating the probability vector of a categorical distribution with K categories (e.g., topic distribution, error type frequency), use the Dirichlet-Multinomial conjugate pair. Prior: theta ~ Dirichlet(alpha_1, ..., alpha_K). After observing counts c_1, ..., c_K, the posterior is Dirichlet(alpha_1+c_1, ..., alpha_K+c_K). Use alpha_i = 1 for uniform, alpha_i = 1/K for symmetric Jeffreys, or alpha_i = 0.1 for sparse (most categories are rare). The posterior mean for category i is (alpha_i + c_i) / sum(alpha_j + c_j)."
+    why: "Raw frequency estimation (c_i / n) assigns exactly 0 probability to unseen categories, which makes any downstream log-probability computation return -infinity. In language models, topic models, and error classification, this 'zero-frequency problem' crashes probability computations. Dirichlet smoothing assigns a small nonzero probability to every category, controlled by the alpha parameter. This is the principled version of add-one (Laplace) smoothing, which is the special case alpha_i = 1."
+    how_to_do_right: |
+      1. Choose alpha based on sparsity expectation:
+         - Dense (all categories likely): alpha_i = 1 (Laplace smoothing).
+         - Sparse (few categories dominate): alpha_i = 0.1 or alpha_i = 1/K.
+         - Informative: set alpha_i proportional to expected frequencies.
+      2. Update: alpha_post_i = alpha_i + c_i for each category.
+      3. Posterior mean: theta_i = alpha_post_i / sum(alpha_post).
+      4. Sample from posterior: numpy.random.dirichlet(alpha_post).
+      5. For Thompson Sampling over K arms: sample theta ~ Dirichlet(alpha_post), pick argmax.
+      6. Effective sample size = sum(alpha_i). Dirichlet([10]*5) is as strong as 50 observations.
+    severity: "high"
+    technologies: [python, scipy, numpy]
+    domains: [mathematics, statistics, bayesian_inference, nlp, topic_modeling]
+    example_good: |
+      import numpy as np
+      from scipy import stats
+
+      # Error classification: 5 error types, observed counts from logs
+      categories = ['timeout', 'auth_fail', 'rate_limit', 'server_error', 'parse_error']
+      counts = np.array([45, 12, 30, 8, 0])  # Note: parse_error has 0 observations!
+
+      # Sparse Dirichlet prior: alpha=0.1 per category
+      alpha_prior = np.full(5, 0.1)
+      alpha_post = alpha_prior + counts
+
+      # Posterior mean (smoothed probabilities)
+      theta = alpha_post / alpha_post.sum()
+      print("Smoothed probabilities:")
+      for cat, p in zip(categories, theta):
+          print(f"  {cat}: {p:.4f}")
+      # timeout: 0.4721, auth_fail: 0.1266, rate_limit: 0.3151,
+      # server_error: 0.0847, parse_error: 0.0016  <- NOT zero!
+
+      # Compare with raw frequencies
+      raw = counts / counts.sum()
+      print(f"\nRaw P(parse_error) = {raw[4]:.4f}")       # 0.0000
+      print(f"Smoothed P(parse_error) = {theta[4]:.4f}")  # 0.0016
+
+      # Sample from posterior (for Thompson Sampling)
+      np.random.seed(42)
+      samples = np.random.dirichlet(alpha_post, size=5)
+      print(f"\nPosterior samples:\n{samples.round(3)}")
+
+      # 95% credible interval for timeout rate using Beta marginal
+      # Dirichlet marginal: theta_i ~ Beta(alpha_post_i, sum(alpha_post) - alpha_post_i)
+      a_i = alpha_post[0]          # 45.1
+      b_i = alpha_post.sum() - a_i  # 50.4
+      ci = stats.beta.ppf([0.025, 0.975], a_i, b_i)
+      print(f"\nTimeout rate 95% CI: [{ci[0]:.3f}, {ci[1]:.3f}]")
+    example_bad: |
+      import numpy as np
+
+      # BAD: Raw frequency with zero counts
+      counts = np.array([45, 12, 30, 8, 0])
+      probs = counts / counts.sum()
+      # probs[4] = 0.0 -> log(0) = -inf in any downstream computation!
+
+      log_probs = np.log(probs)  # Contains -inf at index 4
+      # Any weighted sum involving log_probs[4] propagates to -inf
+
+      # BAD: Using alpha = 0 (improper prior)
+      alpha_bad = np.array([0, 0, 0, 0, 0])
+      alpha_post = alpha_bad + counts
+      # alpha_post[4] = 0 -> Dirichlet is undefined with any alpha_i = 0
+
+      # BAD: Using alpha = 1000 (prior overwhelms data)
+      alpha_strong = np.full(5, 1000)  # Effective sample size = 5000
+      theta_bad = (alpha_strong + counts) / (alpha_strong + counts).sum()
+      # All probabilities ~ 0.2 regardless of data (prior dominates)
+    when_applies: "When estimating categorical distributions from count data, when smoothing zero-frequency categories in text classification, when implementing multi-armed Thompson Sampling, when building topic models or error classifiers."
+    sources:
+      - "https://en.wikipedia.org/wiki/Dirichlet-multinomial_distribution"
+      - "https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.dirichlet.html"
+      - "https://www.pymc.io/projects/docs/en/stable/learn.html"
+
+  - id: "MATH-BAYES-005"
+    text: "Bayesian credible intervals and frequentist confidence intervals answer DIFFERENT questions. A 95% Bayesian credible interval [a, b] means P(theta in [a,b] | data) = 0.95 — there is a 95% probability the parameter is in this interval. A 95% confidence interval means: if we repeated the experiment infinitely, 95% of constructed intervals would contain the true theta. A single confidence interval either contains theta or does not — it has no probability statement about theta. For decision-making under uncertainty, credible intervals are almost always what practitioners actually want."
+    why: "Misinterpreting confidence intervals as credible intervals (saying 'there is a 95% chance the true mean is in this interval') is the most widespread statistical error in applied science and engineering. This misinterpretation leads to incorrect risk assessments. When a product manager asks 'what is the probability that conversion rate is above 5%?', a confidence interval literally cannot answer this question — it requires a credible interval. Using the wrong framework wastes experimentation budget and leads to wrong decisions."
+    how_to_do_right: |
+      1. If you need P(parameter in interval | data): compute a Bayesian credible interval.
+      2. If you need long-run coverage guarantee: compute a frequentist confidence interval.
+      3. For credible interval: get posterior distribution, use ppf([alpha/2, 1-alpha/2]).
+      4. For Highest Density Interval (HDI) — the narrowest 95% interval: use arviz.hdi() or pymc.
+      5. In practice with moderate data (n > 30) and weak priors, credible and confidence intervals nearly coincide numerically. The INTERPRETATION still differs.
+      6. Always state which type you're reporting. "95% CI" is ambiguous — say "95% credible interval" or "95% confidence interval" explicitly.
+    severity: "high"
+    technologies: [python, scipy, numpy, arviz]
+    domains: [mathematics, statistics, bayesian_inference, experiment_design]
+    example_good: |
+      import numpy as np
+      from scipy import stats
+
+      np.random.seed(42)
+      data = np.random.normal(loc=5.0, scale=2.0, size=25)
+      x_bar = data.mean()   # ~ 5.18
+      s = data.std(ddof=1)  # ~ 2.08
+
+      # Frequentist 95% confidence interval (t-distribution)
+      n = len(data)
+      se = s / np.sqrt(n)
+      t_crit = stats.t.ppf(0.975, df=n-1)
+      ci_freq = (x_bar - t_crit * se, x_bar + t_crit * se)
+      print(f"Frequentist 95% CI: [{ci_freq[0]:.3f}, {ci_freq[1]:.3f}]")
+      # Interpretation: If we repeated the experiment, 95% of such intervals
+      # would contain the true mean. THIS interval either does or doesn't.
+
+      # Bayesian 95% credible interval (with weak Normal prior)
+      mu_0, sigma_0 = 0, 100  # Very weak prior
+      sigma_known = s          # Use sample std as plug-in
+
+      tau_0 = 1.0 / sigma_0**2
+      tau_data = n / sigma_known**2
+      tau_post = tau_0 + tau_data
+      sigma_post = np.sqrt(1.0 / tau_post)
+      mu_post = (tau_0 * mu_0 + tau_data * x_bar) / tau_post
+
+      ci_bayes = (mu_post - 1.96 * sigma_post, mu_post + 1.96 * sigma_post)
+      print(f"Bayesian 95% CI:    [{ci_bayes[0]:.3f}, {ci_bayes[1]:.3f}]")
+      # Interpretation: There is a 95% probability that the true mean
+      # lies in this interval, GIVEN the data and prior.
+
+      # They're numerically close with weak prior:
+      print(f"Difference in width: {abs((ci_freq[1]-ci_freq[0]) - (ci_bayes[1]-ci_bayes[0])):.4f}")
+
+      # Answering the actual business question:
+      # "What is the probability the mean is above 4.0?"
+      p_above_4 = 1 - stats.norm.cdf(4.0, loc=mu_post, scale=sigma_post)
+      print(f"P(mu > 4.0 | data) = {p_above_4:.4f}")  # ~ 0.997
+      # Frequentist framework CANNOT answer this question directly.
+    example_bad: |
+      from scipy import stats
+      import numpy as np
+
+      data = np.random.normal(5.0, 2.0, size=25)
+      x_bar, s, n = data.mean(), data.std(ddof=1), len(data)
+      se = s / np.sqrt(n)
+      ci = stats.t.interval(0.95, df=n-1, loc=x_bar, scale=se)
+
+      # BAD: Misinterpreting confidence interval
+      print(f"There is a 95% probability that the true mean is in {ci}")
+      # WRONG! This is a FREQUENTIST CI — no probability statement about the parameter.
+      # The true mean is either in the interval or not. The 95% refers to the
+      # procedure's long-run success rate, not this specific interval.
+
+      # BAD: Using confidence interval to answer probability questions
+      # "Is there a 90% chance the mean is above 4?"
+      # A CI cannot answer this. You need a Bayesian posterior.
+    when_applies: "When reporting uncertainty in parameter estimates, when a stakeholder asks 'what is the probability that X is above/below Y', when designing A/B tests and interpreting results, when choosing between Bayesian and frequentist frameworks."
+    sources:
+      - "https://en.wikipedia.org/wiki/Credible_interval"
+      - "https://www.stat.columbia.edu/~gelman/book/"
+      - "https://www.pymc.io/projects/docs/en/stable/learn.html"
+
+  - id: "MATH-BAYES-006"
+    text: "Bayesian updating is the process of sequentially incorporating evidence into a posterior distribution. Given prior P(theta), after observing data D_1, the posterior P(theta|D_1) becomes the prior for the next observation D_2: P(theta|D_1,D_2) is proportional to P(D_2|theta) * P(theta|D_1). For conjugate families, this is a simple parameter update. For non-conjugate models, each update requires re-running MCMC or variational inference. The ORDER of evidence does not matter for the final posterior (exchangeability), but it matters for computational efficiency."
+    why: "In streaming/online systems — knowledge graph confidence scoring, anomaly detection, live dashboards — data arrives sequentially. Re-running full inference on the entire dataset for each new observation is computationally prohibitive (O(n) per update instead of O(1) for conjugate models). Bayesian updating with conjugate priors gives O(1) incremental updates. Additionally, tracking the posterior over time reveals concept drift: if the posterior mean shifts significantly after stable periods, the underlying process has changed."
+    how_to_do_right: |
+      1. Use conjugate priors whenever possible for O(1) updates:
+         - Binary data: Beta-Binomial.
+         - Count data: Gamma-Poisson.
+         - Mean estimation: Normal-Normal.
+         - Category data: Dirichlet-Multinomial.
+      2. Store only the posterior PARAMETERS (e.g., alpha, beta), not the full data history.
+      3. After each observation, update parameters: alpha_new = alpha_old + success, beta_new = beta_old + failure.
+      4. Monitor for drift: if posterior mean shifts by > 2*posterior_std over a window, flag concept drift.
+      5. For non-conjugate models: use approximate methods (variational Bayes, particle filters).
+      6. Order invariance: P(theta|D1,D2) == P(theta|D2,D1). Use this to verify implementation correctness.
+    severity: "high"
+    technologies: [python, scipy, numpy]
+    domains: [mathematics, statistics, bayesian_inference, online_learning, streaming]
+    example_good: |
+      import numpy as np
+      from scipy import stats
+
+      # Online reliability scoring: track source quality over time
+      class BayesianTracker:
+          def __init__(self, alpha=1.0, beta=1.0):
+              self.alpha = alpha
+              self.beta = beta
+              self.history = [(alpha, beta)]
+
+          def update(self, success: bool):
+              if success:
+                  self.alpha += 1
+              else:
+                  self.beta += 1
+              self.history.append((self.alpha, self.beta))
+
+          @property
+          def mean(self):
+              return self.alpha / (self.alpha + self.beta)
+
+          @property
+          def ci_95(self):
+              return stats.beta.ppf([0.025, 0.975], self.alpha, self.beta)
+
+          @property
+          def n_observations(self):
+              return (self.alpha - 1) + (self.beta - 1)  # Subtract prior
+
+      # Simulate 50 observations from a source with true p=0.8
+      np.random.seed(42)
+      tracker = BayesianTracker(alpha=1, beta=1)  # Uniform prior
+      observations = np.random.binomial(1, 0.8, size=50)
+
+      for obs in observations:
+          tracker.update(bool(obs))
+
+      print(f"After {tracker.n_observations:.0f} obs: mean={tracker.mean:.4f}")
+      print(f"95% CI: {tracker.ci_95}")
+      # mean ~ 0.7692, CI ~ [0.636, 0.872]
+
+      # Verify order invariance: shuffle observations
+      tracker2 = BayesianTracker(alpha=1, beta=1)
+      shuffled = observations.copy()
+      np.random.shuffle(shuffled)
+      for obs in shuffled:
+          tracker2.update(bool(obs))
+
+      print(f"Shuffled: mean={tracker2.mean:.4f}")  # Identical!
+      assert abs(tracker.mean - tracker2.mean) < 1e-10
+    example_bad: |
+      import numpy as np
+
+      # BAD: Storing all data and recomputing from scratch each time
+      all_data = []
+      def update_slow(new_obs, all_data):
+          all_data.append(new_obs)
+          # Recompute everything from scratch — O(n) per update!
+          n = len(all_data)
+          s = sum(all_data)
+          return (1 + s) / (2 + n)  # Wasteful but correct
+
+      # BAD: Resetting prior each time (not actually updating)
+      alpha, beta_param = 1, 1
+      for obs in [1, 1, 0, 1, 0]:
+          # WRONG: using fresh prior each time
+          if obs:
+              mean = (1 + 1) / (1 + 1 + 1)  # Always 0.667!
+          else:
+              mean = (1 + 0) / (1 + 1 + 1)  # Always 0.333!
+          # Ignores all previous observations!
+
+      # BAD: Forgetting that order doesn't matter (leads to debugging confusion)
+      # If updating in different order gives different results, implementation is wrong
+    when_applies: "When processing streaming data, when incrementally updating beliefs about system parameters, when tracking source reliability over time in knowledge graphs, when implementing online learning systems."
+    sources:
+      - "https://en.wikipedia.org/wiki/Bayesian_inference#Bayesian_updating"
+      - "https://www.pymc.io/projects/docs/en/stable/learn.html"
+      - "https://www.probabilitycourse.com/"
+
+  - id: "MATH-BAYES-007"
+    text: "Naive Bayes classifiers assume features are conditionally independent given the class: P(x_1,...,x_d | C) = product(P(x_i | C)). Despite this assumption being almost always wrong, Naive Bayes performs surprisingly well because classification only needs the correct RANKING of P(C|x), not calibrated probabilities. Use Multinomial NB for text (word counts), Gaussian NB for continuous features, and Bernoulli NB for binary features. Always apply Laplace smoothing (alpha=1) to avoid zero probabilities from unseen features."
+    why: "Naive Bayes is the strongest baseline for text classification (spam detection, sentiment, topic labeling) because it trains in O(n*d) time, predicts in O(d) time, and often matches more complex models on small-to-medium datasets. However, its probability ESTIMATES are notoriously miscalibrated — the raw P(C|x) values are pushed toward 0 and 1, making them useless for threshold-based decisions unless calibrated. Using uncalibrated Naive Bayes probabilities for downstream confidence scoring (e.g., in knowledge graph pipelines) corrupts the entire scoring system."
+    how_to_do_right: |
+      1. Choose variant: MultinomialNB for bag-of-words text, GaussianNB for continuous, BernoulliNB for binary.
+      2. Always set alpha >= 1 (Laplace smoothing). Default alpha=1.0 in sklearn is fine for most cases.
+      3. Train: model.fit(X_train, y_train). Predict class: model.predict(X). Get log-probs: model.predict_log_proba(X).
+      4. NEVER use model.predict_proba() directly for calibrated probabilities. Calibrate with CalibratedClassifierCV.
+      5. For text: use TfidfVectorizer or CountVectorizer, then MultinomialNB.
+      6. Feature selection: Naive Bayes degrades with many irrelevant features. Use chi2 or mutual_info to select top-K.
+    severity: "high"
+    technologies: [python, scikit-learn, numpy]
+    domains: [mathematics, statistics, bayesian_inference, nlp, classification]
+    example_good: |
+      import numpy as np
+      from sklearn.naive_bayes import MultinomialNB
+      from sklearn.feature_extraction.text import CountVectorizer
+      from sklearn.calibration import CalibratedClassifierCV
+      from sklearn.model_selection import cross_val_score
+
+      # Spam classification
+      texts = [
+          "buy cheap viagra now", "limited offer click here",
+          "meeting tomorrow at 3pm", "project update attached",
+          "free money winner", "discount pills order",
+          "quarterly report review", "lunch at noon?",
+          "act now or lose out", "earn money from home",
+          "team standup at 9am", "code review needed",
+      ]
+      labels = [1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0]  # 1=spam, 0=ham
+
+      # Vectorize
+      vec = CountVectorizer()
+      X = vec.fit_transform(texts)
+
+      # Train with Laplace smoothing
+      nb = MultinomialNB(alpha=1.0)
+      nb.fit(X, labels)
+
+      # Raw (uncalibrated) probabilities
+      test = vec.transform(["free offer click buy"])
+      raw_prob = nb.predict_proba(test)
+      print(f"Raw P(spam) = {raw_prob[0, 1]:.4f}")  # Often too extreme
+
+      # Calibrated probabilities (use this for downstream scoring!)
+      cal_nb = CalibratedClassifierCV(nb, cv=3, method='isotonic')
+      cal_nb.fit(X, labels)
+      cal_prob = cal_nb.predict_proba(test)
+      print(f"Calibrated P(spam) = {cal_prob[0, 1]:.4f}")
+
+      # Cross-validation accuracy
+      scores = cross_val_score(nb, X, labels, cv=3, scoring='accuracy')
+      print(f"CV Accuracy: {scores.mean():.3f} +/- {scores.std():.3f}")
+    example_bad: |
+      from sklearn.naive_bayes import MultinomialNB
+      from sklearn.feature_extraction.text import CountVectorizer
+
+      texts = ["buy cheap viagra now", "meeting at 3pm"]
+      labels = [1, 0]
+
+      vec = CountVectorizer()
+      X = vec.fit_transform(texts)
+
+      # BAD: alpha=0 — no smoothing
+      nb = MultinomialNB(alpha=0)
+      # If test text contains a word not seen in training for a class,
+      # P(word | class) = 0, making P(class | text) = 0 regardless of other words!
+
+      # BAD: Using raw predict_proba for confidence thresholds
+      nb2 = MultinomialNB(alpha=1.0)
+      nb2.fit(X, labels)
+      prob = nb2.predict_proba(vec.transform(["free offer"]))
+      # prob might be [0.001, 0.999] — looks confident but is MISCALIBRATED
+      # Using this as a confidence score corrupts downstream systems
+
+      # BAD: Using GaussianNB for count/text data
+      from sklearn.naive_bayes import GaussianNB
+      gnb = GaussianNB()
+      gnb.fit(X.toarray(), labels)  # Gaussian assumes continuous, counts are discrete!
+    when_applies: "When building text classifiers (spam, sentiment, topic), when needing a fast baseline classifier, when training data is limited and feature space is large, when interpretability of per-feature contributions is important."
+    sources:
+      - "https://scikit-learn.org/stable/modules/naive_bayes.html"
+      - "https://en.wikipedia.org/wiki/Naive_Bayes_classifier"
+      - "https://www.stat.columbia.edu/~gelman/book/"
+
+  - id: "MATH-BAYES-008"
+    text: "When the posterior distribution has no closed-form solution (non-conjugate models, complex hierarchical models), use Markov Chain Monte Carlo (MCMC) to draw samples from the posterior. The Metropolis-Hastings algorithm proposes a new state theta* from a proposal distribution q(theta*|theta_t), then accepts with probability min(1, [P(theta*|data)*q(theta_t|theta*)] / [P(theta_t|data)*q(theta*|theta_t)]). You only need the UNNORMALIZED posterior (numerator of Bayes' rule) — the normalizing constant cancels in the acceptance ratio."
+    why: "Most real-world Bayesian models are non-conjugate and require MCMC for inference. Metropolis-Hastings is the foundation of all MCMC methods (HMC, NUTS are extensions). Understanding the core algorithm prevents misuse of PyMC/Stan: insufficient burn-in (samples from the wrong distribution), autocorrelated chains (effective sample size much less than actual samples), non-convergence (chains stuck in local modes), and proposal tuning (rejection rate should be 20-50% for random-walk MH). These failures produce posteriors that look reasonable but are statistically garbage."
+    how_to_do_right: |
+      1. Define unnormalized log-posterior: log_post(theta) = log_likelihood(theta) + log_prior(theta).
+      2. Choose proposal: for random-walk MH, use Normal centered at current theta with tuned scale.
+      3. Run burn-in: discard first 25-50% of samples (they depend on initialization).
+      4. Check convergence: R-hat < 1.01 across multiple chains (use arviz.rhat).
+      5. Check effective sample size: ESS > 400 for reliable posterior summaries (use arviz.ess).
+      6. Check acceptance rate: target 20-50% for random-walk MH. Too high -> proposal too small. Too low -> proposal too large.
+      7. In practice, use PyMC or Stan (which use NUTS, an advanced HMC variant) instead of hand-coded MH.
+    severity: "high"
+    technologies: [python, numpy, pymc, arviz]
+    domains: [mathematics, statistics, bayesian_inference, machine_learning]
+    example_good: |
+      import numpy as np
+      from scipy import stats
+
+      # Metropolis-Hastings for Bayesian linear regression: y = a*x + b + noise
+      np.random.seed(42)
+      n = 50
+      x = np.random.uniform(0, 10, n)
+      true_a, true_b, true_sigma = 2.5, 1.0, 1.5
+      y = true_a * x + true_b + np.random.normal(0, true_sigma, n)
+
+      def log_posterior(params, x, y):
+          a, b, log_sigma = params
+          sigma = np.exp(log_sigma)  # Ensure sigma > 0
+          # Likelihood
+          residuals = y - (a * x + b)
+          log_lik = np.sum(stats.norm.logpdf(residuals, scale=sigma))
+          # Priors: a ~ N(0,10), b ~ N(0,10), log_sigma ~ N(0,2)
+          log_prior = (stats.norm.logpdf(a, 0, 10) +
+                       stats.norm.logpdf(b, 0, 10) +
+                       stats.norm.logpdf(log_sigma, 0, 2))
+          return log_lik + log_prior
+
+      # MH sampler
+      n_samples = 20000
+      burn_in = 5000
+      proposal_scale = np.array([0.05, 0.1, 0.05])
+      current = np.array([0.0, 0.0, 0.0])  # Initial guess
+      samples = []
+      accepted = 0
+
+      for i in range(n_samples):
+          proposed = current + np.random.normal(0, proposal_scale, size=3)
+          log_alpha = log_posterior(proposed, x, y) - log_posterior(current, x, y)
+
+          if np.log(np.random.uniform()) < log_alpha:
+              current = proposed
+              accepted += 1
+          samples.append(current.copy())
+
+      samples = np.array(samples[burn_in:])
+      acc_rate = accepted / n_samples
+
+      print(f"Acceptance rate: {acc_rate:.3f}")  # Target: 0.2-0.5
+      print(f"a: mean={samples[:,0].mean():.3f}, std={samples[:,0].std():.3f}")  # ~2.5
+      print(f"b: mean={samples[:,1].mean():.3f}, std={samples[:,1].std():.3f}")  # ~1.0
+      print(f"sigma: mean={np.exp(samples[:,2]).mean():.3f}")                     # ~1.5
+    example_bad: |
+      import numpy as np
+
+      # BAD: No burn-in
+      samples = run_mcmc(n=1000)  # All 1000 used including initial transient
+      mean_wrong = samples.mean()  # Biased by early non-converged samples
+
+      # BAD: Single chain with no convergence check
+      # One chain might be stuck in a local mode
+      # Always run >= 4 chains and check R-hat
+
+      # BAD: Ignoring autocorrelation
+      # 10000 MCMC samples with autocorrelation lag=50 gives
+      # ESS = 10000/50 = 200 effective samples
+      # Reporting std(samples)/sqrt(10000) underestimates uncertainty by 7x!
+      # Correct: std(samples)/sqrt(ESS) = std(samples)/sqrt(200)
+
+      # BAD: Proposal scale not tuned
+      # If proposal_scale = 0.0001: acceptance ~ 99%, but chain barely moves (random walk)
+      # If proposal_scale = 1000: acceptance ~ 0.1%, chain is stuck
+    when_applies: "When the posterior has no closed-form solution, when building hierarchical models, when conjugate priors are not available, when implementing custom Bayesian models that PyMC/Stan cannot express directly."
+    sources:
+      - "https://en.wikipedia.org/wiki/Metropolis%E2%80%93Hastings_algorithm"
+      - "https://www.pymc.io/projects/docs/en/stable/learn.html"
+      - "https://www.stat.columbia.edu/~gelman/book/"
+
+  - id: "MATH-BAYES-009"
+    text: "Gibbs sampling is a special case of MCMC where each parameter is sampled from its full conditional distribution while holding all other parameters fixed. For a model with parameters (theta_1, theta_2, ..., theta_K), each iteration samples theta_i from P(theta_i | theta_{-i}, data) for i = 1..K. Gibbs sampling has a 100% acceptance rate (no rejection step) when full conditionals are available. It is the algorithm behind LDA topic models, Bayesian mixture models, and many hierarchical models."
+    why: "Gibbs sampling is more efficient than general Metropolis-Hastings when full conditionals are available because it never rejects proposals. However, it fails catastrophically when parameters are highly correlated — the sampler makes tiny steps along the correlation axis, requiring millions of samples to explore the posterior. Recognizing when Gibbs is appropriate (conditionals available, low correlation) vs when to use HMC/NUTS (high correlation, continuous parameters) prevents wasted computation and unreliable inference."
+    how_to_do_right: |
+      1. Derive the full conditional for each parameter: P(theta_i | theta_{-i}, data).
+      2. If the full conditional is a known distribution (Normal, Gamma, Beta, etc.), sample directly.
+      3. If not, use a Metropolis-within-Gibbs step for that parameter.
+      4. Initialize all parameters to reasonable values (e.g., MLE estimates or prior means).
+      5. Run burn-in (25-50% of samples), then collect samples.
+      6. Check for slow mixing: trace plot should show rapid oscillation, NOT slow drift.
+      7. If parameters are highly correlated, consider reparameterization or switching to HMC.
+    severity: "medium"
+    technologies: [python, numpy, scipy]
+    domains: [mathematics, statistics, bayesian_inference, topic_modeling]
+    example_good: |
+      import numpy as np
+      from scipy import stats
+
+      # Gibbs sampler for Normal model: unknown mean AND variance
+      # Prior: mu ~ N(mu_0, sigma_0^2), sigma^2 ~ InverseGamma(a, b)
+      np.random.seed(42)
+
+      # Generate data
+      true_mu, true_sigma = 5.0, 2.0
+      data = np.random.normal(true_mu, true_sigma, size=30)
+      n = len(data)
+      x_bar = data.mean()
+      x_ss = np.sum((data - x_bar)**2)  # Sum of squared deviations
+
+      # Hyperparameters
+      mu_0, sigma_0_sq = 0.0, 100.0  # Weak prior on mu
+      a_0, b_0 = 2.0, 1.0            # Prior on sigma^2
+
+      # Gibbs sampler
+      n_iter = 10000
+      burn_in = 2000
+      mu_samples = np.zeros(n_iter)
+      sigma2_samples = np.zeros(n_iter)
+
+      # Initialize
+      mu_current = x_bar
+      sigma2_current = data.var()
+
+      for i in range(n_iter):
+          # Sample mu | sigma^2, data (Normal full conditional)
+          prec_prior = 1.0 / sigma_0_sq
+          prec_data = n / sigma2_current
+          prec_post = prec_prior + prec_data
+          mu_post = (prec_prior * mu_0 + prec_data * x_bar) / prec_post
+          sigma2_post_mu = 1.0 / prec_post
+          mu_current = np.random.normal(mu_post, np.sqrt(sigma2_post_mu))
+
+          # Sample sigma^2 | mu, data (Inverse-Gamma full conditional)
+          a_post = a_0 + n / 2.0
+          ss = np.sum((data - mu_current)**2)
+          b_post = b_0 + ss / 2.0
+          sigma2_current = 1.0 / np.random.gamma(a_post, 1.0 / b_post)
+
+          mu_samples[i] = mu_current
+          sigma2_samples[i] = sigma2_current
+
+      # Discard burn-in
+      mu_post_samples = mu_samples[burn_in:]
+      sigma2_post_samples = sigma2_samples[burn_in:]
+
+      print(f"mu:     mean={mu_post_samples.mean():.3f}, "
+            f"std={mu_post_samples.std():.3f}")      # ~ 5.0, ~0.37
+      print(f"sigma:  mean={np.sqrt(sigma2_post_samples).mean():.3f}, "
+            f"std={np.sqrt(sigma2_post_samples).std():.3f}")  # ~ 2.0
+    example_bad: |
+      import numpy as np
+
+      # BAD: Using Gibbs when parameters are highly correlated
+      # If corr(theta_1, theta_2) > 0.95, Gibbs takes tiny axis-aligned steps
+      # along the narrow diagonal of the posterior
+      # Example: a + b = data, so a and b are perfectly negatively correlated
+      # Gibbs will take thousands of iterations to traverse the ridge
+
+      # BAD: Not sampling from the CORRECT full conditional
+      # If you derive P(mu | sigma^2, data) wrong but it's still a distribution,
+      # the sampler will happily run but produce wrong posteriors.
+      # Always verify with known analytical solutions first.
+
+      # BAD: Forgetting burn-in in Gibbs
+      # Even with 100% acceptance, initial samples depend on starting values
+      mu_samples = run_gibbs(10000)
+      mean_wrong = mu_samples.mean()  # Includes transient — biased!
+    when_applies: "When full conditional distributions are available in closed form, when building Bayesian mixture models or topic models, when implementing LDA or similar generative models, when each parameter can be sampled independently given all others."
+    sources:
+      - "https://en.wikipedia.org/wiki/Gibbs_sampling"
+      - "https://www.pymc.io/projects/docs/en/stable/learn.html"
+      - "https://www.stat.columbia.edu/~gelman/book/"
+
+  - id: "MATH-BAYES-010"
+    text: "For Bayesian A/B testing, use Thompson Sampling: maintain a Beta posterior for each variant's conversion rate, sample from each posterior, and choose the variant with the highest sample. This naturally balances exploration (trying uncertain variants) and exploitation (using the current best). To decide when to stop, compute P(variant_A is best) = fraction of posterior samples where A > B, C, etc. Stop when P(best) > 0.95 or when the expected remaining value of information is less than the cost of continued experimentation."
+    why: "Frequentist A/B testing with fixed sample sizes wastes traffic: you must wait until n is reached even if one variant is clearly winning or losing after 10% of observations. Thompson Sampling allocates more traffic to the winning variant automatically, reducing opportunity cost. The Bayesian stopping rule ('stop when P(best) > 0.95') is more intuitive and actionable than 'stop when p < 0.05' and does not suffer from the multiple-testing problem that plagues frequentist sequential testing."
+    how_to_do_right: |
+      1. Initialize: Beta(1,1) for each variant (uniform prior).
+      2. For each incoming user: sample theta_i ~ Beta(alpha_i, beta_i) for each variant, assign user to argmax(theta_i).
+      3. Observe outcome: if success, alpha_i += 1; if failure, beta_i += 1.
+      4. Monitor: compute P(variant_i is best) using Monte Carlo: draw 10000 samples from each posterior, count how often each variant wins.
+      5. Stop when: P(best) > 0.95 AND n_observations > 100 (minimum to avoid early stopping noise).
+      6. Report: posterior mean, 95% credible interval, and probability of being best for each variant.
+      7. Expected loss: compute E[max(theta) - theta_chosen] to quantify the cost of a wrong decision.
+    severity: "critical"
+    technologies: [python, scipy, numpy]
+    domains: [mathematics, statistics, bayesian_inference, experiment_design, ab_testing]
+    example_good: |
+      import numpy as np
+      from scipy import stats
+
+      class ThompsonSamplingAB:
+          def __init__(self, n_variants):
+              self.alphas = np.ones(n_variants)
+              self.betas = np.ones(n_variants)
+              self.n_variants = n_variants
+
+          def choose_variant(self):
+              """Sample from each posterior, return argmax."""
+              samples = [np.random.beta(a, b)
+                         for a, b in zip(self.alphas, self.betas)]
+              return np.argmax(samples)
+
+          def update(self, variant, success):
+              if success:
+                  self.alphas[variant] += 1
+              else:
+                  self.betas[variant] += 1
+
+          def prob_best(self, n_mc=10000):
+              """Monte Carlo estimate of P(variant_i is best)."""
+              samples = np.array([
+                  np.random.beta(a, b, size=n_mc)
+                  for a, b in zip(self.alphas, self.betas)
+              ])
+              winners = np.argmax(samples, axis=0)
+              return np.bincount(winners, minlength=self.n_variants) / n_mc
+
+          def expected_loss(self, n_mc=10000):
+              """Expected loss of choosing each variant."""
+              samples = np.array([
+                  np.random.beta(a, b, size=n_mc)
+                  for a, b in zip(self.alphas, self.betas)
+              ])
+              best_per_sim = samples.max(axis=0)
+              return np.array([(best_per_sim - samples[i]).mean()
+                               for i in range(self.n_variants)])
+
+      # Simulate: A has true p=0.05, B has true p=0.07
+      np.random.seed(42)
+      true_rates = [0.05, 0.07]
+      ts = ThompsonSamplingAB(2)
+
+      for _ in range(2000):
+          variant = ts.choose_variant()
+          success = np.random.binomial(1, true_rates[variant])
+          ts.update(variant, success)
+
+      # Results
+      p_best = ts.prob_best()
+      e_loss = ts.expected_loss()
+      for i in range(2):
+          mean = ts.alphas[i] / (ts.alphas[i] + ts.betas[i])
+          ci = stats.beta.ppf([0.025, 0.975], ts.alphas[i], ts.betas[i])
+          print(f"Variant {i}: mean={mean:.4f}, CI=[{ci[0]:.4f}, {ci[1]:.4f}], "
+                f"P(best)={p_best[i]:.3f}, E[loss]={e_loss[i]:.5f}")
+    example_bad: |
+      # BAD: Fixed allocation (wastes traffic on losing variant)
+      # Assign 50/50 to A and B for 10000 users even if B is clearly losing
+      # Thompson Sampling would allocate 80%+ to A once A shows superiority
+
+      # BAD: Using frequentist p-value stopping rule
+      # "Stop when p < 0.05" with continuous monitoring inflates Type I error
+      # because you're doing multiple comparisons (peeking problem)
+      # With 10 peeks, actual Type I error is ~30%, not 5%!
+
+      # BAD: No minimum sample size
+      # After 3 observations (2 successes for A, 1 for B), P(A best) might be 0.8
+      # But this is based on almost no data. Require n >= 100 before making decisions.
+    when_applies: "When running online experiments (A/B tests, multi-armed bandits), when implementing exploration-exploitation in knowledge graph scoring, when allocating resources among uncertain options, when CogniLoom's adaptive_weights module needs to balance exploration of new sources with exploitation of known-good sources."
+    sources:
+      - "https://en.wikipedia.org/wiki/Thompson_sampling"
+      - "https://www.pymc.io/projects/docs/en/stable/learn.html"
+      - "https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.beta.html"
+
+  - id: "MATH-BAYES-011"
+    text: "A Bayesian network (BN) is a directed acyclic graph (DAG) where nodes represent random variables and edges represent conditional dependencies. Each node stores P(node | parents). The joint distribution factorizes as P(X_1,...,X_n) = product(P(X_i | parents(X_i))). Conditional independence is read from the graph using d-separation: X is independent of Y given Z if every path between X and Y is blocked by Z. Use BNs when you need to model causal structure, reason about interventions (do-calculus), or perform probabilistic inference with partial observations."
+    why: "Bayesian networks make conditional independence assumptions EXPLICIT and verifiable, unlike black-box models. In knowledge graphs and diagnostic systems, BNs answer interventional questions ('what happens if we DO X?') that purely observational models cannot. The factorized representation also makes inference tractable: instead of storing P(X1,...,X20) which has 2^20 = 1M entries for binary variables, a sparse BN with max 3 parents per node stores only 20 * 2^3 = 160 entries — a 6000x compression."
+    how_to_do_right: |
+      1. Define the DAG structure based on domain knowledge (causal direction matters!).
+      2. Specify conditional probability tables (CPTs) for each node given its parents.
+      3. For inference (computing P(query | evidence)): use variable elimination or junction tree for exact inference. Use belief propagation for approximate.
+      4. For structure learning from data: use score-based (BIC) or constraint-based (PC algorithm) methods.
+      5. Validate structure: no cycles (use topological sort), d-separation matches domain knowledge.
+      6. Libraries: pgmpy (Python), bnlearn (R/Python), pomegranate.
+    severity: "medium"
+    technologies: [python, pgmpy, numpy]
+    domains: [mathematics, statistics, bayesian_inference, causal_inference, knowledge_graphs]
+    example_good: |
+      import numpy as np
+      # pip install pgmpy
+      from pgmpy.models import BayesianNetwork
+      from pgmpy.factors.discrete import TabularCPD
+      from pgmpy.inference import VariableElimination
+
+      # Classic: Rain -> Sprinkler, Rain -> WetGrass, Sprinkler -> WetGrass
+      model = BayesianNetwork([
+          ('Rain', 'Sprinkler'),
+          ('Rain', 'WetGrass'),
+          ('Sprinkler', 'WetGrass')
+      ])
+
+      # CPDs
+      cpd_rain = TabularCPD('Rain', 2, [[0.8], [0.2]])  # P(Rain=0)=0.8
+
+      cpd_sprinkler = TabularCPD(
+          'Sprinkler', 2,
+          [[0.6, 0.99],   # P(Sprinkler=0 | Rain)
+           [0.4, 0.01]],  # P(Sprinkler=1 | Rain)
+          evidence=['Rain'], evidence_card=[2]
+      )
+
+      cpd_wet = TabularCPD(
+          'WetGrass', 2,
+          [[1.0, 0.1, 0.1, 0.01],   # P(WetGrass=0 | Sprinkler, Rain)
+           [0.0, 0.9, 0.9, 0.99]],  # P(WetGrass=1 | Sprinkler, Rain)
+          evidence=['Sprinkler', 'Rain'], evidence_card=[2, 2]
+      )
+
+      model.add_cpds(cpd_rain, cpd_sprinkler, cpd_wet)
+      assert model.check_model()  # Validates CPDs sum to 1, DAG is valid
+
+      # Inference: P(Rain | WetGrass=1)
+      infer = VariableElimination(model)
+      result = infer.query(['Rain'], evidence={'WetGrass': 1})
+      print(result)
+      # Rain=0: ~0.35, Rain=1: ~0.65 (observing wet grass increases rain probability)
+
+      # Interventional: P(WetGrass | do(Sprinkler=1)) — remove incoming edges to Sprinkler
+      # This is different from P(WetGrass | Sprinkler=1) because do() removes confounding
+    example_bad: |
+      # BAD: Confusing correlation with causation in BN structure
+      # Just because Sprinkler and Rain are correlated doesn't mean
+      # Sprinkler -> Rain. Direction matters for interventional queries!
+
+      # BAD: Cycles in the graph
+      # model = BayesianNetwork([('A', 'B'), ('B', 'C'), ('C', 'A')])
+      # This is NOT a DAG — pgmpy will raise an error
+
+      # BAD: CPDs that don't sum to 1
+      # cpd = TabularCPD('X', 2, [[0.3], [0.5]])  # Sums to 0.8, not 1.0!
+      # check_model() will catch this, but skipping validation is dangerous
+
+      # BAD: Confusing observational and interventional queries
+      # P(Y | X=1) != P(Y | do(X=1)) when there's a confounder
+      # Using observational probability for causal claims leads to wrong interventions
+    when_applies: "When modeling causal relationships between variables, when building diagnostic systems (medical, fault diagnosis), when reasoning about interventions and counterfactuals, when encoding domain knowledge as a probabilistic graphical model."
+    sources:
+      - "https://en.wikipedia.org/wiki/Bayesian_network"
+      - "https://pgmpy.org/"
+      - "https://www.stat.columbia.edu/~gelman/book/"
+
+  - id: "MATH-BAYES-012"
+    text: "When comparing two Bayesian models M_1 and M_2, compute the Bayes factor BF_12 = P(data|M_1) / P(data|M_2), where P(data|M_i) = integral of P(data|theta, M_i) * P(theta|M_i) d_theta is the marginal likelihood (model evidence). BF > 10 provides strong evidence for M_1 over M_2 (Jeffreys' scale). The Bayes factor automatically penalizes complexity through the prior — more complex models spread their prior probability over a larger parameter space, reducing P(data|M) for any specific dataset. This is a built-in Occam's razor."
+    why: "Likelihood ratio tests and AIC/BIC compare models at their MLE parameter values, ignoring the full parameter uncertainty. The Bayes factor integrates over all parameter values, penalizing models that are flexible enough to fit many possible datasets but don't concentrate probability on the observed data. This prevents overfitting without an explicit penalty term. In knowledge graph systems, Bayes factors can compare competing explanations: 'is this edge better explained by model A (semantic similarity) or model B (co-occurrence)?'"
+    how_to_do_right: |
+      1. Compute marginal likelihood for each model: P(data|M) = integral P(data|theta,M) P(theta|M) d_theta.
+      2. For conjugate models: marginal likelihood has closed form.
+      3. For non-conjugate: use bridge sampling (bridgesampling package), harmonic mean estimator (AVOID — numerically unstable), or Savage-Dickey ratio (for nested models).
+      4. BF_12 = P(data|M_1) / P(data|M_2). Interpret: BF > 100 decisive, 10-100 strong, 3-10 moderate, 1-3 weak.
+      5. Posterior model probability: P(M_1|data) = BF_12 * P(M_1) / (BF_12 * P(M_1) + P(M_2)).
+      6. BIC approximation (quick): log BF_12 ≈ (BIC_2 - BIC_1) / 2.
+    severity: "medium"
+    technologies: [python, scipy, numpy, pymc]
+    domains: [mathematics, statistics, bayesian_inference, model_selection]
+    example_good: |
+      import numpy as np
+      from scipy import stats
+      from scipy.special import gammaln, betaln
+
+      # Compare two models for coin flip data:
+      # M1: coin is fair (p = 0.5)
+      # M2: coin has unknown bias (p ~ Beta(1,1))
+      # Data: 7 heads in 10 flips
+
+      n, k = 10, 7  # 10 flips, 7 heads
+
+      # M1: P(data | M1) = Binomial(k | n, 0.5)
+      log_ml_m1 = stats.binom.logpmf(k, n, 0.5)
+      print(f"log P(data|M1) = {log_ml_m1:.4f}")  # -3.222
+
+      # M2: P(data | M2) = integral Binomial(k|n,p) * Beta(p|1,1) dp
+      # = Beta(k+1, n-k+1) / Beta(1,1) * C(n,k)
+      # = B(k+1, n-k+1) * C(n,k)  [since B(1,1)=1]
+      # Closed form: 1/(n+1) for uniform prior (elegant result!)
+      log_ml_m2 = -np.log(n + 1)
+      print(f"log P(data|M2) = {log_ml_m2:.4f}")  # -2.398
+
+      # Bayes Factor
+      log_bf_12 = log_ml_m1 - log_ml_m2
+      bf_12 = np.exp(log_bf_12)
+      print(f"BF(M1 vs M2) = {bf_12:.3f}")  # 0.440
+      print(f"BF(M2 vs M1) = {1/bf_12:.3f}")  # 2.273
+
+      # Interpretation: BF = 2.27 in favor of biased coin — weak evidence
+      # Jeffreys: 1 < BF < 3 is "barely worth mentioning"
+
+      # Posterior model probabilities (assuming equal prior: P(M1)=P(M2)=0.5)
+      p_m1 = bf_12 / (bf_12 + 1)
+      p_m2 = 1 / (bf_12 + 1)
+      print(f"P(M1|data) = {p_m1:.3f}")  # 0.306
+      print(f"P(M2|data) = {p_m2:.3f}")  # 0.694
+
+      # BIC approximation
+      # BIC_1 = -2*loglik + 0*log(n) (no free parameters)
+      # BIC_2 = -2*loglik_at_MLE + 1*log(n)
+      loglik_mle = stats.binom.logpmf(k, n, k/n)  # At MLE p=0.7
+      bic_1 = -2 * stats.binom.logpmf(k, n, 0.5)
+      bic_2 = -2 * loglik_mle + 1 * np.log(n)
+      log_bf_approx = (bic_2 - bic_1) / 2
+      print(f"BIC-approximated log BF = {log_bf_approx:.3f}")
+    example_bad: |
+      from scipy import stats
+
+      # BAD: Using the harmonic mean estimator for marginal likelihood
+      # HM = 1 / mean(1 / P(data|theta_i)) for theta_i ~ posterior
+      # This is numerically UNSTABLE — infinite variance, can be off by 10x
+      # Neal (2000) called it "the worst Monte Carlo method ever"
+
+      # BAD: Comparing models with improper priors
+      # If P(theta|M) is improper (doesn't integrate to 1),
+      # the marginal likelihood is undefined -> Bayes factor is meaningless
+      # Common mistake: using "flat prior on all of R" for Normal mean
+
+      # BAD: Using Bayes factor as a binary accept/reject
+      # BF = 3.5 means moderate evidence, NOT a definitive answer
+      # Report the number, don't just say "M1 wins"
+    when_applies: "When comparing competing statistical models, when deciding between simple and complex explanations in knowledge graphs, when performing model selection that accounts for parameter uncertainty, when comparing hypotheses about data-generating processes."
+    sources:
+      - "https://en.wikipedia.org/wiki/Bayes_factor"
+      - "https://www.stat.columbia.edu/~gelman/book/"
+      - "https://www.pymc.io/projects/docs/en/stable/learn.html"
+
+  - id: "MATH-BAYES-013"
+    text: "Hierarchical (multilevel) Bayesian models have parameters that are themselves drawn from higher-level distributions: theta_i ~ P(theta_i | phi), phi ~ P(phi | hyperparams). This creates PARTIAL POOLING: group-level estimates are shrunk toward the global mean, with the amount of shrinkage inversely proportional to within-group sample size. Groups with little data are shrunk heavily (borrowing strength from other groups), while groups with abundant data are barely affected. This is strictly better than both complete pooling (ignoring group structure) and no pooling (independent estimation per group)."
+    why: "In production systems with many entities (users, sources, categories), most entities have sparse data. No-pooling gives wildly unreliable estimates (1/1 = 100% success). Complete pooling ignores real differences between entities. Partial pooling via hierarchical models gives the optimal tradeoff: a source with 2 observations is estimated mostly by the global rate, while a source with 200 observations uses its own rate. CogniLoom's adaptive_promotion uses this principle for per-domain Beta priors — domains with few observations inherit the global promotion rate."
+    how_to_do_right: |
+      1. Define the hierarchy: observations -> group parameters -> hyperparameters.
+      2. Example: success_ij ~ Bernoulli(p_i), p_i ~ Beta(a, b), a,b ~ Exponential(1).
+      3. Fit with PyMC or Stan. Do NOT try to maximize the marginal likelihood analytically — use MCMC.
+      4. Check shrinkage: plot group-level estimates vs raw estimates. Points should be pulled toward the grand mean.
+      5. Evaluate: groups with small n should shrink more than groups with large n.
+      6. The amount of shrinkage is learned from data (empirical Bayes if you fix the hyperparameters, full Bayes if you sample them).
+    severity: "high"
+    technologies: [python, pymc, numpy, scipy, arviz]
+    domains: [mathematics, statistics, bayesian_inference, knowledge_graphs, multilevel_modeling]
+    example_good: |
+      import numpy as np
+      from scipy import stats, optimize
+
+      # 8 knowledge sources with different amounts of data
+      # (successes, total_observations) per source
+      sources = [
+          (1, 1),    # Source 0: tiny sample
+          (3, 5),    # Source 1: small sample
+          (7, 10),   # Source 2: moderate
+          (15, 20),  # Source 3: moderate
+          (70, 100), # Source 4: large
+          (0, 2),    # Source 5: tiny, all failures
+          (45, 50),  # Source 6: large, high quality
+          (5, 8),    # Source 7: small
+      ]
+
+      # No pooling: raw proportions
+      raw_rates = [s / n for s, n in sources]
+      print("No-pooling (raw):", [f"{r:.3f}" for r in raw_rates])
+      # [1.000, 0.600, 0.700, 0.750, 0.700, 0.000, 0.900, 0.625]
+      # Source 0: 1.0 (overconfident!), Source 5: 0.0 (overconfident!)
+
+      # Complete pooling: global rate
+      total_s = sum(s for s, n in sources)
+      total_n = sum(n for s, n in sources)
+      global_rate = total_s / total_n
+      print(f"Complete pooling: {global_rate:.3f} for all sources")  # 0.745
+
+      # Partial pooling: Empirical Bayes (estimate global a, b from data)
+      def neg_log_marginal(params, sources):
+          a, b = params
+          if a <= 0 or b <= 0:
+              return 1e10
+          log_ml = 0
+          for s, n in sources:
+              # Beta-Binomial marginal likelihood
+              from scipy.special import betaln
+              log_ml += (betaln(a + s, b + n - s) - betaln(a, b))
+          return -log_ml
+
+      from scipy.special import betaln
+      result = optimize.minimize(neg_log_marginal, [2, 2], args=(sources,),
+                                  method='L-BFGS-B', bounds=[(0.01, 100), (0.01, 100)])
+      a_hat, b_hat = result.x
+      print(f"Estimated hyperparams: a={a_hat:.2f}, b={b_hat:.2f}")
+
+      # Posterior means per source (partial pooling)
+      partial_rates = [(a_hat + s) / (a_hat + b_hat + n) for s, n in sources]
+      print("Partial pooling:", [f"{r:.3f}" for r in partial_rates])
+      # Source 0 shrinks from 1.000 toward global mean
+      # Source 5 shrinks from 0.000 toward global mean
+      # Source 4 barely changes (n=100 dominates prior)
+
+      # Compare shrinkage
+      for i, (raw, partial) in enumerate(zip(raw_rates, partial_rates)):
+          shrinkage = abs(raw - partial) / max(abs(raw - global_rate), 0.001)
+          n_i = sources[i][1]
+          print(f"Source {i} (n={n_i:3d}): raw={raw:.3f}, partial={partial:.3f}, "
+                f"shrinkage={shrinkage:.2f}")
+    example_bad: |
+      # BAD: No pooling with sparse data
+      sources = [(1, 1), (0, 1)]
+      rates = [1/1, 0/1]  # [1.0, 0.0]
+      # Source 0 looks perfect, Source 1 looks terrible
+      # Both estimates are meaningless with n=1
+
+      # BAD: Complete pooling ignoring real differences
+      # If Source A truly has p=0.9 and Source B has p=0.3,
+      # complete pooling gives both p=0.6 — wrong for both!
+
+      # BAD: Using independent Beta priors with arbitrary fixed hyperparameters
+      # Beta(1,1) for all sources ignores the information that sources share
+      # Hierarchical model LEARNS the appropriate a,b from the data
+    when_applies: "When estimating parameters for many groups with varying sample sizes, when implementing per-domain scoring in knowledge graphs, when building recommendation systems with sparse user data, when shrinkage toward a global estimate is desired for reliability."
+    sources:
+      - "https://en.wikipedia.org/wiki/Bayesian_hierarchical_modeling"
+      - "https://www.stat.columbia.edu/~gelman/book/"
+      - "https://www.pymc.io/projects/docs/en/stable/learn.html"
+
+  - id: "MATH-BAYES-014"
+    text: "Bayesian credibility scoring assigns a reliability score to information sources by maintaining a Beta posterior over each source's accuracy rate, then using the posterior mean (or a conservative quantile like the 5th percentile) as the credibility score. For sources with no observations, the prior determines the default score. To handle source degradation, apply temporal discounting: multiply alpha and beta by a decay factor gamma (0.95-0.99) at each time step, so old observations have less weight. The effective memory is approximately 1/(1-gamma) observations."
+    why: "In knowledge graphs and multi-agent systems, not all sources are equally reliable, and source quality can change over time. A static credibility score based on lifetime accuracy misses degradation: a source that was 90% accurate for 1000 observations but became 50% accurate recently would still show 88% overall. Temporal discounting ensures recent performance weighs more, detecting degradation within approximately 1/(1-gamma) observations. CogniLoom's adaptive_weights.py uses this exact mechanism for Thompson Sampling over knowledge sources."
+    how_to_do_right: |
+      1. Initialize each source with Beta(alpha_0, beta_0). Use alpha_0=beta_0=1 for uniform, or set based on domain default accuracy.
+      2. On success: alpha += 1. On failure: beta += 1.
+      3. Credibility score: use posterior mean (alpha/(alpha+beta)) for neutral estimate, or 5th percentile (beta.ppf(0.05, alpha, beta)) for conservative estimate.
+      4. Temporal decay (each time step): alpha *= gamma, beta *= gamma, where gamma in [0.95, 0.99].
+      5. Floor: ensure alpha >= alpha_0 and beta >= beta_0 after decay (don't decay below prior).
+      6. Effective window: 1/(1-gamma). gamma=0.99 -> last ~100 observations matter most.
+      7. Alert on degradation: if credibility drops by > 0.1 in 50 observations, flag the source.
+    severity: "critical"
+    technologies: [python, scipy, numpy]
+    domains: [mathematics, statistics, bayesian_inference, knowledge_graphs, trust_systems]
+    example_good: |
+      import numpy as np
+      from scipy import stats
+
+      class BayesianCredibility:
+          def __init__(self, alpha_0=1.0, beta_0=1.0, gamma=0.99):
+              self.alpha = alpha_0
+              self.beta = beta_0
+              self.alpha_0 = alpha_0
+              self.beta_0 = beta_0
+              self.gamma = gamma
+
+          def observe(self, success: bool):
+              # Decay old observations
+              self.alpha = max(self.alpha * self.gamma, self.alpha_0)
+              self.beta = max(self.beta * self.gamma, self.beta_0)
+              # Update
+              if success:
+                  self.alpha += 1
+              else:
+                  self.beta += 1
+
+          @property
+          def score_mean(self):
+              return self.alpha / (self.alpha + self.beta)
+
+          @property
+          def score_conservative(self):
+              """5th percentile — lower bound of credibility."""
+              return stats.beta.ppf(0.05, self.alpha, self.beta)
+
+          @property
+          def ci_95(self):
+              return stats.beta.ppf([0.025, 0.975], self.alpha, self.beta)
+
+          @property
+          def effective_n(self):
+              return self.alpha + self.beta - self.alpha_0 - self.beta_0
+
+      # Simulate: good source (p=0.9) that degrades to p=0.5 after 100 obs
+      np.random.seed(42)
+      cred = BayesianCredibility(alpha_0=1, beta_0=1, gamma=0.99)
+
+      # Phase 1: high quality (100 observations at p=0.9)
+      for _ in range(100):
+          cred.observe(np.random.random() < 0.9)
+      print(f"After phase 1: score={cred.score_mean:.3f}, "
+            f"conservative={cred.score_conservative:.3f}")
+      # score ~ 0.88, conservative ~ 0.82
+
+      # Phase 2: degraded quality (100 observations at p=0.5)
+      for _ in range(100):
+          cred.observe(np.random.random() < 0.5)
+      print(f"After phase 2: score={cred.score_mean:.3f}, "
+            f"conservative={cred.score_conservative:.3f}")
+      # score ~ 0.60, conservative ~ 0.52
+      # Decay ensures the degradation is visible quickly!
+
+      # Without decay (for comparison):
+      cred_nodecay = BayesianCredibility(alpha_0=1, beta_0=1, gamma=1.0)
+      for _ in range(100):
+          cred_nodecay.observe(np.random.random() < 0.9)
+      for _ in range(100):
+          cred_nodecay.observe(np.random.random() < 0.5)
+      print(f"Without decay: score={cred_nodecay.score_mean:.3f}")
+      # score ~ 0.70 — still looks "good" despite degradation!
+    example_bad: |
+      # BAD: Using raw lifetime accuracy
+      total_correct = 90 + 50  # 90/100 good + 50/100 bad
+      total = 200
+      score = total_correct / total  # 0.70 — misses the degradation!
+      # Source is currently at 50% but score says 70%
+
+      # BAD: No floor on decay
+      alpha, beta_p = 10, 2
+      gamma = 0.9
+      for _ in range(100):
+          alpha *= gamma
+          beta_p *= gamma
+      # alpha ~ 0.00003, beta ~ 0.000006
+      # Posterior is essentially undefined with such tiny parameters
+      # Always floor at prior values!
+
+      # BAD: Using a single credibility score without uncertainty
+      score = 0.85  # How confident are we? Is this from 10 obs or 10000?
+      # Without alpha, beta there's no credible interval
+    when_applies: "When scoring reliability of knowledge sources in knowledge graphs, when implementing trust systems for multi-agent architectures, when detecting source quality degradation, when CogniLoom's adaptive_weights needs credibility-weighted aggregation."
+    sources:
+      - "https://en.wikipedia.org/wiki/Bayesian_inference"
+      - "https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.beta.html"
+      - "https://www.pymc.io/projects/docs/en/stable/learn.html"
+
+  - id: "MATH-BAYES-015"
+    text: "Prior elicitation is the process of converting domain knowledge into a prior distribution. Use UNINFORMATIVE priors (Beta(1,1), Normal(0,1000)) when you genuinely have no knowledge. Use WEAKLY INFORMATIVE priors (Beta(2,2), Normal(0,10), HalfCauchy(5)) when you want to constrain parameters to reasonable ranges without strongly biasing the posterior — this is Gelman's recommendation for most applied work. Use INFORMATIVE priors (Beta(80,20)) only when you have strong domain knowledge (e.g., historical data from similar systems). Always perform a prior predictive check: simulate data from the prior and verify it looks plausible."
+    why: "The choice of prior is the most controversial and most impactful decision in Bayesian analysis. An uninformative prior on a 'probability' parameter like HalfCauchy(0, 1000) allows the prior predictive to generate absurd values (sigma = 500 when data ranges from 0-10). A weakly informative prior like HalfCauchy(0, 5) constrains sigma to reasonable magnitudes without biasing the specific value. Informative priors can dominate small datasets, so they must be justified explicitly. Prior predictive checks catch these problems BEFORE you collect data."
+    how_to_do_right: |
+      1. Start with weakly informative priors (Gelman's recommendation):
+         - Location parameters: Normal(0, 2.5*sd_data) or Normal(0, 10) on standardized data.
+         - Scale parameters: HalfCauchy(0, 5) or HalfNormal(0, 5).
+         - Probabilities: Beta(2, 2) or Beta(1, 1).
+         - Correlation: LKJ(eta=2) for correlation matrices.
+      2. Prior predictive check: sample theta ~ prior, then sample y ~ P(y|theta). Plot the simulated y.
+      3. Does simulated y look like plausible data? If it includes impossible values (negative lengths, probabilities > 1), tighten the prior.
+      4. Sensitivity analysis: re-run inference with 2-3 different priors. If the posterior changes dramatically, you don't have enough data and the prior matters — report this.
+      5. Document and justify every prior choice in your analysis.
+      6. Never use "improper" priors (uniform on all reals) in production — they cause MCMC issues and undefined Bayes factors.
+    severity: "high"
+    technologies: [python, scipy, numpy, pymc, arviz]
+    domains: [mathematics, statistics, bayesian_inference, experiment_design]
+    example_good: |
+      import numpy as np
+      from scipy import stats
+
+      # Scenario: estimating error rate of a new API endpoint
+      # Domain knowledge: similar endpoints have error rates 1-10%
+      # We want a prior that allows 0-20% but concentrates on 1-10%
+
+      # Option 1: Uninformative — Beta(1,1) uniform
+      prior_uninf = stats.beta(1, 1)
+
+      # Option 2: Weakly informative — Beta(2, 20) means ~9% with wide spread
+      prior_weak = stats.beta(2, 20)
+
+      # Option 3: Informative — Beta(5, 95) means ~5% with moderate confidence
+      prior_inf = stats.beta(5, 95)
+
+      # Prior predictive check: what error rates do these priors generate?
+      np.random.seed(42)
+      for name, prior in [("Uninformative", prior_uninf),
+                           ("Weakly informative", prior_weak),
+                           ("Informative", prior_inf)]:
+          samples = prior.rvs(10000)
+          print(f"{name:20s}: mean={samples.mean():.3f}, "
+                f"95% range=[{np.percentile(samples, 2.5):.3f}, "
+                f"{np.percentile(samples, 97.5):.3f}]")
+
+      # Uninformative:      mean=0.500, range=[0.025, 0.975] <- allows 95% error rate!
+      # Weakly informative:  mean=0.091, range=[0.005, 0.275] <- reasonable for API
+      # Informative:         mean=0.050, range=[0.017, 0.101] <- tight, needs justification
+
+      # Sensitivity analysis: same data, different priors
+      observed_errors, observed_total = 3, 100
+
+      for name, a, b in [("Uninf Beta(1,1)", 1, 1),
+                          ("Weak Beta(2,20)", 2, 20),
+                          ("Inf Beta(5,95)", 5, 95)]:
+          a_post = a + observed_errors
+          b_post = b + (observed_total - observed_errors)
+          post = stats.beta(a_post, b_post)
+          ci = post.ppf([0.025, 0.975])
+          print(f"{name:20s}: posterior mean={post.mean():.4f}, "
+                f"CI=[{ci[0]:.4f}, {ci[1]:.4f}]")
+
+      # All three converge with 100 observations — priors wash out
+      # With only 5 observations, they would diverge significantly
+      # -> sensitivity analysis reveals how much data you need
+
+      # HalfCauchy for scale parameters
+      half_cauchy_samples = np.abs(stats.cauchy(0, 5).rvs(10000))
+      print(f"\nHalfCauchy(5): median={np.median(half_cauchy_samples):.1f}, "
+            f"95th={np.percentile(half_cauchy_samples, 95):.1f}")
+      # Median ~ 5, but 95th ~ 60 — allows large values but concentrates on small
+    example_bad: |
+      from scipy import stats
+
+      # BAD: Flat prior on unbounded parameter
+      # mu ~ Uniform(-inf, inf) is improper — integral diverges
+      # MCMC may not converge, Bayes factors are undefined
+
+      # BAD: Prior that excludes the true value
+      # If true error rate is 15% but prior is Beta(100, 1) (mean=99%),
+      # the prior essentially overrides the data for small n
+      post = stats.beta(100 + 3, 1 + 97)  # 3 errors in 100
+      print(f"Mean: {post.mean():.3f}")  # 0.512 — still pulled to 99%!
+      # 100 observations cannot overcome a prior with ESS=101
+
+      # BAD: No prior predictive check
+      # Using Normal(0, 1000) for a parameter that should be in [0, 1]
+      # Prior predictive will generate y values spanning -3000 to +3000
+      # Obviously wrong but never checked!
+
+      # BAD: "I used uninformative priors so my analysis is objective"
+      # Beta(0.001, 0.001) is NOT uninformative — it concentrates mass near 0 and 1
+      # Jeffreys Beta(0.5, 0.5) is a better default for "minimal information"
+    when_applies: "When starting any Bayesian analysis, when choosing priors for PyMC/Stan models, when domain experts need to encode knowledge into a statistical model, when the amount of data is small enough that prior choice matters."
+    sources:
+      - "https://www.stat.columbia.edu/~gelman/book/"
+      - "https://en.wikipedia.org/wiki/Prior_probability"
+      - "https://www.pymc.io/projects/docs/en/stable/learn.html"
+      - "https://docs.scipy.org/doc/scipy/reference/stats.html"

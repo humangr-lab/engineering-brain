@@ -1,0 +1,845 @@
+layer: rules
+domain: fact_checking
+knowledge:
+- id: FC-NORM-001
+  text: "Normalize all incoming data to a canonical schema before storing. Define explicit Pydantic models for each data source and transform to a unified internal schema at ingestion time, not at query time."
+  why: >
+    Fact-checking aggregates data from dozens of sources (news APIs, government portals, social media,
+    PDFs) each with different field names, date formats, and structures. If normalization happens at
+    query time, every downstream consumer reimplements the same transformations with different bugs.
+    A production system had 4 different date-parsing implementations across 4 services, each handling
+    timezone differently — claims were matched to wrong evidence because timestamps disagreed by hours.
+  how_to_do_right: |
+    1. Define Pydantic v2 models for each external source (RawNewsArticle, RawGovernmentRecord, etc.)
+    2. Define unified internal models (NormalizedDocument, NormalizedClaim)
+    3. Write explicit transform functions: source model -> internal model
+    4. Run transformation at ingestion time — store only normalized data
+    5. Keep raw data in cold storage (S3/blob) for re-processing if schema evolves
+    6. Version your schemas (schema_version field) to handle migrations
+    7. Validate 100% of incoming data against Pydantic models — reject and log invalid records
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [consistency]
+  example_good: |
+    from pydantic import BaseModel, Field
+    from datetime import datetime
+
+    class RawNewsAPIArticle(BaseModel):
+        """Schema for newsdata.io API response"""
+        title: str
+        link: str
+        pubDate: str | None = None
+        creator: list[str] | None = None
+        description: str | None = None
+
+    class NormalizedDocument(BaseModel):
+        """Unified internal schema"""
+        title: str
+        url: str
+        published_at: datetime | None = None
+        author: str = ""
+        content: str = ""
+        source_type: str
+        schema_version: int = 1
+
+    def normalize_newsapi(raw: RawNewsAPIArticle) -> NormalizedDocument:
+        return NormalizedDocument(
+            title=raw.title,
+            url=raw.link,
+            published_at=parse_flexible_date(raw.pubDate) if raw.pubDate else None,
+            author=raw.creator[0] if raw.creator else "",
+            content=raw.description or "",
+            source_type="newsapi",
+        )
+  example_bad: |
+    # Storing raw API responses with different field names
+    db.insert({"title": api_resp["title"], "date": api_resp["pubDate"]})
+    # Another source uses different field names — chaos at query time
+    db.insert({"headline": rss_entry["title"], "timestamp": rss_entry["published"]})
+  when_applies: "Any multi-source data ingestion pipeline, especially for fact-checking"
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/models/"
+
+- id: FC-NORM-002
+  text: "Define explicit schema mappings between source formats using a mapping configuration, not inline code. Schema mappings should be declarative and auditable."
+  why: >
+    When mappings are embedded in transformation code, they become invisible. Adding a new source
+    requires reading through transformation functions to understand the pattern. When a source
+    changes its API, finding the affected mapping requires searching through code. Declarative
+    mappings are reviewable, diffable, and can be validated independently. A fact-checking system
+    with 15 sources had unmaintainable transformation code that nobody could modify safely.
+  how_to_do_right: |
+    1. Create a mapping configuration per source (YAML or Python dict)
+    2. Map source field names to canonical field names explicitly
+    3. Specify type transformations (string->datetime, string->float)
+    4. Define required vs optional fields with defaults
+    5. Include validation rules in the mapping (min/max values, allowed enums)
+    6. Auto-generate Pydantic models from mappings when possible
+    7. Version mappings alongside source API version
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic, pandas]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [consistency]
+  example_good: |
+    from typing import Any, Callable
+
+    SOURCE_MAPPINGS: dict[str, dict[str, Any]] = {
+        "newsdata_io": {
+            "field_map": {
+                "title": "title",
+                "link": "url",
+                "pubDate": "published_at",
+                "creator": "author",
+                "description": "content",
+            },
+            "transforms": {
+                "published_at": "parse_iso_date",
+                "author": "first_element_or_empty",
+            },
+            "required": ["title", "url"],
+            "defaults": {"source_type": "newsapi"},
+        },
+        "dados_gov_br": {
+            "field_map": {
+                "titulo": "title",
+                "url": "url",
+                "metadata_modified": "published_at",
+                "organization.title": "author",
+                "notes": "content",
+            },
+            "transforms": {
+                "published_at": "parse_iso_date",
+                "author": "extract_nested",
+            },
+            "required": ["title", "url"],
+            "defaults": {"source_type": "government"},
+        },
+    }
+
+    def apply_mapping(raw: dict, source: str) -> dict:
+        mapping = SOURCE_MAPPINGS[source]
+        result = dict(mapping.get("defaults", {}))
+        for src_field, dst_field in mapping["field_map"].items():
+            value = _extract_nested(raw, src_field)
+            if dst_field in mapping.get("transforms", {}):
+                value = TRANSFORMS[mapping["transforms"][dst_field]](value)
+            result[dst_field] = value
+        return result
+  example_bad: |
+    # Inline mappings scattered across functions — unmaintainable
+    def transform_newsapi(data):
+        return {"title": data["title"], "url": data["link"]}
+
+    def transform_govbr(data):
+        return {"title": data["titulo"], "url": data["url"]}
+
+    # 15 more functions, each slightly different...
+  when_applies: "Systems integrating data from more than 2 sources with different schemas"
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/models/"
+
+- id: FC-NORM-003
+  text: "Validate Brazilian-specific data fields (CPF, CNPJ, CEP, phone numbers) with proper check digit algorithms. Never trust regex-only validation for these identifiers."
+  why: >
+    CPF and CNPJ have mathematical check digit algorithms that catch 99%+ of typos and fabricated
+    numbers. Regex-only validation (11 digits for CPF, 14 for CNPJ) accepts millions of invalid
+    numbers. In a fact-checking context, linking records by invalid CPF/CNPJ creates false
+    connections between entities — e.g., attributing government contracts to the wrong person.
+    CEP validation matters because wrong postal codes break geographic analysis.
+  how_to_do_right: |
+    1. CPF: validate 11 digits + 2 check digits using modular arithmetic (mod 11)
+    2. CNPJ: validate 14 digits + 2 check digits using weighted sum (mod 11)
+    3. CEP: validate format (XXXXX-XXX or 8 digits), check against Correios range tables
+    4. Phone: validate DDD (2-digit area code, range 11-99), number length (8 or 9 digits)
+    5. Reject known invalid sequences: CPF 000.000.000-00, 111.111.111-11, etc.
+    6. Strip formatting before validation, store without formatting, format for display only
+    7. Use python-validate-docbr library for battle-tested implementations
+  severity: critical
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [fact_checking, compliance]
+    concern: [domain_specific]
+  example_good: |
+    def validate_cpf(cpf: str) -> bool:
+        cpf = "".join(c for c in cpf if c.isdigit())
+        if len(cpf) != 11 or cpf == cpf[0] * 11:
+            return False
+
+        # First check digit
+        total = sum(int(cpf[i]) * (10 - i) for i in range(9))
+        d1 = (total * 10) % 11
+        d1 = 0 if d1 >= 10 else d1
+        if int(cpf[9]) != d1:
+            return False
+
+        # Second check digit
+        total = sum(int(cpf[i]) * (11 - i) for i in range(10))
+        d2 = (total * 10) % 11
+        d2 = 0 if d2 >= 10 else d2
+        return int(cpf[10]) == d2
+
+    def validate_cnpj(cnpj: str) -> bool:
+        cnpj = "".join(c for c in cnpj if c.isdigit())
+        if len(cnpj) != 14 or cnpj == cnpj[0] * 14:
+            return False
+
+        weights1 = [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+        weights2 = [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+
+        total = sum(int(cnpj[i]) * weights1[i] for i in range(12))
+        d1 = 11 - (total % 11)
+        d1 = 0 if d1 >= 10 else d1
+        if int(cnpj[12]) != d1:
+            return False
+
+        total = sum(int(cnpj[i]) * weights2[i] for i in range(13))
+        d2 = 11 - (total % 11)
+        d2 = 0 if d2 >= 10 else d2
+        return int(cnpj[13]) == d2
+  example_bad: |
+    import re
+
+    # Regex-only: accepts any 11 digits, including 000.000.000-00
+    def validate_cpf(cpf: str) -> bool:
+        return bool(re.match(r"\d{3}\.\d{3}\.\d{3}-\d{2}", cpf))
+  when_applies: "Any system processing Brazilian personal or business identifiers"
+  sources:
+    - "https://www.gov.br/receitafederal/pt-br/assuntos/orientacao-tributaria/cadastros/cpf"
+
+- id: FC-NORM-004
+  text: "Handle dates as ISO 8601 (YYYY-MM-DD) internally and in storage. Parse Brazilian dd/mm/yyyy format at ingestion, convert immediately, and always store with timezone."
+  why: >
+    Date ambiguity is a silent fact-checking killer. The string 01/02/2024 means February 1 in Brazil
+    but January 2 in the US. If a claim says an event happened on 01/02, and the system parses it
+    as the wrong date, evidence matching fails silently. Furthermore, storing dates without timezone
+    causes off-by-one-day errors across Brazil's 4 time zones. An actual incident: a government
+    spending record dated 05/06/2024 was matched to the wrong month, invalidating a fact-check.
+  how_to_do_right: |
+    1. Parse incoming dates with explicit format: datetime.strptime(date, "%d/%m/%Y") for Brazilian
+    2. Convert to ISO 8601 immediately: "2024-02-01" not "01/02/2024"
+    3. Always store as timezone-aware datetime (use UTC for storage)
+    4. Default timezone for Brazilian sources: America/Sao_Paulo (BRT/BRST)
+    5. Use python-dateutil for ambiguous dates, with dayfirst=True for Brazilian sources
+    6. Validate date ranges: reject dates in the future or before 1500 (pre-Brazil)
+    7. Log every date parsing decision for auditability
+  severity: critical
+  technologies:
+    lang: [python]
+    library: [pydantic, pandas]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [consistency]
+  example_good: |
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    from dateutil import parser as dateutil_parser
+
+    BR_TZ = ZoneInfo("America/Sao_Paulo")
+
+    def parse_brazilian_date(date_str: str) -> datetime:
+        """Parse Brazilian date format to UTC datetime."""
+        if not date_str:
+            raise ValueError("Empty date string")
+
+        # Try explicit Brazilian format first
+        for fmt in ["%d/%m/%Y", "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S"]:
+            try:
+                dt = datetime.strptime(date_str.strip(), fmt)
+                dt = dt.replace(tzinfo=BR_TZ)
+                return dt.astimezone(timezone.utc)
+            except ValueError:
+                continue
+
+        # Fall back to dateutil with dayfirst=True for Brazilian convention
+        dt = dateutil_parser.parse(date_str, dayfirst=True)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=BR_TZ)
+        return dt.astimezone(timezone.utc)
+  example_bad: |
+    from datetime import datetime
+
+    # Ambiguous: is this Jan 2 or Feb 1?
+    date = datetime.strptime("01/02/2024", "%m/%d/%Y")  # US format — WRONG for Brazilian data
+
+    # No timezone — off-by-one day in queries
+    date = datetime.strptime("01/02/2024", "%d/%m/%Y")  # Naive datetime
+    db.insert({"date": date})  # Stored without timezone
+  when_applies: "All date handling in systems processing Brazilian or multi-locale data"
+  sources:
+    - "https://www.iso.org/iso-8601-date-and-time-format.html"
+    - "https://docs.python.org/3/library/datetime.html"
+
+- id: FC-NORM-005
+  text: "Implement deduplication at three levels: exact (hash), fuzzy (similarity), and semantic (embedding-based). Exact dedup is mandatory; fuzzy and semantic are recommended for fact-checking data quality."
+  why: >
+    The same fact appears in dozens of sources with different wording. The same government record
+    appears in both dados.gov.br and Portal da Transparencia with slightly different formatting.
+    Without deduplication, the fact-checking system wastes resources processing duplicates, shows
+    redundant evidence, and biases confidence scores (10 copies of the same source look like 10
+    independent confirmations). Exact-only dedup catches only byte-identical copies, missing
+    paraphrased and reformatted duplicates.
+  how_to_do_right: |
+    1. Exact dedup: SHA-256 hash of normalized text (lowercase, stripped whitespace)
+    2. Fuzzy dedup: MinHash or SimHash with Jaccard threshold >= 0.85
+    3. Semantic dedup: embedding cosine similarity >= 0.95 (same content, different words)
+    4. Apply dedup levels in order: exact (cheapest), fuzzy (moderate), semantic (expensive)
+    5. Store dedup cluster IDs to track which documents are duplicates of which
+    6. Keep the "best" version: longest text, most metadata, earliest timestamp
+    7. Cross-source dedup: compare across sources to find the same fact from different publishers
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pandas]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [consistency]
+  example_good: |
+    import hashlib
+    from datasketch import MinHash, MinHashLSH
+
+    class DedupPipeline:
+        def __init__(self, jaccard_threshold: float = 0.85):
+            self.exact_hashes: set[str] = set()
+            self.lsh = MinHashLSH(threshold=jaccard_threshold, num_perm=128)
+            self.doc_id = 0
+
+        def is_exact_dup(self, text: str) -> bool:
+            normalized = text.lower().strip()
+            h = hashlib.sha256(normalized.encode()).hexdigest()
+            if h in self.exact_hashes:
+                return True
+            self.exact_hashes.add(h)
+            return False
+
+        def is_fuzzy_dup(self, text: str) -> bool:
+            mh = MinHash(num_perm=128)
+            for word in text.lower().split():
+                mh.update(word.encode("utf-8"))
+            result = self.lsh.query(mh)
+            if result:
+                return True
+            self.doc_id += 1
+            self.lsh.insert(str(self.doc_id), mh)
+            return False
+
+        def deduplicate(self, text: str) -> bool:
+            """Returns True if duplicate (should be skipped)."""
+            if self.is_exact_dup(text):
+                return True
+            return self.is_fuzzy_dup(text)
+  example_bad: |
+    # Only checking URL — same content at different URLs not caught
+    seen_urls = set()
+    for article in articles:
+        if article["url"] not in seen_urls:
+            seen_urls.add(article["url"])
+            store(article)  # Duplicate content from different publishers stored
+  when_applies: "Any data pipeline that aggregates content from multiple sources"
+  sources:
+    - "https://ekzhu.com/datasketch/minhash.html"
+
+- id: FC-NORM-006
+  text: "Implement Change Data Capture (CDC) to track all data mutations. Every insert, update, and delete should produce an immutable event with before/after state and metadata."
+  why: >
+    Fact-checking data changes over time: articles get corrected, government records are amended,
+    claims are retracted. Without CDC, there is no way to answer "what did this record look like
+    when we fact-checked it?" or "when did this data change?" This destroys reproducibility — a
+    fact-check that was correct yesterday cannot be verified today because the underlying data was
+    silently overwritten. CDC also enables real-time downstream processing.
+  how_to_do_right: |
+    1. Never UPDATE in place — use append-only pattern or soft deletes
+    2. Store CDC events: {event_type, timestamp, before_state, after_state, source, user/system}
+    3. Use PostgreSQL logical replication or trigger-based CDC for database changes
+    4. For application-level CDC: emit events in the same transaction as the data change
+    5. Retain CDC events for at least 2 years (legal requirement for fact-checking audit trails)
+    6. Index CDC events by entity_id and timestamp for efficient history queries
+    7. Use CDC stream (Kafka/Redis Streams) for real-time downstream consumers
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [consistency]
+  example_good: |
+    from datetime import datetime, timezone
+    from pydantic import BaseModel
+    from typing import Any
+    from enum import Enum
+
+    class CDCEventType(str, Enum):
+        INSERT = "insert"
+        UPDATE = "update"
+        DELETE = "delete"
+
+    class CDCEvent(BaseModel):
+        event_id: str
+        event_type: CDCEventType
+        entity_type: str
+        entity_id: str
+        timestamp: datetime
+        before: dict[str, Any] | None = None
+        after: dict[str, Any] | None = None
+        source: str
+        metadata: dict[str, Any] = {}
+
+    class CDCStore:
+        async def record_update(
+            self, entity_type: str, entity_id: str,
+            before: dict, after: dict, source: str,
+        ) -> CDCEvent:
+            event = CDCEvent(
+                event_id=generate_uuid(),
+                event_type=CDCEventType.UPDATE,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                timestamp=datetime.now(timezone.utc),
+                before=before,
+                after=after,
+                source=source,
+            )
+            await self._persist(event)
+            await self._publish_to_stream(event)
+            return event
+
+        async def get_history(self, entity_type: str, entity_id: str) -> list[CDCEvent]:
+            return await self._query(entity_type=entity_type, entity_id=entity_id)
+  example_bad: |
+    # In-place update — previous state lost forever
+    db.execute("UPDATE documents SET content = %s WHERE id = %s", (new_content, doc_id))
+    # No one can ever know what the document said before this update
+  when_applies: "Any system where data changes over time and historical state matters for auditing"
+  sources:
+    - "https://martinfowler.com/articles/data-mesh-principles.html"
+
+- id: FC-NORM-007
+  text: "Track data lineage from source to derived artifacts. Every piece of data must carry metadata about where it came from, when it was collected, what transformations were applied, and what version of the code processed it."
+  why: >
+    When a fact-check is challenged, the first question is "where did this data come from?" Without
+    lineage, tracing a derived conclusion back to its raw source requires manual investigation
+    across multiple systems. A Brazilian fact-checking organization lost a legal dispute because
+    they could not prove the provenance of government spending data used in a published fact-check.
+    Data lineage is both a technical necessity and a legal safeguard.
+  how_to_do_right: |
+    1. Every record must have: source_url, fetched_at, fetched_by (pipeline version), raw_hash
+    2. Every transformation must record: input_ids, transform_name, transform_version, output_id
+    3. Store lineage as a DAG: raw_source -> parsed -> normalized -> enriched -> stored
+    4. Include pipeline git commit hash in processing metadata
+    5. Lineage must survive data migrations (carry forward, not regenerate)
+    6. Provide API to query: "given this fact-check, show me all source documents"
+    7. Periodically validate lineage: check that referenced source records still exist
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [fact_checking, compliance]
+    concern: [consistency]
+  example_good: |
+    from pydantic import BaseModel, Field
+    from datetime import datetime
+    from typing import Any
+
+    class DataLineage(BaseModel):
+        source_url: str
+        fetched_at: datetime
+        fetcher_version: str
+        raw_content_hash: str
+        transformations: list[dict[str, Any]] = Field(default_factory=list)
+        pipeline_commit: str = ""
+
+    class NormalizedRecord(BaseModel):
+        id: str
+        data: dict[str, Any]
+        lineage: DataLineage
+
+        def add_transformation(self, name: str, version: str, params: dict = {}):
+            self.lineage.transformations.append({
+                "name": name,
+                "version": version,
+                "params": params,
+                "applied_at": datetime.utcnow().isoformat(),
+            })
+
+    # Usage
+    record = NormalizedRecord(
+        id="doc-123",
+        data={"title": "...", "content": "..."},
+        lineage=DataLineage(
+            source_url="https://dados.gov.br/dataset/xyz",
+            fetched_at=datetime.utcnow(),
+            fetcher_version="scraper-v2.1.0",
+            raw_content_hash="sha256:abc123...",
+            pipeline_commit="7c1a5eb",
+        ),
+    )
+    record.add_transformation("html_to_text", "v1.2", {"parser": "readability"})
+  example_bad: |
+    # No lineage — impossible to trace data back to source
+    db.insert({"title": title, "content": content})
+    # Six months later: "Where did this data come from?" — nobody knows
+  when_applies: "All data pipelines, especially those producing outputs used in published fact-checks"
+  sources:
+    - "https://martinfowler.com/articles/data-mesh-principles.html"
+
+- id: FC-NORM-008
+  text: "Assign a data quality score (0-100) to every record. Score should reflect completeness, freshness, accuracy, and source reliability. Use this score to weight evidence in downstream fact-checking."
+  why: >
+    Not all data is equal. A government official database record is more reliable than a tweet.
+    A record from yesterday is more relevant than one from 3 years ago. A record with all fields
+    populated is more useful than one with only a title. Without quality scoring, the fact-checking
+    system treats all evidence equally, leading to verdicts influenced by low-quality or outdated
+    data. Quality scoring enables downstream systems to weight evidence appropriately.
+  how_to_do_right: |
+    1. Define quality dimensions: completeness (0-25), freshness (0-25), source_reliability (0-25), consistency (0-25)
+    2. Completeness: percentage of non-null fields weighted by field importance
+    3. Freshness: exponential decay from publication date (halve score every 6 months)
+    4. Source reliability: static score per source (government=90, major news=80, blog=40)
+    5. Consistency: cross-reference with other records (confirmed facts score higher)
+    6. Store quality_score alongside every record, recalculate on update
+    7. Expose quality_score in all APIs so downstream systems can filter/weight
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [domain_specific]
+  example_good: |
+    from datetime import datetime, timezone
+    from math import exp
+
+    SOURCE_RELIABILITY = {
+        "dados.gov.br": 90,
+        "transparencia.gov.br": 90,
+        "ibge.gov.br": 95,
+        "major_news": 80,
+        "regional_news": 60,
+        "blog": 40,
+        "social_media": 20,
+    }
+
+    REQUIRED_FIELDS = ["title", "content", "published_at", "author", "url"]
+
+    def calculate_quality_score(record: dict, source_type: str) -> int:
+        # Completeness (0-25)
+        present = sum(1 for f in REQUIRED_FIELDS if record.get(f))
+        completeness = int(25 * (present / len(REQUIRED_FIELDS)))
+
+        # Freshness (0-25) — exponential decay, half-life 6 months
+        freshness = 0
+        if record.get("published_at"):
+            days_old = (datetime.now(timezone.utc) - record["published_at"]).days
+            freshness = int(25 * exp(-0.693 * days_old / 180))
+
+        # Source reliability (0-25)
+        reliability = int(SOURCE_RELIABILITY.get(source_type, 30) * 0.25)
+
+        # Consistency placeholder (0-25) — requires cross-referencing
+        consistency = 15  # Default moderate until cross-referenced
+
+        return min(100, completeness + freshness + reliability + consistency)
+  example_bad: |
+    # All records treated equally regardless of quality
+    for evidence in evidence_list:
+        total_score += evidence["relevance"]  # No quality weighting
+    verdict = "TRUE" if total_score > threshold else "FALSE"
+  when_applies: "Any evidence aggregation system for fact-checking where data quality varies"
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/models/"
+
+- id: FC-NORM-009
+  text: "Implement entity resolution to match the same entity across different data sources despite name variations. Use a combination of exact key matching, fuzzy string matching, and contextual attributes."
+  why: >
+    The same person appears as "Joao da Silva", "JOAO DA SILVA", "J. Silva", "Joao Silva" across
+    different government databases. The same company appears with and without "LTDA", "S.A.", or
+    "ME" suffix. Without entity resolution, the fact-checking system treats these as different
+    entities, missing connections between a politician's declared assets and their government
+    contracts, or between a company's CNPJ in different registries.
+  how_to_do_right: |
+    1. First pass: exact match on canonical identifiers (CPF, CNPJ) when available
+    2. Second pass: normalized name matching (lowercase, remove accents, standardize suffixes)
+    3. Third pass: fuzzy matching (Jaro-Winkler >= 0.92) on normalized names
+    4. Use contextual attributes to confirm: same city + similar name = likely match
+    5. Create entity clusters with confidence scores (exact=1.0, fuzzy=0.85, context=0.70)
+    6. Human review queue for matches with confidence 0.70-0.85
+    7. Track merge decisions for audit: which records were linked and why
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pandas]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [domain_specific]
+  example_good: |
+    import unicodedata
+    from jellyfish import jaro_winkler_similarity
+
+    def normalize_name(name: str) -> str:
+        name = name.lower().strip()
+        # Remove accents
+        name = "".join(
+            c for c in unicodedata.normalize("NFD", name)
+            if unicodedata.category(c) != "Mn"
+        )
+        # Remove common suffixes
+        for suffix in [" ltda", " s.a.", " s/a", " me", " eireli", " epp"]:
+            name = name.removesuffix(suffix)
+        # Normalize whitespace
+        return " ".join(name.split())
+
+    def resolve_entity(
+        name: str, cpf: str | None, records: list[dict]
+    ) -> list[dict]:
+        matches = []
+        normalized = normalize_name(name)
+
+        for record in records:
+            # Exact CPF match
+            if cpf and record.get("cpf") == cpf:
+                matches.append({**record, "match_confidence": 1.0, "match_type": "cpf_exact"})
+                continue
+
+            # Fuzzy name match
+            rec_normalized = normalize_name(record["name"])
+            similarity = jaro_winkler_similarity(normalized, rec_normalized)
+            if similarity >= 0.92:
+                matches.append({
+                    **record, "match_confidence": round(similarity, 3),
+                    "match_type": "name_fuzzy",
+                })
+
+        return sorted(matches, key=lambda m: m["match_confidence"], reverse=True)
+  example_bad: |
+    # Exact string match only — misses 60%+ of valid matches
+    def find_person(name: str, records: list[dict]) -> dict | None:
+        for r in records:
+            if r["name"] == name:  # "Joao da Silva" != "JOAO DA SILVA"
+                return r
+        return None
+  when_applies: "Cross-referencing data across Brazilian government databases, news sources, and registries"
+  sources:
+    - "https://github.com/jamesturk/jellyfish"
+
+- id: FC-NORM-010
+  text: "Version all data with explicit version identifiers and support point-in-time queries. Every record must carry created_at, updated_at, and version fields to enable reproducible fact-checks."
+  why: >
+    A fact-check published in January references data that may change by March. When someone
+    challenges the fact-check, you need to show what the data looked like at the time of the
+    fact-check, not what it looks like now. Without versioning, data mutations silently invalidate
+    published fact-checks. This is both an accuracy issue and a legal requirement — published
+    fact-checks must be reproducible from their original data.
+  how_to_do_right: |
+    1. Every record has: version (integer), created_at (UTC), updated_at (UTC)
+    2. Updates create new versions, never overwrite (append-only or temporal table)
+    3. Support query: get_record(id, as_of=datetime) to retrieve historical state
+    4. Default queries return latest version unless as_of is specified
+    5. Store fact-check snapshots: freeze referenced data versions at fact-check publication time
+    6. Implement retention policy: keep all versions for 2 years minimum
+    7. Provide diff API: compare two versions of the same record
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [consistency]
+  example_good: |
+    from datetime import datetime, timezone
+    from pydantic import BaseModel
+
+    class VersionedRecord(BaseModel):
+        id: str
+        version: int
+        data: dict
+        created_at: datetime
+        updated_at: datetime
+        is_latest: bool = True
+        previous_version: int | None = None
+
+    class VersionedStore:
+        async def upsert(self, id: str, data: dict) -> VersionedRecord:
+            current = await self.get_latest(id)
+            now = datetime.now(timezone.utc)
+
+            if current:
+                # Mark old version as not latest
+                await self._mark_not_latest(current)
+                new_version = current.version + 1
+            else:
+                new_version = 1
+
+            record = VersionedRecord(
+                id=id, version=new_version, data=data,
+                created_at=current.created_at if current else now,
+                updated_at=now, is_latest=True,
+                previous_version=current.version if current else None,
+            )
+            await self._persist(record)
+            return record
+
+        async def get_as_of(self, id: str, as_of: datetime) -> VersionedRecord | None:
+            """Get the version that was current at the given datetime."""
+            return await self._query_temporal(id=id, as_of=as_of)
+  example_bad: |
+    # Overwrite in place — all history lost
+    await db.execute(
+        "UPDATE records SET data = $1, updated_at = NOW() WHERE id = $2",
+        new_data, record_id,
+    )
+  when_applies: "Any data that changes over time and is referenced by published fact-checks"
+  sources:
+    - "https://docs.pydantic.dev/latest/concepts/models/"
+
+- id: FC-NORM-011
+  text: "Choose between ETL and ELT based on data characteristics: ETL for well-known schemas with quality requirements before storage; ELT for exploratory data and large-volume ingestion where transformation logic evolves frequently."
+  why: >
+    Fact-checking has both patterns: government APIs with stable schemas (ETL — validate and
+    transform before loading) and social media or new sources with evolving formats (ELT — load
+    raw, transform later). Choosing wrong means either: storing garbage data that pollutes
+    downstream (wrong ELT) or building rigid pipelines that break when sources change (wrong ETL).
+    Many teams default to one pattern for everything, causing unnecessary technical debt.
+  how_to_do_right: |
+    1. ETL for: government APIs (stable schema), structured databases, official records
+    2. ELT for: social media, web scraping, new sources under evaluation
+    3. ETL pipeline: extract -> validate schema -> transform -> quality check -> load to clean store
+    4. ELT pipeline: extract -> load to raw store -> transform on read -> promote to clean store
+    5. Raw store (ELT): blob storage or raw schema in PostgreSQL, partitioned by date
+    6. Clean store (ETL/ELT): normalized schema with quality scores and lineage
+    7. Promotion from raw to clean requires explicit quality gate (score >= 50)
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic, pandas]
+  domains:
+    domain: [fact_checking, data_engineering]
+    concern: [decision_making]
+  example_good: |
+    from abc import ABC, abstractmethod
+    from enum import Enum
+
+    class PipelineStrategy(str, Enum):
+        ETL = "etl"
+        ELT = "elt"
+
+    SOURCE_STRATEGIES: dict[str, PipelineStrategy] = {
+        "dados.gov.br": PipelineStrategy.ETL,       # Stable schema
+        "ibge.gov.br": PipelineStrategy.ETL,         # Stable schema
+        "transparencia.gov.br": PipelineStrategy.ETL,# Stable schema
+        "twitter": PipelineStrategy.ELT,             # Evolving format
+        "web_scrape": PipelineStrategy.ELT,          # Unknown schema
+        "new_source": PipelineStrategy.ELT,          # Under evaluation
+    }
+
+    class ETLPipeline:
+        async def run(self, raw_data: dict, source: str) -> dict | None:
+            validated = self.validate_schema(raw_data, source)
+            if not validated:
+                return None  # Reject before storage
+            transformed = self.transform(validated)
+            quality = self.quality_check(transformed)
+            if quality.score < 50:
+                return None
+            return await self.store_clean(transformed, quality)
+
+    class ELTPipeline:
+        async def run(self, raw_data: dict, source: str) -> str:
+            raw_id = await self.store_raw(raw_data, source)
+            # Transform later, on demand or scheduled
+            return raw_id
+  example_bad: |
+    # One pipeline for everything — breaks when schema changes
+    def ingest(data, source):
+        normalized = normalize(data)  # Crashes on unknown schemas
+        db.insert(normalized)         # Garbage data from new sources
+  when_applies: "Designing data pipelines that handle both stable and evolving data sources"
+  sources:
+    - "https://martinfowler.com/bliki/CQRS.html"
+
+- id: FC-NORM-012
+  text: "Monitor data freshness actively: track when each source was last successfully ingested, alert when sources go stale beyond their expected update frequency, and display freshness metadata in all downstream UIs."
+  why: >
+    Government APIs go down silently, RSS feeds stop updating, web pages change structure. Without
+    freshness monitoring, the fact-checking system serves stale data without anyone knowing. A
+    fact-check about current inflation rates is worthless if the underlying BACEN data is 3 months
+    old because the ingestion pipeline silently failed. Users and fact-checkers must see data
+    freshness to assess reliability. A stale source presented as current is worse than no source.
+  how_to_do_right: |
+    1. Track per-source: last_successful_ingest, expected_frequency, consecutive_failures
+    2. Alert when: last_successful_ingest > 2x expected_frequency
+    3. Dashboard showing all sources with freshness status (green/yellow/red)
+    4. Every API response and UI display must include data_freshness metadata
+    5. Separate freshness from availability: source may be available but returning stale data
+    6. Automatically reduce quality_score for stale data (linear decay after expected_frequency)
+    7. Weekly freshness report summarizing source health for editorial team
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [fact_checking, observability]
+    concern: [metrics]
+  example_good: |
+    from datetime import datetime, timedelta, timezone
+    from pydantic import BaseModel
+    from enum import Enum
+
+    class FreshnessStatus(str, Enum):
+        FRESH = "fresh"
+        WARNING = "warning"
+        STALE = "stale"
+        DEAD = "dead"
+
+    class SourceFreshness(BaseModel):
+        source_id: str
+        source_name: str
+        last_success: datetime | None
+        expected_interval: timedelta
+        consecutive_failures: int = 0
+        status: FreshnessStatus = FreshnessStatus.FRESH
+
+        def update_status(self) -> None:
+            if self.last_success is None:
+                self.status = FreshnessStatus.DEAD
+                return
+            elapsed = datetime.now(timezone.utc) - self.last_success
+            if elapsed <= self.expected_interval:
+                self.status = FreshnessStatus.FRESH
+            elif elapsed <= self.expected_interval * 2:
+                self.status = FreshnessStatus.WARNING
+            elif elapsed <= self.expected_interval * 5:
+                self.status = FreshnessStatus.STALE
+            else:
+                self.status = FreshnessStatus.DEAD
+
+    SOURCES = [
+        SourceFreshness(
+            source_id="bacen_selic",
+            source_name="BACEN SELIC Rate",
+            last_success=None,
+            expected_interval=timedelta(days=1),
+        ),
+        SourceFreshness(
+            source_id="ibge_ipca",
+            source_name="IBGE IPCA Index",
+            last_success=None,
+            expected_interval=timedelta(days=30),
+        ),
+    ]
+  example_bad: |
+    # No freshness tracking — serving potentially stale data as current
+    def get_inflation_rate():
+        return db.query("SELECT rate FROM inflation ORDER BY date DESC LIMIT 1")
+        # Last record could be from 6 months ago — no one knows
+  when_applies: "Any system that ingests data on a schedule and serves it to users or downstream systems"
+  sources:
+    - "https://opentelemetry.io/docs/concepts/signals/metrics/"

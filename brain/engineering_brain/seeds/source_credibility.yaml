@@ -1,0 +1,765 @@
+layer: rules
+domain: fact_checking
+knowledge:
+- id: FC-SRC-001
+  text: "Score source credibility across multiple dimensions: accuracy_history (past correctness rate), bias_rating (political/ideological lean), expertise_level (domain authority), transparency (methodology disclosure), and track_record (corrections issued). A single 'trust score' hides critical distinctions."
+  why: >
+    A source can be highly accurate but strongly biased (e.g., a partisan think tank with good
+    methodology). A single trust score collapses these dimensions, making it impossible to
+    weight appropriately for different claim types. Multi-dimensional scoring lets the system
+    prefer unbiased sources for political claims while accepting biased-but-accurate sources
+    for scientific claims where expertise matters more than neutrality.
+  how_to_do_right: |
+    1. Define 5 dimensions: accuracy (0-1), bias (0-1, 0=center), expertise (0-1), transparency (0-1), track_record (0-1)
+    2. Store each dimension separately in the source profile
+    3. Compute composite score with domain-dependent weights:
+       - political claims: bias=0.35, accuracy=0.30, transparency=0.20, expertise=0.10, track_record=0.05
+       - science claims: expertise=0.35, accuracy=0.30, track_record=0.20, transparency=0.10, bias=0.05
+    4. Update dimensions incrementally as new data arrives (Bayesian update, not overwrite)
+    5. Flag sources with high accuracy but high bias for human review
+    6. Expose dimension breakdown in API responses, not just composite
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [pydantic]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    class SourceCredibility(BaseModel):
+        source_id: str
+        accuracy: float = Field(ge=0.0, le=1.0)
+        bias: float = Field(ge=0.0, le=1.0)  # 0 = center, 1 = extreme
+        expertise: float = Field(ge=0.0, le=1.0)
+        transparency: float = Field(ge=0.0, le=1.0)
+        track_record: float = Field(ge=0.0, le=1.0)
+
+        def composite(self, domain: str) -> float:
+            weights = DOMAIN_WEIGHTS[domain]
+            return sum(
+                getattr(self, dim) * w
+                for dim, w in weights.items()
+            )
+
+    DOMAIN_WEIGHTS = {
+        "politics": {"accuracy": 0.30, "bias": 0.35, "expertise": 0.10, "transparency": 0.20, "track_record": 0.05},
+        "science": {"accuracy": 0.30, "bias": 0.05, "expertise": 0.35, "transparency": 0.10, "track_record": 0.20},
+    }
+  example_bad: |
+    class Source(BaseModel):
+        name: str
+        trust_score: float  # Single number — hides bias, expertise, etc.
+  when_applies: All evidence evaluation and source selection steps
+  sources:
+    - "NewsGuard rating methodology"
+    - "Media Bias/Fact Check methodology"
+
+- id: FC-SRC-002
+  text: "Detect media bias using both content analysis (language patterns, framing, loaded words) and structural analysis (ownership, funding, editorial board composition). Neither alone is sufficient."
+  why: >
+    Content-only bias detection misses sources that use neutral language to present cherry-picked
+    facts. Structural-only detection misses individual articles that deviate from the outlet's
+    norm. A source rated 'center' by MBFC may publish a heavily biased opinion piece.
+    Combining both approaches catches 40% more bias than either alone according to
+    AllSides media bias research.
+  how_to_do_right: |
+    1. Content analysis: detect loaded words, framing bias, omission of counterarguments
+    2. Use a fine-tuned classifier on labeled bias datasets (MBFC, AllSides, Ad Fontes)
+    3. Structural analysis: map ownership networks, funding sources, editorial leanings
+    4. Combine scores: content_bias * 0.6 + structural_bias * 0.4
+    5. Per-article bias can differ from per-outlet bias — always analyze at article level
+    6. Flag when article bias diverges > 0.3 from outlet baseline
+    7. Update outlet baseline monthly with rolling window of 100 articles
+  severity: high
+  technologies:
+    lang: [python]
+    library: [transformers, spacy]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    class BiasAnalysis(BaseModel):
+        content_bias: float  # -1 (left) to +1 (right)
+        structural_bias: float
+        composite_bias: float
+        loaded_words: list[str]
+        framing_indicators: list[str]
+        diverges_from_outlet: bool
+
+    def analyze_bias(article: Article, outlet: OutletProfile) -> BiasAnalysis:
+        content = classify_content_bias(article.text)
+        structural = outlet.structural_bias
+        composite = content.score * 0.6 + structural * 0.4
+        diverges = abs(content.score - structural) > 0.3
+        return BiasAnalysis(
+            content_bias=content.score,
+            structural_bias=structural,
+            composite_bias=composite,
+            loaded_words=content.loaded_words,
+            framing_indicators=content.framing,
+            diverges_from_outlet=diverges,
+        )
+  example_bad: |
+    def is_biased(source_name: str) -> bool:
+        # Hardcoded list — no article-level analysis, no nuance
+        BIASED = ["source_a", "source_b"]
+        return source_name in BIASED
+  when_applies: Evidence evaluation and source credibility scoring
+  sources:
+    - "AllSides Media Bias Rating methodology"
+    - "Ad Fontes Media Bias Chart"
+
+- id: FC-SRC-003
+  text: "Integrate Media Bias/Fact Check (MBFC) data as a baseline source credibility signal, but never use it as the sole determinant. MBFC provides crowd-sourced bias ratings and factual accuracy ratings for 3,600+ outlets."
+  why: >
+    MBFC is the largest freely available media bias database, covering 3,600+ outlets. It provides
+    a solid baseline that would take years to build independently. However, MBFC ratings are
+    updated infrequently, may lag behind source quality changes, and have limited coverage of
+    non-English and emerging sources. Using it as sole signal creates a single point of failure.
+  how_to_do_right: |
+    1. Import MBFC ratings as one dimension in multi-dimensional source scoring
+    2. Map MBFC categories to numeric scale: LEFT=-1, LEFT_CENTER=-0.5, CENTER=0, RIGHT_CENTER=0.5, RIGHT=1
+    3. Map MBFC factual rating: VERY_HIGH=1.0, HIGH=0.8, MOSTLY_FACTUAL=0.6, MIXED=0.4, LOW=0.2, VERY_LOW=0.0
+    4. Weight MBFC at 30% of total bias score, blended with content analysis (70%)
+    5. For sources not in MBFC: use content analysis only, flag as 'unrated_source'
+    6. Re-sync MBFC data monthly via their API or scraping
+    7. Track drift: if own analysis diverges from MBFC by > 0.4 for > 10 articles, investigate
+  severity: high
+  technologies:
+    lang: [python]
+    library: [httpx, pydantic]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    class MBFCRating(BaseModel):
+        bias: Literal["LEFT", "LEFT_CENTER", "CENTER", "RIGHT_CENTER", "RIGHT"]
+        factual: Literal["VERY_HIGH", "HIGH", "MOSTLY_FACTUAL", "MIXED", "LOW", "VERY_LOW"]
+        credibility: Literal["HIGH", "MEDIUM", "LOW"]
+
+    FACTUAL_MAP = {"VERY_HIGH": 1.0, "HIGH": 0.8, "MOSTLY_FACTUAL": 0.6, "MIXED": 0.4, "LOW": 0.2, "VERY_LOW": 0.0}
+
+    def blend_with_mbfc(content_bias: float, mbfc: MBFCRating | None) -> float:
+        if mbfc is None:
+            return content_bias  # MBFC not available — use content analysis only
+        mbfc_score = FACTUAL_MAP[mbfc.factual]
+        return content_bias * 0.70 + mbfc_score * 0.30
+  example_bad: |
+    def get_source_trust(source_url: str) -> float:
+        mbfc = lookup_mbfc(source_url)
+        if mbfc:
+            return FACTUAL_MAP[mbfc.factual]  # MBFC as sole signal — brittle
+        return 0.5  # Unknown sources default to medium — no analysis at all
+  when_applies: Source credibility initialization and baseline scoring
+  sources:
+    - "https://mediabiasfactcheck.com/methodology/"
+
+- id: FC-SRC-004
+  text: "Generate ClaimReview schema.org markup for every published fact-check. Embed it in the HTML page and expose it via API. This is how Google, Bing, and social platforms discover and surface fact-checks."
+  why: >
+    Without ClaimReview markup, fact-checks are invisible to Google's Fact Check Explorer,
+    Google News fact-check labels, and Facebook's third-party fact-checking program. These
+    platforms exclusively consume ClaimReview to identify fact-checks. A fact-check without
+    ClaimReview reaches 10-100x fewer people because it misses search result integration.
+  how_to_do_right: |
+    1. Every published verdict MUST generate valid ClaimReview JSON-LD
+    2. Required fields: @type, claimReviewed, reviewRating, author, datePublished, url
+    3. reviewRating must include: ratingValue (1-5), bestRating, worstRating, alternateName
+    4. Map verdict labels: TRUE→5, PARTIALLY_TRUE→3, FALSE→1, MISLEADING→2, OUT_OF_CONTEXT→2
+    5. Validate JSON-LD with Google Rich Results Test API before publication
+    6. Include itemReviewed.appearance for social media source links
+    7. Submit to Google Fact Check Markup Tool for faster indexing
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [fact_checking, api]
+    concern: [domain_specific, web]
+  example_good: |
+    def generate_claim_review_jsonld(verdict: PublishedVerdict) -> dict:
+        return {
+            "@context": "https://schema.org",
+            "@type": "ClaimReview",
+            "datePublished": verdict.published_at.isoformat(),
+            "url": f"https://veritas.app/check/{verdict.id}",
+            "claimReviewed": verdict.claim_text,
+            "author": {
+                "@type": "Organization",
+                "name": "Veritas",
+                "url": "https://veritas.app",
+            },
+            "reviewRating": {
+                "@type": "Rating",
+                "ratingValue": VERDICT_TO_RATING[verdict.label],
+                "bestRating": 5,
+                "worstRating": 1,
+                "alternateName": verdict.label,
+            },
+            "itemReviewed": {
+                "@type": "CreativeWork",
+                "author": {"@type": "Person", "name": verdict.claim_author},
+                "datePublished": verdict.claim_date.isoformat() if verdict.claim_date else None,
+            },
+        }
+  example_bad: |
+    def publish_verdict(verdict: Verdict) -> str:
+        return render_template("verdict.html", verdict=verdict)
+        # No structured data — Google cannot find or label this fact-check
+  when_applies: All published fact-checks on Veritas
+  sources:
+    - "https://schema.org/ClaimReview"
+    - "Google Fact Check Explorer documentation"
+
+- id: FC-SRC-005
+  text: "Implement source freshness scoring that decays evidence relevance over time. Recent evidence is more valuable than old evidence, especially for time-sensitive claims. Use exponential decay with domain-specific half-lives."
+  why: >
+    A 2020 economic statistic should not carry the same weight as a 2024 one when verifying a
+    current claim. Without freshness decay, the system treats all evidence equally regardless of
+    age, leading to verdicts based on outdated data. Health guidance changes rapidly; a
+    pre-pandemic source on respiratory illness transmission is dangerously outdated.
+  how_to_do_right: |
+    1. Compute freshness_score = exp(-lambda * days_old) where lambda varies by domain
+    2. Domain half-lives: health=90 days, politics=180 days, science=365 days, history=3650 days
+    3. Multiply evidence relevance by freshness_score before aggregation
+    4. Flag evidence older than 2x half-life as 'potentially_outdated'
+    5. For evergreen topics (math, geography basics): set half-life to 10 years
+    6. Always prefer the most recent version of recurring data (GDP, unemployment)
+    7. Log freshness impact on final confidence score for auditability
+  severity: high
+  technologies:
+    lang: [python]
+    library: [numpy]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    import math
+
+    DOMAIN_HALF_LIVES = {
+        "health": 90, "politics": 180, "finance": 60,
+        "science": 365, "technology": 120, "history": 3650,
+    }
+
+    def freshness_score(published_date: datetime, domain: str) -> float:
+        days_old = (datetime.now() - published_date).days
+        half_life = DOMAIN_HALF_LIVES.get(domain, 365)
+        decay_lambda = math.log(2) / half_life
+        return math.exp(-decay_lambda * days_old)
+
+    def score_evidence_with_freshness(evidence: Evidence, domain: str) -> float:
+        base_score = evidence.relevance * evidence.source_credibility
+        freshness = freshness_score(evidence.published_date, domain)
+        return base_score * freshness
+  example_bad: |
+    def score_evidence(evidence: Evidence) -> float:
+        return evidence.relevance  # No freshness — 10-year-old data same weight as today's
+  when_applies: Evidence scoring and aggregation in all verification pipelines
+  sources:
+    - "https://ifcncodeofprinciples.poynter.org/the-commitments"
+
+- id: FC-SRC-006
+  text: "Detect aggregation bias: when multiple sources all derive from the same original report, they count as one source, not many. Track citation provenance to collapse derivative sources."
+  why: >
+    A single AP wire report picked up by 50 outlets looks like 50-source corroboration but is
+    actually 1-source information. Without aggregation bias detection, the system systematically
+    overcounts evidence strength for wire service stories. This inflates confidence scores and
+    can produce FALSE verdicts marked as high-confidence when the single original source was wrong.
+  how_to_do_right: |
+    1. Extract canonical source from each evidence piece (wire service tags, 'according to' attributions)
+    2. Build citation graph: if article B cites/derives from article A, B is derivative
+    3. Cluster evidence by original source using both URL analysis and text similarity
+    4. Count only cluster centroids as independent sources, not all cluster members
+    5. Reduce confidence proportionally: 5 articles from 1 wire report = 1 source, not 5
+    6. Flag in audit: 'Corroboration reduced from N to M due to aggregation bias'
+    7. Weight original source higher than derivatives within each cluster
+  severity: high
+  technologies:
+    lang: [python]
+    library: [networkx, scikit-learn]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    def collapse_aggregation(evidence: list[Evidence]) -> list[EvidenceCluster]:
+        clusters = []
+        seen = set()
+        for e in sorted(evidence, key=lambda x: x.published_date):
+            if e.id in seen:
+                continue
+            cluster = [e]
+            for other in evidence:
+                if other.id != e.id and other.id not in seen:
+                    if is_derivative(other, e):
+                        cluster.append(other)
+                        seen.add(other.id)
+            seen.add(e.id)
+            clusters.append(EvidenceCluster(original=e, derivatives=cluster[1:]))
+        return clusters
+
+    def effective_source_count(evidence: list[Evidence]) -> int:
+        clusters = collapse_aggregation(evidence)
+        return len(clusters)
+  example_bad: |
+    def count_sources(evidence: list[Evidence]) -> int:
+        return len(evidence)  # 50 syndicated copies of 1 AP report = "50 sources"
+  when_applies: Multi-source corroboration evaluation
+  sources:
+    - "News aggregation and source diversity research (Bro & Wallberg, 2014)"
+
+- id: FC-SRC-007
+  text: "Score domain expertise separately from general credibility. A Nobel laureate in physics has no special authority on economics. Map source expertise to specific knowledge domains and weight accordingly."
+  why: >
+    Appeal to irrelevant authority is a common logical fallacy that automated systems replicate.
+    A system that treats all high-credibility sources equally across domains will overweight
+    a famous scientist's opinion on policy or a politician's claim about science. Domain-specific
+    expertise scoring prevents cross-domain credibility leakage.
+  how_to_do_right: |
+    1. Maintain expertise_domains: dict[str, float] per source (e.g., {"physics": 0.95, "economics": 0.2})
+    2. For individual sources: derive from publication history, credentials, institutional affiliation
+    3. For institutional sources: derive from organizational mission, staff expertise, publication focus
+    4. When scoring evidence, use expertise score for the CLAIM's domain, not source's best domain
+    5. If source has no expertise in claim domain (< 0.3), apply penalty factor 0.5
+    6. Distinguish between expert opinion and expert data — data is domain-neutral, opinion is not
+    7. Allow manual override with justification for cross-domain experts
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    class SourceExpertise(BaseModel):
+        source_id: str
+        domain_scores: dict[str, float]  # e.g., {"health": 0.9, "politics": 0.3}
+
+        def score_for_domain(self, domain: str) -> float:
+            base = self.domain_scores.get(domain, 0.2)  # Default low for unknown domains
+            return base
+
+        def credibility_for_claim(self, claim_domain: str, base_credibility: float) -> float:
+            expertise = self.score_for_domain(claim_domain)
+            if expertise < 0.3:
+                return base_credibility * 0.5  # Penalty for out-of-domain authority
+            return base_credibility * expertise
+  example_bad: |
+    def get_source_credibility(source: Source) -> float:
+        return source.overall_trust  # Same trust for all topics — physics prof trusted on economics
+  when_applies: Evidence evaluation when source authority matters for the verdict
+  sources:
+    - "Expertise and credibility in fact-checking (Graves, 2016)"
+
+- id: FC-SRC-008
+  text: "Track source reputation over time with a sliding window. A source that was reliable 5 years ago but has declined recently should be scored on recent performance, not historical reputation."
+  why: >
+    Media outlets change ownership, editorial direction, and quality over time. A source that
+    was MBFC 'High' credibility in 2020 may have declined to 'Mixed' by 2024. Static reputation
+    scores become stale and misleading. Rolling window tracking captures quality trajectories
+    and enables early detection of declining sources.
+  how_to_do_right: |
+    1. Store accuracy observations as time series: (date, claim_id, was_correct: bool)
+    2. Compute rolling accuracy over 90-day, 180-day, and 365-day windows
+    3. Use the 90-day window as primary signal, longer windows for stability
+    4. Detect declining trend: if 90d accuracy < 365d accuracy by > 0.15, flag as 'declining'
+    5. Detect improving trend: if 90d accuracy > 365d accuracy by > 0.15, flag as 'improving'
+    6. For new sources (< 30 observations): use Bayesian prior from domain average
+    7. Expose trend in source profile: STABLE, IMPROVING, DECLINING
+  severity: high
+  technologies:
+    lang: [python]
+    library: [numpy, sqlalchemy]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    class SourceReputationTracker:
+        def compute_rolling_accuracy(self, source_id: str, window_days: int) -> float:
+            cutoff = datetime.now() - timedelta(days=window_days)
+            observations = self.db.query(AccuracyObservation).filter(
+                AccuracyObservation.source_id == source_id,
+                AccuracyObservation.date >= cutoff,
+            ).all()
+            if len(observations) < 10:
+                return self.domain_prior(source_id)
+            return sum(o.was_correct for o in observations) / len(observations)
+
+        def detect_trend(self, source_id: str) -> str:
+            short = self.compute_rolling_accuracy(source_id, 90)
+            long = self.compute_rolling_accuracy(source_id, 365)
+            if short < long - 0.15:
+                return "DECLINING"
+            elif short > long + 0.15:
+                return "IMPROVING"
+            return "STABLE"
+  example_bad: |
+    TRUSTED_SOURCES = {"reuters": 0.95, "ap": 0.93}  # Static — never updated
+    def get_trust(source: str) -> float:
+        return TRUSTED_SOURCES.get(source, 0.5)
+  when_applies: Source credibility scoring and monitoring
+  sources:
+    - "https://ifcncodeofprinciples.poynter.org/the-commitments"
+
+- id: FC-SRC-009
+  text: "Handle anonymous sources with explicit credibility penalties and transparency requirements. Anonymous evidence is not zero-value but must be clearly flagged and down-weighted."
+  why: >
+    Anonymous sources are sometimes necessary (whistleblowers, safety concerns) but are inherently
+    less verifiable. Without explicit handling, the system either rejects valuable anonymous
+    evidence or treats it equally to named sources. Both extremes are wrong. Down-weighting
+    with transparency flags balances utility against verifiability.
+  how_to_do_right: |
+    1. Tag evidence as anonymous_source: bool in the evidence model
+    2. Apply credibility multiplier of 0.4 for anonymous sources (vs 1.0 for named)
+    3. Anonymous evidence alone CANNOT produce a TRUE/FALSE verdict — only UNVERIFIABLE or LIKELY_*
+    4. If anonymous source corroborated by named source, restore weight to 0.7
+    5. Display anonymous source flag prominently in fact-check output
+    6. Track anonymous source accuracy separately — adjust multiplier based on historical data
+    7. Never attempt to de-anonymize sources — store only the evidence content
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [fact_checking, security]
+    concern: [domain_specific]
+  example_good: |
+    class Evidence(BaseModel):
+        text: str
+        source_url: str | None
+        is_anonymous: bool = False
+        credibility_multiplier: float = 1.0
+
+        def effective_credibility(self, base: float) -> float:
+            if self.is_anonymous:
+                return base * 0.4
+            return base * self.credibility_multiplier
+
+    def can_produce_definitive_verdict(evidence: list[Evidence]) -> bool:
+        named_supporting = [e for e in evidence if not e.is_anonymous and e.supports_verdict]
+        return len(named_supporting) >= 2  # Need 2+ named sources for definitive verdict
+  example_bad: |
+    def evaluate_evidence(evidence: list[Evidence]) -> float:
+        # All sources weighted equally — anonymous leak same as official statement
+        return sum(e.relevance for e in evidence) / len(evidence)
+  when_applies: Evidence evaluation when any source is anonymous or unattributed
+  sources:
+    - "https://ifcncodeofprinciples.poynter.org/the-commitments"
+
+- id: FC-SRC-010
+  text: "Verify social media sources by cross-referencing account identity, posting history, and platform verification status. A viral tweet from an unverified account impersonating an official source is not evidence."
+  why: >
+    Social media is the primary vector for misinformation and the primary source of claims to
+    verify. Fake accounts impersonate officials, doctors, and journalists. Without identity
+    verification, the system may treat a parody account's claim as an official statement.
+    During COVID-19, fake doctor accounts spread medical misinformation that was cited as
+    expert opinion by automated systems.
+  how_to_do_right: |
+    1. Check platform verification status (blue check, verified badge)
+    2. Cross-reference account with known entity database (Wikidata, organizational websites)
+    3. Analyze account age, posting history, follower authenticity (bot detection)
+    4. Assign social_verification_level: VERIFIED_OFFICIAL, LIKELY_AUTHENTIC, UNVERIFIED, SUSPICIOUS
+    5. SUSPICIOUS accounts: zero credibility for attribution purposes
+    6. UNVERIFIED: treat content as anonymous source (0.4 multiplier)
+    7. Store verification result with timestamp — re-verify if > 30 days old
+  severity: high
+  technologies:
+    lang: [python]
+    library: [httpx, pydantic]
+  domains:
+    domain: [fact_checking, security]
+    concern: [domain_specific]
+  example_good: |
+    class SocialVerification(BaseModel):
+        platform: str
+        account_id: str
+        verification_level: Literal["VERIFIED_OFFICIAL", "LIKELY_AUTHENTIC", "UNVERIFIED", "SUSPICIOUS"]
+        account_age_days: int
+        verified_at: datetime
+
+    def assess_social_source(account: SocialAccount) -> SocialVerification:
+        level = "UNVERIFIED"
+        if account.platform_verified and account.matched_to_entity:
+            level = "VERIFIED_OFFICIAL"
+        elif account.age_days > 365 and account.follower_ratio > 0.01 and not account.bot_signals:
+            level = "LIKELY_AUTHENTIC"
+        elif account.bot_signals or account.age_days < 30:
+            level = "SUSPICIOUS"
+        return SocialVerification(
+            platform=account.platform, account_id=account.id,
+            verification_level=level, account_age_days=account.age_days,
+            verified_at=datetime.now(),
+        )
+  example_bad: |
+    def get_tweet_author(tweet: dict) -> str:
+        return tweet["user"]["name"]  # No verification — parody accounts treated as real
+  when_applies: All evidence sourced from social media platforms
+  sources:
+    - "Bot detection and account verification research (Varol et al., 2017)"
+
+- id: FC-SRC-011
+  text: "Score institutional sources differently from individual sources. Institutions have editorial processes, accountability structures, and reputational stakes that individuals lack. An official WHO statement carries different epistemic weight than a single doctor's opinion."
+  why: >
+    Institutional sources undergo internal review before publication, creating a layer of
+    quality control absent from individual sources. However, institutions can also be slower
+    to correct errors and may have political constraints. The scoring model must capture both
+    the reliability advantage and the known limitations of institutional vs individual sources.
+  how_to_do_right: |
+    1. Classify each source as INSTITUTIONAL or INDIVIDUAL
+    2. Institutional boost: +0.15 to accuracy dimension (editorial review acts as filter)
+    3. Institutional penalty: -0.10 to timeliness (slower to publish, slower to correct)
+    4. Within institutional, sub-classify: GOVERNMENT, ACADEMIC, NGO, MEDIA, CORPORATE
+    5. GOVERNMENT data sources (census, treasury): highest tier for statistical claims
+    6. ACADEMIC peer-reviewed: highest tier for scientific claims
+    7. CORPORATE: apply additional bias check (commercial interest)
+    8. Track institutional corrections separately — slow correction is worse than no correction
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    class SourceType(str, Enum):
+        GOVT = "GOVERNMENT"
+        ACADEMIC = "ACADEMIC"
+        NGO = "NGO"
+        MEDIA = "MEDIA"
+        CORPORATE = "CORPORATE"
+        INDIVIDUAL = "INDIVIDUAL"
+
+    INSTITUTIONAL_ADJUSTMENTS = {
+        SourceType.GOVT: {"accuracy_boost": 0.20, "timeliness_penalty": 0.15},
+        SourceType.ACADEMIC: {"accuracy_boost": 0.15, "timeliness_penalty": 0.10},
+        SourceType.NGO: {"accuracy_boost": 0.10, "timeliness_penalty": 0.05},
+        SourceType.MEDIA: {"accuracy_boost": 0.10, "timeliness_penalty": 0.05},
+        SourceType.CORPORATE: {"accuracy_boost": 0.05, "timeliness_penalty": 0.05, "bias_penalty": 0.15},
+        SourceType.INDIVIDUAL: {"accuracy_boost": 0.0, "timeliness_penalty": 0.0},
+    }
+  example_bad: |
+    # Individual blogger and WHO treated identically
+    def score_source(source: Source) -> float:
+        return source.trust_score  # No institutional/individual distinction
+  when_applies: Source credibility scoring for all evidence types
+  sources:
+    - "Institutional trust and source credibility (Metzger & Flanagin, 2013)"
+
+- id: FC-SRC-012
+  text: "When multiple sources conflict (one says TRUE, another says FALSE), resolve using a weighted voting system based on source credibility, domain expertise, and evidence recency. Document the conflict and resolution rationale in the audit trail."
+  why: >
+    Source conflicts are inevitable and are the hardest part of fact-checking. Naive majority
+    voting ignores source quality. A single authoritative primary source should outweigh five
+    low-quality blogs. Without explicit conflict resolution, the system either picks randomly
+    or always picks the majority, both of which produce systematic errors.
+  how_to_do_right: |
+    1. Detect conflict: group evidence by stance (SUPPORTS, REFUTES, NEUTRAL)
+    2. Compute weighted_support = sum(credibility * expertise * freshness for SUPPORTS evidence)
+    3. Compute weighted_refute = sum(credibility * expertise * freshness for REFUTES evidence)
+    4. If |weighted_support - weighted_refute| < 0.2 → DISPUTED, route to human review
+    5. Otherwise, go with the higher-weighted side
+    6. Log: conflict_detected=True, supports_weight, refutes_weight, resolution_method
+    7. Display conflict in explanation: 'Some sources disagree. Our assessment weighs [X] because [Y]'
+  severity: high
+  technologies:
+    lang: [python]
+    library: [pydantic]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific, decision_making]
+  example_good: |
+    class ConflictResolution(BaseModel):
+        supports_weight: float
+        refutes_weight: float
+        resolution: Literal["SUPPORTS", "REFUTES", "DISPUTED"]
+        margin: float
+        routed_to_human: bool
+
+    def resolve_conflict(evidence: list[Evidence], claim_domain: str) -> ConflictResolution:
+        supports = sum(
+            e.credibility * e.expertise_for(claim_domain) * e.freshness
+            for e in evidence if e.stance == "SUPPORTS"
+        )
+        refutes = sum(
+            e.credibility * e.expertise_for(claim_domain) * e.freshness
+            for e in evidence if e.stance == "REFUTES"
+        )
+        margin = abs(supports - refutes)
+        if margin < 0.2:
+            return ConflictResolution(
+                supports_weight=supports, refutes_weight=refutes,
+                resolution="DISPUTED", margin=margin, routed_to_human=True,
+            )
+        return ConflictResolution(
+            supports_weight=supports, refutes_weight=refutes,
+            resolution="SUPPORTS" if supports > refutes else "REFUTES",
+            margin=margin, routed_to_human=False,
+        )
+  example_bad: |
+    def resolve(evidence: list[Evidence]) -> str:
+        support = sum(1 for e in evidence if e.supports)
+        refute = len(evidence) - support
+        return "TRUE" if support > refute else "FALSE"  # Unweighted majority — bad blog = good study
+  when_applies: Evidence evaluation when sources disagree
+  sources:
+    - "https://ifcncodeofprinciples.poynter.org/the-commitments"
+
+- id: FC-SRC-013
+  text: "Maintain a historical accuracy ledger for every source. After each verification, record whether the source's evidence was correct. Use this longitudinal data to adjust credibility scores with Bayesian updates."
+  why: >
+    Static credibility scores do not learn from experience. A source rated 'High' that produces
+    3 incorrect evidence pieces in a row should be downgraded. Bayesian updating provides a
+    principled way to adjust credibility based on observed accuracy while maintaining prior
+    knowledge. This creates a self-improving system that gets better at source evaluation
+    over time.
+  how_to_do_right: |
+    1. After each verdict, record per-source: (source_id, claim_id, was_correct, timestamp)
+    2. Model accuracy as Beta distribution: Beta(alpha=correct+1, beta=incorrect+1)
+    3. Prior: alpha=5, beta=2 for established sources (assume 70% accurate), alpha=2, beta=2 for unknown
+    4. Update: alpha += 1 on correct, beta += 1 on incorrect
+    5. Credibility = alpha / (alpha + beta) — the posterior mean
+    6. Variance = (alpha * beta) / ((alpha + beta)^2 * (alpha + beta + 1)) — tracks uncertainty
+    7. Flag sources where variance is high (< 20 observations) as 'insufficient_data'
+  severity: high
+  technologies:
+    lang: [python]
+    library: [numpy, sqlalchemy]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    class SourceAccuracyTracker:
+        def __init__(self, db_session):
+            self.db = db_session
+
+        def get_bayesian_accuracy(self, source_id: str) -> tuple[float, float]:
+            obs = self.db.query(AccuracyObs).filter_by(source_id=source_id).all()
+            prior_alpha, prior_beta = 5.0, 2.0  # Assume 70% accurate
+            alpha = prior_alpha + sum(1 for o in obs if o.was_correct)
+            beta = prior_beta + sum(1 for o in obs if not o.was_correct)
+            mean = alpha / (alpha + beta)
+            variance = (alpha * beta) / ((alpha + beta) ** 2 * (alpha + beta + 1))
+            return mean, variance
+
+        def record_outcome(self, source_id: str, claim_id: str, was_correct: bool):
+            self.db.add(AccuracyObs(
+                source_id=source_id, claim_id=claim_id,
+                was_correct=was_correct, timestamp=datetime.now(),
+            ))
+            self.db.commit()
+  example_bad: |
+    SOURCE_SCORES = {"reuters": 0.95}  # Hardcoded, never updated from outcomes
+    def get_accuracy(source_id: str) -> float:
+        return SOURCE_SCORES.get(source_id, 0.5)
+  when_applies: Post-verdict feedback loop and source credibility maintenance
+  sources:
+    - "Bayesian approaches to online reputation (Jøsang & Ismail, 2002)"
+
+- id: FC-SRC-014
+  text: "Map source citation networks to detect influence clusters and echo chambers. Sources within the same citation cluster should count as partially dependent, not fully independent."
+  why: >
+    Media ecosystems contain echo chambers where sources within a cluster cite each other
+    and amplify the same narratives. Five sources in the same citation cluster provide less
+    independent corroboration than five sources from different clusters. Without network
+    analysis, corroboration scores are inflated by echo chamber effects, producing
+    overconfident verdicts.
+  how_to_do_right: |
+    1. Build directed citation graph from extracted references and attribution chains
+    2. Run community detection (Louvain or Label Propagation) to identify clusters
+    3. Sources within same cluster: discount corroboration by 50% (count as 0.5 independent)
+    4. Sources across clusters: full independence (count as 1.0)
+    5. Effective_independence = inter_cluster_count + 0.5 * intra_cluster_count
+    6. Update network graph weekly as new citations are observed
+    7. Visualize network in editorial dashboard for manual inspection
+  severity: high
+  technologies:
+    lang: [python]
+    library: [networkx, community]
+  domains:
+    domain: [fact_checking]
+    concern: [domain_specific]
+  example_good: |
+    import networkx as nx
+    from community import community_louvain
+
+    class SourceNetworkAnalyzer:
+        def __init__(self):
+            self.graph = nx.DiGraph()
+
+        def add_citation(self, citing: str, cited: str):
+            self.graph.add_edge(citing, cited)
+
+        def detect_clusters(self) -> dict[str, int]:
+            undirected = self.graph.to_undirected()
+            return community_louvain.best_partition(undirected)
+
+        def effective_independence(self, source_ids: list[str]) -> float:
+            clusters = self.detect_clusters()
+            cluster_groups = {}
+            for sid in source_ids:
+                c = clusters.get(sid, sid)
+                cluster_groups.setdefault(c, []).append(sid)
+            inter = sum(1 for g in cluster_groups.values() if len(g) == 1)
+            intra = sum(len(g) - 1 for g in cluster_groups.values() if len(g) > 1)
+            return inter + 0.5 * intra + len([g for g in cluster_groups.values() if len(g) > 1])
+  example_bad: |
+    def count_independent(sources: list[str]) -> int:
+        return len(set(sources))  # No network analysis — echo chamber = independent
+  when_applies: Multi-source corroboration evaluation
+  sources:
+    - "Echo chambers in news media (Flaxman et al., 2016)"
+
+- id: FC-SRC-015
+  text: "Automate source discovery using web crawling and knowledge graph expansion. When existing sources are insufficient for a claim, discover new relevant sources by following citation links, related organizations, and domain-specific databases."
+  why: >
+    A static source database quickly becomes stale and develops blind spots. New authoritative
+    sources emerge, especially in fast-moving domains like health and technology. Manual source
+    curation cannot keep pace. Automated discovery with quality gates ensures the source database
+    grows organically while maintaining credibility standards.
+  how_to_do_right: |
+    1. Seed discovery from citation links in existing high-credibility evidence
+    2. For each new source candidate: extract domain, check MBFC/NewsGuard, analyze content
+    3. Apply quality gate: new source must have accuracy estimate > 0.5 (Bayesian prior from domain average)
+    4. For domain-specific claims: query specialized APIs (PubMed, arXiv, SEC EDGAR, gov.br/dados)
+    5. Rate-limit discovery: max 10 new sources per claim, max 100 per day
+    6. New sources start with 'provisional' status until 5+ accuracy observations
+    7. Human review required before promoting provisional source to 'trusted'
+    8. Track discovery metrics: sources found, promoted, rejected, accuracy of discovered vs baseline
+  severity: high
+  technologies:
+    lang: [python]
+    library: [httpx, beautifulsoup4, pydantic]
+  domains:
+    domain: [fact_checking, ai_ml]
+    concern: [domain_specific]
+  example_good: |
+    class SourceDiscovery:
+        MAX_PER_CLAIM = 10
+        MAX_PER_DAY = 100
+
+        async def discover_from_citations(self, evidence: list[Evidence]) -> list[CandidateSource]:
+            candidates = []
+            for e in evidence:
+                cited_urls = extract_citation_urls(e.text)
+                for url in cited_urls[:5]:
+                    domain = urlparse(url).netloc
+                    if domain not in self.known_sources:
+                        candidate = await self.evaluate_candidate(url, domain)
+                        if candidate.initial_score > 0.5:
+                            candidates.append(candidate)
+            return candidates[:self.MAX_PER_CLAIM]
+
+        async def evaluate_candidate(self, url: str, domain: str) -> CandidateSource:
+            mbfc = await self.check_mbfc(domain)
+            content_quality = await self.analyze_content_quality(url)
+            return CandidateSource(
+                domain=domain, url=url, initial_score=(mbfc.score if mbfc else 0.5) * content_quality,
+                status="PROVISIONAL",
+            )
+  example_bad: |
+    SOURCES = ["reuters.com", "apnews.com"]  # Static list — never grows
+    def find_evidence(claim: str) -> list[Evidence]:
+        return [search(s, claim) for s in SOURCES]  # Limited to known sources
+  when_applies: Evidence search when existing sources are insufficient or claim is in an underserved domain
+  sources:
+    - "Automated knowledge base construction (Mitchell et al., 2018)"

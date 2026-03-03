@@ -1,0 +1,1461 @@
+layer: principles
+domain: distributed
+knowledge:
+- id: P-DIST-EVENTUAL-CONSIST
+  name: Embrace Eventual Consistency
+  why: |
+    Strong consistency requires coordination across every replica before acknowledging a write, which means every
+    operation pays the latency tax of the slowest participant. In geo-distributed systems this translates to
+    cross-continental round-trips on every single mutation. The CAP theorem formalizes the trade-off: during a
+    network partition you must choose between consistency and availability, and for the vast majority of
+    user-facing workloads, availability wins. Amazon's Dynamo paper (2007) demonstrated that shopping carts,
+    session stores, and preference services all tolerate stale reads for seconds or even minutes without any
+    user-visible impact, while gaining orders-of-magnitude improvement in write throughput and availability.
+    Cassandra adopted the same philosophy — tunable consistency per query lets developers pick ONE, QUORUM, or
+    ALL on a per-operation basis, matching the consistency level to the actual business requirement rather than
+    paying for the strongest guarantee everywhere. Eventual consistency also simplifies failure handling: a
+    node that was partitioned simply merges its local writes when it rejoins, using vector clocks or CRDTs to
+    resolve conflicts deterministically. The key insight is that most data has a natural staleness tolerance.
+    A product catalog that is 5 seconds behind is indistinguishable from a perfectly consistent one to the
+    end user. Identifying which data actually requires linearizability (financial balances, inventory counts
+    at checkout) and which tolerates eventual convergence (user profiles, analytics counters, recommendation
+    scores) is the single most impactful architectural decision in distributed system design.
+  how_to_apply: |
+    1. Classify every data entity by its staleness tolerance: zero (financial ledgers, inventory at checkout),
+    seconds (user sessions, shopping carts), minutes (analytics aggregates, recommendation scores), and hours
+    (reporting dashboards, search indices). This classification drives every subsequent design choice.
+    2. Use CRDTs (Conflict-free Replicated Data Types) for data that must converge without coordination —
+    counters (G-Counter, PN-Counter), sets (OR-Set), and registers (LWW-Register) eliminate the need for
+    consensus on high-write-volume paths. Libraries like Automerge or Yjs provide production-ready
+    implementations.
+    3. Implement anti-entropy protocols for background convergence: Merkle tree comparison (like Cassandra's
+    read repair and anti-entropy repair), gossip-based dissemination, or periodic full-state synchronization
+    for small datasets. Choose the protocol based on dataset size and mutation rate.
+    4. Design read paths with explicit staleness budgets. Expose a max-staleness parameter in your API so
+    callers can opt into fresher reads when needed (similar to Cassandra's consistency levels or DynamoDB's
+    consistent read flag). Cache layers should respect and propagate these budgets.
+    5. Implement conflict resolution strategies appropriate to each entity: last-writer-wins for simple values,
+    application-level merge for complex documents, and human review queues for conflicts that cannot be
+    resolved automatically. Log every conflict for observability.
+    6. Build convergence monitoring: track replication lag per partition, alert when lag exceeds the staleness
+    SLA, and expose a convergence dashboard showing the percentage of replicas that have received each write.
+  mental_model: >-
+    Newspaper printing — every city gets the same news, just not at the exact same millisecond. By morning, everyone has read
+    the same headlines.
+  domains:
+    domain:
+    - distributed
+    - architecture
+    - database
+    concern:
+    - consistency
+  violation_consequence: >-
+    Forcing strong consistency everywhere creates a system that is technically correct but practically unusable — writes stall
+    for hundreds of milliseconds, throughput collapses under partition events, and the system becomes unavailable precisely
+    when users need it most. You end up with a perfectly consistent database that nobody can reach.
+  teaching_example: >-
+    DynamoDB's shopping cart: items added on different replicas during a partition are merged via vector clocks when connectivity
+    returns. The user sees all their items — never loses one — even though the cart was temporarily inconsistent across regions.
+  when_applies: >-
+    Geo-distributed systems, high-availability services, any workload where staleness of seconds to minutes is acceptable
+    and availability is paramount.
+  when_not_applies: >-
+    Financial transactions requiring linearizability, inventory systems at the moment of purchase, or any workflow where reading
+    stale data causes irrecoverable business harm.
+  sources:
+  - https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf
+  text: >-
+    Embrace Eventual Consistency: Newspaper printing — every city gets the same news, just not at the exact same millisecond.
+  severity: high
+  technologies:
+    lang:
+    - python
+  how_to_do_right: |-
+    1. Classify every data entity by its staleness tolerance: zero (financial ledgers, inventory at checkout),
+    seconds (user sessions, shopping carts), minutes (analytics aggregates, recommendation scores), and hours
+    (reporting dashboards, search indices). This classification drives every subsequent design choice.
+    2. Use CRDTs (Conflict-free Replicated Data Types) for data that must converge without coordination —
+    counters (G-Counter, PN-Counter), sets (OR-Set), and registers (LWW-Register) eliminate the need for
+    consensus on high-write-volume paths. Libraries like Automerge or Yjs provide production-ready
+    implementations.
+    3. Implement anti-entropy protocols for background convergence: Merkle tree comparison (like Cassandra's
+    read repair and anti-entropy repair), gossip-based dissemination, or periodic full-state synchronization
+    for small datasets. Choose the protocol based on dataset size and mutation rate.
+    4. Design read paths with explicit staleness budgets. Expose a max-staleness parameter in your API so
+    callers can opt into fresher reads when needed (similar to Cassandra's consistency levels or DynamoDB's
+    consistent read flag). Cache layers should respect and propagate these budgets.
+    5. Implement conflict resolution strategies appropriate to each entity: last-writer-wins for simple values,
+    application-level merge for complex documents, and human review queues for conflicts that cannot be
+    resolved automatically. Log every conflict for observability.
+    6. Build convergence monitoring: track replication lag per partition, alert when lag exceeds the staleness
+    SLA, and expose a convergence dashboard showing the percentage of replicas that have received each write.
+  example_good: |-
+    # DynamoDB's shopping cart: items added on different replicas during a partition are merged via vector clocks when connectivity returns.
+    # The user sees all their items — never loses one — even though the cart was temporarily inconsistent across regions.
+  example_bad: |-
+    # Anti-pattern: Violating Embrace Eventual Consistency
+    # Result: Forcing strong consistency everywhere creates a system that is technically correct but practically unusable — writes stall for hundreds of milliseconds
+    # Result: throughput collapses under partition events
+- id: P-DIST-SAGA
+  name: Sagas Over Distributed Locks
+  why: |
+    Distributed transactions using two-phase commit (2PC) require every participant to hold locks until the
+    coordinator decides to commit or abort. This works in textbook examples but collapses in production for
+    three reasons. First, lock duration scales with the slowest participant: if one microservice is degraded,
+    every other participant holds locks waiting for it, creating cascading contention across the entire system.
+    Second, coordinator failure during the prepared state leaves participants in an uncertain limbo — they
+    cannot commit or abort without the coordinator's decision, leading to blocked resources that may require
+    manual intervention. Third, 2PC assumes reliable messaging, but networks partition, messages are delayed,
+    and timeouts create ambiguous states. The Saga pattern, introduced by Garcia-Molina and Salem (1987),
+    replaces a single atomic transaction with a sequence of local transactions, each with a compensating
+    action that semantically undoes its effect if a later step fails. Instead of locking resources across
+    services, each service commits independently and publishes an event. If step N fails, compensating actions
+    for steps N-1 through 1 execute in reverse order. This approach trades atomicity for availability: the
+    system is always making progress, either forward or backward. Modern implementations use orchestration
+    (a central saga coordinator like Temporal, Step Functions, or Conductor) or choreography (event-driven,
+    each service reacts to events). Orchestration is easier to reason about and debug; choreography scales
+    better but is harder to trace. The key insight is that most business processes are inherently long-running
+    and tolerant of temporary inconsistency — an order can exist in a "pending" state while payment is
+    processed, and reversal (refund) is a natural business operation, not an exceptional failure mode.
+  how_to_apply: |
+    1. Decompose the distributed transaction into a sequence of local transactions, each owned by a single
+    service. Map the happy path: Order Created -> Payment Charged -> Inventory Reserved -> Shipment Scheduled.
+    Each step commits locally and publishes a domain event.
+    2. For every forward step, define a compensating action that semantically reverses its effect. Payment
+    Charged -> Refund Issued. Inventory Reserved -> Inventory Released. Compensating actions must be
+    idempotent because they may be retried.
+    3. Choose between orchestration and choreography. Use orchestration (Temporal, AWS Step Functions) when
+    you need centralized visibility, complex branching logic, or timeouts. Use choreography (event-driven)
+    when services are independently deployed teams and you want loose coupling.
+    4. Implement a saga state machine that tracks which steps have completed and which compensations are
+    needed. Persist this state durably — if the saga coordinator crashes mid-execution, it must resume
+    from the last known state, not restart from scratch.
+    5. Add timeout boundaries for each step. If a service does not respond within the timeout, trigger
+    compensation rather than waiting indefinitely. This prevents sagas from hanging in partial states.
+    6. Build a saga dashboard showing in-flight sagas, their current step, and any that are stuck in
+    compensation. Alert on sagas that have been in a non-terminal state for longer than their expected
+    duration.
+  mental_model: >-
+    Booking a vacation — you reserve the flight, then the hotel, then the car. If the car rental falls through, you cancel
+    the hotel and the flight separately. Each cancellation is a normal business operation, not a system failure.
+  domains:
+    domain:
+    - distributed
+    - architecture
+    - microservices
+    concern:
+    - transactions
+    - coordination
+  violation_consequence: >-
+    Using distributed locks or 2PC across microservices leads to cascading timeouts, deadlocks under load, and coordinator
+    single points of failure. A single slow service freezes the entire transaction chain, and coordinator crashes leave resources
+    locked until manual intervention.
+  teaching_example: >-
+    An e-commerce checkout saga: 1) Create order, 2) Charge payment, 3) Reserve inventory, 4) Schedule shipment. If inventory
+    reservation fails, the saga compensates by refunding the payment and cancelling the order — each service handles its own
+    rollback.
+  when_applies: >-
+    Any business process spanning multiple services or databases where the process can tolerate temporary intermediate states
+    and compensating actions are semantically meaningful.
+  when_not_applies: >-
+    Single-database transactions where ACID is sufficient, or truly atomic operations where partial completion is catastrophic
+    and cannot be compensated (e.g., firing a physical missile).
+  sources:
+  - https://microservices.io/patterns/data/saga.html
+  text: 'Sagas Over Distributed Locks: Booking a vacation — you reserve the flight, then the hotel, then the car.'
+  severity: high
+  technologies:
+    lang:
+    - python
+    - javascript
+    - sql
+  how_to_do_right: |-
+    1. Decompose the distributed transaction into a sequence of local transactions, each owned by a single
+    service. Map the happy path: Order Created -> Payment Charged -> Inventory Reserved -> Shipment Scheduled.
+    Each step commits locally and publishes a domain event.
+    2. For every forward step, define a compensating action that semantically reverses its effect. Payment
+    Charged -> Refund Issued. Inventory Reserved -> Inventory Released. Compensating actions must be
+    idempotent because they may be retried.
+    3. Choose between orchestration and choreography. Use orchestration (Temporal, AWS Step Functions) when
+    you need centralized visibility, complex branching logic, or timeouts. Use choreography (event-driven)
+    when services are independently deployed teams and you want loose coupling.
+    4. Implement a saga state machine that tracks which steps have completed and which compensations are
+    needed. Persist this state durably — if the saga coordinator crashes mid-execution, it must resume
+    from the last known state, not restart from scratch.
+    5. Add timeout boundaries for each step. If a service does not respond within the timeout, trigger
+    compensation rather than waiting indefinitely. This prevents sagas from hanging in partial states.
+    6. Build a saga dashboard showing in-flight sagas, their current step, and any that are stuck in
+    compensation. Alert on sagas that have been in a non-terminal state for longer than their expected
+    duration.
+  example_good: |-
+    # An e-commerce checkout saga: 1) Create order, 2) Charge payment, 3) Reserve inventory, 4) Schedule shipment.
+    # If inventory reservation fails, the saga compensates by refunding the payment and cancelling the order — each service handles its own rollback.
+  example_bad: |-
+    # Anti-pattern: Violating Sagas Over Distributed Locks
+    # Result: Using distributed locks or 2PC across microservices leads to cascading timeouts
+    # Result: deadlocks under load
+- id: P-DIST-CIRCUIT-BREAKER
+  name: Circuit Breaker for Downstream Failures
+  why: |
+    When a downstream service becomes slow or unresponsive, naive retry logic turns a localized problem into
+    a system-wide outage. Every caller blocks waiting for a response that will never arrive (or arrives after
+    30 seconds), exhausting thread pools, connection pools, and file descriptors. This cascading failure
+    pattern is the number one cause of distributed system outages. The circuit breaker pattern, popularized
+    by Michael Nygard in "Release It!" and implemented in libraries like Hystrix, resilience4j, and Polly,
+    introduces three states: Closed (normal operation, requests pass through), Open (downstream is unhealthy,
+    requests fail immediately without attempting the call), and Half-Open (periodically allows a probe request
+    to check if downstream has recovered). When the failure rate exceeds a threshold (e.g., 50% of requests
+    fail within a 10-second window), the circuit trips to Open. In the Open state, callers receive an
+    immediate failure response — typically within microseconds rather than waiting for a timeout — freeing
+    resources for requests that can actually succeed. After a configurable sleep window, the circuit moves
+    to Half-Open and allows one probe request through. If it succeeds, the circuit closes and normal traffic
+    resumes; if it fails, the circuit reopens. Netflix's Hystrix demonstrated this at scale: when their
+    recommendation service degraded, circuits opened and the UI fell back to showing a generic "Top 10" list
+    rather than hanging indefinitely. The key insight is that failing fast is a feature, not a bug — returning
+    an error in 5 milliseconds is infinitely better than returning an error in 30 seconds, because those 30
+    seconds of blocked resources are what kill your system.
+  how_to_apply: |
+    1. Wrap every external service call (HTTP, gRPC, database, message broker) in a circuit breaker. Configure
+    the failure threshold (e.g., 5 failures in 10 seconds), the open duration (e.g., 30 seconds), and the
+    probe interval (e.g., one request every 10 seconds in half-open state).
+    2. Define what counts as a failure for each circuit: connection timeouts, HTTP 5xx responses, and explicit
+    error codes. Do NOT count client errors (4xx) as failures — a 404 means the downstream is healthy but
+    the resource does not exist.
+    3. Implement fallback strategies for each circuit: return cached data, return a default response, degrade
+    to a simpler algorithm, or return a clear error with retry-after header. The fallback must be defined at
+    design time, not invented during an incident.
+    4. Expose circuit state as a health check endpoint and as metrics (Prometheus gauges for circuit state,
+    counters for trips). Alert when any circuit opens — this is an early warning that a dependency is
+    degrading before it becomes a full outage.
+    5. Tune thresholds per dependency based on its expected error rate and latency profile. A database that
+    normally responds in 2ms should trip at 100ms; an external API that normally takes 500ms should trip at
+    2 seconds. One-size-fits-all thresholds either trip too eagerly or too late.
+  mental_model: >-
+    Electrical circuit breaker in your house — when a short circuit occurs, the breaker trips instantly to protect the entire
+    house, rather than letting the overload burn down every room.
+  domains:
+    domain:
+    - distributed
+    - reliability
+    - microservices
+    concern:
+    - fault_tolerance
+    - resilience
+  violation_consequence: >-
+    Without circuit breakers, a single degraded dependency cascades into a full system outage. Thread pools fill with blocked
+    requests, connection pools exhaust, upstream services start timing out, and the failure propagates backward through the
+    entire call chain until the user-facing service is completely unresponsive.
+  teaching_example: >-
+    A payment service depends on a fraud detection API. The fraud API starts responding in 25 seconds instead of 200ms. Without
+    a circuit breaker, every checkout request blocks for 25 seconds, exhausting the payment service's thread pool. With a
+    circuit breaker, after 5 slow requests the circuit opens, and checkout immediately falls back to a rules-based fraud check.
+  when_applies: >-
+    Any service that calls external dependencies — HTTP APIs, databases, message brokers, third-party services — especially
+    when the dependency's failure mode is slowness rather than outright refusal.
+  when_not_applies: >-
+    In-process function calls where failure is immediate, or batch jobs where waiting longer is acceptable and the downstream
+    has no alternative.
+  sources:
+  - https://martinfowler.com/bliki/CircuitBreaker.html
+  text: >-
+    Circuit Breaker for Downstream Failures: Electrical circuit breaker in your house — when a short circuit occurs, the breaker
+    trips instantly to protect the entire house, rather than letting the overload burn down every room.
+  severity: high
+  technologies:
+    lang:
+    - python
+  how_to_do_right: |-
+    1. Wrap every external service call (HTTP, gRPC, database, message broker) in a circuit breaker. Configure
+    the failure threshold (e.g., 5 failures in 10 seconds), the open duration (e.g., 30 seconds), and the
+    probe interval (e.g., one request every 10 seconds in half-open state).
+    2. Define what counts as a failure for each circuit: connection timeouts, HTTP 5xx responses, and explicit
+    error codes. Do NOT count client errors (4xx) as failures — a 404 means the downstream is healthy but
+    the resource does not exist.
+    3. Implement fallback strategies for each circuit: return cached data, return a default response, degrade
+    to a simpler algorithm, or return a clear error with retry-after header. The fallback must be defined at
+    design time, not invented during an incident.
+    4. Expose circuit state as a health check endpoint and as metrics (Prometheus gauges for circuit state,
+    counters for trips). Alert when any circuit opens — this is an early warning that a dependency is
+    degrading before it becomes a full outage.
+    5. Tune thresholds per dependency based on its expected error rate and latency profile. A database that
+    normally responds in 2ms should trip at 100ms; an external API that normally takes 500ms should trip at
+    2 seconds. One-size-fits-all thresholds either trip too eagerly or too late.
+  example_good: |-
+    # A payment service depends on a fraud detection API.
+    # The fraud API starts responding in 25 seconds instead of 200ms.
+    # Without a circuit breaker, every checkout request blocks for 25 seconds, exhausting the payment service's thread pool.
+    # With a circuit breaker, after 5 slow requests the circuit opens, and checkout immediately falls back to a rules-based fraud check.
+  example_bad: |-
+    # Anti-pattern: Violating Circuit Breaker for Downstream Failures
+    # Result: Without circuit breakers
+    # Result: a single degraded dependency cascades into a full system outage. Thread pools fill with blocked requests
+- id: P-DIST-BACKPRESSURE
+  name: Backpressure Over Unbounded Queues
+  why: |
+    Every system has a maximum throughput. When producers generate work faster than consumers can process it,
+    the excess must go somewhere. Without explicit backpressure, it accumulates in unbounded queues — in-memory
+    buffers, message broker topics, or database tables used as queues. This creates a time bomb: memory grows
+    linearly with the rate mismatch, latency increases as queue depth grows (new messages wait behind thousands
+    of older ones), and when memory is finally exhausted, the process crashes and loses everything in the
+    queue. The problem is insidious because the system appears healthy under normal load and only fails under
+    sustained high load — exactly when reliability matters most. Backpressure is the mechanism by which a
+    consumer signals to its producer that it cannot accept more work. This signal propagates upstream through
+    the pipeline, ultimately slowing down the source of load. TCP flow control is the canonical example: the
+    receiver advertises a window size, and the sender cannot transmit more data than the window allows. Reactive
+    Streams (Project Reactor, RxJava, Akka Streams) formalize this as a protocol where subscribers request a
+    specific number of items from publishers. Kafka consumer groups provide natural backpressure through
+    consumer lag — producers can write freely, but consumers process at their own rate, and the lag metric
+    tells you how far behind they are. The key architectural decision is where to shed load: at the edge
+    (rate limiting, HTTP 429), at the queue (bounded queues that reject when full), or at the consumer (pull-
+    based consumption). Each choice has different trade-offs for latency, data loss, and user experience.
+    The worst choice is no choice at all — letting the system decide by crashing.
+  how_to_apply: |
+    1. Bound every queue and buffer in your system. In-memory queues get a max size (e.g., 10,000 items).
+    Kafka topics get retention limits. Database tables used as queues get row count alerts. When the bound
+    is reached, the producer must be told — either block, drop, or receive an error.
+    2. Implement pull-based consumption wherever possible. Instead of pushing messages to consumers, let
+    consumers pull at their own rate. Kafka, SQS, and Redis Streams all support this model. The consumer
+    controls its own throughput, and the broker buffers within its configured limits.
+    3. Add rate limiting at the edge of your system. API gateways should enforce requests-per-second limits
+    per client, returning HTTP 429 with a Retry-After header. This is the earliest point to shed load and
+    protects everything downstream.
+    4. Monitor queue depth and consumer lag as primary health metrics. Alert when queue depth exceeds a
+    threshold that represents more than N minutes of processing time. Consumer lag in Kafka should be
+    tracked per partition and alerted on sustained growth.
+    5. Implement load shedding strategies: priority queues where low-priority work is dropped first,
+    deadline-based expiration where messages older than their SLA are discarded, and graceful degradation
+    where expensive features are disabled under load to free capacity for core operations.
+  mental_model: >-
+    Highway on-ramp metering lights — when the highway is full, the ramp light turns red to prevent new cars from entering
+    and making the congestion worse. Better to wait at the ramp than gridlock the entire highway.
+  domains:
+    domain:
+    - distributed
+    - reliability
+    - messaging
+    - performance
+    concern:
+    - flow_control
+    - scalability
+  violation_consequence: >-
+    Unbounded queues lead to monotonically increasing memory usage, growing latency (new messages wait behind a backlog of
+    thousands), and eventual OOM crashes that lose all queued work. The system fails at the worst possible time — under peak
+    load — and the crash often triggers a retry storm that makes recovery even harder.
+  teaching_example: >-
+    A logging pipeline ingests 100K events/sec but the Elasticsearch cluster can only index 50K/sec. Without backpressure,
+    the Kafka consumer lag grows by 50K/sec. Within an hour, there is a 180M event backlog. Logs arrive 1 hour late, alerting
+    is useless, and the consumer OOMs trying to batch-process the backlog.
+  when_applies: >-
+    Any producer-consumer pipeline where the producer can outpace the consumer, especially under load spikes — message queues,
+    stream processing, API ingestion, log pipelines.
+  when_not_applies: >-
+    Request-response systems where the caller naturally waits for a response, or systems where the producer is inherently
+    slower than the consumer and rate mismatch is structurally impossible.
+  sources:
+  - https://www.reactivemanifesto.org/
+  text: >-
+    Backpressure Over Unbounded Queues: Highway on-ramp metering lights — when the highway is full, the ramp light turns red
+    to prevent new cars from entering and making the congestion worse.
+  severity: high
+  technologies:
+    lang:
+    - python
+  how_to_do_right: |-
+    1. Bound every queue and buffer in your system. In-memory queues get a max size (e.g., 10,000 items).
+    Kafka topics get retention limits. Database tables used as queues get row count alerts. When the bound
+    is reached, the producer must be told — either block, drop, or receive an error.
+    2. Implement pull-based consumption wherever possible. Instead of pushing messages to consumers, let
+    consumers pull at their own rate. Kafka, SQS, and Redis Streams all support this model. The consumer
+    controls its own throughput, and the broker buffers within its configured limits.
+    3. Add rate limiting at the edge of your system. API gateways should enforce requests-per-second limits
+    per client, returning HTTP 429 with a Retry-After header. This is the earliest point to shed load and
+    protects everything downstream.
+    4. Monitor queue depth and consumer lag as primary health metrics. Alert when queue depth exceeds a
+    threshold that represents more than N minutes of processing time. Consumer lag in Kafka should be
+    tracked per partition and alerted on sustained growth.
+    5. Implement load shedding strategies: priority queues where low-priority work is dropped first,
+    deadline-based expiration where messages older than their SLA are discarded, and graceful degradation
+    where expensive features are disabled under load to free capacity for core operations.
+  example_good: |-
+    # A logging pipeline ingests 100K events/sec but the Elasticsearch cluster can only index 50K/sec.
+    # Without backpressure, the Kafka consumer lag grows by 50K/sec.
+    # Within an hour, there is a 180M event backlog.
+    # Logs arrive 1 hour late, alerting is useless, and the consumer OOMs trying to batch-process the backlog.
+  example_bad: |-
+    # Anti-pattern: Violating Backpressure Over Unbounded Queues
+    # Result: Unbounded queues lead to monotonically increasing memory usage
+    # Result: growing latency (new messages wait behind a backlog of thousands)
+- id: P-REL-REDUNDANCY
+  name: Redundancy at Every Layer
+  why: |
+    A single point of failure (SPOF) is a component whose failure causes the entire system to fail. In
+    distributed systems, the question is not whether a component will fail but when. Hard drives have a
+    1-4% annual failure rate. Network switches fail. Data centers lose power. Cloud availability zones
+    experience outages — AWS us-east-1 has had multiple multi-hour outages affecting thousands of customers.
+    Redundancy is the practice of duplicating critical components so that when one fails, another takes over.
+    This applies at every layer: compute (multiple application instances behind a load balancer), storage
+    (replicated databases, RAID, multi-AZ), networking (redundant switches, multiple ISPs, anycast DNS), and
+    even organizational (no single person who is the only one who knows how a system works). The key principle
+    is N+1 redundancy at minimum: for every N components needed to serve traffic, deploy N+1. For critical
+    systems, N+2 provides resilience against simultaneous failures. AWS's multi-AZ deployments exemplify this:
+    RDS Multi-AZ maintains a synchronous standby in a different availability zone, and failover happens
+    automatically within 60-120 seconds. S3 achieves 99.999999999% durability by replicating objects across
+    multiple facilities. But redundancy without automatic failover is just expensive standby. The standby must
+    be tested regularly — an untested failover mechanism is not a failover mechanism, it is a hope. Netflix's
+    Chaos Monkey validates this by randomly terminating instances in production, ensuring that redundancy
+    actually works when needed. The cost of redundancy is real (2x or 3x infrastructure), but the cost of
+    downtime — lost revenue, damaged reputation, SLA penalties — almost always exceeds it for any
+    production system that matters.
+  how_to_apply: |
+    1. Inventory every component in your system and classify it as redundant or SPOF. For each SPOF, design
+    a redundancy strategy: active-active (all replicas serve traffic), active-passive (standby takes over on
+    failure), or active-active-passive (N active + 1 standby).
+    2. Deploy compute across multiple availability zones. Use auto-scaling groups with a minimum of 2
+    instances in different AZs. The load balancer health check must detect unhealthy instances within seconds
+    and stop routing traffic to them.
+    3. Replicate data stores synchronously for zero RPO (Recovery Point Objective) or asynchronously for near-
+    zero RPO with better write performance. PostgreSQL streaming replication, MongoDB replica sets, and Redis
+    Sentinel all provide automatic failover. Test failover monthly by killing the primary.
+    4. Eliminate single points of failure in networking: multiple NAT gateways, redundant load balancers,
+    DNS with health checks (Route 53 failover routing), and CDN as a buffer against origin failures.
+    5. Document and automate failover procedures. Manual failover at 3 AM by a sleep-deprived engineer is
+    not a plan — it is a liability. Every failover must be a single command or, better, fully automatic
+    with human notification after the fact.
+  mental_model: >-
+    Airplane engines — a twin-engine aircraft can fly safely on one engine. The redundancy is designed in from the start,
+    tested regularly, and the crew trains for single-engine operation before they ever need it in a real emergency.
+  domains:
+    domain:
+    - distributed
+    - reliability
+    - architecture
+    - operations
+    concern:
+    - availability
+    - fault_tolerance
+  violation_consequence: >-
+    A single failed component takes down the entire system. Database server crashes at 2 AM with no replica means complete
+    outage until manual recovery. A single load balancer failure means zero traffic reaches healthy backends. Every SPOF is
+    a ticking clock.
+  teaching_example: >-
+    A startup runs their entire platform on a single RDS instance with no read replica and no Multi-AZ. The underlying hardware
+    fails at peak traffic on Black Friday. Recovery takes 4 hours (restore from backup), during which the site is completely
+    down. Total cost: $200K in lost sales. Multi-AZ would have cost $150/month.
+  when_applies: >-
+    Any production system where downtime has a business cost — user-facing services, data stores, networking infrastructure,
+    CI/CD pipelines, monitoring systems.
+  when_not_applies: >-
+    Development environments, local tooling, throwaway prototypes, or systems where the cost of redundancy genuinely exceeds
+    the cost of downtime (rare in practice).
+  sources:
+  - https://sre.google/sre-book/eliminating-toil/
+  text: 'Redundancy at Every Layer: Airplane engines — a twin-engine aircraft can fly safely on one engine.'
+  severity: high
+  technologies:
+    lang:
+    - python
+  how_to_do_right: |-
+    1. Inventory every component in your system and classify it as redundant or SPOF. For each SPOF, design
+    a redundancy strategy: active-active (all replicas serve traffic), active-passive (standby takes over on
+    failure), or active-active-passive (N active + 1 standby).
+    2. Deploy compute across multiple availability zones. Use auto-scaling groups with a minimum of 2
+    instances in different AZs. The load balancer health check must detect unhealthy instances within seconds
+    and stop routing traffic to them.
+    3. Replicate data stores synchronously for zero RPO (Recovery Point Objective) or asynchronously for near-
+    zero RPO with better write performance. PostgreSQL streaming replication, MongoDB replica sets, and Redis
+    Sentinel all provide automatic failover. Test failover monthly by killing the primary.
+    4. Eliminate single points of failure in networking: multiple NAT gateways, redundant load balancers,
+    DNS with health checks (Route 53 failover routing), and CDN as a buffer against origin failures.
+    5. Document and automate failover procedures. Manual failover at 3 AM by a sleep-deprived engineer is
+    not a plan — it is a liability. Every failover must be a single command or, better, fully automatic
+    with human notification after the fact.
+  example_good: |-
+    # A startup runs their entire platform on a single RDS instance with no read replica and no Multi-AZ.
+    # The underlying hardware fails at peak traffic on Black Friday.
+    # Recovery takes 4 hours (restore from backup), during which the site is completely down.
+    # Total cost: $200K in lost sales.
+  example_bad: |-
+    # Anti-pattern: Violating Redundancy at Every Layer
+    # Result: A single failed component takes down the entire system. Database server crashes at 2 AM with no replica means complete outage until manual recovery. A single load balancer failure means zero traffic reaches healthy backends. Every SPOF is a ticking clock.
+- id: P-REL-GRACEFUL-DEGRADE
+  name: Degrade Functionality, Never Availability
+  why: |
+    When a system is under stress — a dependency is down, traffic spikes beyond capacity, or a subsystem is
+    degraded — the worst response is to fail entirely. Users who see a blank page or a connection timeout lose
+    trust and leave. Users who see a slightly reduced experience (cached data instead of real-time, simplified
+    UI instead of full features, generic recommendations instead of personalized ones) often do not even
+    notice the degradation. Graceful degradation is the practice of shedding non-essential functionality to
+    preserve core functionality. Netflix pioneered this approach: when their personalization service is down,
+    users see a generic "Top 10" list instead of personalized recommendations. The streaming experience
+    continues uninterrupted. Amazon's product pages degrade similarly: if the review service is slow, the
+    product page loads without reviews rather than waiting (and timing out) for them. The key architectural
+    decision is defining what is essential and what is non-essential for each user journey BEFORE a failure
+    occurs. This requires explicit feature priority tiers: Tier 0 (must work — authentication, core
+    transaction flow), Tier 1 (should work — search, navigation), Tier 2 (nice to have — recommendations,
+    analytics, personalization), and Tier 3 (expendable under load — A/B tests, non-critical logging). During
+    degradation, tiers are shed from lowest to highest. This prioritization must be decided by product and
+    engineering together, encoded in configuration, and tested in chaos engineering exercises. A system that
+    has never practiced degradation will not degrade gracefully when it needs to — it will degrade chaotically.
+  how_to_apply: |
+    1. Define feature priority tiers with product stakeholders. Tier 0: authentication, core transaction flow
+    (checkout, payment). Tier 1: search, navigation, account management. Tier 2: recommendations,
+    personalization, reviews, analytics. Tier 3: A/B tests, non-critical logging, experimental features.
+    Document these tiers in a runbook accessible during incidents.
+    2. Implement feature flags or degradation switches for every Tier 2 and Tier 3 feature. These switches
+    must be operable in seconds (not minutes) during an incident — a feature flag service like LaunchDarkly
+    or a simple Redis-backed toggle. Automate degradation triggers based on system health metrics.
+    3. Design fallback responses for every external dependency: cached data (serve the last known good
+    response), default data (generic "Top 10" list), simplified computation (rules-based instead of ML-based),
+    or honest omission (show the page without the component, with a "temporarily unavailable" note).
+    4. Test degradation regularly. In chaos engineering exercises, disable Tier 2 and Tier 3 features and
+    verify that core user journeys still complete successfully. Measure the user experience delta — if users
+    cannot tell the difference, your degradation strategy is excellent.
+    5. Implement load shedding at the API gateway level. Under extreme load, return HTTP 503 with Retry-After
+    for Tier 3 endpoints while continuing to serve Tier 0 and Tier 1 endpoints at full capacity.
+  mental_model: >-
+    Airplane in an emergency — the pilot sheds non-essential systems (entertainment, galley power, cabin lights) to preserve
+    the essential ones (engines, flight controls, hydraulics). The plane keeps flying, just without movies.
+  domains:
+    domain:
+    - distributed
+    - reliability
+    - architecture
+    - ui
+    concern:
+    - availability
+    - resilience
+    - ux
+  violation_consequence: >-
+    Without graceful degradation, a non-critical dependency failure (recommendation engine, analytics service) takes down
+    the entire user experience. Users see error pages instead of a slightly reduced but functional application. Revenue loss
+    is total rather than marginal.
+  teaching_example: >-
+    Twitter's fail whale was the opposite of graceful degradation — when any backend service was overloaded, the entire site
+    showed an error page. Modern Twitter degrades gracefully: if the trending topics service is down, the sidebar shows cached
+    trends; if the notification service is slow, notifications simply do not update in real-time.
+  when_applies: >-
+    Any user-facing system with multiple features or dependencies, especially when some features are significantly more critical
+    than others.
+  when_not_applies: >-
+    Systems with a single indivisible function where partial operation is meaningless, or backend batch systems where partial
+    results are worse than no results.
+  sources:
+  - https://sre.google/sre-book/addressing-cascading-failures/
+  text: >-
+    Degrade Functionality, Never Availability: Airplane in an emergency — the pilot sheds non-essential systems (entertainment,
+    galley power, cabin lights) to preserve the essential ones (engines, flight controls, hydraulics).
+  severity: critical
+  technologies:
+    lang:
+    - python
+  how_to_do_right: |-
+    1. Define feature priority tiers with product stakeholders. Tier 0: authentication, core transaction flow
+    (checkout, payment). Tier 1: search, navigation, account management. Tier 2: recommendations,
+    personalization, reviews, analytics. Tier 3: A/B tests, non-critical logging, experimental features.
+    Document these tiers in a runbook accessible during incidents.
+    2. Implement feature flags or degradation switches for every Tier 2 and Tier 3 feature. These switches
+    must be operable in seconds (not minutes) during an incident — a feature flag service like LaunchDarkly
+    or a simple Redis-backed toggle. Automate degradation triggers based on system health metrics.
+    3. Design fallback responses for every external dependency: cached data (serve the last known good
+    response), default data (generic "Top 10" list), simplified computation (rules-based instead of ML-based),
+    or honest omission (show the page without the component, with a "temporarily unavailable" note).
+    4. Test degradation regularly. In chaos engineering exercises, disable Tier 2 and Tier 3 features and
+    verify that core user journeys still complete successfully. Measure the user experience delta — if users
+    cannot tell the difference, your degradation strategy is excellent.
+    5. Implement load shedding at the API gateway level. Under extreme load, return HTTP 503 with Retry-After
+    for Tier 3 endpoints while continuing to serve Tier 0 and Tier 1 endpoints at full capacity.
+  example_good: |-
+    # Twitter's fail whale was the opposite of graceful degradation — when any backend service was overloaded, the entire site showed an error page.
+    # Modern Twitter degrades gracefully: if the trending topics service is down, the sidebar shows cached trends; if the notification service is slow, notifications simply do not update in real-time.
+  example_bad: |-
+    # Anti-pattern: Violating Degrade Functionality, Never Availability
+    # Result: Without graceful degradation
+    # Result: a non-critical dependency failure (recommendation engine
+- id: P-REL-CHAOS
+  name: Test Failure Modes Before They Test You
+  why: |
+    Traditional testing verifies that the system works correctly under ideal conditions. But distributed
+    systems do not fail under ideal conditions — they fail when a network partition coincides with a
+    deployment, when a disk fills up on the busiest node, when a DNS resolver starts returning stale results.
+    These failure modes are nearly impossible to predict through code review or unit testing because they
+    emerge from the interaction of components, not from bugs in individual components. Chaos engineering,
+    pioneered by Netflix's Chaos Monkey and formalized in the "Principles of Chaos Engineering," is the
+    discipline of proactively injecting failures into production systems to discover weaknesses before they
+    cause outages. The process is scientific: form a hypothesis ("if we kill one instance, the load balancer
+    routes around it within 5 seconds"), run the experiment in production, observe the results, and fix any
+    deviations from the hypothesis. Netflix expanded this to Chaos Kong (simulating entire region failures),
+    Latency Monkey (injecting artificial delays), and Conformity Monkey (finding instances that do not adhere
+    to best practices). The key insight is that confidence in a system's resilience can only come from
+    empirical evidence, not from architectural diagrams. A system that has never been tested under failure
+    conditions is a system whose failure behavior is unknown. And unknown failure behavior in production
+    is a guaranteed surprise at the worst possible time. Organizations that practice chaos engineering
+    consistently report faster incident recovery, fewer severity-1 incidents, and higher engineer confidence
+    in deployments.
+  how_to_apply: |
+    1. Start small and in non-production environments. Inject a single instance failure in staging, verify
+    that the system recovers automatically, and measure recovery time. Only move to production chaos
+    experiments after demonstrating control in staging.
+    2. Define steady-state metrics before each experiment: request success rate, p99 latency, error rate,
+    and business metrics (orders per minute, sign-ups per hour). These metrics define "normal" and any
+    deviation during the experiment indicates a resilience gap.
+    3. Use established chaos engineering tools: Chaos Monkey (random instance termination), Litmus Chaos
+    (Kubernetes-native), Gremlin (commercial, broad fault injection), Toxiproxy (network fault injection),
+    or AWS Fault Injection Simulator. Start with instance termination, then progress to network partitions,
+    latency injection, and dependency failures.
+    4. Run experiments during business hours when the team is alert and can respond, not on Friday at 5 PM.
+    Always have a kill switch to immediately halt the experiment if impact exceeds the blast radius.
+    5. After each experiment, document findings in a chaos report: hypothesis, actual behavior, gaps found,
+    and remediation actions. Track remediation to completion — a chaos experiment that finds a gap but does
+    not fix it is worse than no experiment at all, because it creates false confidence.
+    6. Gradually increase scope: single instance -> multiple instances -> entire AZ -> cross-region failover
+    -> dependency failures -> cascading failure scenarios. Each level builds on confidence from the previous.
+  mental_model: >-
+    Fire drill — you do not wait for a real fire to discover that the emergency exit is blocked. You practice regularly so
+    that when the real emergency happens, the response is automatic.
+  domains:
+    domain:
+    - reliability
+    - testing
+    - operations
+    - distributed
+    concern:
+    - resilience
+    - fault_tolerance
+  violation_consequence: >-
+    Without chaos testing, failure modes are discovered during real incidents — at 3 AM, under peak load, with customers watching.
+    Recovery is slow because the team has never practiced. The post-mortem reveals that the failover mechanism was broken
+    for months but nobody knew because it was never tested.
+  teaching_example: >-
+    Netflix runs Chaos Kong, which simulates the failure of an entire AWS region. During one exercise, they discovered that
+    a critical metadata service did not properly failover cross-region. They fixed it in a controlled setting. Six months
+    later, AWS us-east-1 had a real outage, and Netflix's failover worked flawlessly while competitors experienced hours of
+    downtime.
+  when_applies: >-
+    Any production system where availability matters, especially systems with redundancy and failover mechanisms that have
+    never been exercised under real conditions.
+  when_not_applies: >-
+    Early-stage prototypes where the system is still being designed, or systems where the cost of any disruption (even controlled)
+    is unacceptable and resilience is validated through other means.
+  sources:
+  - https://principlesofchaos.org/
+  text: >-
+    Test Failure Modes Before They Test You: Fire drill — you do not wait for a real fire to discover that the emergency exit
+    is blocked.
+  severity: high
+  technologies:
+    lang:
+    - python
+  how_to_do_right: |-
+    1. Start small and in non-production environments. Inject a single instance failure in staging, verify
+    that the system recovers automatically, and measure recovery time. Only move to production chaos
+    experiments after demonstrating control in staging.
+    2. Define steady-state metrics before each experiment: request success rate, p99 latency, error rate,
+    and business metrics (orders per minute, sign-ups per hour). These metrics define "normal" and any
+    deviation during the experiment indicates a resilience gap.
+    3. Use established chaos engineering tools: Chaos Monkey (random instance termination), Litmus Chaos
+    (Kubernetes-native), Gremlin (commercial, broad fault injection), Toxiproxy (network fault injection),
+    or AWS Fault Injection Simulator. Start with instance termination, then progress to network partitions,
+    latency injection, and dependency failures.
+    4. Run experiments during business hours when the team is alert and can respond, not on Friday at 5 PM.
+    Always have a kill switch to immediately halt the experiment if impact exceeds the blast radius.
+    5. After each experiment, document findings in a chaos report: hypothesis, actual behavior, gaps found,
+    and remediation actions. Track remediation to completion — a chaos experiment that finds a gap but does
+    not fix it is worse than no experiment at all, because it creates false confidence.
+    6. Gradually increase scope: single instance -> multiple instances -> entire AZ -> cross-region failover
+    -> dependency failures -> cascading failure scenarios. Each level builds on confidence from the previous.
+  example_good: |-
+    # Netflix runs Chaos Kong, which simulates the failure of an entire AWS region.
+    # During one exercise, they discovered that a critical metadata service did not properly failover cross-region.
+    # They fixed it in a controlled setting.
+    # Six months later, AWS us-east-1 had a real outage, and Netflix's failover worked flawlessly while competitors experienced hours of downtime.
+  example_bad: |-
+    # Anti-pattern: Violating Test Failure Modes Before They Test You
+    # Result: Without chaos testing
+    # Result: failure modes are discovered during real incidents — at 3 AM
+- id: P-REL-BLAST-RADIUS
+  name: Contain Failures to the Smallest Scope
+  why: |
+    In a monolithic system, a single unhandled exception can crash the entire process, taking down every
+    feature for every user. In distributed systems, the equivalent is a failure that propagates across service
+    boundaries — a cascading failure. Blast radius containment is the practice of designing architectural
+    boundaries so that a failure in one component affects the smallest possible set of users, features, or
+    data. This principle operates at multiple levels. At the infrastructure level, deploying across multiple
+    availability zones ensures that an AZ failure affects only 1/N of capacity. At the application level,
+    bulkhead patterns (named after watertight compartments in ships) isolate critical and non-critical
+    workloads into separate thread pools, connection pools, or even separate processes. At the data level,
+    sharding ensures that a corrupted shard affects only the users assigned to that shard, not the entire
+    user base. At the deployment level, canary deployments and feature flags ensure that a bad release
+    affects only 1% of traffic before it is detected and rolled back. AWS practices this religiously with
+    their cell-based architecture: each "cell" serves a subset of customers, and a failure in one cell
+    cannot propagate to others. This is why an AWS outage might affect some customers in a region but
+    rarely all of them. The key insight is that blast radius must be designed in advance — once a failure
+    starts cascading, it is too late to contain it. Every architectural boundary (service boundary, AZ
+    boundary, shard boundary, deployment boundary) is a potential firewall that stops failure propagation,
+    but only if the boundary is properly sealed against cascading effects like retry storms, connection
+    pool exhaustion, and shared dependency failures.
+  how_to_apply: |
+    1. Identify failure domains in your architecture: each microservice, each database, each message queue,
+    each external dependency. For each domain, answer: "If this component fails completely, what is the
+    maximum impact?" If the answer is "everything," the blast radius is too large.
+    2. Implement bulkheads for shared resources. Separate thread pools for critical and non-critical request
+    paths. Separate connection pools for different downstream services. Separate Kubernetes namespaces or
+    node pools for different workload tiers.
+    3. Use cell-based architecture for large-scale services. Partition users into cells (e.g., by user ID
+    hash), and each cell is independently deployable and independently failable. A cell failure affects only
+    the users in that cell, not the entire service.
+    4. Deploy changes gradually: canary deployments (1% -> 5% -> 25% -> 100%) with automated rollback on
+    metric regression. Feature flags to control rollout per-user-segment. Blue-green deployments for
+    zero-downtime cutover with instant rollback capability.
+    5. Set timeout, retry, and circuit breaker policies per dependency to prevent a slow dependency from
+    consuming shared resources. Each dependency gets its own circuit breaker with independent thresholds.
+  mental_model: >-
+    Watertight compartments in a ship — when the Titanic hit an iceberg, water flooded several compartments. Modern ships
+    have better bulkheads: flooding one compartment does not sink the ship because the water cannot spread to other compartments.
+  domains:
+    domain:
+    - distributed
+    - reliability
+    - architecture
+    concern:
+    - fault_tolerance
+    - deployment
+  violation_consequence: >-
+    Without blast radius containment, a single bad deployment, data corruption, or service failure takes down the entire system
+    for all users. A bug in the notification service crashes the shared application server, taking down authentication, payments,
+    and everything else.
+  teaching_example: >-
+    A SaaS platform deploys a new feature to 100% of users simultaneously. The feature has a memory leak that causes OOM kills
+    after 30 minutes. Every instance crashes within a 5-minute window. With canary deployment (1% first), the leak would be
+    detected in one instance, affecting 1% of users, and automatically rolled back.
+  when_applies: >-
+    Any system serving multiple users or features where a failure in one area should not affect others — production services,
+    multi-tenant platforms, systems with mixed criticality workloads.
+  when_not_applies: >-
+    Single-purpose systems where the entire system is one indivisible function, or development environments where failure
+    isolation adds complexity without benefit.
+  sources:
+  - https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/use-fault-isolation-to-protect-your-workload.html
+  text: >-
+    Contain Failures to the Smallest Scope: Watertight compartments in a ship — when the Titanic hit an iceberg, water flooded
+    several compartments.
+  severity: critical
+  technologies:
+    lang:
+    - python
+  how_to_do_right: |-
+    1. Identify failure domains in your architecture: each microservice, each database, each message queue,
+    each external dependency. For each domain, answer: "If this component fails completely, what is the
+    maximum impact?" If the answer is "everything," the blast radius is too large.
+    2. Implement bulkheads for shared resources. Separate thread pools for critical and non-critical request
+    paths. Separate connection pools for different downstream services. Separate Kubernetes namespaces or
+    node pools for different workload tiers.
+    3. Use cell-based architecture for large-scale services. Partition users into cells (e.g., by user ID
+    hash), and each cell is independently deployable and independently failable. A cell failure affects only
+    the users in that cell, not the entire service.
+    4. Deploy changes gradually: canary deployments (1% -> 5% -> 25% -> 100%) with automated rollback on
+    metric regression. Feature flags to control rollout per-user-segment. Blue-green deployments for
+    zero-downtime cutover with instant rollback capability.
+    5. Set timeout, retry, and circuit breaker policies per dependency to prevent a slow dependency from
+    consuming shared resources. Each dependency gets its own circuit breaker with independent thresholds.
+  example_good: |-
+    # A SaaS platform deploys a new feature to 100% of users simultaneously.
+    # The feature has a memory leak that causes OOM kills after 30 minutes.
+    # Every instance crashes within a 5-minute window.
+    # With canary deployment (1% first), the leak would be detected in one instance, affecting 1% of users, and automatically rolled back.
+  example_bad: |-
+    # Anti-pattern: Violating Contain Failures to the Smallest Scope
+    # Result: Without blast radius containment
+    # Result: a single bad deployment
+- id: P-SCALE-HORIZONTAL
+  name: Design for Horizontal Scaling from Day One
+  why: |
+    Vertical scaling (bigger machines) has a hard ceiling: the largest EC2 instance has 448 vCPUs and 24 TB
+    of RAM, and it costs $100+/hour. More importantly, vertical scaling provides zero redundancy — one big
+    machine is still a single point of failure. Horizontal scaling (more machines) has no theoretical ceiling
+    and inherently provides redundancy: losing one of 10 instances means 10% capacity loss, not 100%.
+    However, horizontal scaling only works if the application is designed for it. Stateless services scale
+    horizontally by default — add more instances behind a load balancer and throughput increases linearly.
+    Stateful components (databases, caches, session stores) require explicit design for horizontal scaling:
+    sharding, replication, and consensus protocols. The critical design decision is separating state from
+    compute early in the architecture. If user sessions are stored in application memory, scaling horizontally
+    means losing sessions when instances are added or removed. If sessions are stored in Redis, any instance
+    can serve any user. If file uploads are stored on local disk, scaling horizontally means files are only
+    available on one instance. If uploads go to S3, any instance can serve any file. Every piece of local
+    state is a barrier to horizontal scaling, and retrofitting statelessness into a stateful application is
+    one of the most expensive refactoring efforts in software engineering. The cost of designing for
+    horizontal scaling from day one is minimal — externalize state to Redis/S3/database, use load-balanced
+    connection pools, avoid machine-specific assumptions. The cost of retrofitting is months of engineering
+    time and significant risk of data loss during migration.
+  how_to_apply: |
+    1. Make application instances stateless. Store session data in Redis or a distributed cache, not in
+    application memory. Store file uploads in object storage (S3, GCS), not on local disk. Store user
+    preferences in the database, not in config files. Any instance should be able to serve any request.
+    2. Use load balancers with health checks for all service-to-service communication. Kubernetes Services,
+    AWS ALB, or Envoy provide automatic traffic distribution and instance health monitoring. Never hardcode
+    instance addresses.
+    3. Design database schemas for eventual sharding. Use UUIDs instead of auto-increment IDs (auto-increment
+    requires coordination across shards). Avoid cross-shard joins by denormalizing data that is accessed
+    together. Include the shard key in every query.
+    4. Implement auto-scaling based on meaningful metrics: CPU utilization, request queue depth, or custom
+    business metrics (orders per second). Set scale-up thresholds aggressively (70% CPU) and scale-down
+    thresholds conservatively (30% CPU with a cooldown period) to handle traffic spikes without oscillation.
+    5. Test horizontal scaling regularly: add instances under load and verify that throughput increases
+    proportionally. If doubling instances does not roughly double throughput, there is a bottleneck —
+    typically a shared database, a lock, or a single-threaded component.
+  mental_model: >-
+    Restaurant kitchen — when orders increase, you add more cooks (horizontal), not one giant cook (vertical). Each cook works
+    independently with shared access to the pantry (external state), and any cook can prepare any dish.
+  domains:
+    domain:
+    - distributed
+    - architecture
+    - performance
+    concern:
+    - scalability
+  violation_consequence: >-
+    Stateful application instances cannot scale horizontally without data loss or inconsistency. When traffic doubles, the
+    only option is a bigger (and more expensive) machine, which takes downtime to provision and still has a ceiling. Sticky
+    sessions create hot spots and make deployments disruptive.
+  teaching_example: >-
+    A web application stores user sessions in memory and uploaded files on local disk. To handle Black Friday traffic, they
+    need 10x capacity. But adding instances means users lose their sessions when routed to a new instance, and uploaded files
+    are only accessible from the instance that received them. The entire architecture must be rewritten under time pressure.
+  when_applies: >-
+    Any service that may need to handle growing traffic, any cloud-deployed application, any service where availability requires
+    multiple instances.
+  when_not_applies: >-
+    Embedded systems with fixed hardware, single-user desktop applications, or batch processing jobs that are inherently single-machine
+    and complete within acceptable time.
+  sources:
+  - https://12factor.net/concurrency
+  text: >-
+    Design for Horizontal Scaling from Day One: Restaurant kitchen — when orders increase, you add more cooks (horizontal),
+    not one giant cook (vertical).
+  severity: critical
+  technologies:
+    lang:
+    - python
+  how_to_do_right: |-
+    1. Make application instances stateless. Store session data in Redis or a distributed cache, not in
+    application memory. Store file uploads in object storage (S3, GCS), not on local disk. Store user
+    preferences in the database, not in config files. Any instance should be able to serve any request.
+    2. Use load balancers with health checks for all service-to-service communication. Kubernetes Services,
+    AWS ALB, or Envoy provide automatic traffic distribution and instance health monitoring. Never hardcode
+    instance addresses.
+    3. Design database schemas for eventual sharding. Use UUIDs instead of auto-increment IDs (auto-increment
+    requires coordination across shards). Avoid cross-shard joins by denormalizing data that is accessed
+    together. Include the shard key in every query.
+    4. Implement auto-scaling based on meaningful metrics: CPU utilization, request queue depth, or custom
+    business metrics (orders per second). Set scale-up thresholds aggressively (70% CPU) and scale-down
+    thresholds conservatively (30% CPU with a cooldown period) to handle traffic spikes without oscillation.
+    5. Test horizontal scaling regularly: add instances under load and verify that throughput increases
+    proportionally. If doubling instances does not roughly double throughput, there is a bottleneck —
+    typically a shared database, a lock, or a single-threaded component.
+  example_good: |-
+    # A web application stores user sessions in memory and uploaded files on local disk.
+    # To handle Black Friday traffic, they need 10x capacity.
+    # But adding instances means users lose their sessions when routed to a new instance, and uploaded files are only accessible from the instance that received them.
+    # The entire architecture must be rewritten under time pressure.
+  example_bad: |-
+    # Anti-pattern: Violating Design for Horizontal Scaling from Day One
+    # Result: Stateful application instances cannot scale horizontally without data loss or inconsistency. When traffic doubles
+    # Result: the only option is a bigger (and more expensive) machine
+- id: P-SCALE-SHARD
+  name: Shard by Access Pattern, Re-shard by Growth
+  why: |
+    A single database instance has finite capacity: connection limits, I/O throughput, storage size, and CPU
+    for query processing. Sharding distributes data across multiple database instances, each holding a subset
+    of the total dataset. The critical decision is the shard key — the attribute that determines which shard
+    holds each record. A good shard key distributes data evenly (no hot shards), co-locates data that is
+    accessed together (minimizing cross-shard queries), and aligns with the application's primary access
+    pattern. For a multi-tenant SaaS, tenant_id is often the ideal shard key: all of a tenant's data lives
+    on one shard, queries never need to cross shards, and tenants are naturally distributed. For a social
+    network, user_id works similarly. For a time-series database, time range sharding ensures that recent
+    (hot) data is on fast storage and old (cold) data is on cheap storage. The worst shard key creates hot
+    spots — sharding by country puts 40% of data on the US shard, or sharding by first letter puts 15% on
+    the S shard. Instagram learned this lesson: they initially sharded by user_id but needed to support
+    queries by photo_id, which required a secondary index mapping photo_id to user_id shard. The second
+    critical decision is re-sharding strategy. Data grows, access patterns shift, and the initial shard
+    count becomes insufficient. Re-sharding (splitting or rebalancing shards) must be possible online,
+    without downtime. Vitess, CockroachDB, and DynamoDB handle this automatically; manual sharding requires
+    careful planning for the inevitable re-shard event. Design the shard key to be immutable and include
+    it in every query to avoid scatter-gather operations.
+  how_to_apply: |
+    1. Identify the primary access pattern for your data. If 90% of queries filter by tenant_id, shard by
+    tenant_id. If 90% of queries filter by date range, shard by time. The shard key must appear in every
+    query to avoid scatter-gather (querying all shards).
+    2. Validate shard key distribution before deploying. Histogram the shard key values across your dataset —
+    if any shard would hold more than 2x the average, choose a different key or use composite keys
+    (tenant_id + hash) to distribute hot tenants across multiple shards.
+    3. Start with logical sharding (application-level routing) before physical sharding (separate database
+    instances). Logical sharding means the application includes the shard key in queries and a routing
+    layer directs to the correct schema/table. This is simpler to manage and can be promoted to physical
+    sharding when a single instance reaches its limits.
+    4. Plan for re-sharding from day one. Use consistent hashing (like DynamoDB or Cassandra) to minimize
+    data movement when adding shards. If using range-based sharding, design ranges to be splittable.
+    Never assume the initial shard count will be sufficient forever.
+    5. Build cross-shard query support for the rare queries that need it: scatter-gather with merge, or
+    maintain a global index for secondary access patterns. Accept that cross-shard queries will be slower
+    and design the application to minimize them.
+    6. Monitor per-shard metrics: query latency, storage usage, connection count, and throughput. Alert when
+    any shard deviates significantly from the average — this indicates a hot shard that needs splitting.
+  mental_model: >-
+    Library card catalog organized by subject — if most people search by subject, organizing by subject means one catalog
+    drawer per section. If the Science section overflows, you split it into Physics, Chemistry, and Biology — re-sharding
+    by growth.
+  domains:
+    domain:
+    - distributed
+    - database
+    - architecture
+    - performance
+    concern:
+    - scalability
+    - data_management
+  violation_consequence: >-
+    A poor shard key creates hot shards that bottleneck the entire system while other shards sit idle. Scatter-gather queries
+    that hit all shards negate the performance benefits of sharding. Inability to re-shard means the system hits a wall when
+    data outgrows the initial design.
+  teaching_example: >-
+    A SaaS platform shards by company_name first letter. Companies starting with 'S' (Samsung, Salesforce, SAP, Spotify) all
+    land on the same shard, which handles 3x the load of average shards. Re-sharding by company_id hash distributes load evenly
+    and eliminates the hot shard.
+  when_applies: >-
+    Any database that will grow beyond a single instance's capacity, multi-tenant systems, high-throughput OLTP systems, time-series
+    data stores.
+  when_not_applies: >-
+    Small datasets that fit comfortably on a single instance, read-heavy workloads better served by read replicas, or systems
+    using databases with built-in automatic sharding (CockroachDB, Spanner).
+  sources:
+  - https://www.mongodb.com/docs/manual/sharding/
+  text: >-
+    Shard by Access Pattern, Re-shard by Growth: Library card catalog organized by subject — if most people search by subject,
+    organizing by subject means one catalog drawer per section.
+  severity: medium
+  technologies:
+    lang:
+    - python
+  how_to_do_right: |-
+    1. Identify the primary access pattern for your data. If 90% of queries filter by tenant_id, shard by
+    tenant_id. If 90% of queries filter by date range, shard by time. The shard key must appear in every
+    query to avoid scatter-gather (querying all shards).
+    2. Validate shard key distribution before deploying. Histogram the shard key values across your dataset —
+    if any shard would hold more than 2x the average, choose a different key or use composite keys
+    (tenant_id + hash) to distribute hot tenants across multiple shards.
+    3. Start with logical sharding (application-level routing) before physical sharding (separate database
+    instances). Logical sharding means the application includes the shard key in queries and a routing
+    layer directs to the correct schema/table. This is simpler to manage and can be promoted to physical
+    sharding when a single instance reaches its limits.
+    4. Plan for re-sharding from day one. Use consistent hashing (like DynamoDB or Cassandra) to minimize
+    data movement when adding shards. If using range-based sharding, design ranges to be splittable.
+    Never assume the initial shard count will be sufficient forever.
+    5. Build cross-shard query support for the rare queries that need it: scatter-gather with merge, or
+    maintain a global index for secondary access patterns. Accept that cross-shard queries will be slower
+    and design the application to minimize them.
+    6. Monitor per-shard metrics: query latency, storage usage, connection count, and throughput. Alert when
+    any shard deviates significantly from the average — this indicates a hot shard that needs splitting.
+  example_good: |-
+    # A SaaS platform shards by company_name first letter.
+    # Companies starting with 'S' (Samsung, Salesforce, SAP, Spotify) all land on the same shard, which handles 3x the load of average shards.
+    # Re-sharding by company_id hash distributes load evenly and eliminates the hot shard.
+  example_bad: |-
+    # Anti-pattern: Violating Shard by Access Pattern, Re-shard by Growth
+    # Result: A poor shard key creates hot shards that bottleneck the entire system while other shards sit idle. Scatter-gather queries that hit all shards negate the performance benefits of sharding. Inability to re-shard means the system hits a wall when data outgrows the initial design.
+- id: P-SCALE-CQRS
+  name: Separate Read and Write Models
+  why: |
+    In most applications, read and write workloads have fundamentally different characteristics. Writes need
+    strong consistency, validation, and transactional guarantees. Reads need speed, flexible querying, and
+    often tolerate slight staleness. A single data model optimized for writes (normalized, indexed for write
+    throughput) is suboptimal for reads (denormalized, indexed for query patterns), and vice versa. CQRS
+    (Command Query Responsibility Segregation), introduced by Greg Young and building on Bertrand Meyer's
+    CQS principle, separates the write model (commands) from the read model (queries) into distinct data
+    stores optimized for their respective workloads. The write side uses a normalized relational database
+    with strong consistency and referential integrity. The read side uses denormalized views, materialized
+    in read-optimized stores like Elasticsearch (full-text search), Redis (key-value lookups), or a
+    denormalized read replica (complex queries). Changes on the write side are propagated to the read side
+    via domain events, typically through a message broker. This separation provides three benefits. First,
+    each model is independently scalable: read-heavy workloads scale the read store without affecting write
+    throughput. Second, each model is independently optimizable: the read model can be denormalized,
+    pre-computed, and cached aggressively without compromising write-side integrity. Third, the read model
+    can evolve independently: adding a new query pattern means adding a new read projection, not changing
+    the write schema. The trade-off is eventual consistency between write and read models (the read model
+    lags behind the write model by the event propagation delay) and increased system complexity (two models,
+    an event bus, and projection logic to maintain). CQRS is not appropriate for every system — it shines
+    in systems with highly asymmetric read/write ratios (100:1 is common in user-facing applications) or
+    where read and write models need fundamentally different data structures.
+  how_to_apply: |
+    1. Identify workloads where read and write patterns diverge significantly. A social media feed (writes
+    are posts/likes/comments; reads are chronological timelines with aggregated engagement counts) is a
+    classic CQRS candidate. A simple CRUD form where reads and writes use the same schema is not.
+    2. Implement the write side as the source of truth: normalized schema, strong consistency, all business
+    rule validation. Every mutation goes through the write model and produces a domain event (e.g.,
+    OrderPlaced, PaymentProcessed, ItemShipped).
+    3. Implement the read side as materialized projections: event handlers that consume domain events and
+    update denormalized read stores. An OrderPlaced event updates the user's order history view, the
+    admin's order dashboard view, and the analytics aggregate — three different projections from one event.
+    4. Choose appropriate read stores for each query pattern: Elasticsearch for full-text search and
+    filtering, Redis for low-latency key-value lookups, a denormalized PostgreSQL table for complex joins,
+    or a pre-computed API response stored as JSON.
+    5. Handle eventual consistency explicitly in the UI. After a user creates a post, optimistically display
+    it immediately (client-side) while the event propagates to the read model. Use "read-your-writes"
+    consistency where the user always sees their own recent changes, even if other users see them with a
+    slight delay.
+  mental_model: >-
+    Restaurant menu vs kitchen inventory — the menu (read model) is optimized for customers to browse: pictures, descriptions,
+    categories. The kitchen inventory (write model) is optimized for accuracy: quantities, expiration dates, supplier info.
+    They serve different audiences with different needs.
+  domains:
+    domain:
+    - distributed
+    - architecture
+    - database
+    - performance
+    concern:
+    - scalability
+    - design
+  violation_consequence: >-
+    A single model serving both reads and writes forces compromises in both directions. Write-optimized schemas require expensive
+    joins for reads. Read-optimized denormalization complicates write validation. The database becomes the bottleneck as read
+    and write workloads compete for the same resources.
+  teaching_example: >-
+    An e-commerce platform uses a single normalized database for product catalog reads and inventory writes. During a sale,
+    read traffic (browsing products) increases 50x while write traffic (purchasing) increases 5x. The shared database's connection
+    pool is exhausted by reads, causing write timeouts and failed purchases. With CQRS, reads hit a denormalized Elasticsearch
+    index while writes hit the transactional database independently.
+  when_applies: >-
+    Systems with highly asymmetric read/write ratios, systems where read and write models need different data structures or
+    storage engines, event-sourced systems where projections naturally emerge.
+  when_not_applies: >-
+    Simple CRUD applications where read and write schemas are identical, low-traffic systems where a single database handles
+    both easily, or systems where eventual consistency between models is unacceptable.
+  sources:
+  - https://martinfowler.com/bliki/CQRS.html
+  text: >-
+    Separate Read and Write Models: Restaurant menu vs kitchen inventory — the menu (read model) is optimized for customers
+    to browse: pictures, descriptions, categories.
+  severity: critical
+  technologies:
+    lang:
+    - python
+  how_to_do_right: |-
+    1. Identify workloads where read and write patterns diverge significantly. A social media feed (writes
+    are posts/likes/comments; reads are chronological timelines with aggregated engagement counts) is a
+    classic CQRS candidate. A simple CRUD form where reads and writes use the same schema is not.
+    2. Implement the write side as the source of truth: normalized schema, strong consistency, all business
+    rule validation. Every mutation goes through the write model and produces a domain event (e.g.,
+    OrderPlaced, PaymentProcessed, ItemShipped).
+    3. Implement the read side as materialized projections: event handlers that consume domain events and
+    update denormalized read stores. An OrderPlaced event updates the user's order history view, the
+    admin's order dashboard view, and the analytics aggregate — three different projections from one event.
+    4. Choose appropriate read stores for each query pattern: Elasticsearch for full-text search and
+    filtering, Redis for low-latency key-value lookups, a denormalized PostgreSQL table for complex joins,
+    or a pre-computed API response stored as JSON.
+    5. Handle eventual consistency explicitly in the UI. After a user creates a post, optimistically display
+    it immediately (client-side) while the event propagates to the read model. Use "read-your-writes"
+    consistency where the user always sees their own recent changes, even if other users see them with a
+    slight delay.
+  example_good: |-
+    # An e-commerce platform uses a single normalized database for product catalog reads and inventory writes.
+    # During a sale, read traffic (browsing products) increases 50x while write traffic (purchasing) increases 5x.
+    # The shared database's connection pool is exhausted by reads, causing write timeouts and failed purchases.
+    # With CQRS, reads hit a denormalized Elasticsearch index while writes hit the transactional database independently.
+  example_bad: |-
+    # Anti-pattern: Violating Separate Read and Write Models
+    # Result: A single model serving both reads and writes forces compromises in both directions. Write-optimized schemas require expensive joins for reads. Read-optimized denormalization complicates write validation. The database becomes the bottleneck as read and write workloads compete for the same resources.
+- id: P-MSG-IDEMPOTENT
+  name: Every Message Handler Must Be Idempotent
+  why: |
+    In distributed messaging systems, messages can be delivered more than once. This is not a bug — it is a
+    fundamental consequence of the at-least-once delivery guarantee that most message brokers provide. Kafka,
+    SQS, RabbitMQ, and Redis Streams all guarantee that a message will be delivered at least once but cannot
+    guarantee exactly-once delivery across system boundaries. Duplicate delivery occurs in several scenarios:
+    the consumer processes the message but crashes before acknowledging it (the broker redelivers), a network
+    partition causes the broker to lose the acknowledgment, or the consumer takes too long and the visibility
+    timeout expires (SQS redelivers to another consumer). If a message handler is not idempotent — meaning
+    processing the same message twice produces the same result as processing it once — duplicates cause real
+    damage: double charges, duplicate records, incorrect counters, phantom inventory deductions. The at-most-
+    once alternative (acknowledging before processing) risks losing messages entirely, which is worse than
+    duplicates for most use cases. Exactly-once processing can be achieved at the application level through
+    idempotency: store a unique message ID (or idempotency key) and check it before processing. If the ID
+    exists, the message was already processed — skip it or return the previous result. This pattern is used
+    by every payment processor (Stripe's Idempotency-Key header), every event-driven system (Kafka's
+    idempotent producer), and every reliable message consumer. Idempotency is not just about duplicate
+    detection — it is about making your system resilient to the fundamental unreliability of distributed
+    communication. Design every handler as if every message will arrive twice, because eventually it will.
+  how_to_apply: |
+    1. Assign a globally unique idempotency key to every message at the producer. Use UUIDv7 (timestamp-
+    sortable), or a deterministic key derived from the business operation (e.g., order_id + operation_type).
+    Include this key in the message payload.
+    2. Before processing a message, check if the idempotency key exists in a deduplication store (Redis with
+    TTL, a database table, or a Bloom filter for probabilistic deduplication). If it exists, skip processing
+    and return the stored result. If it does not exist, store the key and proceed.
+    3. Use database UPSERT (INSERT ON CONFLICT DO UPDATE) instead of INSERT for all write operations triggered
+    by messages. This makes the database operation itself idempotent — processing the same message twice
+    produces the same database state.
+    4. For side effects that cannot be made naturally idempotent (sending emails, calling external APIs),
+    implement a deduplication check before triggering the side effect. Store a record of "email sent for
+    order X" and check it before sending. External APIs should support idempotency keys (Stripe, PayPal).
+    5. Set appropriate TTLs on idempotency keys. They need to survive long enough to cover the maximum
+    redelivery window (e.g., SQS visibility timeout of 12 hours) but not forever. 24-72 hours covers most
+    scenarios.
+    6. Test idempotency explicitly: write tests that send the same message twice and verify that the system
+    state is identical to processing it once. This should be a standard test pattern for every handler.
+  mental_model: >-
+    ATM deposit — if the ATM prints 'transaction complete' but you are not sure the screen updated correctly, you can insert
+    the same check again. The system recognizes the duplicate deposit (same check number) and does not double-credit your
+    account.
+  domains:
+    domain:
+    - distributed
+    - messaging
+    - architecture
+    - reliability
+    concern:
+    - message_processing
+    - consistency
+  violation_consequence: >-
+    Non-idempotent handlers cause double charges to customers, duplicate records in databases, incorrect inventory counts,
+    phantom notifications, and corrupted aggregate statistics. These bugs are intermittent (they only occur on redelivery),
+    hard to reproduce, and often discovered by customers rather than monitoring.
+  teaching_example: >-
+    A payment handler deducts the user's balance on every message receipt. During a Kafka consumer rebalance, a batch of 50
+    payment messages is redelivered. Without idempotency, 50 users are double-charged. With idempotency keys stored in Redis,
+    the duplicate messages are detected and skipped — each user is charged exactly once.
+  when_applies: >-
+    Every message handler in every distributed system — this is not optional. Any handler that processes messages from a queue,
+    topic, or stream must be idempotent.
+  when_not_applies: >-
+    In-process function calls where the caller guarantees single invocation, or read-only handlers that have no side effects
+    (though even these benefit from deduplication to avoid wasted computation).
+  sources:
+  - https://stripe.com/docs/webhooks#handle-duplicate-events
+  text: >-
+    Every Message Handler Must Be Idempotent: ATM deposit — if the ATM prints 'transaction complete' but you are not sure
+    the screen updated correctly, you can insert the same check again.
+  severity: high
+  technologies:
+    lang:
+    - python
+    - sql
+  how_to_do_right: |-
+    1. Assign a globally unique idempotency key to every message at the producer. Use UUIDv7 (timestamp-
+    sortable), or a deterministic key derived from the business operation (e.g., order_id + operation_type).
+    Include this key in the message payload.
+    2. Before processing a message, check if the idempotency key exists in a deduplication store (Redis with
+    TTL, a database table, or a Bloom filter for probabilistic deduplication). If it exists, skip processing
+    and return the stored result. If it does not exist, store the key and proceed.
+    3. Use database UPSERT (INSERT ON CONFLICT DO UPDATE) instead of INSERT for all write operations triggered
+    by messages. This makes the database operation itself idempotent — processing the same message twice
+    produces the same database state.
+    4. For side effects that cannot be made naturally idempotent (sending emails, calling external APIs),
+    implement a deduplication check before triggering the side effect. Store a record of "email sent for
+    order X" and check it before sending. External APIs should support idempotency keys (Stripe, PayPal).
+    5. Set appropriate TTLs on idempotency keys. They need to survive long enough to cover the maximum
+    redelivery window (e.g., SQS visibility timeout of 12 hours) but not forever. 24-72 hours covers most
+    scenarios.
+    6. Test idempotency explicitly: write tests that send the same message twice and verify that the system
+    state is identical to processing it once. This should be a standard test pattern for every handler.
+  example_good: |-
+    # A payment handler deducts the user's balance on every message receipt.
+    # During a Kafka consumer rebalance, a batch of 50 payment messages is redelivered.
+    # Without idempotency, 50 users are double-charged.
+    # With idempotency keys stored in Redis, the duplicate messages are detected and skipped — each user is charged exactly once.
+  example_bad: |-
+    # Anti-pattern: Violating Every Message Handler Must Be Idempotent
+    # Result: Non-idempotent handlers cause double charges to customers
+    # Result: duplicate records in databases
+- id: P-MSG-DLQ
+  name: Dead Letter Queues Are Your Safety Net
+  why: |
+    In any message processing system, some messages will fail. The message format might be invalid, a required
+    downstream service might be permanently unavailable, or the message might contain data that triggers a
+    bug in the handler. Without a dead letter queue (DLQ), these poison messages have two fates: they are
+    retried infinitely (blocking the queue and preventing other messages from being processed) or they are
+    silently dropped (data loss). Both outcomes are unacceptable. A DLQ is a separate queue where messages
+    are sent after they have exhausted their retry attempts. The DLQ serves three critical functions. First,
+    it prevents poison messages from blocking the main queue — after N retries (typically 3-5), the message
+    is moved to the DLQ and the consumer continues processing other messages. Second, it preserves failed
+    messages for investigation and reprocessing — engineers can examine the DLQ to understand why messages
+    failed and fix the root cause. Third, it provides an audit trail of processing failures, enabling
+    metrics like DLQ ingestion rate (a spike indicates a systemic problem), message age in DLQ (indicates
+    how quickly failures are addressed), and DLQ depth trend (growing depth indicates unresolved issues).
+    SQS has built-in DLQ support with configurable maxReceiveCount. Kafka achieves DLQ behavior through error
+    topics. RabbitMQ supports dead letter exchanges. The DLQ must be monitored as aggressively as the primary
+    queue. An unmonitored DLQ is a data graveyard — messages go in and never come out, and nobody notices
+    until a customer reports missing transactions. Every message in the DLQ represents a failed business
+    operation that needs resolution, whether through automated reprocessing, manual intervention, or
+    intentional discard with documentation.
+  how_to_apply: |
+    1. Configure a DLQ for every queue and topic in your system. Set the max retry count to 3-5 attempts with
+    exponential backoff between retries. After max retries, route the message to the DLQ automatically.
+    In SQS, this is the redrive policy; in Kafka, produce to an error topic in the catch block.
+    2. Enrich messages entering the DLQ with failure metadata: original queue, failure timestamp, error
+    message, stack trace, retry count, and the handler version that failed. This metadata is essential for
+    diagnosis and enables automated classification of failure types.
+    3. Build a DLQ dashboard showing: current depth, ingestion rate (messages per minute entering the DLQ),
+    age of oldest message, and failure reason distribution. Alert on depth exceeding a threshold (indicates
+    systemic failure) and on messages older than 24 hours (indicates unresolved failures).
+    4. Implement a reprocessing mechanism: a tool or script that reads messages from the DLQ, optionally
+    transforms them (e.g., fixes a known data issue), and republishes them to the original queue. This
+    must be a one-click operation, not a manual database query.
+    5. Review the DLQ daily as part of operational hygiene. Every message in the DLQ is a failed business
+    operation. Categorize failures as transient (will succeed on retry after a fix), permanent (message is
+    invalid and must be discarded), or bug-related (handler code needs a fix before reprocessing).
+  mental_model: >-
+    Hospital triage — patients who cannot be treated immediately are not sent home (lost) or left blocking the emergency room
+    (stuck). They go to a holding area with documentation of their condition, and a specialist reviews them as soon as possible.
+  domains:
+    domain:
+    - distributed
+    - messaging
+    - reliability
+    - operations
+    concern:
+    - message_processing
+    - observability
+  violation_consequence: >-
+    Without a DLQ, poison messages retry infinitely, blocking the queue and preventing all subsequent messages from processing.
+    Alternatively, failed messages are silently dropped, causing data loss that is only discovered when customers report missing
+    transactions days later. Neither outcome is acceptable.
+  teaching_example: >-
+    An order processing system receives a message with a malformed address field. Without a DLQ, the message retries every
+    30 seconds forever, and 500 valid orders behind it in the queue never get processed. With a DLQ, the malformed message
+    moves to the DLQ after 3 retries, the valid orders process normally, and the ops team is alerted to investigate the address
+    parsing bug.
+  when_applies: >-
+    Every message queue and topic in every distributed system — DLQs are non-negotiable infrastructure. If you have a queue,
+    you need a DLQ.
+  when_not_applies: >-
+    In-memory queues in development environments, or truly fire-and-forget workloads where message loss is acceptable (rare
+    in practice).
+  sources:
+  - https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html
+  text: >-
+    Dead Letter Queues Are Your Safety Net: Hospital triage — patients who cannot be treated immediately are not sent home
+    (lost) or left blocking the emergency room (stuck).
+  severity: high
+  technologies:
+    lang:
+    - python
+  how_to_do_right: |-
+    1. Configure a DLQ for every queue and topic in your system. Set the max retry count to 3-5 attempts with
+    exponential backoff between retries. After max retries, route the message to the DLQ automatically.
+    In SQS, this is the redrive policy; in Kafka, produce to an error topic in the catch block.
+    2. Enrich messages entering the DLQ with failure metadata: original queue, failure timestamp, error
+    message, stack trace, retry count, and the handler version that failed. This metadata is essential for
+    diagnosis and enables automated classification of failure types.
+    3. Build a DLQ dashboard showing: current depth, ingestion rate (messages per minute entering the DLQ),
+    age of oldest message, and failure reason distribution. Alert on depth exceeding a threshold (indicates
+    systemic failure) and on messages older than 24 hours (indicates unresolved failures).
+    4. Implement a reprocessing mechanism: a tool or script that reads messages from the DLQ, optionally
+    transforms them (e.g., fixes a known data issue), and republishes them to the original queue. This
+    must be a one-click operation, not a manual database query.
+    5. Review the DLQ daily as part of operational hygiene. Every message in the DLQ is a failed business
+    operation. Categorize failures as transient (will succeed on retry after a fix), permanent (message is
+    invalid and must be discarded), or bug-related (handler code needs a fix before reprocessing).
+  example_good: |-
+    # An order processing system receives a message with a malformed address field.
+    # Without a DLQ, the message retries every 30 seconds forever, and 500 valid orders behind it in the queue never get processed.
+    # With a DLQ, the malformed message moves to the DLQ after 3 retries, the valid orders process normally, and the ops team is alerted to investigate the address parsing bug.
+  example_bad: |-
+    # Anti-pattern: Violating Dead Letter Queues Are Your Safety Net
+    # Result: Without a DLQ
+    # Result: poison messages retry infinitely
+- id: P-MSG-BACKOFF
+  name: Exponential Backoff with Jitter
+  why: |
+    When a service fails and multiple clients detect the failure simultaneously, they all retry at the same
+    time. This synchronized retry creates a "thundering herd" — a sudden spike of requests that can overwhelm
+    the recovering service and prevent it from actually recovering. Simple linear retry (retry every 1 second)
+    is even worse: every client retries on the exact same cadence, creating periodic spikes that keep the
+    service pinned. Exponential backoff addresses this by increasing the wait time between retries
+    exponentially: 1s, 2s, 4s, 8s, 16s. This spreads retries over a longer time window, reducing instantaneous
+    load on the recovering service. But exponential backoff alone is insufficient — if all clients start
+    retrying at the same time with the same base, their retries are still synchronized (all retry at 1s, all
+    at 2s, all at 4s). Jitter adds randomness to break this synchronization. Full jitter (random between 0
+    and the exponential backoff value) provides the best distribution, reducing the probability of collision
+    to near zero. AWS's architecture blog published an influential analysis showing that exponential backoff
+    with full jitter reduces total completion time and retry load by 40-60% compared to exponential backoff
+    alone. The formula is: sleep = random(0, min(cap, base * 2^attempt)). The cap prevents unbounded backoff
+    (you do not want a client waiting 17 minutes between retries). This pattern is used by every AWS SDK,
+    every gRPC client, and every well-designed HTTP client. It is the standard retry strategy for a reason:
+    it is simple to implement, mathematically sound, and empirically proven across millions of production
+    systems. Truncated exponential backoff with jitter and a maximum retry count should be the default for
+    every remote call in your system.
+  how_to_apply: |
+    1. Implement the standard backoff formula: sleep_time = random(0, min(max_delay, base_delay * 2^attempt)).
+    Typical values: base_delay = 100ms, max_delay = 30s, max_attempts = 5. This gives retry intervals of
+    roughly 0-100ms, 0-200ms, 0-400ms, 0-800ms, 0-1600ms with full jitter.
+    2. Use full jitter (random between 0 and the exponential value), not equal jitter or decorrelated jitter.
+    AWS's empirical analysis shows full jitter provides the best spread and lowest total system load. The
+    implementation is a single random() call.
+    3. Set a maximum retry count (typically 3-5) and a maximum delay cap (typically 30-60 seconds). After
+    exhausting retries, fail the operation — do not retry forever. Route the failed operation to error
+    handling (DLQ, circuit breaker trip, user notification).
+    4. Classify errors before retrying. Retry transient errors (HTTP 503, connection timeout, ECONNREFUSED).
+    Do NOT retry permanent errors (HTTP 400, 401, 404) — retrying a bad request will never succeed and
+    wastes resources. Do NOT retry HTTP 429 — use the Retry-After header value instead of your backoff.
+    5. Log every retry with the attempt number, delay, and error reason. This creates an audit trail for
+    debugging and enables metrics: retry rate per service, average retries per operation, and retry
+    exhaustion rate. A high retry rate is an early warning of downstream degradation.
+  mental_model: >-
+    Polite phone redialing — instead of mashing redial every second (annoying and ineffective), wait 1 minute, then 5 minutes,
+    then 15 minutes, each time with a random offset so you and the other 100 callers are not all redialing at the same instant.
+  domains:
+    domain:
+    - distributed
+    - messaging
+    - reliability
+    - networking
+    concern:
+    - retry
+    - resilience
+  violation_consequence: >-
+    Without jitter, synchronized retries create thundering herd effects that prevent the failing service from recovering.
+    Without exponential backoff, constant-interval retries maintain sustained high load on the failing service. Together,
+    the absence of both turns a brief service hiccup into a prolonged outage.
+  teaching_example: >-
+    A load balancer health check marks a backend as unhealthy for 5 seconds. 10,000 in-flight requests fail and retry simultaneously
+    after 1 second. The backend receives 10,000 requests at once, fails again, and the cycle repeats. With exponential backoff
+    and jitter, retries spread over 0-8 seconds, the backend receives a gradual ramp of traffic, and it recovers within seconds.
+  when_applies: >-
+    Every remote call that can fail transiently — HTTP requests, database connections, message broker publishes, gRPC calls,
+    DNS resolution. This is the universal retry strategy.
+  when_not_applies: >-
+    Synchronous in-process function calls, operations with hard real-time deadlines where any retry is too slow, or operations
+    where the first failure is guaranteed to be permanent.
+  sources:
+  - https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/
+  text: >-
+    Exponential Backoff with Jitter: Polite phone redialing — instead of mashing redial every second (annoying and ineffective),
+    wait 1 minute, then 5 minutes, then 15 minutes, each time with a random offset so you and the other 100 callers are not
+    all redialing at the same instant.
+  severity: high
+  technologies:
+    lang:
+    - python
+  how_to_do_right: |-
+    1. Implement the standard backoff formula: sleep_time = random(0, min(max_delay, base_delay * 2^attempt)).
+    Typical values: base_delay = 100ms, max_delay = 30s, max_attempts = 5. This gives retry intervals of
+    roughly 0-100ms, 0-200ms, 0-400ms, 0-800ms, 0-1600ms with full jitter.
+    2. Use full jitter (random between 0 and the exponential value), not equal jitter or decorrelated jitter.
+    AWS's empirical analysis shows full jitter provides the best spread and lowest total system load. The
+    implementation is a single random() call.
+    3. Set a maximum retry count (typically 3-5) and a maximum delay cap (typically 30-60 seconds). After
+    exhausting retries, fail the operation — do not retry forever. Route the failed operation to error
+    handling (DLQ, circuit breaker trip, user notification).
+    4. Classify errors before retrying. Retry transient errors (HTTP 503, connection timeout, ECONNREFUSED).
+    Do NOT retry permanent errors (HTTP 400, 401, 404) — retrying a bad request will never succeed and
+    wastes resources. Do NOT retry HTTP 429 — use the Retry-After header value instead of your backoff.
+    5. Log every retry with the attempt number, delay, and error reason. This creates an audit trail for
+    debugging and enables metrics: retry rate per service, average retries per operation, and retry
+    exhaustion rate. A high retry rate is an early warning of downstream degradation.
+  example_good: |-
+    # A load balancer health check marks a backend as unhealthy for 5 seconds.
+    # 10,000 in-flight requests fail and retry simultaneously after 1 second.
+    # The backend receives 10,000 requests at once, fails again, and the cycle repeats.
+    # With exponential backoff and jitter, retries spread over 0-8 seconds, the backend receives a gradual ramp of traffic, and it recovers within seconds.
+  example_bad: |-
+    # Anti-pattern: Violating Exponential Backoff with Jitter
+    # Result: Without jitter
+    # Result: synchronized retries create thundering herd effects that prevent the failing service from recovering. Without exponential backoff
+- id: P-MSG-ORDERING
+  name: Require Message Ordering Only When Semantically Necessary
+  why: |
+    Message ordering guarantees are expensive in distributed systems. Kafka guarantees ordering within a
+    partition but not across partitions — to get global ordering, you must use a single partition, which
+    limits throughput to what one broker can handle. SQS standard queues provide nearly unlimited throughput
+    but no ordering; SQS FIFO queues guarantee ordering but cap at 3,000 messages per second with batching
+    (300 without). RabbitMQ guarantees ordering per queue but not across queues. The cost of ordering is not
+    just throughput — it also means head-of-line blocking: if message N cannot be processed (handler crash,
+    downstream failure), messages N+1, N+2, etc. must wait, even if they are completely independent. This
+    single constraint can turn a high-throughput parallel system into a serial bottleneck. The key insight is
+    that most messages do not actually require global ordering. An e-commerce system processes orders from
+    different users — order A and order B are completely independent, and processing B before A has no
+    semantic impact. What matters is ordering within a business entity: the sequence of events for a single
+    order (created -> paid -> shipped -> delivered) must be preserved. Kafka's partition key achieves this
+    perfectly: partition by order_id, and all events for a single order land on the same partition in order.
+    Events for different orders land on different partitions and are processed in parallel. This entity-level
+    ordering provides the semantic guarantee the business needs without sacrificing throughput. Before
+    requiring ordering, ask: "If these two messages are swapped, does the business outcome change?" If the
+    answer is no, do not pay the ordering tax.
+  how_to_apply: |
+    1. For every message type, explicitly document whether ordering matters and at what scope. "Order events
+    must be ordered per order_id" is a valid requirement. "All messages must be globally ordered" is almost
+    certainly over-specified.
+    2. Use entity-level partitioning to get ordering where it matters without sacrificing throughput. In Kafka,
+    set the partition key to the entity ID (order_id, user_id, account_id). All events for one entity go to
+    one partition (ordered); events for different entities go to different partitions (parallel).
+    3. Design handlers to be order-independent where possible. Instead of "apply delta +5 to balance" (order-
+    dependent), use "set balance to 105 with version 7" (idempotent and order-independent via optimistic
+    concurrency). This eliminates ordering requirements at the handler level.
+    4. For cases where ordering is required but throughput is critical, use sequence numbers in messages and
+    have the consumer buffer and reorder: if message 5 arrives before message 4, buffer message 5 until
+    message 4 arrives. This decouples transport ordering from processing ordering.
+    5. Monitor partition distribution to prevent hot partitions. If one entity generates 100x more events
+    than average (a viral user, a bulk import), it can create a hot partition that bottlenecks throughput.
+    Use sub-partitioning or rate limiting for hot entities.
+  mental_model: >-
+    Supermarket checkout lanes — each customer's items must be scanned in the order they are placed on the belt (entity ordering),
+    but different customers use different lanes simultaneously (no global ordering needed). Adding more lanes increases throughput
+    without violating anyone's item order.
+  domains:
+    domain:
+    - distributed
+    - messaging
+    - architecture
+    - performance
+    concern:
+    - message_processing
+    - scalability
+  violation_consequence: >-
+    Requiring global ordering when only entity-level ordering is needed caps throughput at a single partition's capacity,
+    introduces head-of-line blocking across independent entities, and prevents horizontal scaling of consumers. A system designed
+    for 100K msg/sec can be limited to 1K msg/sec by an unnecessary ordering constraint.
+  teaching_example: >-
+    A notification service requires all notifications to be globally ordered. With one Kafka partition, throughput is 5K messages/sec.
+    During a marketing campaign sending 500K notifications, the queue builds a 100-second backlog. Re-designing with per-user
+    ordering (partition by user_id, 64 partitions) achieves 200K msg/sec with zero backlog. No user notices the change because
+    ordering only matters within their own notification stream.
+  when_applies: >-
+    When evaluating whether to use ordered messaging (FIFO queues, single partitions) — always question whether the ordering
+    guarantee is semantically necessary or just a default assumption.
+  when_not_applies: >-
+    Truly sequential state machines where every event depends on the previous one's outcome (financial ledgers, consensus
+    protocols), or systems where the throughput requirements are low enough that ordering comes for free.
+  sources:
+  - https://kafka.apache.org/documentation/#design_quotasandthrottling
+  text: >-
+    Require Message Ordering Only When Semantically Necessary: Supermarket checkout lanes — each customer's items must be
+    scanned in the order they are placed on the belt (entity ordering), but different customers use different lanes simultaneously
+    (no global ordering needed).
+  severity: high
+  technologies:
+    lang:
+    - python
+  how_to_do_right: |-
+    1. For every message type, explicitly document whether ordering matters and at what scope. "Order events
+    must be ordered per order_id" is a valid requirement. "All messages must be globally ordered" is almost
+    certainly over-specified.
+    2. Use entity-level partitioning to get ordering where it matters without sacrificing throughput. In Kafka,
+    set the partition key to the entity ID (order_id, user_id, account_id). All events for one entity go to
+    one partition (ordered); events for different entities go to different partitions (parallel).
+    3. Design handlers to be order-independent where possible. Instead of "apply delta +5 to balance" (order-
+    dependent), use "set balance to 105 with version 7" (idempotent and order-independent via optimistic
+    concurrency). This eliminates ordering requirements at the handler level.
+    4. For cases where ordering is required but throughput is critical, use sequence numbers in messages and
+    have the consumer buffer and reorder: if message 5 arrives before message 4, buffer message 5 until
+    message 4 arrives. This decouples transport ordering from processing ordering.
+    5. Monitor partition distribution to prevent hot partitions. If one entity generates 100x more events
+    than average (a viral user, a bulk import), it can create a hot partition that bottlenecks throughput.
+    Use sub-partitioning or rate limiting for hot entities.
+  example_good: |-
+    # A notification service requires all notifications to be globally ordered.
+    # With one Kafka partition, throughput is 5K messages/sec.
+    # During a marketing campaign sending 500K notifications, the queue builds a 100-second backlog.
+    # Re-designing with per-user ordering (partition by user_id, 64 partitions) achieves 200K msg/sec with zero backlog.
+  example_bad: |-
+    # Anti-pattern: Violating Require Message Ordering Only When Semantically Necessary
+    # Result: Requiring global ordering when only entity-level ordering is needed caps throughput at a single partition\'s capacity
+    # Result: introduces head-of-line blocking across independent entities

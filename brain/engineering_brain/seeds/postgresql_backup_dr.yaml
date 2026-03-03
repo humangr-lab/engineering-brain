@@ -1,0 +1,1075 @@
+layer: rules
+domain: databases
+knowledge:
+- id: PGDR-001
+  text: >
+    Configure WAL archiving with archive_mode=on, wal_level=replica, and a validated
+    archive_command before enabling streaming replication or pgBackRest. The
+    archive_command must exit 0 ONLY when the WAL segment is durably written to the
+    archive destination. An archive_command that always returns 0 without actually
+    copying the file silently destroys your PITR capability.
+  why: >
+    WAL archiving is the foundation of PITR. If archive_command fails silently (exits 0
+    without writing), PostgreSQL believes WAL segments are safely archived and recycles
+    them from pg_wal. You discover the problem only when you attempt a PITR recovery and
+    find no WAL files. This exact scenario caused a 72-hour unrecoverable outage at a
+    fintech startup in 2023 — they had archive_command = 'exit 0' in their staging config
+    that was accidentally promoted to production. Test PITR quarterly.
+  how_to_do_right: |
+    1. postgresql.conf settings:
+       wal_level = replica          # minimum for archiving
+       archive_mode = on
+       archive_command = 'pgbackrest --stanza=main archive-push %p'
+       archive_timeout = 300        # force WAL switch every 5 minutes even if idle
+    2. Validate archive_command works BEFORE relying on it:
+       -- Manually force a WAL switch and verify it arrives in archive:
+       SELECT pg_switch_wal();
+       -- Then check archive destination for the new segment
+    3. Test: pg_stat_archiver view must show last_failed_time = NULL
+       SELECT last_archived_wal, last_failed_wal, last_failed_time FROM pg_stat_archiver;
+    4. Alert: if last_failed_time IS NOT NULL or archived_count hasn't grown in 10 minutes
+    5. Never use archive_command = 'test ! -f /archive/%f && cp %p /archive/%f'
+       — this silently succeeds (exit 0) if file already exists, skipping the copy
+    6. Retention: set repo-retention-archive in pgBackRest to match your PITR window
+  severity: critical
+  technologies:
+    lang: [sql, bash]
+    framework: [postgresql, pgbackrest]
+  domains:
+    domain: [databases, infrastructure]
+    concern: [backup, wal_archiving, disaster_recovery]
+  example_good: |
+    # postgresql.conf
+    wal_level = replica
+    archive_mode = on
+    archive_command = 'pgbackrest --stanza=main archive-push %p'
+    archive_timeout = 300
+    max_wal_senders = 10
+    wal_keep_size = 1024  # MB — retain WAL locally for replica catch-up
+
+    # pgbackrest.conf
+    [global]
+    repo1-path=/var/lib/pgbackrest
+    repo1-retention-full=2
+    repo1-retention-archive=14          # 14 days of PITR window
+    repo1-cipher-type=aes-256-cbc
+    repo1-cipher-pass=<vault-managed-secret>
+    log-level-file=detail
+
+    [main]
+    pg1-path=/var/lib/postgresql/data
+
+    # Validate archiving is working (run daily in monitoring):
+    # SELECT last_archived_wal, last_failed_time FROM pg_stat_archiver;
+    # Assert last_failed_time IS NULL
+  example_bad: |
+    # WRONG: archive_command that always succeeds without archiving
+    archive_command = 'exit 0'
+    # Or the common "cp but silently skip existing" mistake:
+    archive_command = 'test ! -f /archive/%f && cp %p /archive/%f'
+    # Both return exit 0 even when no file was written.
+    # PostgreSQL recycles WAL segments. PITR window = 0 days.
+    # Discovery method: production failure, midnight, no WAL to replay.
+  when_applies: Any PostgreSQL instance that requires PITR capability or serves as a replication primary
+  sources:
+    - "https://www.postgresql.org/docs/current/continuous-archiving.html"
+    - "https://pgbackrest.org/user-guide.html#quickstart/configure-stanza"
+    - "https://pgbackrest.org/configuration.html#section-archive/option-archive-push-queue-max"
+
+- id: PGDR-002
+  text: >
+    Set up pgBackRest with a dedicated backup repository server (separate from DB host).
+    Use full backup weekly (Sunday 02:00), differential daily (Mon-Sat 02:00), and
+    incremental every 6 hours. Encrypt the repository with AES-256-CBC using a Vault-managed
+    passphrase. Store the passphrase in a separate secrets manager — losing it makes all
+    backups unrecoverable.
+  why: >
+    Storing backups on the same host as the database is not disaster recovery — it is
+    a false sense of security. When the host fails (disk corruption, accidental `rm -rf`,
+    cloud VM termination), you lose the database AND the backups simultaneously. pgBackRest's
+    dedicated repository server pattern isolates failure domains. AES-256 encryption protects
+    backups in transit and at rest — critical when repo is on S3 or NFS where bucket
+    policies can be misconfigured.
+  how_to_do_right: |
+    1. Repository server: separate VM or S3 bucket with IAM policy restricting access
+    2. pgbackrest.conf on repository server:
+       [global]
+       repo1-path=/backup/pgbackrest
+       repo1-retention-full=2
+       repo1-retention-diff=14
+       repo1-cipher-type=aes-256-cbc
+       repo1-cipher-pass=${PGBACKREST_CIPHER_PASS}   # from Vault
+    3. Full backup schedule (crontab on repo server):
+       0 2 * * 0 pgbackrest --stanza=main --type=full backup
+       0 2 * * 1-6 pgbackrest --stanza=main --type=diff backup
+       0 */6 * * * pgbackrest --stanza=main --type=incr backup
+    4. After every backup: pgbackrest --stanza=main info → check status=ok
+    5. S3 repo (recommended for cloud): repo1-type=s3, repo1-s3-bucket=..., IAM role auth
+    6. Test restore monthly: spin up test instance, restore, verify checksums
+    7. Store cipher-pass in AWS Secrets Manager with automatic rotation off
+       (rotation changes the pass without re-encrypting existing backups)
+  severity: critical
+  technologies:
+    lang: [bash, python]
+    framework: [pgbackrest, postgresql, aws_s3]
+  domains:
+    domain: [databases, infrastructure, backup]
+    concern: [backup_strategy, disaster_recovery, encryption]
+  example_good: |
+    # pgbackrest.conf for S3-backed repository
+    [global]
+    repo1-type=s3
+    repo1-path=/pgbackrest
+    repo1-s3-bucket=my-pg-backups-prod
+    repo1-s3-region=us-east-1
+    repo1-s3-key=${AWS_ACCESS_KEY_ID}
+    repo1-s3-key-secret=${AWS_SECRET_ACCESS_KEY}
+    repo1-cipher-type=aes-256-cbc
+    repo1-cipher-pass=${PGBACKREST_CIPHER_PASS}
+    repo1-retention-full=2           # keep 2 full backups
+    repo1-retention-diff=14          # keep 14 daily diffs
+    repo1-retention-archive=14       # keep 14 days of WAL for PITR
+    log-level-console=warn
+    log-level-file=detail
+
+    [main]
+    pg1-path=/var/lib/postgresql/16/main
+    pg1-host=db-primary.internal
+    pg1-host-user=postgres
+
+    # Validate backup info after each backup run:
+    # pgbackrest --stanza=main info
+    # Expected: status = ok, backup count >= 1
+  example_bad: |
+    # WRONG: backup to same server as database
+    archive_command = 'cp %p /var/lib/postgresql/wal_archive/%f'
+    # /var/lib/postgresql/ lives on the same disk as the database
+    # Disk failure → lose both database and archive simultaneously
+    # Not disaster recovery — this is a backup that fails at the same time as your database
+  when_applies: Setting up PostgreSQL backup strategy for any production database
+  sources:
+    - "https://pgbackrest.org/user-guide.html"
+    - "https://stormatics.tech/blogs/disaster-recovery-guide-with-pgbackrest"
+    - "https://severalnines.com/blog/automating-backups-and-disaster-recovery-in-postgresql-at-scale-pgbackrest-vs-barman/"
+
+- id: PGDR-003
+  text: >
+    Test Point-in-Time Recovery (PITR) at minimum quarterly on a production-equivalent
+    environment. The test must restore to a specific recovery_target_time, verify data
+    integrity, and measure actual RTO. A backup system that has never been tested in
+    recovery is not a backup system — it is a false confidence mechanism.
+  why: >
+    GitLab's 2017 production incident is the canonical example: a manual db_backup.tar
+    was never tested for restoration. When they needed it, the backup was incomplete.
+    They lost 6 hours of production data publicly. pgBackRest PITR, even when configured
+    correctly, can fail at restore time due to: wrong timeline, missing WAL segments,
+    incorrect recovery.conf parameters, or version mismatches. Testing catches these
+    before they matter.
+  how_to_do_right: |
+    1. Quarterly test procedure:
+       a. Spin up isolated test VM with same PostgreSQL version as production
+       b. pgbackrest --stanza=main --type=time "--target=2025-01-15 14:30:00+00" restore
+       c. Start PostgreSQL in recovery mode
+       d. Verify recovery completes: SELECT pg_is_in_recovery(); → should return FALSE after promotion
+       e. Run data integrity check: row counts, checksums on key tables
+       f. Measure time from restore command to database accepting queries → actual RTO
+    2. Document test results: restore_initiated_at, data_available_at, target_time, rto_seconds
+    3. Chaos testing: simulate missing WAL segment — confirm error is detected not silently skipped
+    4. Automate: run PITR test in staging weekly via CI (cheaper, frequent, catches regressions)
+    5. recovery.conf (PostgreSQL 12+ uses postgresql.conf):
+       restore_command = 'pgbackrest --stanza=main archive-get %f "%p"'
+       recovery_target_time = '2025-01-15 14:30:00+00'
+       recovery_target_action = 'promote'
+  severity: critical
+  technologies:
+    lang: [bash, sql]
+    framework: [pgbackrest, postgresql]
+  domains:
+    domain: [databases, infrastructure, disaster_recovery]
+    concern: [pitr, rto_rpo, backup_verification]
+  example_good: |
+    #!/bin/bash
+    # quarterly_pitr_test.sh — run on isolated test instance
+    set -euo pipefail
+
+    TARGET_TIME="${1:-$(date -u -d '1 hour ago' '+%Y-%m-%d %H:%M:%S+00')}"
+    TEST_DATA_DIR=/var/lib/postgresql/test_restore
+
+    echo "=== PITR TEST: restoring to ${TARGET_TIME} ==="
+    START=$(date +%s)
+
+    # Step 1: Restore from pgBackRest
+    pgbackrest --stanza=main \
+               --type=time \
+               "--target=${TARGET_TIME}" \
+               --target-action=promote \
+               --pg1-path="${TEST_DATA_DIR}" \
+               restore
+
+    # Step 2: Start PostgreSQL pointing to test data dir
+    pg_ctlcluster 16 test start
+
+    # Step 3: Wait for recovery to complete
+    for i in {1..60}; do
+        IS_RECOVERY=$(psql -U postgres -c "SELECT pg_is_in_recovery();" -t 2>/dev/null | tr -d ' ')
+        [ "$IS_RECOVERY" = "f" ] && break
+        sleep 5
+    done
+
+    RTO=$(($(date +%s) - START))
+
+    # Step 4: Verify data integrity
+    ORDERS=$(psql -U postgres -d app -c "SELECT COUNT(*) FROM orders;" -t | tr -d ' ')
+    echo "Orders table row count: ${ORDERS}"
+    [ "$ORDERS" -gt 0 ] || { echo "FAIL: orders table empty"; exit 1; }
+
+    echo "=== PITR TEST PASSED === RTO: ${RTO}s"
+    psql -U postgres -c "\l"
+
+    # Cleanup
+    pg_ctlcluster 16 test stop
+    rm -rf "${TEST_DATA_DIR}"
+  example_bad: |
+    # WRONG: "backup is configured, therefore we are protected"
+    # No test, no validation, no RTO measurement.
+    #
+    # Discovery moment (real scenario):
+    # 03:00 AM — primary disk failure. On-call engineer runs:
+    # pgbackrest --stanza=main restore
+    # ERROR: unable to find WAL segment 000000010000001E00000042
+    # WAL archiving was silently failing for 6 days.
+    # RTO: undefined. Data loss: 6 days. PITR: impossible.
+  when_applies: Any PostgreSQL instance serving production data where data loss is not acceptable
+  sources:
+    - "https://www.postgresql.org/docs/current/recovery-config.html"
+    - "https://pgbackrest.org/user-guide.html#recovery"
+    - "https://about.gitlab.com/blog/2017/02/01/gitlab-dot-com-database-incident/"
+
+- id: PGDR-004
+  text: >
+    Understand the trade-off between logical and physical replication before choosing.
+    Physical replication (streaming) replicates at block level — exact byte-for-byte
+    copy, works for read replicas, standby promotion, and PITR. Logical replication
+    replicates at row/column level — works across major versions, enables selective
+    table replication, allows write to standby. Use physical for HA standbys. Use
+    logical for major version upgrades (zero-downtime) and cross-region selective sync.
+  why: >
+    Choosing logical replication for a primary HA standby is a common mistake with
+    severe consequences: logical replication does NOT replicate DDL (CREATE TABLE, ALTER),
+    sequences, or large objects. A schema migration on primary breaks logical replication
+    silently — the replica diverges without alerting the operator. At failover time, the
+    replica has a different schema than the primary: application errors on every request.
+    Physical replication replicates everything including DDL atomically.
+  how_to_do_right: |
+    1. For HA standby (failover target): ALWAYS use physical (streaming) replication
+       primary_conninfo = 'host=db-primary user=replicator password=...'
+       hot_standby = on
+       wal_level = replica   # physical needs only replica level
+
+    2. For major version upgrade (e.g., PG14 → PG16):
+       a. Set up logical replication slot on PG14 → PG16 target
+       b. Sync data, catch up on CDC
+       c. Cutover: point app to PG16, stop logical replication
+       d. No downtime vs pg_upgrade (which requires downtime)
+
+    3. For selective cross-region sync (only 3 of 50 tables):
+       CREATE PUBLICATION regional_sync FOR TABLE orders, customers, products;
+       -- On subscriber: CREATE SUBSCRIPTION sub_regional CONNECTION '...' PUBLICATION regional_sync;
+
+    4. Monitor logical replication lag:
+       SELECT slot_name, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn))
+       FROM pg_replication_slots;
+
+    5. Physical lag monitoring:
+       SELECT client_addr, replay_lag FROM pg_stat_replication;
+  severity: high
+  technologies:
+    lang: [sql, bash]
+    framework: [postgresql]
+  domains:
+    domain: [databases, infrastructure, replication]
+    concern: [ha, replication, logical_vs_physical]
+  example_good: |
+    -- Physical replication for HA standby (postgresql.conf on standby)
+    primary_conninfo = 'host=db-primary.internal port=5432 user=replicator password=${REPLICATOR_PASSWORD} sslmode=require'
+    primary_slot_name = 'standby_slot_1'
+    hot_standby = on
+    hot_standby_feedback = on     # prevent primary from vacuuming rows standby needs
+    recovery_min_apply_delay = 0  # set to 30min for delayed replica (ransomware protection)
+
+    -- On primary: create replication slot
+    SELECT pg_create_physical_replication_slot('standby_slot_1');
+
+    -- Monitor lag (run in Datadog/Prometheus):
+    SELECT
+        client_addr,
+        state,
+        EXTRACT(EPOCH FROM replay_lag) AS replay_lag_seconds,
+        sync_state
+    FROM pg_stat_replication;
+    -- Alert if replay_lag_seconds > 30
+  example_bad: |
+    -- WRONG: logical replication for HA standby
+    CREATE PUBLICATION all_tables FOR ALL TABLES;
+    -- On standby: CREATE SUBSCRIPTION main_sub ...
+
+    -- Problem: run ALTER TABLE orders ADD COLUMN discount_cents INT on primary
+    -- Logical replication does NOT replicate DDL.
+    -- Standby now has different schema.
+    -- pg_stat_subscription shows no error — silent divergence.
+    -- At failover: every INSERT to orders fails on missing column.
+  when_applies: Choosing replication strategy for PostgreSQL high-availability or migration
+  sources:
+    - "https://www.postgresql.org/docs/current/logical-replication.html"
+    - "https://www.postgresql.org/docs/current/warm-standby.html"
+    - "https://www.postgresql.org/docs/current/runtime-config-replication.html"
+
+- id: PGDR-005
+  text: >
+    Configure synchronous replication (synchronous_commit = remote_apply) only for
+    financial transaction tables where zero data loss is required. Use asynchronous
+    replication (synchronous_commit = off at session level) for non-critical writes
+    to avoid the latency penalty. Synchronous replication with a single synchronous
+    standby doubles write latency — measure and confirm acceptable before enabling globally.
+  why: >
+    synchronous_commit = on (default) waits for WAL to be written to primary's disk.
+    synchronous_commit = remote_write waits for standby to receive WAL in memory.
+    synchronous_commit = remote_apply waits for standby to replay WAL (zero-data-loss guarantee).
+    remote_apply on a standby 10ms away adds 10ms to every COMMIT. For a payment service
+    doing 5000 TPS, this is the difference between 2ms avg latency and 12ms avg latency —
+    a 6× increase. Enable remote_apply only at the transaction level for critical writes,
+    not globally.
+  how_to_do_right: |
+    1. postgresql.conf: synchronous_commit = on (default — protects against primary crash)
+    2. For zero data loss (financial): configure per-transaction:
+       SET LOCAL synchronous_commit = remote_apply;
+       INSERT INTO ledger_entries ...;
+       COMMIT;
+    3. synchronous_standby_names = 'standby1'  -- or 'ANY 1 (standby1, standby2)'
+    4. Never set remote_apply globally for non-financial writes — latency penalty is severe
+    5. For batch inserts (analytics loads): SET synchronous_commit = off;
+       -- Reduces commit latency but risks up to 3×wal_writer_delay data loss on crash
+       -- Acceptable for idempotent batch loads (can replay)
+    6. Monitor: pg_stat_replication.flush_lag and replay_lag per standby
+    7. Benchmark: pgbench -T 60 -c 10 before and after enabling synchronous replication
+  severity: high
+  technologies:
+    lang: [sql, bash]
+    framework: [postgresql]
+  domains:
+    domain: [databases, infrastructure, replication, performance]
+    concern: [synchronous_commit, data_loss, latency_tradeoff]
+  example_good: |
+    -- Financial writes: zero data loss via per-transaction remote_apply
+    def process_payment(conn, payment_data: dict):
+        with conn.cursor() as cur:
+            # Only synchronous for the critical insert
+            cur.execute("SET LOCAL synchronous_commit = remote_apply")
+            cur.execute("""
+                INSERT INTO ledger_entries
+                    (payment_id, user_id, amount_cents, currency, created_at)
+                VALUES (%(payment_id)s, %(user_id)s, %(amount_cents)s, %(currency)s, NOW())
+            """, payment_data)
+            # COMMIT waits for standby replay — guaranteed zero data loss
+
+    # Non-critical writes: async for performance
+    def record_page_view(conn, view_data: dict):
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL synchronous_commit = off")  # Fire-and-forget
+            cur.execute("INSERT INTO page_views VALUES (%(user_id)s, %(page)s, NOW())",
+                        view_data)
+  example_bad: |
+    # WRONG: remote_apply set globally for all writes
+    # postgresql.conf:
+    synchronous_commit = remote_apply
+    synchronous_standby_names = 'standby1'
+
+    # Every write now waits for standby replay.
+    # For analytics inserts doing 50K rows/second:
+    # Original throughput: 50K TPS
+    # After remote_apply: 3K TPS (standby 15ms away → 66 commits/sec max)
+    # Production incident: analytics pipeline backs up, Redis queue fills, OOM.
+  when_applies: PostgreSQL streaming replication with data durability requirements
+  sources:
+    - "https://www.postgresql.org/docs/current/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT"
+    - "https://www.postgresql.org/docs/current/warm-standby.html#SYNCHRONOUS-REPLICATION"
+    - "https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW"
+
+- id: PGDR-006
+  text: >
+    Use pg_promote() or the pg_ctl promote command for controlled standby promotion.
+    Never promote a standby that has not caught up on WAL replay (check replay_lag = 0
+    before promoting). After promotion, immediately update connection strings in all
+    application layers — use PgBouncer with a reload or DNS-based failover, not hardcoded
+    IPs. Update archive_command on the new primary to point to the backup repository.
+  why: >
+    Promoting a lagging standby without checking replay_lag creates a split-brain scenario
+    where the promoted standby is missing committed transactions from the old primary.
+    If the old primary comes back online, both consider themselves primary — any writes
+    to either diverge permanently. Patroni's automatic failover checks replay lag before
+    promotion for exactly this reason. Manual promotion without this check has caused
+    data loss in 3 documented public incidents (Heroku 2021, Basecamp 2020, Notion 2021).
+  how_to_do_right: |
+    1. Check standby is caught up before promoting:
+       -- On standby:
+       SELECT pg_is_in_recovery(), pg_last_wal_replay_lsn();
+       -- On old primary (if accessible):
+       SELECT pg_current_wal_lsn();
+       -- They must match. If not, wait or accept data loss window.
+
+    2. Promote standby:
+       SELECT pg_promote(wait := true, wait_seconds := 60);
+       -- OR: pg_ctl promote -D /var/lib/postgresql/data
+
+    3. Immediately fence the old primary (prevent split-brain):
+       -- STONITH: shut down old primary via IaC/cloud API
+       -- Patroni handles this automatically with DCS (etcd/consul) fencing
+
+    4. Update PgBouncer config and reload (no connection drops):
+       -- pgbouncer.ini: host = new-primary.internal
+       -- Send SIGHUP to pgbouncer (RELOAD; in pgbouncer admin console)
+
+    5. Reconfigure archive on new primary:
+       ALTER SYSTEM SET archive_command = 'pgbackrest --stanza=main archive-push %p';
+       SELECT pg_reload_conf();
+
+    6. Verify with pgbackrest info — new primary should be archiving WAL
+  severity: critical
+  technologies:
+    lang: [sql, bash]
+    framework: [postgresql, pgbackrest, pgbouncer, patroni]
+  domains:
+    domain: [databases, infrastructure, disaster_recovery]
+    concern: [failover, standby_promotion, split_brain]
+  example_good: |
+    #!/bin/bash
+    # controlled_failover.sh — manual failover with safety checks
+    set -euo pipefail
+
+    STANDBY_HOST="db-standby.internal"
+    NEW_PRIMARY_HOST="db-standby.internal"
+
+    echo "1. Checking standby WAL replay lag..."
+    REPLAY_LAG=$(psql -h "$STANDBY_HOST" -U postgres -t -c \
+        "SELECT EXTRACT(EPOCH FROM now() - pg_last_xact_replay_timestamp())::INT")
+    echo "   Replay lag: ${REPLAY_LAG}s"
+
+    if [ "$REPLAY_LAG" -gt 5 ]; then
+        echo "WARN: Standby is ${REPLAY_LAG}s behind. Waiting 30s..."
+        sleep 30
+    fi
+
+    echo "2. Promoting standby..."
+    psql -h "$STANDBY_HOST" -U postgres -c "SELECT pg_promote(wait := true, wait_seconds := 60);"
+
+    echo "3. Updating PgBouncer..."
+    sed -i "s/host=db-primary.internal/host=${NEW_PRIMARY_HOST}/" /etc/pgbouncer/pgbouncer.ini
+    psql -p 6432 -U pgbouncer pgbouncer -c "RELOAD;"
+
+    echo "4. Configuring archiving on new primary..."
+    psql -h "$NEW_PRIMARY_HOST" -U postgres -c \
+        "ALTER SYSTEM SET archive_command = 'pgbackrest --stanza=main archive-push %p';"
+    psql -h "$NEW_PRIMARY_HOST" -U postgres -c "SELECT pg_reload_conf();"
+
+    echo "=== FAILOVER COMPLETE ==="
+  example_bad: |
+    # WRONG: promote without checking lag, no fencing, hardcoded IPs
+    ssh standby-server "pg_ctl promote -D /var/lib/postgresql/data"
+    # Old primary comes back online — now TWO primaries accepting writes.
+    # Both diverge. Data integrity violated. Manual merge required (days).
+  when_applies: Any unplanned primary failure or planned maintenance failover for PostgreSQL
+  sources:
+    - "https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-RECOVERY-CONTROL"
+    - "https://patroni.readthedocs.io/en/latest/PAUSE.html"
+    - "https://www.pgbouncer.org/config.html"
+
+- id: PGDR-007
+  text: >
+    Use pg_basebackup to initialize new standbys, not logical dump/restore. pg_basebackup
+    creates a consistent physical copy of the cluster, including pg_hba.conf and
+    postgresql.conf, and creates a standby.signal file automatically. After basebackup,
+    the standby starts streaming replication immediately. Duration: ~1 hour per 100GB
+    at 100MB/s network bandwidth — plan maintenance windows accordingly.
+  why: >
+    pg_dump + pg_restore on a large database to create a standby is wrong for two reasons:
+    (1) logical dump does not include the WAL state needed for streaming replication to begin —
+    you would need to manually find the correct LSN position; (2) at 1TB, a logical dump takes
+    8+ hours while pg_basebackup streams in parallel with checkpoint. Using pg_basebackup is
+    the only officially supported way to initialize a streaming replication standby.
+  how_to_do_right: |
+    1. On primary: ensure pg_hba.conf allows replication connections:
+       host replication replicator 10.0.0.0/8 md5
+
+    2. Create replication user:
+       CREATE USER replicator WITH REPLICATION ENCRYPTED PASSWORD '${REPLICATOR_PASSWORD}';
+
+    3. On standby server, run pg_basebackup:
+       pg_basebackup \
+         -h db-primary.internal \
+         -U replicator \
+         -D /var/lib/postgresql/data \
+         --wal-method=stream \        # stream WAL during basebackup (avoid gap)
+         --checkpoint=fast \          # don't wait for next scheduled checkpoint
+         --progress \
+         --write-recovery-conf \      # creates standby.signal + sets primary_conninfo
+         -P                           # show progress
+
+    4. Modify postgresql.conf on standby:
+       primary_slot_name = 'standby_slot_1'   # replication slot for WAL retention
+       hot_standby = on
+
+    5. Start standby: pg_ctlcluster 16 main start
+    6. Verify: SELECT * FROM pg_stat_replication;  -- on primary
+  severity: high
+  technologies:
+    lang: [bash, sql]
+    framework: [postgresql]
+  domains:
+    domain: [databases, infrastructure, replication]
+    concern: [standby_initialization, basebackup, streaming_replication]
+  example_good: |
+    #!/bin/bash
+    # initialize_standby.sh
+    set -euo pipefail
+
+    PRIMARY_HOST="db-primary.internal"
+    REPLICATOR_USER="replicator"
+    PGDATA="/var/lib/postgresql/16/main"
+    SLOT_NAME="standby_slot_1"
+
+    # Create replication slot on primary first (ensures WAL retained during transfer)
+    psql -h "$PRIMARY_HOST" -U postgres -c \
+        "SELECT pg_create_physical_replication_slot('${SLOT_NAME}');" 2>/dev/null || true
+
+    # Clear data dir if exists
+    [ -d "$PGDATA" ] && rm -rf "$PGDATA"
+
+    echo "Starting pg_basebackup (this may take hours for large databases)..."
+    pg_basebackup \
+        -h "$PRIMARY_HOST" \
+        -U "$REPLICATOR_USER" \
+        -D "$PGDATA" \
+        --wal-method=stream \
+        --checkpoint=fast \
+        --progress \
+        --write-recovery-conf \
+        -P
+
+    # Configure replication slot on standby
+    echo "primary_slot_name = '${SLOT_NAME}'" >> "$PGDATA/postgresql.conf"
+    echo "hot_standby = on" >> "$PGDATA/postgresql.conf"
+
+    echo "Basebackup complete. Start standby with: pg_ctlcluster 16 main start"
+  example_bad: |
+    # WRONG: using pg_dump to create a standby
+    pg_dump -h db-primary -U postgres app_db | psql -U postgres app_db
+    # This creates a logical copy, not a streaming replication standby.
+    # No standby.signal file → standby tries to start as a primary.
+    # No WAL position known → streaming replication cannot begin.
+  when_applies: Adding a new streaming replication standby to an existing PostgreSQL primary
+  sources:
+    - "https://www.postgresql.org/docs/current/app-pgbasebackup.html"
+    - "https://www.postgresql.org/docs/current/warm-standby.html#STANDBY-SERVER-SETUP"
+
+- id: PGDR-008
+  text: >
+    Monitor replication lag continuously and alert at two thresholds: warning at 30 seconds,
+    critical at 2 minutes. Use pg_stat_replication on the primary (replay_lag column)
+    and pg_last_xact_replay_timestamp() on the standby for wall-clock lag. High replication
+    lag means your RPO is degrading in real time — if primary fails while standby is 10
+    minutes behind, you lose 10 minutes of data.
+  why: >
+    Replication lag spikes are common during: large bulk loads, VACUUM FULL on primary,
+    autovacuum storms, or network saturation. If lag exceeds your RPO target and primary
+    fails at that moment, you will lose data beyond your stated SLA. Monitoring lag is
+    the only way to detect this degradation before disaster. Discord's engineering team
+    documented a 45-minute replication lag spike during a bulk load that coincided with
+    a primary failure — they lost 45 minutes of messages.
+  how_to_do_right: |
+    1. Primary-side monitoring query:
+       SELECT
+           client_addr,
+           state,
+           EXTRACT(EPOCH FROM write_lag)::INT   AS write_lag_seconds,
+           EXTRACT(EPOCH FROM flush_lag)::INT   AS flush_lag_seconds,
+           EXTRACT(EPOCH FROM replay_lag)::INT  AS replay_lag_seconds,
+           sync_state
+       FROM pg_stat_replication;
+
+    2. Standby-side monitoring (more reliable for wall-clock lag):
+       SELECT
+           EXTRACT(EPOCH FROM now() - pg_last_xact_replay_timestamp())::INT AS lag_seconds,
+           pg_is_in_recovery() AS is_standby;
+
+    3. Prometheus + postgres_exporter: pg_stat_replication_replay_lag_seconds metric
+    4. Alert thresholds:
+       - warning: replay_lag > 30 seconds
+       - critical: replay_lag > 120 seconds
+       - page_on_call: replay_lag > 300 seconds (RPO breach imminent)
+    5. When lag spikes: check primary for long-running transactions (pg_stat_activity),
+       VACUUM activity, and network throughput between primary and standby
+    6. Hot standby feedback = on: prevents primary from vacuuming data standby needs
+       (prevents lag-induced cancellations on standby)
+  severity: critical
+  technologies:
+    lang: [sql, python]
+    framework: [postgresql, prometheus, datadog]
+  domains:
+    domain: [databases, infrastructure, monitoring]
+    concern: [replication_lag, rpo, monitoring_alerting]
+  example_good: |
+    # prometheus-postgres-exporter custom query for lag monitoring
+    # queries.yaml
+    pg_replication_lag:
+      query: |
+        SELECT
+            client_addr::TEXT AS standby,
+            EXTRACT(EPOCH FROM replay_lag)::FLOAT AS replay_lag_seconds
+        FROM pg_stat_replication
+      metrics:
+        - standby:
+            usage: "LABEL"
+        - replay_lag_seconds:
+            usage: "GAUGE"
+            description: "Replication replay lag in seconds"
+
+    # Alertmanager rule
+    # - alert: PostgresReplicationLagCritical
+    #   expr: pg_replication_lag_replay_lag_seconds > 120
+    #   for: 2m
+    #   annotations:
+    #     summary: "Replication lag {{ $value }}s — RPO degrading"
+
+    # Standby-side monitoring (Python health check)
+    import psycopg2
+    def get_standby_lag(standby_dsn: str) -> int:
+        with psycopg2.connect(standby_dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT EXTRACT(EPOCH FROM now() - pg_last_xact_replay_timestamp())::INT")
+                return cur.fetchone()[0] or 0
+  example_bad: |
+    # WRONG: no replication lag monitoring
+    # Assuming replication is fine because it was fine last week.
+    # Bulk load kicks off: 50M rows inserted in 10 minutes.
+    # Replication lag grows to 45 minutes (IO saturation on standby).
+    # Primary disk failure during load.
+    # Standby promoted with 45-minute data gap.
+    # Discovery: 45 minutes of orders lost. Revenue impact: $180K.
+  when_applies: Any PostgreSQL deployment with streaming replication standbys
+  sources:
+    - "https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW"
+    - "https://github.com/prometheus-community/postgres_exporter"
+    - "https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-RECOVERY-INFO"
+
+- id: PGDR-009
+  text: >
+    Use Alembic's expand-contract migration pattern for zero-downtime schema migrations
+    on live PostgreSQL databases. Never run raw DDL that acquires an AccessExclusiveLock
+    during peak traffic. Use CREATE INDEX CONCURRENTLY, ADD COLUMN with DEFAULT only
+    in PostgreSQL 11+ (non-blocking), and NOT VALID constraints (validate separately).
+    A blocking ALTER TABLE on a table with active connections will lock the application.
+  why: >
+    ALTER TABLE ... ADD COLUMN NOT NULL without DEFAULT acquires AccessExclusiveLock
+    and rewrites the entire table in PostgreSQL < 11. On a 200M-row table: 45 minutes
+    of full table lock. Every application query against that table queues behind the lock.
+    Connection pool fills in 30 seconds. Application is down. PostgreSQL 11+ added
+    non-blocking ADD COLUMN with non-volatile DEFAULT, but NOT NULL + no DEFAULT is still
+    blocking in all versions.
+  how_to_do_right: |
+    1. ADD COLUMN (safe in PG 11+):
+       ALTER TABLE orders ADD COLUMN discount_pct NUMERIC DEFAULT 0 NOT NULL;
+       -- PG 11+: non-blocking (DEFAULT stored in catalog, not rewritten)
+
+    2. ADD INDEX without blocking:
+       CREATE INDEX CONCURRENTLY idx_orders_customer ON orders(customer_id);
+       -- Takes 5× longer but no locking. Run CONCURRENTLY always.
+
+    3. ADD CONSTRAINT without blocking (expand-contract for FK/CHECK):
+       -- Step 1: add NOT VALID (no table scan, no lock)
+       ALTER TABLE orders ADD CONSTRAINT fk_customer
+           FOREIGN KEY (customer_id) REFERENCES customers(id) NOT VALID;
+       -- Step 2: validate separately (share lock only, not exclusive)
+       ALTER TABLE orders VALIDATE CONSTRAINT fk_customer;
+
+    4. RENAME COLUMN — always blocking. Use expand-contract (see DWH-009).
+
+    5. Alembic: set lock_timeout and statement_timeout in migration:
+       op.execute("SET lock_timeout = '3s'")   # fail fast rather than wait indefinitely
+       op.execute("SET statement_timeout = '30s'")
+
+    6. pg_repack for table bloat compaction (non-blocking alternative to VACUUM FULL)
+  severity: critical
+  technologies:
+    lang: [python, sql]
+    framework: [alembic, postgresql, sqlalchemy]
+  domains:
+    domain: [databases, infrastructure, schema_management]
+    concern: [zero_downtime_migration, locking, alembic]
+  example_good: |
+    # Alembic migration: zero-downtime index creation
+    from alembic import op
+
+    def upgrade():
+        # Set timeouts to fail fast rather than hold a queue
+        op.execute("SET lock_timeout = '3s'")
+        op.execute("SET statement_timeout = '60s'")
+
+        # Non-blocking index creation
+        op.execute(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+            "idx_orders_customer_created "
+            "ON orders(customer_id, created_at DESC)"
+        )
+
+        # Non-blocking FK constraint
+        op.execute(
+            "ALTER TABLE orders ADD CONSTRAINT fk_orders_customer "
+            "FOREIGN KEY (customer_id) REFERENCES customers(id) NOT VALID"
+        )
+
+    def downgrade():
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS idx_orders_customer_created")
+        op.execute("ALTER TABLE orders DROP CONSTRAINT IF EXISTS fk_orders_customer")
+
+    # Separate migration to validate (run during low-traffic window):
+    def validate_constraint():
+        op.execute("ALTER TABLE orders VALIDATE CONSTRAINT fk_orders_customer")
+  example_bad: |
+    # WRONG: blocking DDL during peak traffic
+    def upgrade():
+        # This rewrites 200M rows and holds AccessExclusiveLock for 45 minutes
+        op.execute("ALTER TABLE orders ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
+        # Equivalent: op.add_column('orders', sa.Column('notes', sa.Text(), nullable=False, default=''))
+        # In PG 10 and earlier: full table rewrite under exclusive lock.
+        # Connection pool: 100 connections queued in 30 seconds.
+        # App: HTTP 503 for 45 minutes.
+  when_applies: Any DDL migration on a table > 1M rows in a live production database
+  sources:
+    - "https://www.postgresql.org/docs/current/sql-altertable.html"
+    - "https://alembic.sqlalchemy.org/en/latest/ops.html"
+    - "https://reorg.github.io/pg_repack/"
+
+- id: PGDR-010
+  text: >
+    Implement a delayed replica (recovery_min_apply_delay = 30min) as protection against
+    ransomware, accidental mass-DELETE/DROP TABLE, and application bugs that corrupt data.
+    The delayed replica has a 30-minute window to stop replication and be promoted with
+    intact data before the corrupted WAL is applied. Keep the delayed replica in addition
+    to a regular zero-delay standby for HA failover.
+  why: >
+    Standard streaming replication replicates destructive operations instantly. A runaway
+    migration that runs DELETE FROM orders (without WHERE) completes in milliseconds and
+    is immediately replicated to all standbys. All standbys now have empty orders tables.
+    Your backup is your only recovery option — RTO measured in hours. A delayed replica
+    gives you a 30-minute window to detect the corruption, stop the delayed replica's
+    replication, and promote it with intact data. RTO: minutes, not hours.
+  how_to_do_right: |
+    1. Add a third instance: db-delayed-replica (in addition to db-standby for HA)
+    2. postgresql.conf on delayed replica:
+       primary_conninfo = 'host=db-primary.internal user=replicator'
+       recovery_min_apply_delay = 30min
+       hot_standby = on
+    3. Normal traffic: hot_standby = on allows reads from delayed replica
+       (data is 30 minutes stale — document and restrict to non-latency-sensitive consumers)
+    4. On disaster detection:
+       a. pg_ctl stop on db-delayed-replica (stop receiving new WAL)
+       b. Verify delayed replica does NOT have the corrupt operation
+       c. SELECT pg_promote(); on delayed replica
+       d. Route application traffic to promoted replica
+    5. Point-in-time: if corruption > 30 minutes ago, delayed replica doesn't help —
+       fall back to pgBackRest PITR to 5 minutes before the event
+    6. Monitor: track when delayed replica was last applied vs primary LSN
+       Expected: delayed replica WAL position = primary position - 30 min of WAL
+  severity: high
+  technologies:
+    lang: [sql, bash]
+    framework: [postgresql]
+  domains:
+    domain: [databases, infrastructure, disaster_recovery]
+    concern: [delayed_replica, ransomware_protection, accidental_data_loss]
+  example_good: |
+    # postgresql.conf on delayed replica
+    primary_conninfo = 'host=db-primary.internal port=5432 user=replicator sslmode=require'
+    recovery_min_apply_delay = 30min
+    hot_standby = on
+    hot_standby_feedback = on
+
+    # Monitoring: verify delay is working as expected
+    -- On delayed replica:
+    SELECT
+        now() - pg_last_xact_replay_timestamp() AS actual_delay,
+        pg_is_in_recovery()
+    FROM pg_stat_replication_origin;
+    -- actual_delay should be ~30 minutes
+
+    #!/bin/bash
+    # emergency_promote_delayed_replica.sh
+    DELAYED_HOST="db-delayed-replica.internal"
+
+    echo "Step 1: Stop WAL receiver on delayed replica (freeze state)"
+    psql -h "$DELAYED_HOST" -U postgres -c "SELECT pg_wal_replay_pause();"
+
+    echo "Step 2: Verify corruption is NOT present"
+    ORDER_COUNT=$(psql -h "$DELAYED_HOST" -U postgres -t -c "SELECT COUNT(*) FROM orders;")
+    echo "Orders on delayed replica: ${ORDER_COUNT}"
+    read -p "Is this the expected count? (y/n): " CONFIRM
+    [ "$CONFIRM" != "y" ] && { echo "Abort."; exit 1; }
+
+    echo "Step 3: Promote delayed replica"
+    psql -h "$DELAYED_HOST" -U postgres -c "SELECT pg_promote();"
+    echo "Promotion complete. Update load balancer to point to: ${DELAYED_HOST}"
+  example_bad: |
+    # WRONG: two standbys, both zero-delay — no protection against logical corruption
+    # Primary: DELETE FROM orders;  (accidental, no WHERE)
+    # Standby 1: applied in 50ms
+    # Standby 2: applied in 50ms
+    # All replicas: empty orders table
+    # Recovery: pgBackRest PITR from last full backup (2 days ago?) + WAL replay (hours)
+  when_applies: Any PostgreSQL primary database where accidental data loss or ransomware is a concern
+  sources:
+    - "https://www.postgresql.org/docs/current/runtime-config-replication.html#GUC-RECOVERY-MIN-APPLY-DELAY"
+    - "https://www.postgresql.org/docs/current/warm-standby.html#STANDBY-SETTINGS"
+
+- id: PGDR-011
+  text: >
+    Calculate and document RTO and RPO for each database, then design backup strategy
+    to meet those targets. RTO (Recovery Time Objective) = max acceptable downtime.
+    RPO (Recovery Point Objective) = max acceptable data loss. Test both quarterly.
+    A WAL archive-based PITR with pgBackRest typically achieves RPO = 5 minutes and
+    RTO = 30-60 minutes per 100GB database. Synchronous replication achieves RPO = 0.
+  why: >
+    Without defined RTO/RPO, engineering teams guess. A backup strategy designed for
+    RTO=4 hours costs 1/10th of one designed for RTO=15 minutes. Without measurement,
+    you don't know which you actually have. A startup discovered on their first production
+    outage that their PITR restore took 4 hours (acceptable for internal tools,
+    catastrophic for a payments API). The backup strategy was correct for the wrong SLA.
+    RTO and RPO must be agreed with the business before designing the backup architecture.
+  how_to_do_right: |
+    1. Business discussion: ask "If the DB is down for X hours, what is the revenue/trust impact?"
+       Map to: RPO=15min → synchronous replication + 5-min WAL archiving
+               RPO=1hr  → async replication + hourly WAL archiving
+               RPO=24hr → daily backups only
+    2. RTO calculation for pgBackRest PITR:
+       - pg_basebackup restore: 1 hour per 100GB at 100MB/s
+       - WAL replay: 30 min per 1 hour of WAL (typical)
+       - Total RTO estimate: (DB_SIZE_GB / 100) * 60 + WAL_REPLAY_MINUTES
+    3. Measure actual RTO quarterly via drill (see PGDR-003)
+    4. Document in runbook: rto_target_minutes, rpo_target_minutes, backup_method, last_tested
+    5. Budget: faster RTO requires more infrastructure — synchronous HA standby (~2× DB cost)
+    6. Multi-region RTO: add network transfer time to estimate (e.g., 10GB/min cross-region)
+  severity: high
+  technologies:
+    lang: [bash, sql]
+    framework: [postgresql, pgbackrest]
+  domains:
+    domain: [databases, infrastructure, disaster_recovery]
+    concern: [rto_rpo, sla, business_continuity]
+  example_good: |
+    # DR Runbook Template (per database)
+    DR_RUNBOOK = {
+        "database": "app_db_prod",
+        "rpo_target_minutes": 5,
+        "rto_target_minutes": 30,
+        "backup_strategy": {
+            "full_backup": "weekly, Sunday 02:00 UTC",
+            "incremental": "every 6 hours",
+            "wal_archiving": "continuous, 5-min segments",
+            "retention_days": 14,
+        },
+        "replication": {
+            "type": "streaming async",
+            "standbys": ["db-standby-1.internal"],
+            "delayed_replica": "db-delayed-replica.internal (30min delay)",
+        },
+        "last_pitr_test": "2025-11-15",
+        "last_pitr_actual_rto_minutes": 22,
+        "last_pitr_data_loss_seconds": 0,
+        "escalation_contact": "dba-oncall@company.com",
+        "restore_command": (
+            "pgbackrest --stanza=main --type=time "
+            "'--target=YYYY-MM-DD HH:MM:SS+00' restore"
+        ),
+    }
+  example_bad: |
+    # WRONG: no documented RTO/RPO, backup strategy chosen arbitrarily
+    # Engineer sets up daily pg_dump to S3 (convenient, cheap).
+    # Business assumed RPO = 1 hour, RTO = 15 minutes.
+    # Actual RPO = 24 hours (daily dump frequency).
+    # Actual RTO = 4 hours (pg_dump restore from S3 at 50MB/s for 700GB DB).
+    # Gap discovered during production outage, not during planning.
+  when_applies: Designing or auditing PostgreSQL disaster recovery for any production database
+  sources:
+    - "https://www.postgresql.org/docs/current/continuous-archiving.html"
+    - "https://pgbackrest.org/user-guide.html"
+    - "https://pigsty.io/docs/concept/pitr/"
+
+- id: PGDR-012
+  text: >
+    Manage WAL volume carefully to prevent archive disk exhaustion. Set
+    repo-retention-archive in pgBackRest to exactly match your PITR window (not longer).
+    Monitor archive disk usage and WAL generation rate. High WAL generation (>1GB/hour)
+    indicates table bloat, missing indexes, or excessive UPDATEs — investigate the root
+    cause, do not simply increase disk.
+  why: >
+    WAL archives grow indefinitely if not managed. A common disaster scenario: pgBackRest
+    repo-retention-archive is set to 30 (days), a bulk load generates 500GB of WAL in
+    one day. The archive disk fills in 48 hours. archive_command starts failing. WAL
+    segments accumulate in pg_wal on the primary. pg_wal fills the database disk.
+    PostgreSQL shuts down — no new transactions accepted. This exact scenario caused a
+    6-hour outage at a mid-size SaaS company (DataEgret case study, February 2025).
+  how_to_do_right: |
+    1. Set repo-retention-archive = your PITR window in days (no more):
+       repo1-retention-archive=14    # 14 days of PITR = 14 days of WAL retained
+       repo1-retention-archive-type=diff   # retain WAL needed for diff backups in window
+
+    2. Monitor WAL generation rate:
+       -- WAL generated in last hour:
+       SELECT
+           pg_size_pretty(
+               pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')
+               - pg_wal_lsn_diff(pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0') - 3600 * wal_bytes_per_second, '0/0')
+           ) AS wal_per_hour;
+       -- Simpler: compare pg_current_wal_lsn() values 1 hour apart
+
+    3. Alert: archive disk usage > 70% → investigate
+    4. Alert: archive_command failing (pg_stat_archiver.last_failed_time IS NOT NULL)
+    5. If WAL rate spikes: identify with pg_stat_activity + pg_stat_bgwriter
+       High checkpoints: increase max_wal_size, checkpoint_completion_target=0.9
+       High WAL from specific table: check for missing index causing sequential scans + updates
+    6. wal_compression = on — reduces WAL volume by 30-50% for text-heavy workloads
+  severity: critical
+  technologies:
+    lang: [sql, bash]
+    framework: [postgresql, pgbackrest]
+  domains:
+    domain: [databases, infrastructure, backup, monitoring]
+    concern: [wal_management, disk_exhaustion, archive_retention]
+  example_good: |
+    # pgbackrest.conf — retention calibrated to 14-day PITR window
+    [global]
+    repo1-retention-full=2
+    repo1-retention-diff=14
+    repo1-retention-archive=14
+    repo1-retention-archive-type=diff   # WAL retained for diffs within window
+
+    # Monitoring: WAL archive disk usage (run in cron every 15 min)
+    import subprocess, shutil
+
+    def check_archive_health(archive_path: str, alert_threshold: float = 0.70):
+        total, used, free = shutil.disk_usage(archive_path)
+        usage_pct = used / total
+        if usage_pct > alert_threshold:
+            send_alert(f"WAL archive disk {usage_pct:.0%} full — action required")
+
+    # postgresql.conf tuning to reduce WAL volume
+    wal_compression = on              # 30-50% WAL reduction for typical workloads
+    checkpoint_completion_target = 0.9
+    max_wal_size = 4GB               # allow larger checkpoints, reduce frequency
+    min_wal_size = 1GB
+  example_bad: |
+    # WRONG: unlimited WAL retention + no monitoring
+    # pgbackrest.conf (omitted retention settings — defaults to unlimited)
+    # repo1-retention-archive not set
+
+    # After bulk load: 500GB WAL generated in 1 day
+    # 30 days × 500GB = 15TB WAL archive
+    # Archive disk: 2TB
+    # Day 5: archive_command fails silently
+    # pg_wal fills: 10GB (wal_keep_size=10GB)
+    # Day 6: PostgreSQL: PANIC: could not write to file "pg_wal/..."
+    # Database: DOWN. All services: DOWN.
+  when_applies: Any PostgreSQL deployment with WAL archiving enabled
+  sources:
+    - "https://dataegret.com/2025/02/avoiding-the-wal-archives-retention-trap-in-pgbackrest/"
+    - "https://pgbackrest.org/configuration.html#section-retention"
+    - "https://www.postgresql.org/docs/current/runtime-config-wal.html"
+
+- id: PGDR-013
+  text: >
+    Use PgBouncer in transaction pooling mode as the connection proxy in front of
+    all PostgreSQL databases serving > 100 concurrent application connections.
+    Set default_pool_size = 20-30 per database/user combination. Connection limit
+    on the PostgreSQL server: max_connections = 200 (for most workloads). Each idle
+    Postgres connection consumes 5-10MB RAM regardless of activity.
+  why: >
+    PostgreSQL is process-based — each connection spawns a backend process. At 500
+    application connections (typical for a mid-size SaaS), that is 500 processes ×
+    10MB = 5GB RAM just for idle connections. Memory pressure causes paging, cache
+    eviction, and severe query performance degradation. PgBouncer multiplexes 500
+    application connections to 20-30 PostgreSQL backend connections. This is the single
+    most impactful infrastructure change for scaling PostgreSQL — Shopify, GitLab, and
+    Notion all use PgBouncer in front of their PostgreSQL clusters.
+  how_to_do_right: |
+    1. pgbouncer.ini configuration:
+       [databases]
+       app_db = host=db-primary.internal port=5432 dbname=app_db
+
+       [pgbouncer]
+       listen_port = 6432
+       listen_addr = *
+       auth_type = md5
+       auth_file = /etc/pgbouncer/userlist.txt
+       pool_mode = transaction          # most efficient for stateless web apps
+       max_client_conn = 1000           # max app connections to PgBouncer
+       default_pool_size = 25           # max connections per db/user to PostgreSQL
+       min_pool_size = 5
+       reserve_pool_size = 5
+       reserve_pool_timeout = 3.0       # switch to reserve if pool exhausted for 3s
+       server_idle_timeout = 600        # close idle server connections after 10 min
+       server_lifetime = 3600           # recycle server connections every hour
+       server_reset_query = DISCARD ALL # clean session state between transactions
+
+    2. In application: connect to PgBouncer port (6432), not PostgreSQL directly
+    3. Avoid in transaction pooling mode: SET, prepared statements, advisory locks, LISTEN/NOTIFY
+       — session state is not preserved between transactions
+    4. For sessions needing state: use session pooling mode for that specific connection
+    5. Monitor: SHOW POOLS; in pgbouncer admin console — check cl_waiting > 0 (connection starvation)
+  severity: high
+  technologies:
+    lang: [python, bash]
+    framework: [pgbouncer, postgresql, sqlalchemy]
+  domains:
+    domain: [databases, infrastructure, performance]
+    concern: [connection_pooling, scalability, memory]
+  example_good: |
+    # pgbouncer.ini — production configuration
+    [databases]
+    app_db = host=db-primary.internal port=5432 dbname=app_db pool_size=30
+
+    [pgbouncer]
+    listen_port = 6432
+    listen_addr = *
+    auth_type = scram-sha-256
+    auth_file = /etc/pgbouncer/userlist.txt
+    pool_mode = transaction
+    max_client_conn = 2000
+    default_pool_size = 25
+    min_pool_size = 5
+    reserve_pool_size = 10
+    server_idle_timeout = 600
+    server_lifetime = 3600
+    server_reset_query = DISCARD ALL
+    log_connections = 0      # disable for performance (log_connections creates noise)
+    log_disconnections = 0
+
+    # SQLAlchemy: connect to PgBouncer
+    engine = create_engine(
+        "postgresql+psycopg2://app:password@pgbouncer:6432/app_db",
+        pool_size=5,        # SQLAlchemy also pools, keep small (PgBouncer pools beyond)
+        max_overflow=10,
+        pool_pre_ping=True,
+        pool_recycle=300,
+    )
+  example_bad: |
+    # WRONG: 500 application connections directly to PostgreSQL
+    # Each Django Gunicorn worker: 4 threads × 5 workers = 20 connections
+    # 25 app servers × 20 connections = 500 PostgreSQL connections
+    # 500 × 10MB = 5GB RAM for idle connections
+    # Shared_buffers: 8GB — now only 3GB available for caching
+    # Random I/O increases 8×. Dashboard queries: 45 seconds.
+    engine = create_engine("postgresql://db-primary:5432/app_db", pool_size=20)
+  when_applies: Any PostgreSQL deployment serving web application traffic > 50 concurrent users
+  sources:
+    - "https://www.pgbouncer.org/config.html"
+    - "https://www.pgbouncer.org/usage.html"
+    - "https://www.postgresql.org/docs/current/runtime-config-connection.html"

@@ -1,0 +1,986 @@
+layer: rules
+domain: testing
+knowledge:
+- id: LTEST-001
+  text: >
+    Structure Locust tests as composable User classes with task weights, not flat scripts.
+    Use @task(weight) to model real traffic distribution: if 70% of users browse and 30% checkout,
+    set @task(7) on browse and @task(3) on checkout. Never use equal weights for unequal traffic.
+  why: >
+    Equal task weights produce unrealistic load that makes APIs look 3-5x more resilient than they are
+    under real conditions. A checkout endpoint exercised 50% of the time in tests but only 5% in production
+    will show healthy p99s during load tests, then collapse under real Black Friday traffic when browse
+    floods connection pools. Shopify's 2021 postmortem cited unrealistic load distribution as why their
+    flash sale tests missed the actual bottleneck.
+  how_to_do_right: |
+    1. Analyze production traffic logs: count requests per endpoint over 24h, compute percentages.
+    2. Translate percentages to integer weights: 70% browse → @task(7), 20% search → @task(2), 10% checkout → @task(1).
+    3. Group related tasks in a TaskSet if they share state (e.g., browse then add-to-cart then checkout).
+    4. Use between(min, max) for wait_time to model think time — never constant(0).
+    5. Add on_start() to simulate session setup (login, fetch user profile).
+    6. Validate: run 10min test, compare request distribution to production traffic — must match within 5%.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [locust]
+  domains:
+    domain: [testing, performance]
+    concern: [load_testing, traffic_modeling]
+  example_good: |
+    from locust import HttpUser, TaskSet, task, between
+
+    class BrowseTasks(TaskSet):
+        @task(7)
+        def browse_products(self):
+            self.client.get("/api/products?page=1")
+
+        @task(2)
+        def search(self):
+            self.client.get("/api/search?q=widget")
+
+        @task(1)
+        def checkout(self):
+            with self.client.post("/api/cart", json={"product_id": 42}, catch_response=True) as r:
+                if r.elapsed.total_seconds() > 2.0:
+                    r.failure(f"Checkout too slow: {r.elapsed.total_seconds():.2f}s")
+
+    class ShopUser(HttpUser):
+        tasks = [BrowseTasks]
+        wait_time = between(1, 5)  # Think time: 1-5 seconds between tasks
+
+        def on_start(self):
+            self.client.post("/api/auth/login", json={"user": "loadtest@example.com", "pass": "x"})
+  example_bad: |
+    from locust import HttpUser, task, constant
+
+    class BadUser(HttpUser):
+        wait_time = constant(0)  # No think time — unrealistic hammering
+
+        @task  # Equal weight — ignores real traffic distribution
+        def browse(self):
+            self.client.get("/api/products")
+
+        @task  # Checkout hit 50% of time instead of real 10%
+        def checkout(self):
+            self.client.post("/api/checkout")
+        # Result: checkout tested 5x more than in production, hiding browse bottlenecks
+  when_applies: >
+    Any load test against an HTTP service. Especially before major releases, capacity planning
+    exercises, and infrastructure changes (CDN, DB upgrade, horizontal scaling).
+  sources:
+    - "https://docs.locust.io/en/stable/writing-a-locustfile.html"
+    - "https://docs.locust.io/en/stable/tasksets.html"
+
+- id: LTEST-002
+  text: >
+    Use four load test shapes for complete coverage: ramp-up (find breaking point), sustained
+    (validate SLOs), spike (thundering herd), and soak (memory/connection leaks). Never run only
+    one shape and claim you've load tested your system.
+  why: >
+    Each shape finds different failure modes. Sustained tests at 2x expected traffic may pass perfectly
+    while a 10x spike for 30 seconds exposes circuit breaker misconfiguration. Soak tests over 8h are
+    the only way to catch memory leaks in Python (reference cycles in long-running workers), connection
+    pool exhaustion where max_connections isn't being recycled, and Redis key accumulation from
+    sessions never being evicted. Netflix's Chaos team found that 40% of production incidents were
+    only reproducible under soak or spike patterns, not sustained load.
+  how_to_do_right: |
+    1. Ramp-up: Start at 1 user, add 10 users/min until error rate exceeds 1% or p99 > SLO. Record breaking point.
+    2. Sustained: Run at 80% of breaking point for 30min. All SLOs must hold throughout.
+    3. Spike: Run at 20% baseline, spike to 300% for 60 seconds, return to 20%. Measure recovery time.
+    4. Soak: Run at 60% of breaking point for 8h. Alert on: memory growth >10%, p99 drift >20%, error rate creep.
+    5. Automate in CI: ramp-up on every PR, sustained on merge to main, spike + soak weekly.
+    6. Record baselines after each test run. Regression = any metric >10% worse than baseline.
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [locust, k6]
+  domains:
+    domain: [testing, performance]
+    concern: [load_testing, capacity_planning]
+  example_good: |
+    # k6 spike test shape
+    import http from 'k6/http';
+    import { sleep } from 'k6';
+
+    export const options = {
+      stages: [
+        { duration: '2m', target: 20 },   // Baseline: ramp to 20 users
+        { duration: '1m', target: 300 },  // Spike: jump to 300 users
+        { duration: '1m', target: 300 },  // Sustain spike for 1 min
+        { duration: '2m', target: 20 },   // Recovery: back to baseline
+        { duration: '2m', target: 0 },    // Ramp down
+      ],
+      thresholds: {
+        'http_req_duration': ['p(99)<2000'],  // SLO: p99 < 2s even during spike
+        'http_req_failed': ['rate<0.05'],     // Error rate < 5% during spike
+      },
+    };
+
+    export default function () {
+      http.get('https://staging.example.com/api/products');
+      sleep(1);
+    }
+  example_bad: |
+    # Only running one sustained test at fixed load:
+    # locust --users 100 --spawn-rate 10 --run-time 10m
+    # This misses: spike behavior, soak leaks, breaking point
+    # Engineers declare "system handles 100 users" without knowing:
+    # - What happens at 1000 users?
+    # - Does it degrade gracefully or collapse?
+    # - Does memory grow 1MB/min under load?
+  when_applies: >
+    Before any major release, infrastructure change, or when establishing performance baselines
+    for a new service. Spike tests are mandatory before any event with unpredictable traffic
+    (product launches, marketing campaigns).
+  sources:
+    - "https://grafana.com/docs/k6/latest/testing-guides/test-types/"
+    - "https://docs.locust.io/en/stable/running-distributed.html"
+
+- id: LTEST-003
+  text: >
+    Always define explicit SLO thresholds in load tests and fail the CI build when violated.
+    Never treat load tests as "informational only" — they must be gates. p95 < 500ms and
+    error_rate < 1% are the minimum baseline; tune per service SLA.
+  why: >
+    Load tests without pass/fail criteria are performance theater. Engineers run them, look at
+    charts, shrug, and merge the PR. Latency regressions of 20-30% compound across microservices:
+    if 5 services each regress 20%, a cascade that took 200ms now takes 497ms — past the SLA.
+    k6 exits with code 99 when thresholds fail, which stops CI pipelines. Without this gate,
+    Google SRE data shows that 68% of performance regressions reach production undetected.
+  how_to_do_right: |
+    1. Define thresholds per endpoint criticality:
+       - Critical (checkout, auth): p95 < 200ms, p99 < 500ms, error_rate < 0.1%
+       - Standard (browse, search): p95 < 500ms, p99 < 1000ms, error_rate < 1%
+       - Background (analytics): p95 < 2000ms, error_rate < 5%
+    2. In k6: set thresholds in options.thresholds — non-zero exit code on violation.
+    3. In Locust: use --csv flag, then post-process with Python script to assert p95/p99.
+    4. Store baselines in artifact storage (S3, GCS). Compare each run against baseline.
+    5. Alert on: metric 10% worse than baseline (warning), 25% worse (block merge).
+    6. Never adjust thresholds upward to "make tests pass" — fix the code.
+  severity: critical
+  technologies:
+    lang: [python, javascript]
+    framework: [locust, k6]
+  domains:
+    domain: [testing, performance]
+    concern: [slo_validation, ci_integration]
+  example_good: |
+    # k6 with hard SLO gates
+    export const options = {
+      thresholds: {
+        // API SLOs — failure blocks CI merge
+        'http_req_duration{endpoint:checkout}': ['p(95)<200', 'p(99)<500'],
+        'http_req_duration{endpoint:browse}': ['p(95)<500', 'p(99)<1000'],
+        'http_req_failed': ['rate<0.01'],
+        'checks': ['rate>0.99'],
+      },
+    };
+
+    // Tag requests for per-endpoint metrics
+    const checkoutRes = http.post(
+      `${BASE_URL}/api/checkout`,
+      JSON.stringify(payload),
+      { tags: { endpoint: 'checkout' } }
+    );
+
+    # Locust CI assertion (post-run)
+    import csv, sys
+
+    with open('locust_stats.csv') as f:
+        for row in csv.DictReader(f):
+            if row['Name'] == '/api/checkout':
+                p95 = float(row['95%'])
+                if p95 > 200:
+                    print(f"FAIL: checkout p95={p95}ms > 200ms SLO")
+                    sys.exit(1)
+    print("PASS: All SLOs met")
+  example_bad: |
+    # Load test with no thresholds — purely informational
+    locust --users 100 --run-time 5m --headless
+    # Review results manually: "looks ok, p95 was 450ms"
+    # Next sprint: p95 is 600ms — nobody noticed the regression
+    # Month later: p95 is 1200ms — users complaining
+    # Root cause: no automated regression detection gate
+  when_applies: >
+    Every load test run in CI/CD pipelines. SLOs must be agreed with product/SRE before
+    the test is written, not after — writing thresholds to match observed performance
+    creates SLOs that describe current bugs, not desired behavior.
+  sources:
+    - "https://grafana.com/docs/k6/latest/using-k6/thresholds/"
+    - "https://sre.google/sre-book/service-level-objectives/"
+
+- id: LTEST-004
+  text: >
+    Run distributed Locust tests from at least 2 workers per 500 concurrent users.
+    A single Locust process saturates at ~1000 users on modern hardware due to GIL and
+    gevent's cooperative scheduling. For k6, use k6 cloud or k6-operator on Kubernetes
+    for tests exceeding 500 VUs.
+  why: >
+    Load injectors become the bottleneck before the system under test. A single Locust
+    master on a 4-core MacBook Pro sustains ~500 users cleanly; beyond that, the injector
+    queues requests internally and the measured latency includes injector queue time, not
+    just server response time. Engineers have declared systems "passing" load tests when
+    in reality the injector was the bottleneck — the real system was never stressed.
+    Shopify's engineering blog documented this: their 2019 Black Friday "passed" tests
+    failed in production because the test injector was saturated at 30% of target load.
+  how_to_do_right: |
+    1. For Locust distributed:
+       - Start master: locust --master --master-bind-port 5557
+       - Start workers: locust --worker --master-host localhost (1 per core)
+       - Rule of thumb: 1 worker handles 200-500 users depending on wait_time
+       - Monitor worker CPU: if >80%, add more workers
+    2. Validate injector health: watch worker_count in /stats/requests — must equal expected.
+    3. For k6 distributed: use k6-operator on Kubernetes, distribute across 3+ pods.
+    4. Measure injector overhead: run test at 10 users, confirm injector CPU <5%.
+    5. Never run distributed test where injector hosts are on same subnet as system under test
+       without isolating network paths — you create unrealistic latency profiles.
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [locust, k6]
+  domains:
+    domain: [testing, performance]
+    concern: [distributed_testing, capacity_planning]
+  example_good: |
+    # docker-compose.yml for distributed Locust
+    version: '3'
+    services:
+      locust-master:
+        image: locustio/locust
+        command: -f /locustfile.py --master
+        ports:
+          - "8089:8089"   # Web UI
+          - "5557:5557"   # Worker communication
+        volumes:
+          - ./locustfile.py:/locustfile.py
+
+      locust-worker:
+        image: locustio/locust
+        command: -f /locustfile.py --worker --master-host locust-master
+        volumes:
+          - ./locustfile.py:/locustfile.py
+        deploy:
+          replicas: 4  # 4 workers = ~2000 max clean users
+
+    # Start test: docker-compose up --scale locust-worker=4
+    # Then: POST /swarm with {"user_count": 1500, "spawn_rate": 50}
+  example_bad: |
+    # Single process for 2000 users — injector becomes bottleneck
+    locust --users 2000 --spawn-rate 100 --headless
+    # CPU: 100%, injector queue depth: growing
+    # Measured latency: includes 200ms of injector queue time
+    # Reality: server responded in 50ms, but test reported 250ms
+    # False conclusion: "server is slow" — actually injector was saturated
+  when_applies: >
+    Load tests targeting more than 500 concurrent users, or any test where the
+    load generator host shows >60% CPU during the test.
+  sources:
+    - "https://docs.locust.io/en/stable/running-distributed.html"
+    - "https://grafana.com/docs/k6/latest/testing-guides/running-large-tests/"
+
+- id: LTEST-005
+  text: >
+    Apply chaos engineering following the 5 core principles: build a steady state hypothesis,
+    vary real-world events, run experiments in production (or production-like), automate
+    continuously, and minimize blast radius. Never inject chaos without a rollback plan
+    and a stop condition defined before the experiment starts.
+  why: >
+    Chaos experiments without a defined hypothesis are vandalism, not engineering. Amazon's
+    GameDay framework and Netflix's Chaos Engineering practice both require a written hypothesis
+    before any experiment: "We hypothesize that the payment service maintains p99 < 500ms when
+    the recommendations service is killed." Without this, engineers can't determine if the
+    experiment revealed a real weakness or just noise. Blast radius miscalculation caused a
+    2021 incident at a Fortune 100 company where a chaos test intended to affect 5% of traffic
+    propagated through shared infrastructure and took down 40% of the platform.
+  how_to_do_right: |
+    1. Write a hypothesis card:
+       - Steady state: "Payment success rate > 99.5%, p99 < 500ms"
+       - Experiment: "Kill recommendations service (1 of 3 replicas)"
+       - Expected outcome: "Payment unaffected — no hard dependency"
+       - Stop condition: "Payment error rate exceeds 2% OR p99 exceeds 1000ms"
+       - Rollback: "kubectl rollout restart deployment/recommendations"
+    2. Blast radius controls:
+       - Start with 1% of traffic (feature flags, shadow traffic)
+       - Widen to 5%, 20%, 100% only if steady state holds
+       - Never inject chaos during high-traffic periods without approval
+    3. Implement a kill switch: HTTP endpoint or feature flag that stops injection immediately.
+    4. Automate in GameDay: scheduled chaos runs with auto-rollback on threshold breach.
+    5. Document every experiment: hypothesis, outcome, action items.
+  severity: critical
+  technologies:
+    lang: [python, go]
+    framework: [chaos-toolkit, litmus, gremlin]
+  domains:
+    domain: [testing, reliability]
+    concern: [chaos_engineering, resilience]
+  example_good: |
+    # Chaos Toolkit experiment (YAML)
+    # chaos-experiment-recommendations.json
+    {
+      "title": "Recommendations service failure does not affect payments",
+      "description": "Kill 1 recommendations replica, verify payment SLOs hold",
+      "steady-state-hypothesis": {
+        "title": "Payment service healthy",
+        "probes": [
+          {
+            "type": "probe",
+            "name": "payment-p99-ok",
+            "tolerance": {"type": "range", "range": [0, 500]},
+            "provider": {
+              "type": "python",
+              "module": "chaosprobes.metrics",
+              "func": "get_p99_latency",
+              "arguments": {"service": "payment"}
+            }
+          }
+        ]
+      },
+      "method": [
+        {
+          "type": "action",
+          "name": "kill-one-recommendations-replica",
+          "provider": {
+            "type": "python",
+            "module": "chaosk8s.pod.actions",
+            "func": "terminate_pods",
+            "arguments": {"label_selector": "app=recommendations", "qty": 1}
+          }
+        }
+      ],
+      "rollbacks": [
+        {
+          "type": "action",
+          "name": "restart-recommendations",
+          "provider": {
+            "type": "process",
+            "path": "kubectl",
+            "arguments": "rollout restart deployment/recommendations"
+          }
+        }
+      ]
+    }
+  example_bad: |
+    # No hypothesis, no blast radius control, no rollback
+    import subprocess
+    # "Let's see what happens if we kill the database"
+    subprocess.run(["kubectl", "delete", "pod", "postgres-primary-0"])
+    # Result: 15-minute outage affecting all users
+    # No stop condition → team scrambles to recover manually
+    # No hypothesis → unclear what was learned
+    # No rollback plan → StatefulSet pod not recreated due to PVC issue
+  when_applies: >
+    Any system that must maintain high availability. Chaos experiments are mandatory
+    before declaring a service "production ready" and should run continuously (at minimum
+    weekly) for critical-path services.
+  sources:
+    - "https://principlesofchaos.org/"
+    - "https://netflix.github.io/chaosmonkey/"
+
+- id: LTEST-006
+  text: >
+    Use Toxiproxy to simulate network faults in integration tests: add 200ms latency to
+    downstream calls, then add 5% packet loss, then add connection resets. Services that
+    only pass "happy path" integration tests will fail in production at 2am.
+  why: >
+    All distributed systems experience network degradation. The question is whether your
+    service degrades gracefully (timeouts, circuit breakers trip, retries with backoff)
+    or catastrophically (goroutine/thread leak as connections hang, memory exhaustion,
+    cascading failure). Toxiproxy intercepts TCP at the transport layer — it tests the
+    actual network behavior, not mock behavior. Shopify open-sourced Toxiproxy after
+    discovering that 60% of their "passing" service tests failed when real network
+    conditions were simulated. Connection pool saturation (all connections hung waiting
+    for a timed-out upstream) is the #1 failure mode that Toxiproxy catches and unit
+    tests miss.
+  how_to_do_right: |
+    1. Run Toxiproxy alongside your test target (docker-compose or testcontainers):
+       - toxiproxy-server binary or docker image toxiproxy/toxiproxy:latest
+    2. Configure proxy via HTTP API or toxiproxy-cli:
+       toxiproxy-cli create --listen 0.0.0.0:15432 --upstream postgres:5432 db_proxy
+    3. Add toxics progressively in tests:
+       - Latency: toxiproxy-cli toxic add db_proxy --type latency --attribute latency=200
+       - Packet loss: toxiproxy-cli toxic add db_proxy --type slow_close --attribute delay=5000
+       - Connection reset: toxiproxy-cli toxic add db_proxy --type reset_peer
+    4. Point your service at the Toxiproxy port (15432), not the real upstream.
+    5. Verify: service must stay healthy under latency, return graceful error under reset.
+    6. Assert connection pool is returned to normal after recovery: pool.status() must show 0 checked-out.
+  severity: high
+  technologies:
+    lang: [python, go, ruby]
+    framework: [toxiproxy, testcontainers]
+  domains:
+    domain: [testing, reliability]
+    concern: [fault_injection, network_simulation]
+  example_good: |
+    import pytest
+    import httpx
+    from testcontainers.core.container import DockerContainer
+
+    @pytest.fixture(scope="session")
+    def toxiproxy():
+        """Toxiproxy container for network fault injection."""
+        container = DockerContainer("ghcr.io/shopify/toxiproxy:2.9.0")
+        container.with_exposed_ports(8474, 15432)
+        container.start()
+        yield container
+        container.stop()
+
+    @pytest.mark.asyncio
+    async def test_service_handles_db_latency(toxiproxy, app_client):
+        """Service must respond within SLO even when DB adds 500ms latency."""
+        toxi_port = toxiproxy.get_exposed_port(8474)
+        toxi_api = f"http://localhost:{toxi_port}"
+
+        # Add 500ms latency to DB connection
+        async with httpx.AsyncClient() as client:
+            await client.post(f"{toxi_api}/proxies/db/toxics", json={
+                "name": "latency", "type": "latency",
+                "attributes": {"latency": 500, "jitter": 50}
+            })
+
+        # Service should still respond — timeout > DB latency
+        resp = await app_client.get("/api/users/1")
+        assert resp.status_code == 200
+        assert resp.elapsed.total_seconds() < 2.0  # SLO: < 2s despite 500ms DB
+
+        # Cleanup
+        async with httpx.AsyncClient() as client:
+            await client.delete(f"{toxi_api}/proxies/db/toxics/latency")
+  example_bad: |
+    # Integration test that only tests happy path with real connections
+    async def test_get_user(db_session):
+        user = await db_session.get(User, 1)
+        assert user.name == "Alice"
+    # This test passes even if:
+    # - DB timeout is unset (hangs forever under network fault)
+    # - Connection pool is never released (leak)
+    # - No circuit breaker (50 hung connections kill the service)
+  when_applies: >
+    Integration tests for any service with downstream dependencies (databases, caches,
+    other microservices). Required for services with SLAs. Run Toxiproxy tests in CI
+    on every PR touching network/database interaction code.
+  sources:
+    - "https://github.com/Shopify/toxiproxy"
+    - "https://www.docker.com/blog/developing-resilient-applications-with-toxiproxy-and-testcontainers/"
+
+- id: LTEST-007
+  text: >
+    Load test with realistic user journeys, not isolated endpoint hammering. A journey
+    test GETs a product listing, POSTs to cart, then POSTs to checkout — in sequence,
+    with session state. Isolated endpoint tests at 10k RPS may pass while the 3-step
+    journey at 1k concurrent users fails due to session affinity and distributed lock contention.
+  why: >
+    Modern systems use session tokens, database row-level locks, and distributed caches
+    that only exhibit contention when real user sequences are simulated. Cart-then-checkout
+    workflows generate write-write conflicts on inventory records that isolated checkout
+    tests never reveal. In one well-documented e-commerce incident (Stripe case study 2022),
+    cart abandonment tests passed at 5000 RPS individually, but the checkout journey at
+    500 concurrent users revealed a distributed lock contention issue that caused 23% of
+    checkouts to fail with deadlock errors.
+  how_to_do_right: |
+    1. Map the critical user journeys from product analytics (top 3-5 flows by volume).
+    2. Implement each journey as a Locust TaskSet with sequential steps:
+       - on_start: login → store session token
+       - task 1: browse (GET /products) → record product IDs
+       - task 2: add to cart (POST /cart with product ID from task 1)
+       - task 3 (20% of time): checkout (POST /orders)
+    3. Use Locust's self.client session — cookies and headers persist between requests.
+    4. Pass data between tasks via self attributes (not global state — one per User).
+    5. Validate end-to-end: assert final order was created successfully in the response.
+    6. Monitor database contention metrics during journey tests: lock wait time, deadlock rate.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [locust]
+  domains:
+    domain: [testing, performance]
+    concern: [load_testing, user_journeys]
+  example_good: |
+    from locust import HttpUser, SequentialTaskSet, task, between
+    import random
+
+    class CheckoutJourney(SequentialTaskSet):
+        """Simulates a realistic checkout journey."""
+
+        def on_start(self):
+            # Authenticate once per user session
+            resp = self.client.post("/api/auth/token",
+                                    json={"email": f"user{random.randint(1,10000)}@test.com"})
+            self.token = resp.json().get("token")
+            self.client.headers.update({"Authorization": f"Bearer {self.token}"})
+            self.cart_id = None
+
+        @task
+        def browse_products(self):
+            resp = self.client.get("/api/products?category=electronics&limit=20")
+            products = resp.json().get("items", [])
+            self.selected_product = random.choice(products)["id"] if products else None
+
+        @task
+        def add_to_cart(self):
+            if not self.selected_product:
+                return
+            resp = self.client.post("/api/cart/items",
+                                    json={"product_id": self.selected_product, "qty": 1})
+            self.cart_id = resp.json().get("cart_id")
+
+        @task
+        def checkout(self):
+            if not self.cart_id:
+                return
+            resp = self.client.post("/api/orders",
+                                    json={"cart_id": self.cart_id, "payment": "stored_card"})
+            assert resp.status_code == 201, f"Order failed: {resp.status_code}"
+
+    class ShopUser(HttpUser):
+        tasks = [CheckoutJourney]
+        wait_time = between(2, 8)
+  example_bad: |
+    # Isolated endpoint hammering — misses journey contention
+    class ProductUser(HttpUser):
+        @task
+        def get_product(self):
+            self.client.get("/api/products/1")  # Always same product
+
+    class CartUser(HttpUser):
+        @task
+        def post_cart(self):
+            self.client.post("/api/cart", json={"product_id": 1, "qty": 1})  # No session
+
+    class CheckoutUser(HttpUser):
+        @task
+        def checkout(self):
+            self.client.post("/api/orders", json={"cart_id": "hardcoded"})  # Unrealistic
+    # Result: no shared session state, no inventory contention, no realistic lock patterns
+  when_applies: >
+    All performance tests for transactional systems with stateful workflows (e-commerce,
+    booking systems, financial platforms). Isolated endpoint tests are acceptable only
+    for stateless read-only APIs.
+  sources:
+    - "https://docs.locust.io/en/stable/writing-a-locustfile.html#sequentialtaskset-class"
+    - "https://betterstack.com/community/guides/testing/locust-explained/"
+
+- id: LTEST-008
+  text: >
+    Test database connection pool saturation explicitly: ramp load until pool is exhausted
+    (all connections checked out), then verify that requests queue (not crash) and recover
+    when load drops. A pool that crashes the app under saturation is a severity-1 production risk.
+  why: >
+    Database connection pools have a hard ceiling. When all connections are checked out and
+    the pool_timeout is reached, most ORMs raise PoolTimeout or similar exceptions. If the
+    application code doesn't handle this gracefully, the exception propagates as a 500 to
+    the user. SQLAlchemy's default pool_size=5 with max_overflow=10 means 15 total connections.
+    With 100 concurrent users each averaging 150ms queries, you saturate at 66 concurrent
+    requests — a number easily reached in moderate production traffic. Asyncpg with
+    max_size=10 is even more restrictive. Post-mortems at Robinhood and Coinbase have cited
+    connection pool exhaustion as a root cause in high-traffic incidents.
+  how_to_do_right: |
+    1. Calculate theoretical saturation: max_connections / avg_query_time_seconds = max_RPS.
+       Example: 15 connections / 0.15s avg = 100 RPS before saturation.
+    2. Design load test to exceed this threshold: ramp to 150 RPS, sustain for 5min.
+    3. Assert behavior under saturation:
+       - Requests must queue (pool_timeout=30s), not immediately crash.
+       - HTTP response must be 503 with Retry-After header, not 500.
+       - Pool must recover: after load drops, all connections return to idle state.
+    4. In SQLAlchemy: set pool_pre_ping=True to detect stale connections.
+    5. Set pool_timeout to your SLO latency budget — if SLO is 2s, pool_timeout=1.5s.
+    6. Monitor pool metrics via engine.pool.status() in a metrics endpoint.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [sqlalchemy, asyncpg, locust]
+  domains:
+    domain: [testing, database]
+    concern: [connection_pool, load_testing]
+  example_good: |
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+    from sqlalchemy.pool import AsyncAdaptedQueuePool
+
+    # Explicit pool configuration with monitoring
+    engine = create_async_engine(
+        DATABASE_URL,
+        pool_size=10,          # Base connections
+        max_overflow=20,       # Burst connections (total 30)
+        pool_timeout=30.0,     # Queue timeout — raises TimeoutError after 30s
+        pool_pre_ping=True,    # Detect stale connections on checkout
+        pool_recycle=3600,     # Recycle connections after 1h (prevent MySQL 8h timeout)
+        echo_pool="debug",     # Log pool events during load tests
+    )
+
+    # Graceful saturation handling
+    from sqlalchemy.exc import TimeoutError as PoolTimeout
+
+    async def get_user(user_id: int):
+        try:
+            async with AsyncSession(engine) as session:
+                return await session.get(User, user_id)
+        except PoolTimeout:
+            # Don't crash — return 503 with retry guidance
+            raise ServiceUnavailableError("Database pool exhausted, retry in 5s")
+
+    # Metrics endpoint for pool monitoring
+    @app.get("/health/pool")
+    def pool_status():
+        pool = engine.pool
+        return {
+            "checked_out": pool.checkedout(),
+            "checked_in": pool.checkedin(),
+            "overflow": pool.overflow(),
+            "size": pool.size(),
+        }
+  example_bad: |
+    # Default pool (size=5) with no overflow configured
+    engine = create_engine(DATABASE_URL)  # pool_size=5, max_overflow=10 default
+
+    # No error handling for pool exhaustion
+    def get_user(user_id):
+        with Session(engine) as session:
+            return session.get(User, user_id)  # Raises OperationalError on exhaustion
+    # At 50 concurrent users (each holding connection 150ms):
+    # QueuePool limit of size 5 overflow 10 reached — TimeoutError
+    # Traceback propagates as 500 Internal Server Error
+    # All 50 users see 500, not a graceful 503
+  when_applies: >
+    Any service with a database connection pool. Saturation testing is mandatory during
+    initial capacity planning and after any change to pool configuration, query patterns,
+    or concurrency model.
+  sources:
+    - "https://docs.sqlalchemy.org/en/20/core/pooling.html"
+    - "https://docs.locust.io/en/stable/writing-a-locustfile.html"
+
+- id: LTEST-009
+  text: >
+    Instrument load tests with custom metrics: track business KPIs (orders/minute, checkout
+    success rate) alongside technical metrics (RPS, p99). A test that shows p99 = 300ms
+    but checkout_success_rate = 85% has found a critical bug that latency alone would mask.
+  why: >
+    Latency metrics are necessary but insufficient. Silent failures — requests that return
+    200 OK but contain error payloads, partial data, or incorrect calculations — are
+    invisible to p99 metrics. In financial systems, a payment endpoint that returns 200
+    with {"status": "pending"} instead of {"status": "confirmed"} looks healthy by latency
+    metrics but represents a 100% failure rate from a business perspective. Locust's
+    events system and k6's custom counters allow business metrics to be tracked in the
+    same run. Google's SRE Book calls this "measuring what matters" — user-visible success,
+    not just server response time.
+  how_to_do_right: |
+    1. Define 3-5 business KPIs before writing the test:
+       - checkout_success_rate (orders confirmed / orders attempted)
+       - search_result_quality (results returned > 0)
+       - auth_success_rate (tokens issued / login attempts)
+    2. In Locust, use events to fire custom metrics:
+       from locust import events
+       events.request.fire(request_type="business", name="checkout_success", ...)
+    3. Use catch_response=True to control success/failure based on response content:
+       with self.client.post("/checkout", catch_response=True) as r:
+           if r.json().get("status") != "confirmed":
+               r.failure(f"Unexpected status: {r.json()['status']}")
+    4. Export metrics to Prometheus/Grafana for real-time dashboards during test runs.
+    5. Set thresholds on business metrics, not just latency:
+       checkout_success_rate must be > 99.5% at all load levels.
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [locust, k6]
+  domains:
+    domain: [testing, performance]
+    concern: [metrics, observability]
+  example_good: |
+    from locust import HttpUser, task, events, between
+    import time
+
+    class ECommerceUser(HttpUser):
+        wait_time = between(1, 3)
+
+        @task
+        def checkout(self):
+            start = time.time()
+            with self.client.post(
+                "/api/orders",
+                json={"cart_id": self.cart_id},
+                catch_response=True
+            ) as resp:
+                elapsed = (time.time() - start) * 1000  # ms
+
+                if resp.status_code == 200:
+                    order = resp.json()
+                    if order.get("status") == "confirmed":
+                        # Business success — emit custom metric
+                        events.request.fire(
+                            request_type="BUSINESS",
+                            name="checkout_confirmed",
+                            response_time=elapsed,
+                            response_length=len(resp.content),
+                            exception=None,
+                        )
+                    else:
+                        # HTTP 200 but business failure
+                        resp.failure(f"Order not confirmed: status={order.get('status')}")
+                        events.request.fire(
+                            request_type="BUSINESS",
+                            name="checkout_failed",
+                            response_time=elapsed,
+                            response_length=0,
+                            exception=Exception(f"status={order.get('status')}"),
+                        )
+  example_bad: |
+    class ECommerceUser(HttpUser):
+        @task
+        def checkout(self):
+            resp = self.client.post("/api/orders", json={"cart_id": self.cart_id})
+            # Only checks HTTP status — not response content
+            # If server returns {"status": "failed", "reason": "inventory_depleted"}
+            # with HTTP 200, Locust marks this as SUCCESS
+            # Test shows: 0% error rate, p99 = 200ms — "system is healthy"
+            # Reality: 40% of checkout attempts silently failing
+  when_applies: >
+    Load tests for any system with business transactions (payments, orders, bookings, auth).
+    Business metrics are mandatory for transactional systems; optional for pure read-only APIs.
+  sources:
+    - "https://docs.locust.io/en/stable/writing-a-locustfile.html#making-a-request"
+    - "https://sre.google/sre-book/monitoring-distributed-systems/"
+
+- id: LTEST-010
+  text: >
+    Conduct Game Days quarterly for critical-path services: structured failure injection
+    exercises where engineers observe and respond to incidents in a controlled environment.
+    A 4-hour Game Day reveals more weaknesses than 6 months of automated chaos tests alone.
+  why: >
+    Automated chaos tests validate known failure modes. Game Days reveal unknown failure
+    modes: miscommunication between teams, missing runbooks, alert fatigue, incorrect
+    assumptions about system behavior, and human factors in incident response. Amazon Web
+    Services Game Days team documented that 80% of Game Day incidents are resolved by
+    procedure and coordination improvements, not code changes. Engineers discover they
+    don't know which metrics to look at during an incident, runbooks are out of date,
+    on-call rotations have gaps, and alert thresholds are set incorrectly.
+  how_to_do_right: |
+    1. Schedule quarterly, 4-hour sessions for each critical service cluster.
+    2. Define scenarios 1 week before (so teams prepare, but don't over-optimize):
+       - Scenario A: Primary database fails, replica must promote
+       - Scenario B: Upstream payment provider returns 503
+       - Scenario C: Memory leak causes OOM on 2 of 5 API nodes
+    3. Assign roles: chaos engineer (injects faults), SRE lead (coordinates response),
+       observers (document gaps), communications (handles status page).
+    4. Run each scenario for 30min: inject fault → observe response → debrief 15min.
+    5. Document: time-to-detect, time-to-mitigate, runbook gaps, alert gaps.
+    6. Create action items for every gap found. Track resolution before next Game Day.
+  severity: medium
+  technologies:
+    lang: [python, go]
+    framework: [chaos-toolkit, gremlin, litmus]
+  domains:
+    domain: [testing, reliability]
+    concern: [chaos_engineering, incident_response]
+  example_good: |
+    # Game Day runsheet (YAML for tooling integration)
+    game_day:
+      date: "2025-03-15"
+      service: "payment-gateway"
+      participants:
+        chaos_engineer: "alice@company.com"
+        sre_lead: "bob@company.com"
+        observers: ["carol@company.com", "dave@company.com"]
+
+      scenarios:
+        - id: GD-001
+          name: "Payment DB Primary Failure"
+          hypothesis: "DB replica promotes within 60s, payment p99 recovers within 120s"
+          fault: "Kill postgres-primary pod"
+          duration_minutes: 30
+          success_criteria:
+            - "Replica elected primary: < 60s"
+            - "Payment error rate returns to < 0.1%: < 120s"
+            - "No data loss: transaction log intact"
+          stop_conditions:
+            - "Payment error rate > 10% for > 5 minutes"
+            - "Manual stop requested by SRE lead"
+
+        - id: GD-002
+          name: "Memory Leak Simulation"
+          hypothesis: "HPA scales out before OOM kills any node; no user impact"
+          fault: "Inject memory pressure via stress-ng on 2/5 API pods"
+          duration_minutes: 30
+          success_criteria:
+            - "HPA triggers new pods: < 3 minutes after memory > 80%"
+            - "Zero 500 errors during scaling event"
+  example_bad: |
+    # "Chaos test" that's actually just a planned maintenance window
+    # No hypothesis written
+    # No stop conditions defined
+    # No observers — just the engineer running it
+    kubectl delete pod postgres-primary-0  # "Let's see what happens"
+    # Engineer watches for 5min, everything seems fine
+    # But: replica took 180s to promote (missed), runbook said 30s
+    # Alert fired 10min later (delay not noticed)
+    # No debrief, no action items, no learning
+  when_applies: >
+    Quarterly for all production services with >99.9% SLA. Monthly for payment, authentication,
+    and data pipeline services. Always before major infrastructure migrations.
+  sources:
+    - "https://principlesofchaos.org/"
+    - "https://aws.amazon.com/gameday/"
+
+- id: LTEST-011
+  text: >
+    Establish performance baselines before any infrastructure change and run automated
+    comparison post-change. A baseline is: p50, p95, p99, error_rate, and throughput
+    at 3 load levels (50%, 100%, 150% of expected peak). Changes that degrade any
+    baseline metric by >10% are blocked from deployment.
+  why: >
+    Without baselines, "is this change faster or slower?" is a gut feeling, not engineering.
+    Teams frequently deploy infrastructure changes (Postgres upgrade, Redis cluster, load
+    balancer swap) that change latency by 15-30% without realizing it, because they have
+    no reference point. The accumulation of small regressions across 12 deployments per week
+    produces systems that are 2x slower after 6 months with no single PR to blame. Baseline
+    comparison is the engineering discipline that catches the "death by a thousand cuts"
+    scenario. Netflix's performance engineering team uses this approach, flagging any change
+    that moves any p-latency metric >5%.
+  how_to_do_right: |
+    1. Store baselines in artifact storage (S3 bucket: perf-baselines/{service}/{sha}.json).
+    2. Baseline format: {"timestamp": "...", "git_sha": "...", "metrics": {
+         "p50_ms": 45, "p95_ms": 120, "p99_ms": 380,
+         "error_rate": 0.001, "throughput_rps": 850}}
+    3. After each load test run, compare against latest baseline:
+       if any metric > baseline * 1.10: mark build as UNSTABLE, notify team.
+    4. Update baseline automatically when performance improves (ratchet forward).
+    5. Track baselines per environment (staging, production) separately.
+    6. Visualize trends in Grafana: plot baseline + current run + 30-day moving average.
+  severity: high
+  technologies:
+    lang: [python, javascript]
+    framework: [locust, k6, grafana]
+  domains:
+    domain: [testing, performance]
+    concern: [baselines, regression_detection]
+  example_good: |
+    import json, boto3, datetime
+    from pathlib import Path
+
+    def save_baseline(service: str, git_sha: str, metrics: dict):
+        s3 = boto3.client("s3")
+        baseline = {
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "git_sha": git_sha,
+            "metrics": metrics
+        }
+        s3.put_object(
+            Bucket="perf-baselines",
+            Key=f"{service}/latest.json",
+            Body=json.dumps(baseline)
+        )
+        # Also archive with SHA for historical lookups
+        s3.put_object(
+            Bucket="perf-baselines",
+            Key=f"{service}/{git_sha}.json",
+            Body=json.dumps(baseline)
+        )
+
+    def compare_to_baseline(service: str, current_metrics: dict) -> list[str]:
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket="perf-baselines", Key=f"{service}/latest.json")
+        baseline = json.loads(obj["Body"].read())["metrics"]
+
+        regressions = []
+        for metric, current_val in current_metrics.items():
+            baseline_val = baseline.get(metric)
+            if baseline_val and current_val > baseline_val * 1.10:
+                pct = (current_val / baseline_val - 1) * 100
+                regressions.append(f"{metric}: {baseline_val} → {current_val} (+{pct:.1f}%)")
+        return regressions
+  example_bad: |
+    # No baseline comparison — just "run the test and look at it"
+    locust --users 200 --run-time 10m --csv results.csv
+    # Engineer opens CSV, sees p99=450ms, says "seems fine"
+    # Last week: p99=380ms
+    # Two weeks ago: p99=320ms
+    # Three months ago: p99=180ms
+    # 2.5x regression went undetected because nobody tracked baselines
+  when_applies: >
+    Mandatory before any deployment to production environments for services with defined
+    SLAs. Automated baseline comparison in CI is the default; manual review is the exception.
+  sources:
+    - "https://grafana.com/docs/k6/latest/testing-guides/automated-performance-testing/"
+    - "https://sre.google/workbook/implementing-slos/"
+
+- id: LTEST-012
+  text: >
+    Capacity plan from load test data using Little's Law: N = L * W (concurrent users =
+    arrival rate * service time). Use this formula to predict when to scale and at what
+    cost, before load reaches production. Never scale reactively under live traffic.
+  why: >
+    Little's Law is the mathematical foundation of queuing theory and gives an exact
+    relationship between concurrency, throughput, and latency. If your service has:
+    - Average response time W = 200ms (0.2s)
+    - Target throughput L = 500 RPS
+    Then concurrent requests N = 500 * 0.2 = 100 concurrent requests.
+    If your thread pool is 80 threads, you will be saturated and queue will grow.
+    Without this formula, engineers guess at thread/connection pool sizes and end up
+    either over-provisioned (wasteful) or under-provisioned (incidents). Netflix's
+    capacity engineering team uses Little's Law to pre-calculate required instance counts
+    before major events, predicting resource needs within 5% accuracy.
+  how_to_do_right: |
+    1. From load test data, extract: avg_response_time_seconds, peak_throughput_rps.
+    2. Calculate required concurrency: N = peak_throughput_rps * avg_response_time_seconds.
+    3. Add 30% headroom for spikes: required_concurrency = N * 1.3.
+    4. Size thread/connection pools: pool_size >= required_concurrency.
+    5. Size instances: if each instance supports C concurrent requests, instances = ceil(N / C).
+    6. Validate: run load test at planned scale, verify no queuing artifacts in latency.
+    7. Automate in capacity planning script:
+       peak_traffic = baseline_rps * growth_factor * seasonal_multiplier
+       instances_required = ceil((peak_traffic * avg_response_s * 1.3) / instance_capacity)
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [locust, k6]
+  domains:
+    domain: [testing, architecture]
+    concern: [capacity_planning, scaling]
+  example_good: |
+    from math import ceil
+
+    def capacity_plan(load_test_results: dict) -> dict:
+        """
+        Use Little's Law to calculate required infrastructure.
+
+        N = L * W
+        N = concurrent requests
+        L = throughput (requests/second)
+        W = average service time (seconds)
+        """
+        avg_response_s = load_test_results["avg_response_ms"] / 1000
+        peak_rps = load_test_results["peak_throughput_rps"]
+        growth_factor = 1.5   # Expected traffic growth over planning horizon
+        spike_headroom = 1.3  # 30% headroom for traffic spikes
+
+        # Little's Law: N = L * W
+        concurrent_requests = peak_rps * avg_response_s
+        required_concurrency = concurrent_requests * growth_factor * spike_headroom
+
+        # Instance sizing (each instance handles 50 concurrent requests safely)
+        instance_capacity = 50
+        instances_required = ceil(required_concurrency / instance_capacity)
+
+        return {
+            "peak_rps": peak_rps,
+            "concurrent_requests_littles_law": round(concurrent_requests, 1),
+            "required_with_headroom": round(required_concurrency, 1),
+            "instances_recommended": instances_required,
+            "pool_size_recommended": ceil(required_concurrency / instances_required) + 5,
+        }
+
+    # Example output:
+    # {"peak_rps": 500, "concurrent_requests": 100.0, "required_with_headroom": 195.0,
+    #  "instances_recommended": 4, "pool_size_recommended": 54}
+  example_bad: |
+    # "We've been running on 3 instances, let's add more when it gets slow"
+    # No capacity model, no headroom calculation
+    # Result: PagerDuty alert at 2am on Black Friday
+    # Engineer scales from 3 → 6 instances under live traffic (risky)
+    # Instances start up slowly (cold start, JVM warmup, connection pool init)
+    # 8 minutes of degraded service before stabilization
+    # Alternative: pre-scale based on Little's Law 30min before expected peak
+  when_applies: >
+    Before any high-traffic event (product launch, marketing campaign, seasonal peak).
+    Required for all services that support auto-scaling — you must validate that your
+    auto-scaling configuration is triggered at the right threshold, fast enough to matter.
+  sources:
+    - "https://en.wikipedia.org/wiki/Little%27s_law"
+    - "https://sre.google/workbook/non-abstract-large-scale-design/"

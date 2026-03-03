@@ -1,0 +1,585 @@
+layer: rules
+technology: Spark
+domain: data_engineering
+knowledge:
+- id: CR-SPARK-001
+  text: Use DataFrames (or Datasets in Scala/Java) for all new Spark code — avoid RDDs unless you need fine-grained control
+    over physical data layout.
+  why: RDDs bypass Spark's Catalyst optimizer and Tungsten execution engine. Every RDD operation is executed exactly as written
+    — no predicate pushdown, no join reordering, no whole-stage code generation. A DataFrame groupBy().agg() compiles to optimized
+    JVM bytecode that runs 10-100x faster than the equivalent RDD map/reduce. Additionally, RDD serialization uses Java/Kryo
+    (slow, large) while DataFrames use Tungsten's binary format (compact, zero-copy).
+  how_to_do_right: Use spark.read to load data as DataFrames. Use DataFrame API or Spark SQL for transformations. Use UDFs
+    only when built-in functions are insufficient (and prefer pandas UDFs over row-at-a-time UDFs). Drop to RDD only for custom
+    partitioning, accumulator-based algorithms, or low-level byte manipulation. If you have existing RDD code, convert via
+    rdd.toDF() as a first migration step.
+  severity: high
+  technologies:
+    lang: [python, scala]
+    framework: [pyspark]
+    platform: [spark]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, engineering]
+  example_good: "from pyspark.sql import SparkSession, functions as F\n\nspark = SparkSession.builder.appName(\"sales_agg\"\
+    ).getOrCreate()\n\n# DataFrame API — Catalyst optimizes the entire query plan\nresult = (\n    spark.read.parquet(\"s3://data/sales/\"\
+    )\n    .filter(F.col(\"date\") >= \"2026-01-01\")         # Predicate pushdown to Parquet\n    .groupBy(\"region\", \"\
+    product_category\")\n    .agg(\n        F.sum(\"amount\").alias(\"total_sales\"),\n        F.countDistinct(\"customer_id\"\
+    ).alias(\"unique_customers\"),\n    )\n    .orderBy(F.desc(\"total_sales\"))\n)\nresult.write.parquet(\"s3://data/sales_summary/\"\
+    )\n"
+  example_bad: "# RDD approach — no optimizer, 10-100x slower\nrdd = spark.sparkContext.textFile(\"s3://data/sales/\")\nresult\
+    \ = (\n    rdd\n    .map(lambda line: line.split(\",\"))\n    .filter(lambda row: row[1] >= \"2026-01-01\")    # No predicate\
+    \ pushdown\n    .map(lambda row: ((row[2], row[3]), float(row[4])))\n    .reduceByKey(lambda a, b: a + b)            \
+    \    # Full shuffle, no optimization\n    .sortBy(lambda x: -x[1])\n)\n# Manual serialization, no code generation, no\
+    \ Tungsten memory management\n"
+  when_applies: Projects using Apache Spark data processing, PySpark, or Scala
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant
+  sources: ["https://spark.apache.org/docs/latest/sql-programming-guide.html"]
+- id: CR-SPARK-002
+  text: Use broadcast joins for small tables (<100MB) to eliminate expensive shuffles in large-small table joins.
+  why: A regular join in Spark shuffles both tables across all executors by join key — moving potentially terabytes of data
+    over the network. When one table is small (dimension table, lookup table), broadcasting it sends the small table to every
+    executor once, allowing the join to execute locally without any shuffle of the large table. This can reduce a 30-minute
+    shuffle-heavy join to 2 minutes.
+  how_to_do_right: Set spark.sql.autoBroadcastJoinThreshold (default 10MB) to auto-broadcast small tables. For explicit control,
+    use F.broadcast(small_df). Monitor the Spark UI's SQL tab to verify the join type is BroadcastHashJoin, not SortMergeJoin.
+    For tables between 100MB-2GB, consider broadcast if executor memory allows (broadcast goes to driver memory first).
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pyspark]
+    platform: [spark]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, engineering]
+  example_good: "from pyspark.sql import functions as F\n\n# 50MB dimension table — broadcast to avoid shuffle of 500GB fact\
+    \ table\ndim_products = spark.read.parquet(\"s3://data/dim_products/\")  # 50MB\nfact_sales = spark.read.parquet(\"s3://data/fact_sales/\"\
+    )      # 500GB\n\n# Explicit broadcast hint\nresult = fact_sales.join(\n    F.broadcast(dim_products),\n    on=\"product_id\"\
+    ,\n    how=\"left\"\n)\n# Spark UI shows: BroadcastHashJoin (no shuffle of fact_sales)\n\n# Or set threshold for automatic\
+    \ broadcast\nspark.conf.set(\"spark.sql.autoBroadcastJoinThreshold\", \"100m\")\n"
+  example_bad: '# Default join shuffles BOTH tables — 500GB+ network transfer
+
+    result = fact_sales.join(dim_products, on="product_id", how="left")
+
+    # Spark UI shows: SortMergeJoin
+
+    # 500GB fact table shuffled across network + 50MB dim table shuffled
+
+    # 30 minutes instead of 2 minutes
+
+    '
+  when_applies: Projects using Apache Spark data processing or PySpark
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Spark or PySpark
+  sources: ["https://spark.apache.org/docs/latest/sql-performance-tuning.html#broadcast-hint"]
+- id: CR-SPARK-003
+  text: Use coalesce() to reduce partitions and repartition() to increase them — never use repartition() to decrease.
+  why: repartition(N) always triggers a full shuffle of all data across the cluster, regardless of whether N is larger or
+    smaller than the current partition count. coalesce(N) merges adjacent partitions locally without a shuffle when reducing
+    partition count. Using repartition(1) on a 1TB dataset shuffles the entire dataset to a single executor — a catastrophic
+    performance antipattern. However, coalesce() can create uneven partitions when reducing dramatically.
+  how_to_do_right: 'To reduce partitions (e.g., before writing fewer output files): use coalesce(N). To increase partitions
+    (e.g., for more parallelism): use repartition(N). To redistribute evenly by key: use repartitionByRange() or repartition(N,
+    ''key_col''). After coalesce, check partition sizes are reasonably even. Target 128MB-256MB per partition for most workloads.'
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [pyspark]
+    platform: [spark]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, engineering]
+  example_good: '# Reduce partitions before writing (no shuffle)
+
+    df = spark.read.parquet("s3://data/raw/")  # 1000 partitions
+
+    df.coalesce(10).write.parquet("s3://data/output/")  # 10 output files, no shuffle
+
+
+    # Increase partitions for more parallelism (requires shuffle)
+
+    skewed_df = spark.read.parquet("s3://data/skewed/")  # 10 partitions
+
+    balanced_df = skewed_df.repartition(200, "user_id")   # 200 partitions by key
+
+
+    # Repartition by range for sorted output
+
+    sorted_df = df.repartitionByRange(100, "date")
+
+    '
+  example_bad: '# repartition(1) on 1TB dataset — shuffles everything to one executor
+
+    df.repartition(1).write.parquet("s3://data/output/")
+
+    # OOM on the single executor, 1+ hour shuffle
+
+    # Use coalesce(1) instead (but still creates a bottleneck — use only for tiny outputs)
+
+
+    # repartition to reduce — unnecessary full shuffle
+
+    df.repartition(10).write.parquet("s3://data/output/")
+
+    # Shuffles all data across network just to reduce file count
+
+    '
+  when_applies: Projects using Apache Spark data processing or PySpark
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Spark or PySpark
+  sources: ["https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrame.coalesce.html"]
+- id: CR-SPARK-004
+  text: Cache DataFrames only when they are reused multiple times in the same job — and always call unpersist() when done.
+  why: Caching stores the DataFrame in executor memory (or disk, depending on storage level). If the DataFrame is used only
+    once, caching wastes memory and adds overhead (materialization time, garbage collection pressure). If the DataFrame is
+    reused 3+ times, caching avoids redundant recomputation and I/O. But forgetting to unpersist cached DataFrames accumulates
+    memory pressure across the job, eventually causing OOMs or spilling to disk that degrades performance.
+  how_to_do_right: Cache when a DataFrame is used 2+ times downstream (e.g., join + aggregation, or iterative algorithms).
+    Use .cache() for MEMORY_AND_DISK (default) or .persist(StorageLevel.MEMORY_ONLY) when you can tolerate recomputation on
+    eviction. Always call .unpersist() after the last use. Monitor the Storage tab in Spark UI to see cached DataFrames and
+    their memory usage. For DataFrames that do not fit in memory, use DISK_ONLY or do not cache.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [pyspark]
+    platform: [spark]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, engineering]
+  example_good: 'from pyspark import StorageLevel
+
+
+    # DataFrame reused in 3 operations — cache it
+
+    filtered_df = spark.read.parquet("s3://data/events/").filter("date = ''2026-02-17''")
+
+    filtered_df.cache()  # Materialize once
+
+
+    # Reuse 1: aggregate
+
+    daily_stats = filtered_df.groupBy("event_type").count()
+
+    daily_stats.write.parquet("s3://output/stats/")
+
+
+    # Reuse 2: join with users
+
+    enriched = filtered_df.join(users_df, on="user_id")
+
+    enriched.write.parquet("s3://output/enriched/")
+
+
+    # Reuse 3: anomaly detection
+
+    anomalies = filtered_df.filter("value > 1000")
+
+    anomalies.write.parquet("s3://output/anomalies/")
+
+
+    # Done — release memory
+
+    filtered_df.unpersist()
+
+    '
+  example_bad: '# Cache everything — memory pressure, GC storms
+
+    df1 = spark.read.parquet("s3://data/a/").cache()  # Used once
+
+    df2 = spark.read.parquet("s3://data/b/").cache()  # Used once
+
+    result = df1.join(df2, on="id")
+
+    result.write.parquet("s3://output/")
+
+    # df1 and df2 never unpersisted — 50GB wasted in executor memory
+
+    # Subsequent stages OOM because cache consumed all available memory
+
+    '
+  when_applies: Projects using Apache Spark data processing or PySpark
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Spark or PySpark
+  sources: ["https://spark.apache.org/docs/latest/rdd-programming-guide.html#rdd-persistence"]
+- id: CR-SPARK-005
+  text: Use built-in Spark functions instead of Python UDFs — UDFs disable Catalyst optimizations and add serialization overhead.
+  why: Python UDFs serialize each row from JVM to Python, execute the Python function, then serialize the result back to JVM.
+    This serialization round-trip costs 10-100x compared to built-in functions that execute entirely in the JVM. Additionally,
+    Catalyst cannot optimize through UDFs — it treats them as black boxes, preventing predicate pushdown, constant folding,
+    and whole-stage code generation. A single Python UDF in a pipeline can make the entire query 10x slower.
+  how_to_do_right: Check pyspark.sql.functions for built-in alternatives before writing a UDF. Use F.when/F.otherwise instead
+    of conditional UDFs. Use F.regexp_extract instead of regex UDFs. If you must use a UDF, use pandas UDFs (vectorized UDFs)
+    which operate on Arrow batches (10-100x faster than row-at-a-time UDFs). Register UDFs with explicit return types to avoid
+    double serialization.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pyspark, pandas]
+    platform: [spark]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, engineering]
+  example_good: "from pyspark.sql import functions as F\n\n# Built-in functions — Catalyst optimized, JVM-native execution\n\
+    result = df.withColumn(\n    \"category\",\n    F.when(F.col(\"amount\") > 1000, \"high\")\n     .when(F.col(\"amount\"\
+    ) > 100, \"medium\")\n     .otherwise(\"low\")\n).withColumn(\n    \"domain\", F.regexp_extract(F.col(\"email\"), r\"\
+    @(.+)$\", 1)\n)\n\n# If UDF is unavoidable — use pandas UDF (vectorized, Arrow-based)\nfrom pyspark.sql.functions import\
+    \ pandas_udf\nimport pandas as pd\n\n@pandas_udf(\"double\")\ndef haversine_distance(lat1: pd.Series, lon1: pd.Series,\n\
+    \                       lat2: pd.Series, lon2: pd.Series) -> pd.Series:\n    # Operates on Arrow batches — 100x faster\
+    \ than row UDF\n    dlat = np.radians(lat2 - lat1)\n    dlon = np.radians(lon2 - lon1)\n    # ... vectorized math ...\n\
+    \    return pd.Series(distances)\n"
+  example_bad: "from pyspark.sql.functions import udf\nfrom pyspark.sql.types import StringType\n\n# Row-at-a-time Python\
+    \ UDF — serialization per row\n@udf(StringType())\ndef categorize(amount):\n    if amount > 1000:\n        return \"high\"\
+    \n    elif amount > 100:\n        return \"medium\"\n    return \"low\"\n\nresult = df.withColumn(\"category\", categorize(F.col(\"\
+    amount\")))\n# Each row: JVM → serialize → Python → execute → serialize → JVM\n# Catalyst cannot push predicates through\
+    \ the UDF\n# 10-100x slower than F.when() equivalent\n"
+  when_applies: Projects using Apache Spark data processing, PySpark, or Pandas
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant
+  sources: ["https://spark.apache.org/docs/latest/sql-pyspark-pandas-with-arrow.html"]
+- id: CR-SPARK-006
+  text: Leverage partition pruning by including partition columns in WHERE clauses when reading partitioned datasets.
+  why: Partitioned datasets (Parquet, Delta, Hive tables) store data in directory structures like year=2026/month=02/day=17/.
+    Spark's Catalyst optimizer can skip entire directories that do not match the WHERE clause — this is partition pruning.
+    Without a filter on partition columns, Spark reads every partition (potentially terabytes of data). With the right filter,
+    it reads only the relevant partitions (possibly megabytes). This is often the single biggest performance optimization
+    for data lake queries.
+  how_to_do_right: Always include partition columns (date, region, event_type) in your WHERE clause or .filter(). Use explicit
+    date ranges instead of date functions that prevent pushdown (e.g., filter by string 'date >= 2026-02-01' not by current_date()
+    - 7). Verify pruning in Spark UI's SQL tab — look for PartitionFilters. Write data with a meaningful partition scheme
+    (date is most common).
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pyspark]
+    platform: [spark, parquet, delta_lake]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, engineering]
+  example_good: "# Partition pruning: reads only February 2026 data\ndf = (\n    spark.read.parquet(\"s3://data/events/\"\
+    )\n    .filter(\"year = 2026 AND month = 2\")  # Prunes to 1/24 of data\n    .filter(F.col(\"event_type\") == \"purchase\"\
+    )\n)\n# Spark UI: PartitionFilters: [year=2026, month=2]\n# Reads: 2 directories instead of 48\n\n# Write with partition\
+    \ scheme for future pruning\nevents_df.write.partitionBy(\"year\", \"month\").parquet(\"s3://data/events/\")\n"
+  example_bad: "# No partition filter — reads ALL partitions (48 months of data)\ndf = spark.read.parquet(\"s3://data/events/\"\
+    ).filter(\"event_type = 'purchase'\")\n# Spark reads every year/month directory, then filters event_type in memory\n#\
+    \ 10TB read instead of 400GB\n\n# UDF prevents partition pushdown\n@udf(\"boolean\")\ndef is_recent(date_str):\n    return\
+    \ date_str >= \"2026-02-01\"\ndf = spark.read.parquet(\"s3://data/events/\").filter(is_recent(F.col(\"date\")))\n# Catalyst\
+    \ cannot push UDF to partition pruning — reads everything\n"
+  when_applies: Projects using Apache Spark data processing, PySpark, Parquet, or Delta Lake
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant
+  sources: ["https://spark.apache.org/docs/latest/sql-data-sources-parquet.html#partition-discovery"]
+- id: CR-SPARK-007
+  text: Configure watermarks in Structured Streaming to bound state and handle late data — without watermarks, state grows
+    unbounded.
+  why: Streaming aggregations and joins maintain state for every group key. Without watermarks, Spark has no way to know when
+    a group is 'complete' and keeps all historical state in memory forever. For a stream aggregating by user_id over event_time
+    windows, after 24 hours you have state for every user who has ever sent an event. This causes executor OOMs, checkpoint
+    bloat, and restart recovery taking hours. Watermarks tell Spark 'data older than X will not arrive' so it can drop old
+    state.
+  how_to_do_right: Call .withWatermark('event_time', 'threshold') before aggregation or join. Set threshold based on your
+    data's maximum expected lateness (e.g., '10 minutes' for real-time, '1 hour' for batch-like streaming). Use append output
+    mode (results after watermark crosses window boundary) for downstream sinks. Monitor state size in Spark UI's Structured
+    Streaming tab.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [pyspark]
+    library: [structured streaming]
+    platform: [spark]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, engineering, streaming]
+  example_good: "from pyspark.sql import functions as F\n\nevents = (\n    spark.readStream\n    .format(\"kafka\")\n    .option(\"\
+    subscribe\", \"events\")\n    .load()\n    .selectExpr(\"CAST(value AS STRING)\", \"timestamp AS event_time\")\n)\n\n\
+    # Watermark: data arriving >10 minutes late is dropped\nwindowed_counts = (\n    events\n    .withWatermark(\"event_time\"\
+    , \"10 minutes\")  # Bound state\n    .groupBy(\n        F.window(\"event_time\", \"5 minutes\"),     # 5-minute tumbling\
+    \ windows\n        \"event_type\"\n    )\n    .count()\n)\n\n# Append mode: emit final results after watermark passes\
+    \ window boundary\nquery = (\n    windowed_counts.writeStream\n    .outputMode(\"append\")\n    .format(\"parquet\")\n\
+    \    .option(\"path\", \"s3://output/windowed_counts/\")\n    .option(\"checkpointLocation\", \"s3://checkpoints/windowed_counts/\"\
+    )\n    .trigger(processingTime=\"1 minute\")\n    .start()\n)\n"
+  example_bad: "# No watermark — state grows unbounded, OOM after hours\nwindowed_counts = (\n    events\n    # .withWatermark()\
+    \ missing!\n    .groupBy(F.window(\"event_time\", \"5 minutes\"), \"event_type\")\n    .count()\n)\n# After 24 hours:\
+    \ millions of window-key combinations in memory\n# Executor OOM, checkpoint recovery takes hours\n"
+  when_applies: Any project using Apache Spark data processing, Structured Streaming, or PySpark
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html#handling-late-data-and-watermarking"]
+- id: CR-SPARK-008
+  text: Handle data skew in joins and aggregations using salting or AQE — a single skewed key can bottleneck the entire job.
+  why: Spark partitions data by key hash during shuffles. If one key has 1000x more records than others (e.g., 'null' user_id,
+    one popular product, one large customer), all those records go to a single task. That task takes hours while 199 other
+    tasks finish in seconds. The job's runtime equals the slowest task. AQE (Adaptive Query Execution) can automatically handle
+    moderate skew, but extreme skew requires manual salting.
+  how_to_do_right: 'Enable AQE: spark.sql.adaptive.enabled=true, spark.sql.adaptive.skewJoin.enabled=true (default in Spark
+    3.0+). For extreme skew, use salting: add a random suffix (0-N) to the skewed key in both tables, join on salted key,
+    then aggregate to remove the salt. Monitor the Spark UI''s Stages tab for tasks with execution time >>median. Target:
+    max task time < 2x median task time.'
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pyspark]
+    platform: [spark]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, engineering]
+  example_good: "# Enable AQE for automatic skew handling (Spark 3.0+)\nspark.conf.set(\"spark.sql.adaptive.enabled\", \"\
+    true\")\nspark.conf.set(\"spark.sql.adaptive.skewJoin.enabled\", \"true\")\nspark.conf.set(\"spark.sql.adaptive.skewJoin.skewedPartitionFactor\"\
+    , \"5\")\n\n# Manual salting for extreme skew (one key = 80% of data)\nfrom pyspark.sql import functions as F\n\nSALT_BUCKETS\
+    \ = 10\n\n# Salt the large (fact) table\nsalted_facts = facts.withColumn(\n    \"salt\", (F.rand() * SALT_BUCKETS).cast(\"\
+    int\")\n).withColumn(\n    \"salted_key\", F.concat(F.col(\"join_key\"), F.lit(\"_\"), F.col(\"salt\"))\n)\n\n# Explode\
+    \ the small (dimension) table across all salt values\nsalt_range = spark.range(SALT_BUCKETS).withColumnRenamed(\"id\"\
+    , \"salt\")\nsalted_dim = dim.crossJoin(salt_range).withColumn(\n    \"salted_key\", F.concat(F.col(\"join_key\"), F.lit(\"\
+    _\"), F.col(\"salt\"))\n)\n\n# Join on salted key — skewed key distributed across 10 tasks\nresult = salted_facts.join(salted_dim,\
+    \ on=\"salted_key\").drop(\"salt\", \"salted_key\")\n"
+  example_bad: '# Regular join with skewed key — one task gets 80% of data
+
+    result = facts.join(dim, on="customer_id")
+
+    # Task 47: 500GB, 3 hours
+
+    # Tasks 0-46, 48-199: 2GB each, 2 minutes each
+
+    # Job runtime: 3 hours (bottlenecked by task 47)
+
+    '
+  when_applies: Projects using Apache Spark data processing or PySpark
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Spark or PySpark
+  sources: ["https://spark.apache.org/docs/latest/sql-performance-tuning.html#adaptive-query-execution"]
+- id: CR-SPARK-009
+  text: Set executor memory, overhead, and off-heap memory correctly — OOMs are the most common Spark failure mode.
+  why: 'Spark executors have three memory regions: JVM heap (spark.executor.memory), off-heap overhead (spark.executor.memoryOverhead),
+    and optional Tungsten off-heap. The default memoryOverhead is 10% of heap or 384MB (whichever is larger), which is often
+    insufficient for PySpark workloads (Python processes, Arrow serialization, pandas UDFs). When overhead is exhausted, the
+    container is killed by YARN/Kubernetes with a cryptic ''Container killed by the ApplicationMaster'' error, not a Java
+    OOM.'
+  how_to_do_right: 'For PySpark: set memoryOverhead to 20-30% of executor memory. For Scala: 10-15% is usually sufficient.
+    Total container memory = spark.executor.memory + spark.executor.memoryOverhead. For YARN/K8s, ensure the container request
+    fits the node. Rule of thumb: 4-8GB executor heap with 1-2GB overhead for most workloads. Monitor executor memory in Spark
+    UI''s Executors tab. If using pandas UDFs heavily, increase overhead to 40%.'
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pyspark]
+    library: [yarn]
+    platform: [spark, kubernetes]
+  domains:
+    domain: [architecture, performance, operations]
+    concern: [data, engineering]
+  example_good: "# PySpark job with adequate memory allocation\nspark = (\n    SparkSession.builder\n    .appName(\"etl_pipeline\"\
+    )\n    .config(\"spark.executor.memory\", \"8g\")           # JVM heap\n    .config(\"spark.executor.memoryOverhead\"\
+    , \"2g\")    # Off-heap (Python, Arrow)\n    .config(\"spark.executor.cores\", 4)                # 4 tasks per executor\n\
+    \    .config(\"spark.driver.memory\", \"4g\")\n    .config(\"spark.driver.memoryOverhead\", \"1g\")\n    .config(\"spark.sql.shuffle.partitions\"\
+    , 200)      # Match cluster parallelism\n    .config(\"spark.memory.fraction\", 0.6)             # 60% for execution/storage\n\
+    \    .config(\"spark.memory.storageFraction\", 0.5)      # 50% of that for cache\n    .getOrCreate()\n)\n# Total per executor:\
+    \ 8g heap + 2g overhead = 10g container\n"
+  example_bad: "spark = (\n    SparkSession.builder\n    .config(\"spark.executor.memory\", \"16g\")           # Large heap\n\
+    \    # memoryOverhead defaults to max(0.1 * 16g, 384MB) = 1.6g\n    # PySpark pandas UDF uses 4g Python memory → container\
+    \ killed\n    .config(\"spark.executor.cores\", 8)                # Too many cores per executor\n    # 8 tasks compete\
+    \ for 16g heap = 2g per task = frequent spills\n    .getOrCreate()\n)\n"
+  when_applies: Projects using Apache Spark data processing, PySpark, YARN, or Kubernetes-orchestrated deployments
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant
+  sources: ["https://spark.apache.org/docs/latest/configuration.html#memory-management"]
+- id: CR-SPARK-010
+  text: Use Kryo serialization instead of Java serialization for RDD-based operations and custom objects.
+  why: Java serialization is the default in Spark but produces 2-5x larger serialized objects than Kryo and is 10x slower
+    to serialize/deserialize. For RDD operations that shuffle custom objects (case classes, POJOs), the serialization overhead
+    during shuffle can dominate job runtime. Kryo is not the default because it requires class registration for full performance,
+    but the payoff is substantial for shuffle-heavy jobs.
+  how_to_do_right: 'Set spark.serializer=org.apache.spark.serializer.KryoSerializer. Register frequently shuffled classes
+    with spark.kryo.classesToRegister. Set spark.kryo.registrationRequired=false initially, then switch to true after registering
+    all classes (catches unregistered classes with clear errors instead of slow fallback). Note: Kryo mainly affects RDD operations
+    and broadcast variables — DataFrames use Tungsten''s own serialization.'
+  severity: medium
+  technologies:
+    lang: [python, scala]
+    framework: [pyspark]
+    platform: [spark]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, engineering]
+  example_good: "# Kryo serialization configuration\nspark = (\n    SparkSession.builder\n    .config(\"spark.serializer\"\
+    , \"org.apache.spark.serializer.KryoSerializer\")\n    .config(\"spark.kryo.registrationRequired\", \"false\")  # Warn,\
+    \ don't fail\n    .config(\"spark.kryoserializer.buffer.max\", \"1g\")\n    .getOrCreate()\n)\n\n# In Scala, register\
+    \ custom classes\n# conf.registerKryoClasses(Array(\n#   classOf[UserEvent],\n#   classOf[ProductInfo],\n#   classOf[TransactionRecord],\n\
+    # ))\n"
+  example_bad: '# Default Java serialization — 2-5x larger objects, 10x slower
+
+    spark = SparkSession.builder.getOrCreate()
+
+    # spark.serializer defaults to org.apache.spark.serializer.JavaSerializer
+
+    # Shuffle of 100M custom objects: 50GB with Java, 15GB with Kryo
+
+    # Shuffle time: 20 minutes with Java, 5 minutes with Kryo
+
+    '
+  when_applies: Projects using Apache Spark data processing, PySpark, or Scala
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant
+  sources: ["https://spark.apache.org/docs/latest/tuning.html#data-serialization"]
+- id: CR-SPARK-011
+  text: Enable dynamic allocation for multi-tenant clusters — but set min/max executors to prevent resource starvation.
+  why: 'Fixed executor allocation wastes resources: a job that needs 100 executors during its shuffle phase only needs 10
+    during its file write phase, but holds all 100 for the entire duration. Dynamic allocation scales executors up during
+    high-parallelism phases and releases them during low-parallelism phases. However, without min/max bounds, a single job
+    can monopolize the entire cluster during a burst, starving other jobs.'
+  how_to_do_right: Enable spark.dynamicAllocation.enabled=true. Set minExecutors to avoid cold-start latency (start with enough
+    for baseline). Set maxExecutors to your fair share of the cluster. Set executorIdleTimeout to 60-120s (how long before
+    idle executors are released). Set schedulerBacklogTimeout to 5-10s (how long before requesting more executors). Requires
+    an external shuffle service (spark.shuffle.service.enabled=true) so executors can be removed without losing shuffle data.
+  severity: medium
+  technologies:
+    library: [yarn]
+    platform: [spark, kubernetes]
+  domains:
+    domain: [architecture, performance, operations]
+    concern: [data, engineering]
+  example_good: "spark = (\n    SparkSession.builder\n    .config(\"spark.dynamicAllocation.enabled\", \"true\")\n    .config(\"\
+    spark.dynamicAllocation.minExecutors\", 2)       # Always have 2 ready\n    .config(\"spark.dynamicAllocation.maxExecutors\"\
+    , 50)      # Cap at 50\n    .config(\"spark.dynamicAllocation.executorIdleTimeout\", \"120s\")\n    .config(\"spark.dynamicAllocation.schedulerBacklogTimeout\"\
+    , \"10s\")\n    .config(\"spark.shuffle.service.enabled\", \"true\")         # Required for dynamic alloc\n    .getOrCreate()\n\
+    )\n"
+  example_bad: "# Fixed allocation — holds 100 executors for entire 2-hour job\nspark = (\n    SparkSession.builder\n    .config(\"\
+    spark.executor.instances\", 100)  # Fixed, no release\n    .getOrCreate()\n)\n# Phase 1 (shuffle): uses 100 executors\
+    \ for 20 minutes\n# Phase 2 (write): uses 5 executors for 100 minutes\n# 95 executors idle for 100 minutes — wasted cluster\
+    \ resources\n"
+  when_applies: Projects using Apache Spark data processing, YARN, or Kubernetes-orchestrated deployments
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant
+  sources: ["https://spark.apache.org/docs/latest/configuration.html#dynamic-allocation"]
+- id: CR-SPARK-012
+  text: Control output file count and size — too many small files degrade downstream read performance and overload metadata
+    services.
+  why: 'Spark writes one output file per task per partition. A job with 1000 tasks writing to a partitioned dataset can create
+    10,000+ small files (1-10MB each). Small files are catastrophic for downstream performance: each file requires a separate
+    metadata lookup (HDFS NameNode or S3 LIST), sequential file open/close overhead, and prevents efficient columnar reads
+    (Parquet/ORC work best with 128MB-1GB files). S3 LIST operations have a 5,000 object/request limit, making directories
+    with 100K files extremely slow to read.'
+  how_to_do_right: Use coalesce(N) before write to control file count. Target 128MB-1GB per output file. For partitioned writes,
+    use repartition(partition_cols) to align task output with partition boundaries. Use maxRecordsPerFile option to cap individual
+    file size. Monitor output with a post-write validation step that counts files and sizes.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pyspark]
+    library: [hdfs]
+    platform: [spark, parquet, aws, s3]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, engineering]
+  example_good: "# Control output: 128MB target per file, partitioned by date\nTARGET_FILE_SIZE_MB = 128\ninput_size_mb =\
+    \ df.rdd.map(lambda r: len(str(r))).sum() / (1024 * 1024)\ntarget_files = max(1, int(input_size_mb / TARGET_FILE_SIZE_MB))\n\
+    \n(\n    df\n    .repartition(\"date\")          # Align partitions with output directories\n    .coalesce(target_files)\
+    \        # Control file count within each partition\n    .write\n    .partitionBy(\"date\")\n    .option(\"maxRecordsPerFile\"\
+    , 1000000)  # Safety cap per file\n    .mode(\"overwrite\")\n    .parquet(\"s3://data/output/\")\n)\n"
+  example_bad: '# 10,000 tasks = 10,000 small files per partition
+
+    df.write.partitionBy("date").parquet("s3://data/output/")
+
+    # Result: date=2026-02-17/ contains 10,000 files of 1MB each
+
+    # Downstream spark.read.parquet: 30 seconds just listing files
+
+    # S3 LIST pagination: 2 API calls just to enumerate the directory
+
+    '
+  when_applies: Projects using Apache Spark data processing, PySpark, Parquet, or AWS S3 object storage
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant
+  sources: ["https://spark.apache.org/docs/latest/sql-data-sources-parquet.html"]
+- id: CR-SPARK-013
+  text: Set checkpoint directory for Structured Streaming and long iterative jobs — without it, lineage grows unbounded.
+  why: Spark recomputes lost partitions by replaying the RDD lineage (transformation chain). For streaming jobs, the lineage
+    grows with every micro-batch. For iterative algorithms (ML training, graph algorithms), the lineage grows with every iteration.
+    After 100 iterations, recomputing a lost partition requires replaying 100 transformations, causing StackOverflow errors
+    and catastrophic recovery times. Checkpointing truncates the lineage by materializing the RDD/DataFrame to reliable storage.
+  how_to_do_right: 'For Structured Streaming: set checkpointLocation option on writeStream (mandatory). For iterative batch
+    jobs: call rdd.checkpoint() every 10-20 iterations and set spark.sparkContext.setCheckpointDir(). Use HDFS or S3 for checkpoint
+    storage (must be reliable, not local disk). For streaming, checkpoint recovery requires the same query (same transformations)
+    — breaking changes require a new checkpoint directory.'
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pyspark]
+    library: [structured streaming]
+    platform: [spark]
+  domains:
+    domain: [architecture, reliability]
+    concern: [data, engineering, streaming]
+  example_good: "# Structured Streaming — checkpoint is mandatory\nspark.sparkContext.setCheckpointDir(\"s3://checkpoints/app/\"\
+    )\n\nquery = (\n    streaming_df\n    .writeStream\n    .format(\"parquet\")\n    .option(\"path\", \"s3://data/output/\"\
+    )\n    .option(\"checkpointLocation\", \"s3://checkpoints/streaming_query_1/\")\n    .trigger(processingTime=\"1 minute\"\
+    )\n    .start()\n)\n\n# Iterative batch job — checkpoint every 10 iterations\nspark.sparkContext.setCheckpointDir(\"s3://checkpoints/pagerank/\"\
+    )\nfor i in range(100):\n    ranks = links.join(ranks).mapValues(compute_rank)\n    if i % 10 == 0:\n        ranks.checkpoint()\
+    \  # Truncate lineage every 10 iterations\n        ranks.count()       # Force materialization\n"
+  example_bad: "# Streaming without checkpoint — cannot recover from failures\nquery = streaming_df.writeStream.format(\"\
+    parquet\").start()\n# On failure: all progress lost, starts from scratch\n# After recovery: duplicates in output (no exactly-once\
+    \ without checkpoint)\n\n# Iterative job without checkpoint — lineage explosion\nfor i in range(1000):\n    ranks = links.join(ranks).mapValues(compute_rank)\n\
+    # After 1000 iterations: lineage has 1000 stages\n# Lost partition = replay 1000 transformations = StackOverflowError\n"
+  when_applies: Projects using Apache Spark data processing, Structured Streaming, or PySpark
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html#recovering-from-failures-with-checkpointing"]
+- id: CR-SPARK-014
+  text: Enable Adaptive Query Execution (AQE) for automatic shuffle partition coalescing, skew join handling, and join strategy
+    switching.
+  why: Without AQE, spark.sql.shuffle.partitions defaults to 200 for all shuffles regardless of data size. A 10MB dataset
+    gets split into 200 tasks (50KB each — massive overhead). A 1TB dataset has 200 tasks of 5GB each (too large, OOM). AQE
+    adjusts shuffle partition count at runtime based on actual data sizes, converts sort-merge joins to broadcast joins when
+    one side is smaller than expected, and splits skewed partitions automatically.
+  how_to_do_right: Enable spark.sql.adaptive.enabled=true (default in Spark 3.2+). Set spark.sql.adaptive.coalescePartitions.enabled=true
+    for auto-coalescing. Set spark.sql.adaptive.skewJoin.enabled=true for skew handling. Set advisoryPartitionSizeInBytes
+    to target partition size (128MB default). AQE works with SQL and DataFrame API transparently. Monitor in Spark UI's SQL
+    tab — look for 'AQE' badges on stages.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [pyspark]
+    platform: [spark]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, engineering]
+  example_good: "spark = (\n    SparkSession.builder\n    .config(\"spark.sql.adaptive.enabled\", \"true\")\n    .config(\"\
+    spark.sql.adaptive.coalescePartitions.enabled\", \"true\")\n    .config(\"spark.sql.adaptive.skewJoin.enabled\", \"true\"\
+    )\n    .config(\"spark.sql.adaptive.advisoryPartitionSizeInBytes\", \"128m\")\n    .config(\"spark.sql.adaptive.coalescePartitions.minPartitionSize\"\
+    , \"1m\")\n    .config(\"spark.sql.shuffle.partitions\", 1000)  # AQE will coalesce as needed\n    .getOrCreate()\n)\n\
+    \n# Set shuffle.partitions high — AQE coalesces empty/small partitions\n# 1000 initial partitions → AQE coalesces to ~50\
+    \ for small dataset\n"
+  example_bad: "spark = (\n    SparkSession.builder\n    .config(\"spark.sql.adaptive.enabled\", \"false\")\n    .config(\"\
+    spark.sql.shuffle.partitions\", 200)   # Fixed for all shuffles\n    .getOrCreate()\n)\n# 10MB dataset: 200 tasks of 50KB\
+    \ each — scheduling overhead > actual work\n# 1TB dataset: 200 tasks of 5GB each — OOMs, long GC pauses\n"
+  when_applies: Projects using Apache Spark data processing or PySpark
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Spark or PySpark
+  sources: ["https://spark.apache.org/docs/latest/sql-performance-tuning.html#adaptive-query-execution"]
+- id: CR-SPARK-015
+  text: Use Delta Lake or Iceberg for data lake tables that need ACID transactions, schema evolution, and time travel.
+  why: Plain Parquet on S3/HDFS has no atomicity (partial writes visible to readers during job failure), no schema enforcement
+    (any schema can be written to the same directory), and no efficient updates or deletes. A failed Spark job can leave partial
+    data that corrupts downstream queries. Concurrent writes can overwrite each other. Delta Lake and Iceberg add a transaction
+    log that provides ACID, schema enforcement, time travel, and efficient merge/update/delete operations.
+  how_to_do_right: Use Delta Lake (Databricks ecosystem) or Apache Iceberg (vendor-neutral) as your table format. Write with
+    format('delta') or format('iceberg'). Use MERGE INTO for upserts instead of read-modify-write. Enable schema enforcement
+    (mergeSchema=false by default in Delta). Use time travel for debugging (VERSION AS OF, TIMESTAMP AS OF). Vacuum old data
+    files periodically.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [pyspark]
+    platform: [spark, delta_lake, iceberg]
+  domains:
+    domain: [architecture, reliability]
+    concern: [data, engineering, data_lake]
+  example_good: "# Delta Lake: ACID writes, schema enforcement, time travel\n(\n    df.write\n    .format(\"delta\")\n   \
+    \ .mode(\"overwrite\")\n    .option(\"overwriteSchema\", \"false\")  # Reject schema changes\n    .save(\"s3://data/orders_delta/\"\
+    )\n)\n\n# MERGE (upsert) — atomically insert or update\nfrom delta.tables import DeltaTable\n\ntarget = DeltaTable.forPath(spark,\
+    \ \"s3://data/orders_delta/\")\ntarget.alias(\"t\").merge(\n    updates_df.alias(\"u\"),\n    \"t.order_id = u.order_id\"\
+    \n).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()\n\n# Time travel for debugging\nyesterday = spark.read.format(\"\
+    delta\").option(\"versionAsOf\", 42).load(\"s3://data/orders_delta/\")\n"
+  example_bad: '# Plain Parquet — no transactions, no schema enforcement
+
+    df.write.mode("overwrite").parquet("s3://data/orders/")
+
+    # If job fails mid-write: partial files visible to readers
+
+    # Concurrent write: overwrites other job''s data silently
+
+    # Schema change: no validation, downstream queries break at runtime
+
+    '
+  when_applies: Projects using Apache Spark data processing, Delta Lake, Iceberg, or PySpark
+  sources: ["https://docs.delta.io/latest/index.html", "https://iceberg.apache.org/docs/latest/"]

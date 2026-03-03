@@ -1,0 +1,216 @@
+layer: rules
+technology: SRE
+domain: kubernetes
+knowledge:
+- id: CR-SRE-K8S-001
+  text: Set resource requests AND limits for every container. Without requests, the scheduler cannot make intelligent placement decisions. Without limits, a single runaway container can consume all node
+    resources and crash every other container on the node.
+  why: 'Google''s Borg system (the predecessor to Kubernetes, described across multiple SRE Book chapters) requires resource declarations for every job. Kubernetes inherited this principle but many teams
+    skip it — deploying containers with no resource requests or limits. Without requests, the Kubernetes scheduler places pods randomly, potentially overcommitting nodes. Without limits, a memory leak in
+    one container grows until OOM-killer kills random containers on the same node — including healthy ones. Google''s rule: requests define the GUARANTEED resources (scheduler uses these for placement),
+    limits define the MAXIMUM resources (kernel enforces these via cgroups). Both are mandatory. The gap between request and limit is the "burst" capacity — useful for handling traffic spikes but dangerous
+    if every container bursts simultaneously.
+
+    '
+  how_to_do_right: '1. Set CPU and memory requests based on steady-state usage (measured, not guessed). Use `kubectl top pods` and metrics-server.
+
+    2. Set CPU limits to 2-3x the request (allow bursting). Set memory limits to 1.2-1.5x the request (memory overcommit is dangerous).
+
+    3. Never set memory request = memory limit unless you want guaranteed QoS (which prevents overcommit and wastes resources).
+
+    4. Monitor resource usage vs requests: if actual usage is consistently < 50% of request, the request is too high (wasting resources).
+
+    5. Use Vertical Pod Autoscaler (VPA) recommendations to right-size resource requests based on actual usage patterns.
+
+    6. Test with resource limits: deliberately set tight limits and verify the application degrades gracefully rather than crashing.
+
+    '
+  example_good: "# Kubernetes deployment with proper resource requests AND limits\napiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n      - name: api-server\n        resources:\n          requests:\n            cpu: \"250m\"      # Guaranteed: scheduler uses for placement\n            memory: \"256Mi\"\n          limits:\n            cpu: \"750m\"      # Max: 3x request for burst capacity\n            memory: \"384Mi\"  # Max: 1.5x request (safe for memory)\n"
+  example_bad: "# No resource requests or limits — scheduler guesses, OOM-killer strikes randomly\napiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n      - name: api-server\n        image: api:latest\n        # No resources block at all!\n        # Scheduler places pods randomly, memory leak crashes neighbors\n"
+  when_applies: "When defining any Kubernetes Deployment, StatefulSet, or Job that will run in a shared cluster."
+  severity: high
+  technologies:
+    platform: [cloud, docker, kubernetes]
+  domains:
+    domain: [code_quality, deployment, reliability, planning]
+    concern: [resource_management, orchestration, kubernetes, capacity]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-K8S-002
+  text: Readiness probes prevent traffic from reaching unready pods. Liveness probes restart stuck pods. Startup probes give slow-starting apps time to initialize. All three serve different purposes — using
+    only liveness probes is the most common Kubernetes misconfiguration.
+  why: 'Google''s Borg uses health checks extensively, and Kubernetes provides three probe types that map to different failure modes. Liveness probe: "Is the process fundamentally alive?" If no, Kubernetes
+    kills and restarts the pod. Readiness probe: "Can the process accept new traffic?" If no, Kubernetes removes the pod from the service endpoint (no traffic, but no restart). Startup probe: "Has the process
+    finished initializing?" Until it passes, liveness and readiness probes are not checked. The most common misconfiguration: using liveness probes for everything. If a pod is slow because the database
+    is overloaded, a liveness probe restart makes things WORSE (cold cache, reconnection, lost in-flight requests). A readiness probe would simply stop sending traffic while the pod recovers.
+
+    '
+  how_to_do_right: '1. Readiness probe: check if the application can serve requests (database connected, cache warm, dependencies reachable). Remove from service if not.
+
+    2. Liveness probe: check if the application is fundamentally broken (deadlock, infinite loop). Restart only if fatally stuck.
+
+    3. Startup probe: for slow-starting applications (JVM warmup, data loading). Give it a generous timeout (e.g., 300 seconds).
+
+    4. NEVER use the same check for liveness and readiness. A slow database should cause readiness failure (remove traffic), not liveness failure (restart).
+
+    5. Liveness probe should check LOCAL health only — not external dependencies. If the database is down, restarting the pod won''t fix it.
+
+    6. Set probe timeouts and failure thresholds carefully: failureThreshold=3, periodSeconds=10 means 30 seconds before action — too long or too short for your case?
+
+    '
+  example_good: "# Separate probes for different failure modes\napiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n      - name: api-server\n        readinessProbe:      # Can it serve traffic?\n          httpGet:\n            path: /healthz/ready  # Checks DB connection, cache warmth\n            port: 8080\n          periodSeconds: 5\n          failureThreshold: 3\n        livenessProbe:       # Is it fundamentally alive?\n          httpGet:\n            path: /healthz/live   # Only checks LOCAL health (deadlock, crash)\n            port: 8080\n          periodSeconds: 10\n          failureThreshold: 5\n        startupProbe:        # Has it finished initializing?\n          httpGet:\n            path: /healthz/live\n            port: 8080\n          failureThreshold: 30   # 30 * 10s = 300s for slow starts\n          periodSeconds: 10\n"
+  example_bad: "# Same probe for liveness and readiness — causes restart storms\ncontainers:\n- name: api-server\n  livenessProbe:\n    httpGet:\n      path: /healthz  # Checks DB connectivity\n      port: 8080\n    periodSeconds: 5\n    failureThreshold: 2\n  # No readiness probe! No startup probe!\n  # If DB is slow, liveness fails, pod restarts, cold cache, even slower\n"
+  when_applies: "When configuring health checks for any Kubernetes pod that serves traffic or has external dependencies."
+  severity: high
+  technologies:
+    platform: [docker, kubernetes]
+  domains:
+    domain: [deployment, observability, reliability]
+    concern: [orchestration, kubernetes, monitoring, health_checks]
+  sources:
+  - url: https://sre.google/sre-book/load-balancing-datacenter/
+    title: 'Google SRE Book — Chapter 20: Load Balancing in the Datacenter'
+  validation_status: cross_checked
+- id: CR-SRE-K8S-003
+  text: Pod Disruption Budgets (PDBs) prevent Kubernetes from evicting too many pods simultaneously during voluntary disruptions (node drain, cluster upgrade, autoscaling). Without PDBs, a node drain can
+    take down your entire service if all pods happen to be on that node.
+  why: 'Kubernetes performs voluntary disruptions frequently: node upgrades, cluster autoscaling, spot instance reclamation, pod rescheduling. During a voluntary disruption, Kubernetes evicts pods from
+    nodes. Without a PDB, it can evict ALL pods of a service simultaneously — causing complete downtime until new pods start on other nodes. With a PDB (e.g., minAvailable=2 or maxUnavailable=1), Kubernetes
+    ensures that at least N pods remain running during disruption. It will wait to evict pods until doing so doesn''t violate the budget. PDBs are essential for any service that requires high availability
+    during maintenance operations.
+
+    '
+  how_to_do_right: '1. Create a PDB for every production deployment. Use maxUnavailable=1 for services that can tolerate losing one pod, minAvailable=N for services with strict availability requirements.
+
+    2. Size PDBs relative to replica count: with 3 replicas, maxUnavailable=1 means at least 2 are always running.
+
+    3. Test PDBs by draining a node and verifying that the service remains available throughout the drain.
+
+    4. PDBs only protect against VOLUNTARY disruptions. Node failures (involuntary) ignore PDBs. You still need enough replicas to survive node failures.
+
+    5. Don''t set PDBs too restrictive: minAvailable=replicaCount blocks ALL voluntary disruptions. Maintenance becomes impossible.
+
+    6. Monitor PDB violations: if Kubernetes cannot evict pods due to PDB constraints, cluster maintenance is blocked.
+
+    '
+  example_good: "# PDB ensures at least 2 pods survive voluntary disruptions\napiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: api-server-pdb\nspec:\n  maxUnavailable: 1  # At most 1 pod evicted at a time\n  selector:\n    matchLabels:\n      app: api-server\n# With 3 replicas + maxUnavailable=1: always >= 2 running during drains\n"
+  example_bad: "# No PDB — node drain evicts ALL pods simultaneously\n# kubectl drain node-1 --ignore-daemonsets\n# All 3 api-server pods on node-1 are evicted at once\n# Service has 0 replicas for 30-60 seconds until new pods start\n# Complete downtime during a routine maintenance operation\n"
+  when_applies: "When running any production Kubernetes workload with multiple replicas that must remain available during cluster maintenance."
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [deployment, reliability]
+    concern: [orchestration, kubernetes, availability]
+  sources:
+  - url: https://sre.google/sre-book/reliable-product-launches/
+    title: 'Google SRE Book — Chapter 27: Reliable Product Launches at Scale'
+  validation_status: cross_checked
+- id: CR-SRE-K8S-004
+  text: Spread pods across failure domains using topology spread constraints or pod anti-affinity. If all replicas land on the same node (or same AZ), a single node (or AZ) failure takes down all replicas
+    simultaneously.
+  why: 'Kubernetes scheduler optimizes for resource utilization, not failure domain spreading. Without explicit spreading constraints, the scheduler may place all 3 replicas of a service on the same node
+    (because it has the most free resources) or the same availability zone (because pods there start faster). When that node or AZ fails, all 3 replicas are lost simultaneously. Google''s Borg automatically
+    spreads tasks across failure domains, and Kubernetes provides the same capability through topology spread constraints and pod anti-affinity rules. These tell the scheduler to distribute pods across
+    nodes, racks, zones, and regions — ensuring that a single failure domain loss only affects a fraction of replicas.
+
+    '
+  how_to_do_right: '1. Use topologySpreadConstraints to spread pods across zones: maxSkew=1, topologyKey=topology.kubernetes.io/zone.
+
+    2. Use pod anti-affinity to prevent multiple replicas from landing on the same node: requiredDuringScheduling, topologyKey=kubernetes.io/hostname.
+
+    3. For critical services, spread across BOTH zones and nodes: zone-level spread + node-level anti-affinity.
+
+    4. Verify spreading: `kubectl get pods -o wide` should show pods on different nodes in different zones.
+
+    5. Test failure: drain one node and verify that surviving pods handle the load.
+
+    6. Balance spreading with scheduling speed: strict spreading (required) may delay pod scheduling if resources are uneven across zones.
+
+    '
+  example_good: "# Spread pods across zones AND nodes\napiVersion: apps/v1\nkind: Deployment\nspec:\n  replicas: 3\n  template:\n    spec:\n      topologySpreadConstraints:\n      - maxSkew: 1\n        topologyKey: topology.kubernetes.io/zone\n        whenUnsatisfiable: DoNotSchedule\n        labelSelector:\n          matchLabels:\n            app: api-server\n      affinity:\n        podAntiAffinity:\n          requiredDuringSchedulingIgnoredDuringExecution:\n          - labelSelector:\n              matchExpressions:\n              - key: app\n                operator: In\n                values: [api-server]\n            topologyKey: kubernetes.io/hostname\n"
+  example_bad: "# No spreading constraints — scheduler puts all pods on the cheapest node\napiVersion: apps/v1\nkind: Deployment\nspec:\n  replicas: 3\n  template:\n    spec:\n      containers:\n      - name: api-server\n        image: api:latest\n      # All 3 replicas land on node-1 (most free resources)\n      # node-1 fails -> 0 replicas -> complete outage\n"
+  when_applies: "When deploying any multi-replica workload in Kubernetes across nodes or availability zones."
+  severity: high
+  technologies:
+    platform: [cloud, kubernetes]
+  domains:
+    domain: [deployment, reliability]
+    concern: [orchestration, kubernetes, availability, resilience, failure_domains]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: 'Google SRE Book — Chapter 22: Addressing Cascading Failures'
+  validation_status: cross_checked
+- id: CR-SRE-K8S-005
+  text: Graceful shutdown is mandatory — when Kubernetes sends SIGTERM, the application must finish in-flight requests, close connections cleanly, and exit. Without graceful shutdown, every deployment causes
+    request failures for active users.
+  why: 'Kubernetes sends SIGTERM to a pod before killing it (default 30-second grace period). If the application doesn''t handle SIGTERM — which is the case for many applications by default — Kubernetes
+    sends SIGKILL after the grace period, forcibly killing the process. In-flight requests are dropped, database connections are left in an unclean state, and users see errors. Google''s services handle
+    shutdown signals by: stopping acceptance of new requests (removing from service endpoint), completing in-flight requests (draining), closing downstream connections cleanly, and flushing buffers/caches.
+    Combined with a preStop hook that gives the service mesh time to remove the pod from endpoints, this enables zero-downtime deployments.
+
+    '
+  how_to_do_right: '1. Handle SIGTERM in your application: stop accepting new requests, finish in-flight requests, close connections, exit cleanly.
+
+    2. Set terminationGracePeriodSeconds to at least: max_request_duration + connection_drain_time + 5 seconds buffer.
+
+    3. Use a preStop hook with a small sleep (5-10 seconds) to give the service mesh/load balancer time to remove the pod from endpoints before shutdown begins.
+
+    4. Test graceful shutdown: send requests during a rolling update and verify zero errors.
+
+    5. In Python: use signal.signal(signal.SIGTERM, handler). In Go: use signal.NotifyContext. In Node.js: process.on(''SIGTERM'', handler).
+
+    6. If the application cannot drain within the grace period, increase the grace period — don''t rely on SIGKILL.
+
+    '
+  example_good: "import signal\nimport sys\nimport threading\n\nshutdown_event = threading.Event()\n\ndef sigterm_handler(signum, frame):\n    print(\"SIGTERM received, starting graceful shutdown\")\n    server.stop_accepting_new_requests()\n    shutdown_event.set()  # Signal workers to finish\n\nsignal.signal(signal.SIGTERM, sigterm_handler)\n\n# In Kubernetes deployment:\n# terminationGracePeriodSeconds: 60\n# lifecycle:\n#   preStop:\n#     exec:\n#       command: [\"sleep\", \"10\"]  # Wait for LB to remove pod\n"
+  example_bad: "# No SIGTERM handler — process ignores shutdown signal\n# Kubernetes sends SIGTERM -> app does nothing for 30s\n# Kubernetes sends SIGKILL -> process killed immediately\n# All in-flight requests dropped, connections not closed\n# Users see connection reset errors on every deployment\n"
+  when_applies: "When deploying any application in Kubernetes that processes in-flight requests or holds open connections."
+  severity: high
+  technologies:
+    lang: [go, java, javascript, nodejs, python]
+    platform: [kubernetes]
+  domains:
+    domain: [deployment, reliability]
+    concern: [database_migrations, zero_downtime, orchestration, kubernetes]
+  sources:
+  - url: https://sre.google/sre-book/release-engineering/
+    title: 'Google SRE Book — Chapter 8: Release Engineering'
+  validation_status: cross_checked
+- id: CR-SRE-K8S-006
+  text: Horizontal Pod Autoscaler (HPA) must be configured with appropriate metrics, stabilization windows, and scaling policies. Default HPA configurations are too aggressive — they oscillate between scaling
+    up and scaling down, creating instability instead of reducing it.
+  why: 'Kubernetes HPA scales pods based on metrics (CPU, memory, custom metrics). The default configuration has known problems: it scales up quickly (good) but also scales down quickly (bad — removes capacity
+    that may be needed for the next traffic spike). It uses average CPU across all pods (which can be skewed by outliers). And it doesn''t account for the "cold start" penalty — newly created pods need
+    time to warm up before they can handle full load. Google''s Borg autoscaler uses sophisticated algorithms with stabilization windows (don''t scale down for 5 minutes after scaling up), scaling velocity
+    limits (don''t scale more than 4x in one step), and custom metrics (scale on request rate, not CPU — because CPU is a lagging indicator).
+
+    '
+  how_to_do_right: '1. Scale on application-level metrics (request rate, queue depth) not infrastructure metrics (CPU). CPU is a lagging indicator.
+
+    2. Set stabilization window for scale-down: behavior.scaleDown.stabilizationWindowSeconds=300 (5 minutes). Prevents flapping.
+
+    3. Limit scale-down rate: behavior.scaleDown.policies with type=Percent, value=10, periodSeconds=60 (reduce by at most 10% per minute).
+
+    4. Set minReplicas to handle minimum expected traffic. Never scale to zero for production services.
+
+    5. Account for pod startup time: if pods take 60 seconds to become ready, the HPA must scale up 60 seconds BEFORE the traffic hits.
+
+    6. Monitor scaling events: frequent scale-up/scale-down cycles indicate misconfiguration or highly variable traffic that needs a different strategy.
+
+    '
+  example_good: "# HPA with stabilization window and conservative scale-down\napiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nspec:\n  minReplicas: 3\n  maxReplicas: 20\n  metrics:\n  - type: Pods\n    pods:\n      metric:\n        name: http_requests_per_second  # Application metric, not CPU\n      target:\n        type: AverageValue\n        averageValue: \"100\"  # Scale when each pod gets >100 RPS\n  behavior:\n    scaleDown:\n      stabilizationWindowSeconds: 300   # Wait 5 min before scaling down\n      policies:\n      - type: Percent\n        value: 10\n        periodSeconds: 60  # Max 10% reduction per minute\n"
+  example_bad: "# Default HPA — oscillates and creates instability\napiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nspec:\n  minReplicas: 1\n  maxReplicas: 100\n  metrics:\n  - type: Resource\n    resource:\n      name: cpu           # CPU is a lagging indicator\n      target:\n        type: Utilization\n        averageUtilization: 50\n  # No stabilization window — scales down immediately after spike\n  # Removes capacity just before the next traffic wave hits\n"
+  when_applies: "When configuring Horizontal Pod Autoscaler for any Kubernetes workload that experiences variable traffic."
+  severity: high
+  technologies:
+    platform: [kubernetes, hpa]
+  domains:
+    domain: [deployment, reliability, planning]
+    concern: [orchestration, kubernetes, capacity, autoscaling]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked

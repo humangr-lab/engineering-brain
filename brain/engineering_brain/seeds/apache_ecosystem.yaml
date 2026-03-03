@@ -1,0 +1,533 @@
+layer: rules
+technology: Apache
+domain: infrastructure
+knowledge:
+- id: CR-ZK-001
+  text: Use ephemeral znodes for service discovery and leader election — they automatically disappear when the session ends,
+    preventing stale registrations.
+  why: 'Persistent znodes survive client disconnection. If a service registers itself with a persistent znode and crashes
+    without cleanup, the znode remains — other services believe the dead instance is still alive and route traffic to it.
+    Ephemeral znodes are tied to the client session: when the client disconnects (crash, network partition, graceful shutdown),
+    ZooKeeper automatically deletes the znode after the session timeout. This provides self-healing service discovery without
+    garbage collection logic.'
+  how_to_do_right: 'Create ephemeral znodes for service registration: create(''/services/api/instance-1'', data, flags=EPHEMERAL).
+    Use ephemeral sequential znodes for leader election: create(''/election/leader-'', data, flags=EPHEMERAL|SEQUENTIAL).
+    Set session timeout to match your failure detection SLA (typically 10-30 seconds). Implement session event watchers to
+    detect and handle reconnection (re-register ephemeral znodes after reconnect). Never store critical data in ephemeral
+    znodes — they disappear on disconnect.'
+  severity: critical
+  technologies:
+    lang: [java, python]
+    library: [zookeeper, kazoo]
+  domains:
+    domain: [infrastructure, architecture]
+    concern: [distributed_systems, service_discovery]
+  example_good: "# Python Kazoo client — ephemeral znode for service registration\nfrom kazoo.client import KazooClient\n\n\
+    zk = KazooClient(hosts='zk1:2181,zk2:2181,zk3:2181', timeout=15.0)\nzk.start()\n\n# Ephemeral: auto-deleted when this\
+    \ process dies\nzk.create(\n    '/services/payment-api/instance-001',\n    b'{\"host\": \"10.0.1.5\", \"port\": 8080}',\n\
+    \    ephemeral=True,   # Disappears when session ends\n    makepath=True,\n)\n\n# Leader election with ephemeral sequential\
+    \ znodes\nfrom kazoo.recipe.election import Election\n\nelection = Election(zk, '/leader/payment-processor')\n# Blocks\
+    \ until this instance becomes leader\nelection.run(leader_function)  # Automatically releases on disconnect\n"
+  example_bad: "# Persistent znode — remains after crash, stale forever\nzk.create(\n    '/services/payment-api/instance-001',\n\
+    \    b'{\"host\": \"10.0.1.5\", \"port\": 8080}',\n    # Default: persistent znode\n)\n# Process crashes → znode stays\
+    \ → other services route to dead instance\n# Manual cleanup required for every crash/restart\n# Stale registrations accumulate\
+    \ silently\n"
+  when_applies: Any project using ZooKeeper coordination service, Java/JVM applications, Python codebases, or Kazoo
+  sources: ["https://zookeeper.apache.org/doc/current/zookeeperProgrammers.html#Ephemeral+Nodes"]
+- id: CR-ZK-002
+  text: Use ZooKeeper watches to react to changes instead of polling — but always re-register watches after they fire (watches
+    are one-shot).
+  why: 'ZooKeeper watches are triggered exactly once and then removed. If you set a watch on /config/database_url and the
+    value changes, your callback fires once. If the value changes again, you do not get notified because the watch was consumed.
+    This is the most common ZooKeeper programming bug: developers set a watch, handle the event, but forget to re-register
+    the watch for subsequent changes. The application works correctly for the first change but silently ignores all subsequent
+    changes.'
+  how_to_do_right: 'In the watch callback, always re-register the watch by calling get() or exists() with watch=True again.
+    Use a loop pattern: set watch, handle event, re-set watch. For the Kazoo Python client, use DataWatch or ChildrenWatch
+    decorators that automatically re-register. Handle the SESSION_EXPIRED event by reconnecting and re-registering all watches.
+    Test by changing the watched znode multiple times in rapid succession.'
+  severity: high
+  technologies:
+    lang: [java]
+    library: [zookeeper, kazoo]
+  domains:
+    domain: [infrastructure, architecture]
+    concern: [distributed_systems]
+  example_good: "from kazoo.client import KazooClient\n\nzk = KazooClient(hosts='zk1:2181,zk2:2181,zk3:2181')\nzk.start()\n\
+    \n# DataWatch: automatically re-registers after every change\n@zk.DataWatch('/config/database_url')\ndef watch_config(data,\
+    \ stat):\n    \"\"\"Called on every change — Kazoo re-registers automatically.\"\"\"\n    if data is not None:\n     \
+    \   new_url = data.decode('utf-8')\n        update_database_connection(new_url)\n        log.info(f\"Database URL updated\
+    \ to: {new_url} (version {stat.version})\")\n    return True  # Return True to keep watching, False to stop\n\n# ChildrenWatch:\
+    \ monitors child node additions/removals\n@zk.ChildrenWatch('/services/api')\ndef watch_instances(children):\n    \"\"\
+    \"Called whenever instances register/deregister.\"\"\"\n    instances = [zk.get(f'/services/api/{c}')[0].decode() for\
+    \ c in children]\n    update_load_balancer(instances)\n    return True\n"
+  example_bad: "# One-shot watch — only fires once, misses subsequent changes\ndef my_watch(event):\n    data, stat = zk.get('/config/database_url')\n\
+    \    update_database_connection(data.decode())\n    # Watch NOT re-registered — next change is silently ignored\n\nzk.get('/config/database_url',\
+    \ watch=my_watch)\n# First config change: callback fires, connection updated\n# Second config change: no callback, stale\
+    \ connection forever\n"
+  when_applies: Projects using ZooKeeper coordination service, Kazoo, or Java/JVM applications
+  sources: ["https://zookeeper.apache.org/doc/current/zookeeperProgrammers.html#sc_WatchRememberThese"]
+- id: CR-ZK-003
+  text: Deploy ZooKeeper as an odd-numbered ensemble (3 or 5 nodes) — even numbers provide no additional fault tolerance and
+    waste a node.
+  why: 'ZooKeeper requires a strict majority (quorum) to process writes: (N/2 + 1) nodes must agree. With 3 nodes, quorum
+    is 2 — tolerates 1 failure. With 4 nodes, quorum is 3 — still tolerates only 1 failure (same as 3 nodes, but with an extra
+    machine). With 5 nodes, quorum is 3 — tolerates 2 failures. The 4th node adds cost and network traffic without improving
+    fault tolerance. This is a mathematical property of majority quorum, not a ZooKeeper-specific limitation.'
+  how_to_do_right: Use 3 nodes for most production deployments (tolerates 1 failure). Use 5 nodes for mission-critical deployments
+    requiring tolerance of 2 simultaneous failures. Place nodes across availability zones or racks for true fault isolation.
+    Never use a single node in production (no fault tolerance). Set tickTime=2000, initLimit=10, syncLimit=5 as starting points.
+    Monitor ensemble health with mntr four-letter word.
+  severity: high
+  technologies:
+    library: [zookeeper]
+  domains:
+    domain: [infrastructure, architecture, operations]
+    concern: [distributed_systems]
+  example_good: '# zoo.cfg — 3-node ensemble across availability zones
+
+    tickTime=2000
+
+    initLimit=10
+
+    syncLimit=5
+
+    dataDir=/var/zookeeper/data
+
+    dataLogDir=/var/zookeeper/log  # Separate disk for transaction log
+
+    clientPort=2181
+
+
+    # 3 nodes in 3 AZs — tolerates 1 AZ failure
+
+    server.1=zk-az1:2888:3888
+
+    server.2=zk-az2:2888:3888
+
+    server.3=zk-az3:2888:3888
+
+
+    # Monitoring (cron or Prometheus exporter)
+
+    # echo mntr | nc zk-az1 2181 | grep zk_synced_followers
+
+    # Expected: zk_synced_followers = 2 (for leader)
+
+    '
+  example_bad: '# 4-node ensemble — wastes a node, same fault tolerance as 3
+
+    server.1=zk1:2888:3888
+
+    server.2=zk2:2888:3888
+
+    server.3=zk3:2888:3888
+
+    server.4=zk4:2888:3888
+
+    # Quorum = 3, tolerates 1 failure — same as 3 nodes
+
+    # 4th node costs money, adds network overhead, zero benefit
+
+
+    # Single node — zero fault tolerance
+
+    server.1=zk1:2888:3888
+
+    # Any failure = complete ZooKeeper outage
+
+    # All dependent services (Kafka, HBase, etc.) go down
+
+    '
+  when_applies: Projects using ZooKeeper coordination service
+  when_not_applies: projects not using ZooKeeper
+  sources: ["https://zookeeper.apache.org/doc/current/zookeeperAdmin.html#sc_CrossMachineRequirements"]
+- id: CR-PULSAR-001
+  text: Use Pulsar's multi-tenancy model (tenant/namespace/topic) to isolate workloads — do not mix production and dev traffic
+    in the same namespace.
+  why: 'Pulsar''s multi-tenancy model provides resource isolation at the namespace level: separate retention policies, storage
+    quotas, rate limits, and authentication policies. Without namespace isolation, a runaway dev consumer can overwhelm the
+    broker that also serves production topics. A misconfigured retention policy on a dev namespace can fill the disk and impact
+    production. Namespace-level isolation is a first-class feature in Pulsar — not using it wastes one of Pulsar''s key advantages
+    over Kafka.'
+  how_to_do_right: 'Create tenants for organizational boundaries (team, service, environment). Create namespaces within tenants
+    for workload isolation (production, staging, dev). Apply policies per namespace: retention, backlog quota, dispatch rate,
+    replication. Use tenant/namespace-level authentication and authorization. Example path: persistent://payments/production/transactions.'
+  severity: high
+  technologies:
+    lang: [java]
+    platform: [pulsar]
+  domains:
+    domain: [architecture, infrastructure]
+    concern: [streaming, multi_tenancy]
+  example_good: "# Create tenant and namespaces via pulsar-admin\npulsar-admin tenants create payments \\\n  --allowed-clusters\
+    \ us-east,us-west \\\n  --admin-roles payments-admin\n\n# Production namespace with strict policies\npulsar-admin namespaces\
+    \ create payments/production\npulsar-admin namespaces set-retention payments/production \\\n  --size 100G --time 7d\n\
+    pulsar-admin namespaces set-backlog-quota payments/production \\\n  --limit 50G --limitTime -1 \\\n  --policy producer_request_hold\
+    \  # Block producers when backlog is full\npulsar-admin namespaces set-dispatch-rate payments/production \\\n  --msg-dispatch-rate\
+    \ 100000 --byte-dispatch-rate 104857600\n\n# Dev namespace with relaxed policies\npulsar-admin namespaces create payments/dev\n\
+    pulsar-admin namespaces set-retention payments/dev \\\n  --size 5G --time 1d  # Short retention for dev\n\n# Topic paths\
+    \ include tenant/namespace\n# persistent://payments/production/transactions\n# persistent://payments/dev/transactions\n"
+  example_bad: '# Everything in one namespace — no isolation
+
+    # persistent://public/default/prod-transactions
+
+    # persistent://public/default/dev-transactions
+
+    # persistent://public/default/test-load-generator
+
+    # Dev load generator saturates broker, production transactions delayed
+
+    # Dev retention fills disk, production topics fail to write
+
+    '
+  when_applies: Projects using Pulsar or Java/JVM applications
+  when_not_applies: batch-only workloads, simple request-response systems. projects not using Pulsar or Java
+  sources: ["https://pulsar.apache.org/docs/concepts-multi-tenancy/"]
+- id: CR-PULSAR-002
+  text: Use Pulsar's tiered storage to offload old data to S3/GCS — keeping all data on BookKeeper is expensive and unnecessary
+    for infrequently accessed segments.
+  why: BookKeeper stores data on SSDs or HDDs attached to bookie nodes. Keeping 90 days of high-throughput topic data on bookies
+    requires expensive, locally-attached storage that grows linearly with retention. Tiered storage automatically moves ledger
+    segments older than a configurable threshold to object storage (S3, GCS, Azure Blob), which is 10-50x cheaper per GB.
+    Old data is still readable transparently — consumers seeking to old offsets read from object storage automatically.
+  how_to_do_right: 'Enable tiered storage in broker.conf: managedLedgerOffloadDriver=aws-s3, managedLedgerOffloadMaxThreads=2.
+    Set offload thresholds per namespace: managedLedgerOffloadThresholdInBytes or managedLedgerOffloadDeletionLagInMillis.
+    Configure S3 bucket, region, and credentials. Monitor offload status: pulsar-admin topics offload-status. Keep 1-7 days
+    on bookies for hot data, offload older to S3.'
+  severity: medium
+  technologies:
+    library: [bookkeeper]
+    platform: [pulsar, aws, s3]
+  domains:
+    domain: [architecture, infrastructure]
+    concern: [streaming, cost_optimization]
+  example_good: "# broker.conf — tiered storage to S3\nmanagedLedgerOffloadDriver=aws-s3\ns3ManagedLedgerOffloadBucket=pulsar-offload-prod\n\
+    s3ManagedLedgerOffloadRegion=us-east-1\ns3ManagedLedgerOffloadServiceEndpoint=https://s3.us-east-1.amazonaws.com\nmanagedLedgerOffloadMaxThreads=4\n\
+    \n# Per-namespace offload policy: offload after 2 days\npulsar-admin namespaces set-offload-threshold payments/production\
+    \ \\\n  --size 0  # Offload all data older than deletion lag\npulsar-admin namespaces set-offload-deletion-lag payments/production\
+    \ \\\n  --lag 172800000  # Keep on bookies for 2 days (ms)\n\n# Result: last 2 days on SSD (fast), older data on S3 (cheap)\n\
+    # 30-day retention costs: $50/month S3 instead of $500/month SSD\n"
+  example_bad: '# All data on bookies — 30 days × 1TB/day = 30TB on SSDs
+
+    # managedLedgerOffloadDriver=  (not configured)
+
+    # Cost: $500/month for bookie storage
+
+    # Bookie disk fills up → brokers reject writes → outage
+
+    '
+  when_applies: Projects using Pulsar, AWS S3 object storage, or BookKeeper
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://pulsar.apache.org/docs/tiered-storage-overview/"]
+- id: CR-BEAM-001
+  text: Write Beam pipelines using PTransforms and PCollections — the unified model runs on any runner (Flink, Spark, Dataflow)
+    without code changes.
+  why: Apache Beam provides a single programming model that compiles to multiple execution engines. A pipeline written with
+    Beam's PTransform API runs on Google Cloud Dataflow, Apache Flink, Apache Spark, or even the DirectRunner for testing
+    — without changing application code. This portability prevents vendor lock-in and allows you to switch runners based on
+    cost, performance, or operational requirements. Writing runner-specific code (Flink DataStream API, Spark RDDs) locks
+    you into that runner.
+  how_to_do_right: Use beam.Map, beam.FlatMap, beam.GroupByKey, beam.CombinePerKey for transformations. Use beam.io for sources
+    and sinks. Test with DirectRunner locally. Deploy with FlinkRunner or DataflowRunner in production. Avoid runner-specific
+    features unless performance requires it. Use beam.WindowInto for windowing, beam.TimestampCombiner for timestamp handling.
+    Check the Beam capability matrix for runner support of specific features.
+  severity: high
+  technologies:
+    lang: [python, java]
+    library: [dataflow]
+    platform: [beam, flink, spark]
+  domains:
+    domain: [architecture]
+    concern: [data, engineering, streaming, portability]
+  example_good: "import apache_beam as beam\nfrom apache_beam.options.pipeline_options import PipelineOptions\n\n# Pipeline\
+    \ runs on ANY runner — just change --runner flag\noptions = PipelineOptions([\n    '--runner=FlinkRunner',           #\
+    \ Or DataflowRunner, SparkRunner, DirectRunner\n    '--flink_master=localhost:8081',\n])\n\nwith beam.Pipeline(options=options)\
+    \ as pipeline:\n    (\n        pipeline\n        | 'ReadFromKafka' >> beam.io.ReadFromKafka(\n            consumer_config={'bootstrap.servers':\
+    \ 'broker:9092'},\n            topics=['events'],\n        )\n        | 'ParseJSON' >> beam.Map(parse_event)\n       \
+    \ | 'FilterValid' >> beam.Filter(lambda e: e['status'] == 'valid')\n        | 'Window5min' >> beam.WindowInto(\n     \
+    \       beam.window.FixedWindows(300),  # 5-minute tumbling windows\n        )\n        | 'CountPerType' >> beam.CombinePerKey(sum)\n\
+    \        | 'WriteToSink' >> beam.io.WriteToText('output/counts')\n    )\n\n# Same code runs on Flink, Spark, or Dataflow:\n\
+    # --runner=FlinkRunner --flink_master=flink:8081\n# --runner=DataflowRunner --project=my-gcp --region=us-central1\n# --runner=DirectRunner\
+    \  (local testing)\n"
+  example_bad: '# Flink-specific code — locked to Flink, cannot run on Dataflow or Spark
+
+    from pyflink.datastream import StreamExecutionEnvironment
+
+
+    env = StreamExecutionEnvironment.get_execution_environment()
+
+    events = env.from_source(kafka_source, watermark_strategy, "kafka")
+
+    events.key_by(lambda e: e[''type'']).window(...).aggregate(...)
+
+    # Migrating to Dataflow = rewrite entire pipeline
+
+    # Testing locally requires full Flink setup
+
+    '
+  when_applies: Projects using Beam, Python codebases, Java/JVM applications, or Apache Flink stream processing
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://beam.apache.org/documentation/programming-guide/"]
+- id: CR-BEAM-002
+  text: Use Beam's windowing and watermark model for streaming semantics — it provides the most portable abstraction for event-time
+    processing.
+  why: 'Beam''s windowing model (FixedWindows, SlidingWindows, Sessions, GlobalWindows) with watermarks and triggers provides
+    complete control over when results are emitted. The model is portable across runners: Flink, Dataflow, and Spark all implement
+    Beam''s windowing semantics. Understanding Beam''s model means understanding windowing everywhere — Flink''s windowing
+    is essentially Beam''s model. Triggers control early/on-time/late firing: emit speculative results before the window closes,
+    emit the final result when the watermark passes, and update results when late data arrives.'
+  how_to_do_right: Assign event timestamps at the source. Use WindowInto to define windows. Configure triggers for early and
+    late firings. Use withAllowedLateness to accept late data. Use AfterWatermark.pastEndOfWindow() as the base trigger, with
+    early firings (AfterProcessingTime) for dashboards and late firings (AfterCount) for corrections. Test windowing with
+    the DirectRunner using synthetic event-time data.
+  severity: medium
+  technologies:
+    lang: [python, java]
+    platform: [beam]
+  domains:
+    domain: [architecture]
+    concern: [streaming, data, engineering]
+  example_good: "import apache_beam as beam\nfrom apache_beam import window\nfrom apache_beam.transforms.trigger import (\n\
+    \    AfterWatermark, AfterProcessingTime, AfterCount, AccumulationMode,\n)\n\n(\n    pipeline\n    | 'ReadEvents' >> beam.io.ReadFromKafka(...)\n\
+    \    | 'AddTimestamps' >> beam.Map(\n        lambda e: beam.window.TimestampedValue(e, e['event_time'])\n    )\n    |\
+    \ 'Window5min' >> beam.WindowInto(\n        window.FixedWindows(300),  # 5-minute tumbling windows\n        trigger=AfterWatermark(\n\
+    \            early=AfterProcessingTime(60),   # Emit speculative every 60s\n            late=AfterCount(1),          \
+    \     # Emit correction per late event\n        ),\n        accumulation_mode=AccumulationMode.ACCUMULATING,\n       \
+    \ allowed_lateness=600,  # Accept data up to 10 minutes late\n    )\n    | 'CountPerKey' >> beam.CombinePerKey(sum)\n\
+    \    | 'WriteSink' >> beam.io.WriteToBigQuery(...)\n)\n"
+  example_bad: "# No windowing — entire stream in one global window\n(\n    pipeline\n    | 'ReadEvents' >> beam.io.ReadFromKafka(...)\n\
+    \    | 'CountAll' >> beam.CombineGlobally(sum)  # Never emits for unbounded input\n)\n# GlobalWindow on unbounded PCollection:\
+    \ result never emitted\n# because the window never \"closes\"\n"
+  when_applies: Projects using Beam, Python codebases, or Java/JVM applications
+  when_not_applies: batch-only workloads, simple request-response systems
+  sources: ["https://beam.apache.org/documentation/programming-guide/#windowing"]
+- id: CR-NIFI-001
+  text: Design NiFi data flows with back-pressure configuration on every connection — without it, a fast producer overwhelms
+    a slow consumer and causes OOM.
+  why: NiFi connections buffer FlowFiles between processors. Without back-pressure thresholds, a fast source processor (reading
+    from Kafka at 100K msgs/sec) fills the connection queue faster than a slow processor (writing to database at 1K msgs/sec)
+    can drain it. The queue grows unboundedly until NiFi exhausts its content repository disk or JVM heap, causing the entire
+    NiFi instance to crash. Back-pressure thresholds pause the upstream processor when the queue reaches a limit.
+  how_to_do_right: 'Set back-pressure thresholds on every connection: object threshold (max FlowFiles in queue, default 10,000)
+    and data size threshold (max bytes in queue, default 1GB). For high-throughput flows, increase these thresholds but ensure
+    the content repository has sufficient disk. Monitor queue depths in the NiFi UI — persistent high queue depths indicate
+    a bottleneck that needs scaling (concurrent tasks on the slow processor) or flow redesign.'
+  severity: high
+  technologies:
+    lang: [java]
+    library: [nifi]
+  domains:
+    domain: [architecture, infrastructure, reliability]
+    concern: [data, engineering]
+  example_good: "<!-- NiFi flow: Kafka → ProcessRecord → PutDatabaseRecord -->\n<!-- Connection from Kafka to ProcessRecord\
+    \ -->\n<connection>\n    <source>ConsumeKafka</source>\n    <destination>ProcessRecord</destination>\n    <backPressureObjectThreshold>50000</backPressureObjectThreshold>\n\
+    \    <backPressureDataSizeThreshold>500 MB</backPressureDataSizeThreshold>\n    <!-- When queue hits 50K records or 500MB,\
+    \ ConsumeKafka pauses -->\n</connection>\n\n<!-- Connection from ProcessRecord to Database (slower sink) -->\n<connection>\n\
+    \    <source>ProcessRecord</source>\n    <destination>PutDatabaseRecord</destination>\n    <backPressureObjectThreshold>10000</backPressureObjectThreshold>\n\
+    \    <backPressureDataSizeThreshold>200 MB</backPressureDataSizeThreshold>\n    <!-- Lower threshold for slow sink — back-pressure\
+    \ propagates upstream -->\n</connection>\n\n<!-- PutDatabaseRecord: increase concurrent tasks for throughput -->\n<processor>\n\
+    \    <name>PutDatabaseRecord</name>\n    <concurrentTasks>8</concurrentTasks>  <!-- Parallel DB writes -->\n</processor>\n"
+  example_bad: "<!-- No back-pressure configuration -->\n<connection>\n    <source>ConsumeKafka</source>\n    <destination>PutDatabaseRecord</destination>\n\
+    \    <!-- Default thresholds may be insufficient -->\n    <!-- Kafka reads at 100K/sec, DB writes at 1K/sec -->\n    <!--\
+    \ Queue grows by 99K FlowFiles per second -->\n    <!-- Content repository fills in minutes → NiFi OOM crash -->\n</connection>\n"
+  when_applies: Projects using NiFi or Java/JVM applications
+  when_not_applies: projects not using NiFi or Java
+  sources: ["https://nifi.apache.org/docs/nifi-docs/html/user-guide.html#back-pressure"]
+- id: CR-NIFI-002
+  text: Enable NiFi data provenance for audit trails — it tracks every FlowFile's complete lineage from source to destination.
+  why: Data provenance is NiFi's killer feature for compliance and debugging. It records every event (CREATE, RECEIVE, SEND,
+    CLONE, MODIFY, DROP, ROUTE) for every FlowFile, creating a complete audit trail. Without provenance, debugging 'where
+    did my data go?' requires manual log analysis across all processors. For compliance (GDPR, HIPAA, SOX), provenance provides
+    the answer to 'who processed this record, when, and what happened to it' — a regulatory requirement for sensitive data.
+  how_to_do_right: 'Configure provenance repository in nifi.properties: nifi.provenance.repository.max.storage.time=30 days,
+    nifi.provenance.repository.max.storage.size=10 GB. Use the NiFi UI''s Data Provenance view to trace individual FlowFiles.
+    Index provenance events by FlowFile attributes for efficient searching. For long-term compliance, export provenance to
+    external storage (Elasticsearch, S3). Set provenance reporting tasks for automated compliance reports.'
+  severity: medium
+  technologies:
+    lang: [java]
+    library: [nifi]
+  domains:
+    domain: [architecture, compliance, observability]
+    concern: [data, engineering]
+  example_good: '# nifi.properties — provenance configuration
+
+    nifi.provenance.repository.implementation=org.apache.nifi.provenance.WriteAheadProvenanceRepository
+
+    nifi.provenance.repository.max.storage.time=30 days
+
+    nifi.provenance.repository.max.storage.size=10 GB
+
+    nifi.provenance.repository.rollover.time=10 mins
+
+    nifi.provenance.repository.rollover.size=100 MB
+
+    nifi.provenance.repository.indexed.fields=EventType,FlowFileUUID,Filename,TransitURI
+
+    nifi.provenance.repository.indexed.attributes=customer_id,data_classification
+
+
+    # Query provenance via REST API for compliance report
+
+    # POST /nifi-api/provenance
+
+    # {
+
+    #   "searchTerms": {
+
+    #     "FlowFileAttribute": "customer_id:CUST-123",
+
+    #     "EventType": "SEND"
+
+    #   },
+
+    #   "startDate": "2026-02-01T00:00:00Z",
+
+    #   "endDate": "2026-02-17T23:59:59Z"
+
+    # }
+
+    '
+  example_bad: '# Provenance disabled — no audit trail
+
+    nifi.provenance.repository.implementation=org.apache.nifi.provenance.VolatileProvenanceRepository
+
+    # VolatileProvenanceRepository: in-memory only, lost on restart
+
+    # "Where did customer 123''s data go?" → "We don''t know"
+
+    # GDPR audit request → manual log grep across 50 processors
+
+    '
+  when_applies: Projects using NiFi or Java/JVM applications
+  when_not_applies: projects not using NiFi or Java
+  sources: ["https://nifi.apache.org/docs/nifi-docs/html/user-guide.html#data-provenance"]
+- id: CR-CAMEL-001
+  text: Use Camel's Enterprise Integration Patterns (EIP) for routing logic — do not implement routing, splitting, aggregation,
+    or retry manually.
+  why: Apache Camel implements all 65 Enterprise Integration Patterns from the Hohpe/Woolf book as first-class components.
+    Implementing content-based routing, message splitting, aggregation, dead letter channels, or retry policies from scratch
+    in application code is error-prone and duplicates decades of pattern refinement. Camel's EIP implementations handle edge
+    cases (partial aggregation, redelivery with backoff, idempotent consumers) that manual implementations typically miss.
+  how_to_do_right: Define routes using Camel's Java DSL or YAML DSL. Use from() for source, to() for destination. Use choice().when().otherwise()
+    for content-based routing. Use split() for message splitting. Use aggregate() with aggregation strategies for combining
+    messages. Use errorHandler() and onException() for error handling. Use idempotentConsumer() to prevent duplicate processing.
+    Leverage Camel's 300+ components for connectivity.
+  severity: medium
+  technologies:
+    lang: [java]
+    framework: [spring_boot]
+    library: [camel]
+  domains:
+    domain: [infrastructure, architecture, messaging]
+    concern: [integration]
+  example_good: "// Java DSL — Camel route with EIP patterns\nimport org.apache.camel.builder.RouteBuilder;\n\npublic class\
+    \ OrderRoutes extends RouteBuilder {\n    @Override\n    public void configure() {\n        // Error handling with dead\
+    \ letter channel\n        errorHandler(deadLetterChannel(\"kafka:orders-dlq\")\n            .maximumRedeliveries(3)\n\
+    \            .redeliveryDelay(5000)\n            .backOffMultiplier(2)\n            .useExponentialBackOff()\n       \
+    \ );\n\n        // Content-based routing\n        from(\"kafka:raw-orders?groupId=order-router\")\n            .unmarshal().json(Order.class)\n\
+    \            .choice()\n                .when(simple(\"${body.type} == 'PHYSICAL'\"))\n                    .to(\"direct:physical-order\"\
+    )\n                .when(simple(\"${body.type} == 'DIGITAL'\"))\n                    .to(\"direct:digital-order\")\n \
+    \               .otherwise()\n                    .to(\"kafka:unknown-orders\");\n\n        // Splitter + Aggregator pattern\n\
+    \        from(\"direct:physical-order\")\n            .split(simple(\"${body.items}\"))  // Split order into items\n \
+    \               .to(\"direct:check-inventory\")\n            .end()\n            .aggregate(header(\"orderId\"), new OrderAggregator())\n\
+    \                .completionSize(simple(\"${body.itemCount}\"))\n                .completionTimeout(30000)\n         \
+    \   .to(\"kafka:fulfilled-orders\");\n\n        // Idempotent consumer — dedup by order ID\n        from(\"kafka:payment-events\"\
+    )\n            .idempotentConsumer(\n                simple(\"${body.orderId}\"),\n                MemoryIdempotentRepository.memoryIdempotentRepository(10000)\n\
+    \            )\n            .to(\"direct:process-payment\");\n    }\n}\n"
+  example_bad: "// Manual routing — error-prone, no standard patterns\n@KafkaListener(topics = \"raw-orders\")\npublic void\
+    \ processOrder(String message) {\n    Order order = objectMapper.readValue(message, Order.class);\n    if (order.getType().equals(\"\
+    PHYSICAL\")) {\n        // Manual routing — no dead letter, no retry, no idempotency\n        processPhysical(order);\n\
+    \    } else if (order.getType().equals(\"DIGITAL\")) {\n        processDigital(order);\n    }\n    // No error handling\
+    \ — exceptions crash the consumer\n    // No idempotency — duplicate messages processed twice\n    // No dead letter —\
+    \ poison pills block the partition\n}\n"
+  when_applies: Projects using Camel, Java/JVM applications, or Spring Boot Java services
+  sources: ["https://camel.apache.org/manual/enterprise-integration-patterns.html"]
+- id: CR-LUCENE-001
+  text: Configure text analyzers (tokenizers, filters, stemmers) per field based on the language and search requirements —
+    the default analyzer is rarely correct.
+  why: Lucene's default StandardAnalyzer lowercases text and removes English stop words, but does not stem, handle synonyms,
+    or support non-English languages. Searching for 'running' will not match documents containing 'ran' or 'runs'. A French
+    text field analyzed with English stop words removes incorrect words. A product SKU field ('ABC-123') should not be tokenized
+    at all — the default splits it into 'ABC' and '123'. The analyzer is the most critical configuration for search quality,
+    and getting it wrong means users cannot find what they are looking for.
+  how_to_do_right: 'Define a custom analyzer per field type in the Solr schema. For natural language text: use language-specific
+    analyzer (EnglishAnalyzer, GermanAnalyzer) with stemming and stop words. For identifiers (SKUs, codes): use KeywordTokenizer
+    (no splitting). For autocomplete: use EdgeNGramTokenizer. For fuzzy matching: add PhoneticFilter. Test analyzers using
+    Solr''s Admin UI Analysis tab before deploying — verify that query terms match indexed terms.'
+  severity: high
+  technologies:
+    library: [lucene, solr]
+    platform: [elasticsearch]
+  domains:
+    domain: [architecture, infrastructure]
+    concern: [search, text_processing]
+  example_good: "<!-- Solr schema.xml — per-field analyzers -->\n\n<!-- English text with stemming, synonyms, and stop words\
+    \ -->\n<fieldType name=\"text_en\" class=\"solr.TextField\">\n  <analyzer type=\"index\">\n    <tokenizer class=\"solr.StandardTokenizerFactory\"\
+    />\n    <filter class=\"solr.LowerCaseFilterFactory\"/>\n    <filter class=\"solr.StopFilterFactory\" words=\"lang/stopwords_en.txt\"\
+    />\n    <filter class=\"solr.SynonymGraphFilterFactory\" synonyms=\"synonyms.txt\" expand=\"true\"/>\n    <filter class=\"\
+    solr.FlattenGraphFilterFactory\"/>  <!-- Required after SynonymGraph at index time -->\n    <filter class=\"solr.PorterStemFilterFactory\"\
+    />   <!-- running → run -->\n  </analyzer>\n  <analyzer type=\"query\">\n    <tokenizer class=\"solr.StandardTokenizerFactory\"\
+    />\n    <filter class=\"solr.LowerCaseFilterFactory\"/>\n    <filter class=\"solr.StopFilterFactory\" words=\"lang/stopwords_en.txt\"\
+    />\n    <filter class=\"solr.SynonymGraphFilterFactory\" synonyms=\"synonyms.txt\"/>\n    <filter class=\"solr.PorterStemFilterFactory\"\
+    />\n  </analyzer>\n</fieldType>\n\n<!-- Exact match for SKUs — no tokenization -->\n<fieldType name=\"sku\" class=\"solr.TextField\"\
+    >\n  <analyzer>\n    <tokenizer class=\"solr.KeywordTokenizerFactory\"/>  <!-- Keep \"ABC-123\" as one token -->\n   \
+    \ <filter class=\"solr.LowerCaseFilterFactory\"/>\n  </analyzer>\n</fieldType>\n\n<field name=\"description\" type=\"\
+    text_en\"/>\n<field name=\"product_sku\" type=\"sku\"/>\n"
+  example_bad: '<!-- Default analyzer for everything -->
+
+    <field name="description" type="text_general"/>
+
+    <field name="product_sku" type="text_general"/>  <!-- SKU "ABC-123" split into "abc" and "123" -->
+
+    <field name="french_content" type="text_general"/>  <!-- English stop words on French text -->
+
+
+    <!-- Search for "ABC-123" returns everything containing "abc" or "123" -->
+
+    <!-- Search for "running shoes" does not match "ran in new shoes" -->
+
+    '
+  when_applies: Projects using Lucene, Solr, or Elasticsearch search clusters
+  sources: ["https://solr.apache.org/guide/solr/latest/indexing-guide/analyzers.html"]
+- id: CR-LUCENE-002
+  text: Use Lucene's BM25 scoring (default since Lucene 6) and understand how field boosts, document length normalization,
+    and term frequency affect relevance.
+  why: BM25 (Best Matching 25) is a probabilistic scoring function that ranks documents by relevance. It considers term frequency
+    (how often the search term appears in the document), inverse document frequency (how rare the term is across all documents),
+    and field length normalization (shorter documents with the same term get higher scores). Without understanding BM25, you
+    cannot debug why irrelevant documents rank higher than relevant ones, or why boosting a field has no effect.
+  how_to_do_right: Tune k1 (term frequency saturation, default 1.2) and b (length normalization, default 0.75). Lower k1 for
+    exact-match-heavy use cases. Lower b when document length should not penalize relevance. Use field boosts (qf=title^3
+    content^1) to weight fields by importance. Use the Solr debug handler (/select?debug=all) to see per-document score breakdowns.
+    Use the explain API to understand why a specific document ranked where it did.
+  severity: medium
+  technologies:
+    library: [lucene, solr]
+    platform: [elasticsearch]
+  domains:
+    domain: [architecture]
+    concern: [search, information_retrieval]
+  example_good: "# Solr query with field boosts and BM25 tuning\n# solrconfig.xml — BM25 similarity\n<similarity class=\"\
+    solr.SchemaSimilarityFactory\">\n  <str name=\"defaultSimClass\">org.apache.lucene.search.similarities.BM25Similarity</str>\n\
+    </similarity>\n\n# Query with field boosts: title 3x more important than content\n/select?\n  q=machine learning deployment&\n\
+    \  defType=edismax&\n  qf=title^3 description^1.5 content^1&\n  mm=75%&          # At least 75% of terms must match\n\
+    \  pf=title^5&      # Phrase boost — exact phrase in title gets extra score\n  ps=2&            # Phrase slop — allow\
+    \ 2 words between phrase terms\n  debug=all        # Show score explanation\n\n# Schema-level BM25 tuning per field\n\
+    <fieldType name=\"text_product\" class=\"solr.TextField\">\n  <similarity class=\"solr.BM25SimilarityFactory\">\n    <float\
+    \ name=\"k1\">1.5</float>  <!-- Higher: term frequency matters more -->\n    <float name=\"b\">0.5</float>   <!-- Lower:\
+    \ less length normalization penalty -->\n  </similarity>\n</fieldType>\n"
+  example_bad: '# No field boosts — title and body content weighted equally
+
+    /select?q=machine learning&defType=lucene
+
+    # A 10,000-word blog post mentioning "machine learning" once in the body
+
+    # ranks higher than a 50-word product titled "Machine Learning Platform"
+
+    # because default scoring ignores field importance
+
+    '
+  when_applies: Projects using Lucene, Solr, or Elasticsearch search clusters
+  sources: ["https://lucene.apache.org/core/9_0_0/core/org/apache/lucene/search/similarities/BM25Similarity.html"]

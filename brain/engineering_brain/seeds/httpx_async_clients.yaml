@@ -1,0 +1,988 @@
+layer: rules
+domain: architecture
+knowledge:
+- id: HTTPX-001
+  text: >
+    Use httpx.AsyncClient as a long-lived context manager shared across the application
+    lifetime, never instantiated per-request. Create one client at startup, store it on
+    the app state, and close it on shutdown. Per-request clients bypass connection pooling,
+    re-do TLS handshakes on every call, and cause fd (file descriptor) exhaustion under load.
+  why: >
+    Each httpx.AsyncClient instantiation creates a new connection pool. A service making
+    100 RPS to an upstream API will open 100 new TCP connections per second if the client
+    is created per-request — TLS handshakes alone add 20-50ms per connection, and the OS
+    limits file descriptors (default 1024 on Linux). In production at scale, fd exhaustion
+    causes "Too many open files" errors that crash the service. Measured impact: per-request
+    clients at 500 RPS consumed 48,000 connections/minute vs. a shared client's steady 20.
+  how_to_do_right: |
+    1. Create ONE AsyncClient at application startup.
+    2. In FastAPI: use lifespan context manager to create/close the client.
+    3. Store on app.state.http_client — accessible from any request handler.
+    4. Never create clients inside route handlers, background tasks, or loops.
+    5. Call await client.aclose() in the shutdown handler — prevents resource leaks.
+    6. Verify: run a 60s load test, check "open file handles" via /proc/self/fd — must be stable.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [httpx, fastapi]
+  domains:
+    domain: [architecture, performance]
+    concern: [connection_pooling, resource_management]
+  example_good: |
+    from contextlib import asynccontextmanager
+    import httpx
+    from fastapi import FastAPI, Request
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Startup: create one shared client
+        limits = httpx.Limits(
+            max_connections=100,
+            max_keepalive_connections=20,
+            keepalive_expiry=30,
+        )
+        timeout = httpx.Timeout(connect=3.0, read=10.0, write=5.0, pool=5.0)
+        app.state.http_client = httpx.AsyncClient(limits=limits, timeout=timeout)
+        yield
+        # Shutdown: close client — drains pool gracefully
+        await app.state.http_client.aclose()
+
+    app = FastAPI(lifespan=lifespan)
+
+    @app.get("/proxy/data")
+    async def get_data(request: Request):
+        # Reuse the shared client — no new connection unless pool needs it
+        client: httpx.AsyncClient = request.app.state.http_client
+        resp = await client.get("https://upstream.example.com/api/data")
+        resp.raise_for_status()
+        return resp.json()
+  example_bad: |
+    from fastapi import FastAPI
+    import httpx
+
+    app = FastAPI()
+
+    @app.get("/proxy/data")
+    async def get_data():
+        # NEW client per request — destroys connection reuse
+        async with httpx.AsyncClient() as client:
+            resp = await client.get("https://upstream.example.com/api/data")
+            return resp.json()
+        # At 500 RPS: 500 new TLS handshakes/sec, 500 TCP connections opened/closed
+        # Symptoms: latency spikes, "Too many open files" errors, upstream rate limits triggered
+  when_applies: >
+    Any application making outbound HTTP requests. Applies to FastAPI, background workers,
+    data pipelines, and CLIs that make repeated HTTP calls.
+  sources:
+    - "https://www.python-httpx.org/advanced/clients/"
+    - "https://www.python-httpx.org/async/"
+
+- id: HTTPX-002
+  text: >
+    Configure explicit timeouts for every dimension: connect, read, write, and pool.
+    Never use the default Timeout(5.0) for production services — it applies the same
+    5s to all operations, which is too slow for health checks and too fast for file
+    uploads. Set each dimension based on operation type and downstream SLA.
+  why: >
+    The default httpx Timeout(5.0) applies 5s to connect AND read. A connect timeout
+    of 5s is far too long — a TCP connect taking >1s typically means the host is
+    unreachable, not slow. A read timeout of 5s may be too short for batch operations
+    or too long for health checks. Untuned timeouts create two failure modes: services
+    hang for too long waiting for a dead upstream (cascading failure), or time out on
+    legitimate long-running operations. The connect timeout should match DNS/TCP round
+    trip: 1-3s. The read timeout should match the slowest expected response from the
+    upstream SLA, plus 20% buffer.
+  how_to_do_right: |
+    1. Set connect=2.0 — if TCP connect takes >2s, the host is unreachable.
+    2. Set read timeout to upstream p99 + 20%: if upstream SLA is p99 < 2s, set read=2.4.
+    3. Set write timeout for upload endpoints: for 10MB uploads at 10Mbps, write=10.0.
+    4. Set pool=1.0 — if you can't get a connection from the pool in 1s, you are overloaded.
+    5. Override per-request for known slow operations:
+       await client.post("/batch", timeout=httpx.Timeout(read=60.0))
+    6. Log TimeoutException with the upstream URL and operation — critical for debugging.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [httpx]
+  domains:
+    domain: [architecture, reliability]
+    concern: [timeouts, fault_tolerance]
+  example_good: |
+    import httpx
+
+    # Default timeouts for standard API calls
+    API_TIMEOUT = httpx.Timeout(
+        connect=2.0,   # TCP connect: fail fast if host unreachable
+        read=5.0,      # Response: upstream SLA p99 (3s) + 67% buffer
+        write=3.0,     # Request body send: fast for normal requests
+        pool=1.0,      # Pool checkout: if >1s, we are saturated
+    )
+
+    # Long-running operation timeout (batch processing, file uploads)
+    BATCH_TIMEOUT = httpx.Timeout(
+        connect=2.0,
+        read=120.0,    # Batch jobs may take up to 2 minutes
+        write=30.0,    # Large payload upload
+        pool=5.0,      # Accept longer pool wait for batch operations
+    )
+
+    async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
+        # Standard call uses API_TIMEOUT
+        resp = await client.get("https://api.example.com/users/1")
+
+        # Override for batch call
+        batch_resp = await client.post(
+            "https://api.example.com/batch",
+            json=large_payload,
+            timeout=BATCH_TIMEOUT,
+        )
+  example_bad: |
+    import httpx
+
+    # Default timeout — same 5s for connect AND read
+    async with httpx.AsyncClient() as client:
+        # Health check — 5s timeout is absurdly long (should be <500ms)
+        resp = await client.get("https://api.example.com/health")
+
+        # File upload — 5s timeout causes failures for large payloads
+        resp = await client.post("https://api.example.com/upload",
+                                  content=large_file_bytes)
+        # At 100Mbps, a 50MB file takes 4s — barely within 5s, flaky in prod
+  when_applies: >
+    Every httpx.AsyncClient instantiation. Set the application-wide default timeout at
+    client creation time; override per-request only for operations with known different
+    latency characteristics.
+  sources:
+    - "https://www.python-httpx.org/advanced/timeouts/"
+    - "https://www.python-httpx.org/api/#timeout"
+
+- id: HTTPX-003
+  text: >
+    Add retry logic with exponential backoff and jitter using tenacity, not built-in httpx
+    retries. Only retry on transient errors: ConnectError, ConnectTimeout, ReadTimeout for
+    idempotent methods (GET, PUT, DELETE). Never retry POST without idempotency keys —
+    you will create duplicate records.
+  why: >
+    httpx's transport-level retries only handle ConnectError. They don't handle HTTP 429
+    (rate limit), HTTP 503 (temporary unavailability), or ReadTimeout (slow upstream). Tenacity
+    provides fine-grained control over which exceptions to retry, backoff strategy, and
+    maximum attempts. Without jitter, all clients synchronize retries at t=1s, t=2s, t=4s
+    creating retry storms that make overloaded upstreams worse. Jitter spreads retries across
+    a time window, reducing correlated load spikes. Never retrying POST without idempotency
+    keys is a data integrity rule: the original request may have succeeded server-side but
+    the response was lost — retrying creates a duplicate payment, order, or record.
+  how_to_do_right: |
+    1. Install tenacity: pip install tenacity
+    2. Decorate only idempotent methods with @retry.
+    3. Retry on: httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError(429/503).
+    4. Use wait_exponential(multiplier=1, min=1, max=30) + wait_random(0, 0.5) for jitter.
+    5. Set stop=stop_after_attempt(5) — never infinite retries.
+    6. Log each retry with upstream URL, attempt number, and exception.
+    7. For POST/PATCH: require caller to provide idempotency key, add to headers.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [httpx, tenacity]
+  domains:
+    domain: [architecture, reliability]
+    concern: [retry_logic, fault_tolerance]
+  example_good: |
+    import httpx
+    from tenacity import (
+        retry, stop_after_attempt, wait_exponential, wait_random,
+        retry_if_exception_type, retry_if_result, before_sleep_log,
+    )
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    def is_retryable_status(resp: httpx.Response) -> bool:
+        return resp.status_code in (429, 502, 503, 504)
+
+    @retry(
+        retry=(
+            retry_if_exception_type((httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout))
+            | retry_if_result(is_retryable_status)
+        ),
+        wait=wait_exponential(multiplier=1, min=1, max=30) + wait_random(0, 0.5),
+        stop=stop_after_attempt(5),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+    )
+    async def get_with_retry(client: httpx.AsyncClient, url: str) -> httpx.Response:
+        """GET with exponential backoff. Only call for idempotent operations."""
+        resp = await client.get(url)
+        return resp
+
+    async def post_with_idempotency(
+        client: httpx.AsyncClient,
+        url: str,
+        payload: dict,
+        idempotency_key: str,
+    ) -> httpx.Response:
+        """POST with idempotency key — safe to retry."""
+        resp = await client.post(
+            url,
+            json=payload,
+            headers={"Idempotency-Key": idempotency_key},
+        )
+        return resp
+  example_bad: |
+    import httpx
+
+    async def get_data(client, url):
+        # Manual retry loop — no backoff, no jitter, retry storm risk
+        for attempt in range(3):
+            try:
+                return await client.get(url)
+            except Exception:
+                if attempt == 2:
+                    raise
+        # No distinction between GET (safe to retry) and POST (unsafe)
+        # Retries all exceptions including 400 Bad Request (pointless)
+        # No logging — silent retries are debugging nightmares
+  when_applies: >
+    All outbound HTTP calls to external services, internal microservices, and third-party
+    APIs. Retry policy must be reviewed and explicitly decided, even if the decision is
+    "no retries" (for operations where retrying would cause harm).
+  sources:
+    - "https://tenacity.readthedocs.io/en/latest/"
+    - "https://www.python-httpx.org/advanced/transports/"
+
+- id: HTTPX-004
+  text: >
+    Configure connection pool limits explicitly: max_connections=100 for API services,
+    max_keepalive_connections=20, keepalive_expiry=30s. The default (max_connections=None,
+    unlimited) will exhaust OS file descriptors under load. Cap keepalive connections to
+    ~20% of max to prevent pool from holding open connections to rarely-used hosts.
+  why: >
+    httpx's default Limits has max_connections=None (unlimited) and max_keepalive_connections=20.
+    Unlimited connections means 1000 concurrent coroutines can each open their own connection —
+    on Linux with default fd limit of 1024, this crashes the process with "OSError: [Errno 24]
+    Too many open files." The keepalive_expiry controls how long idle connections are held
+    open — too high wastes file descriptors, too low (or 0) disables keepalive, eliminating
+    the latency benefit of persistent connections. AWS ALB and most proxies close idle
+    connections after 60s; setting keepalive_expiry=30s avoids the race where the proxy
+    closes the connection the moment you try to reuse it.
+  how_to_do_right: |
+    1. Set max_connections = (expected peak concurrent requests) * 1.5.
+    2. Set max_keepalive_connections = max_connections * 0.2 (20% of max).
+    3. Set keepalive_expiry = 30s (half of typical proxy idle timeout of 60s).
+    4. Monitor active connections: instrument httpx events to track pool usage.
+    5. Alert if active_connections / max_connections > 0.8 (80% pool utilization).
+    6. Per-host limits for services with upstream connection limits (many APIs cap per-IP).
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [httpx]
+  domains:
+    domain: [architecture, performance]
+    concern: [connection_pooling, resource_limits]
+  example_good: |
+    import httpx
+
+    # Calculate based on expected concurrent load
+    EXPECTED_PEAK_CONCURRENT = 50  # concurrent outbound requests
+
+    limits = httpx.Limits(
+        max_connections=int(EXPECTED_PEAK_CONCURRENT * 1.5),  # 75 — headroom for bursts
+        max_keepalive_connections=15,  # 20% of max — only keep active host connections warm
+        keepalive_expiry=30.0,  # 30s — under ALB's 60s idle timeout
+    )
+
+    client = httpx.AsyncClient(limits=limits)
+
+    # Monitor pool health (instrument via httpx events)
+    import httpx._transports.default
+
+    original_send = client._transport.handle_async_request
+
+    async def monitored_send(request):
+        pool = client._transport._pool
+        active = len([c for c in pool._connections if c.is_idle() is False])
+        if active / limits.max_connections > 0.8:
+            logger.warning(f"Connection pool at {active}/{limits.max_connections} — approaching limit")
+        return await original_send(request)
+  example_bad: |
+    import httpx
+
+    # Default limits — max_connections=None (unlimited!)
+    client = httpx.AsyncClient()
+
+    # With 500 concurrent asyncio tasks each calling client.get():
+    # Each task opens a new connection if pool is "full" (no limit)
+    # At 500 concurrent: 500 open file descriptors
+    # Linux default ulimit -n = 1024, minus other fds = ~800 available
+    # At 800 concurrent requests: OSError: Too many open files
+    # Process crashes, PagerDuty wakes up the on-call
+  when_applies: >
+    Any application using httpx.AsyncClient in production. Pool limits must be sized
+    based on measured or modeled concurrency, not left at defaults.
+  sources:
+    - "https://www.python-httpx.org/advanced/clients/#pool-limits"
+    - "https://www.python-httpx.org/api/#limits"
+
+- id: HTTPX-005
+  text: >
+    Use respx for mocking httpx in tests. Never use unittest.mock.patch on httpx internals
+    or use real network calls in unit tests. respx pattern-matches URLs and returns
+    controlled responses including errors, timeouts, and streaming.
+  why: >
+    Unit tests with real HTTP calls are slow (100-500ms per call), flaky (network
+    unavailable in CI), and test external behavior rather than your code's behavior.
+    unittest.mock.patch on httpx internals breaks across httpx versions and couples tests
+    to implementation details. respx mocks at the transport layer — your code sees identical
+    httpx.Response objects as it would from real calls, making tests accurate and stable.
+    respx also validates that all registered routes were called (assert_all_called=True),
+    catching bugs where your code skips HTTP calls it should make.
+  how_to_do_right: |
+    1. Install: pip install respx
+    2. Use @respx.mock decorator or respx.mock context manager.
+    3. Route patterns: respx.get("https://api.example.com/users/1")
+    4. Simulate errors: .mock(side_effect=httpx.ConnectError("connection refused"))
+    5. Simulate timeouts: .mock(side_effect=httpx.ReadTimeout("read timeout"))
+    6. Use assert_all_called=True when you want to verify all mocked calls were made.
+    7. Test retry logic: route first N calls to fail, Nth+1 to succeed.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [httpx, respx, pytest]
+  domains:
+    domain: [testing, architecture]
+    concern: [mocking, unit_testing]
+  example_good: |
+    import pytest
+    import httpx
+    import respx
+    from myapp.clients import UserServiceClient
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_get_user_success():
+        """Test happy path using respx transport mock."""
+        respx.get("https://users.example.com/api/users/42").mock(
+            return_value=httpx.Response(200, json={"id": 42, "name": "Alice"})
+        )
+
+        client = UserServiceClient(base_url="https://users.example.com")
+        user = await client.get_user(42)
+
+        assert user["name"] == "Alice"
+        assert respx.calls.call_count == 1  # Verify exactly one call was made
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_get_user_retries_on_503():
+        """Test that client retries on 503 and succeeds on second attempt."""
+        route = respx.get("https://users.example.com/api/users/42")
+        route.side_effect = [
+            httpx.Response(503, text="Service Unavailable"),  # First call fails
+            httpx.Response(200, json={"id": 42, "name": "Alice"}),  # Second succeeds
+        ]
+
+        client = UserServiceClient(base_url="https://users.example.com")
+        user = await client.get_user(42)  # Should retry once and succeed
+
+        assert user["name"] == "Alice"
+        assert route.call_count == 2  # Verify retry happened
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_get_user_raises_on_connection_error():
+        """Test that ConnectError is propagated correctly."""
+        respx.get("https://users.example.com/api/users/42").mock(
+            side_effect=httpx.ConnectError("Connection refused")
+        )
+
+        client = UserServiceClient(base_url="https://users.example.com")
+        with pytest.raises(httpx.ConnectError):
+            await client.get_user(42)
+  example_bad: |
+    from unittest.mock import AsyncMock, patch
+    import httpx
+
+    async def test_get_user():
+        # Patching httpx internals — brittle, breaks on version upgrades
+        with patch("httpx.AsyncClient.get") as mock_get:
+            mock_get.return_value = AsyncMock(
+                status_code=200,
+                json=lambda: {"id": 42, "name": "Alice"}
+            )
+            # Does not test: timeout configuration, connection pooling behavior,
+            # error propagation, response parsing — patches too deep
+            pass
+  when_applies: >
+    All unit tests for code that makes outbound HTTP calls. Integration tests may use
+    real HTTP calls to a local test server (e.g., Docker-composed service), but unit
+    tests must use respx.
+  sources:
+    - "https://lundberg.github.io/respx/"
+    - "https://www.python-httpx.org/advanced/transports/"
+
+- id: HTTPX-006
+  text: >
+    Enable HTTP/2 explicitly for services that support it. Add h2 as a dependency and
+    pass http2=True to AsyncClient. HTTP/2 multiplexes multiple requests over a single
+    TCP connection, reducing latency by 30-60% for workloads making many small requests
+    to the same host. Verify the upstream supports it before enabling.
+  why: >
+    HTTP/1.1 opens a new TCP connection per request unless keep-alive is negotiated.
+    Even with keepalive, HTTP/1.1 uses one connection per in-flight request (head-of-line
+    blocking). HTTP/2 multiplexes all requests over a single connection with per-stream
+    flow control. For a service calling an upstream API with 10 concurrent requests per
+    operation, HTTP/2 reduces TCP connections from 10 to 1 and eliminates the TLS
+    handshake overhead for connections 2-10. Measured improvements: Cloudflare reported
+    40% reduction in connection overhead; Stripe API client measured 35% latency reduction
+    for bulk operations.
+  how_to_do_right: |
+    1. Install h2 extra: pip install httpx[http2]
+    2. Enable: client = httpx.AsyncClient(http2=True)
+    3. Verify server support: response.http_version should return "HTTP/2"
+    4. HTTP/2 requires TLS in most implementations — won't work with http:// unless
+       the server supports h2c (cleartext HTTP/2, rare).
+    5. Check for incompatibilities: some proxies and load balancers downgrade to HTTP/1.1.
+    6. Debug: httpx logs show "HTTP/2 CONNECTED" vs "HTTP/1.1 CONNECTED".
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [httpx]
+  domains:
+    domain: [architecture, performance]
+    concern: [http2, latency_optimization]
+  example_good: |
+    import httpx
+
+    # HTTP/2 enabled — requires: pip install httpx[http2]
+    async with httpx.AsyncClient(http2=True) as client:
+        resp = await client.get("https://api.example.com/data")
+
+        # Verify HTTP/2 was negotiated
+        assert resp.http_version == "HTTP/2", f"Expected HTTP/2, got {resp.http_version}"
+
+        # With HTTP/2: 10 concurrent requests share ONE TCP connection
+        import asyncio
+        responses = await asyncio.gather(*[
+            client.get(f"https://api.example.com/items/{i}")
+            for i in range(10)
+        ])
+        # 10 requests, 1 TCP connection, no new TLS handshakes
+        # vs HTTP/1.1: 10 connections or serial requests over 1 keepalive connection
+  example_bad: |
+    import httpx
+
+    # HTTP/1.1 only — misses multiplexing benefit
+    async with httpx.AsyncClient() as client:
+        # These 10 requests each need their own TCP connection (or wait for keepalive)
+        responses = await asyncio.gather(*[
+            client.get(f"https://api.example.com/items/{i}")
+            for i in range(10)
+        ])
+        # 10 TCP connections, 10 TLS handshakes (~30ms each = 300ms wasted)
+        # With HTTP/2: 1 connection, ~5ms multiplexed
+  when_applies: >
+    Services making concurrent requests to the same HTTPS host (especially external APIs,
+    CDN origins, gRPC-web endpoints). Verify the upstream supports HTTP/2 before enabling;
+    some older upstreams (Python WSGI servers, legacy APIs) only support HTTP/1.1.
+  sources:
+    - "https://www.python-httpx.org/http2/"
+    - "https://developers.google.com/web/fundamentals/performance/http2"
+
+- id: HTTPX-007
+  text: >
+    Implement client-side rate limiting with asyncio.Semaphore when calling APIs with
+    rate limits. Never send requests at maximum speed and rely on the server's 429 response
+    to throttle — you will exhaust retries, trigger circuit breakers, and potentially
+    get your IP banned.
+  why: >
+    Most external APIs have rate limits: OpenAI (10,000 RPM), GitHub (5,000/hour),
+    Stripe (100 RPS). Hitting these limits with retries wastes request quota on 429
+    responses and creates thundering-herd patterns when all clients back off and retry
+    simultaneously. Client-side rate limiting with a Semaphore or token bucket is
+    deterministic: you never exceed the limit, never waste quota on 429s, and latency
+    is predictable. Difference in practice: 1000 concurrent requests with no rate
+    limiting → 750 immediate 429s, 6 retry rounds, 3 minutes of degraded operation.
+    With a Semaphore(10): 100% success, predictable 100s total runtime.
+  how_to_do_right: |
+    1. Use asyncio.Semaphore(N) where N = your API's concurrency limit.
+    2. For RPM-limited APIs: use asyncio.Semaphore combined with time windowing.
+    3. Track remaining quota from response headers (X-RateLimit-Remaining, Retry-After).
+    4. When Retry-After header is present, sleep for that duration before next request.
+    5. Never set concurrency higher than what the API supports — even if retries "fix" it.
+    6. Log rate limit headroom: alert when X-RateLimit-Remaining < 10% of limit.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [httpx, asyncio]
+  domains:
+    domain: [architecture, reliability]
+    concern: [rate_limiting, api_clients]
+  example_good: |
+    import asyncio
+    import httpx
+    from typing import Any
+
+    class RateLimitedClient:
+        """HTTP client with client-side concurrency and rate limit awareness."""
+
+        def __init__(self, client: httpx.AsyncClient, max_concurrent: int = 10):
+            self._client = client
+            self._semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def get(self, url: str, **kwargs) -> httpx.Response:
+            async with self._semaphore:  # Enforces max_concurrent in-flight requests
+                resp = await self._client.get(url, **kwargs)
+
+                # Respect Retry-After if rate limited
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After", "60"))
+                    await asyncio.sleep(retry_after)
+                    resp = await self._client.get(url, **kwargs)  # One retry after cooldown
+
+                # Warn when approaching rate limit
+                remaining = resp.headers.get("X-RateLimit-Remaining")
+                limit = resp.headers.get("X-RateLimit-Limit")
+                if remaining and limit:
+                    if int(remaining) / int(limit) < 0.1:
+                        logger.warning(f"Rate limit low: {remaining}/{limit} remaining")
+
+                return resp
+
+    # Usage
+    async def batch_enrich(items: list) -> list:
+        async with httpx.AsyncClient() as http_client:
+            client = RateLimitedClient(http_client, max_concurrent=10)
+            tasks = [client.get(f"https://api.example.com/enrich/{item}") for item in items]
+            responses = await asyncio.gather(*tasks)
+            return [r.json() for r in responses]
+  example_bad: |
+    import asyncio, httpx
+
+    async def batch_enrich(items: list) -> list:
+        async with httpx.AsyncClient() as client:
+            # No rate limiting — sends all 500 requests simultaneously
+            tasks = [client.get(f"https://api.example.com/enrich/{item}") for item in items]
+            responses = await asyncio.gather(*tasks)
+            # Result with 100 RPM API limit:
+            # 500 requests → 400 immediate 429 responses
+            # Retry loop → another 400 429s
+            # IP ban after 3 rounds
+            # Total time: 10+ minutes instead of 5 minutes with rate limiting
+  when_applies: >
+    Any code calling external APIs with documented rate limits. Also applies to
+    internal services during load tests: client-side rate limiting prevents unintentional
+    DDoS of internal dependencies.
+  sources:
+    - "https://docs.python.org/3/library/asyncio-sync.html#asyncio.Semaphore"
+    - "https://www.python-httpx.org/async/"
+
+- id: HTTPX-008
+  text: >
+    Stream large response bodies instead of buffering them in memory. Use
+    client.stream() for responses >10MB. Buffering 100MB responses from a file API
+    will exhaust heap memory and cause OOM kills on services with constrained memory.
+  why: >
+    httpx.get() buffers the entire response body into memory before returning. A service
+    fetching 500MB S3 objects for processing will hold 500MB in Python heap simultaneously
+    for each concurrent request. With 10 concurrent downloads: 5GB heap pressure, triggering
+    garbage collection pauses and OOM kills. Streaming processes the response in chunks
+    — you can write a 500MB file while holding only the chunk size (default 65536 bytes)
+    in memory. The same principle applies to streaming uploads (request body streaming).
+  how_to_do_right: |
+    1. Use async with client.stream("GET", url) as response: for responses >10MB.
+    2. Iterate with async for chunk in response.aiter_bytes(chunk_size=65536):
+    3. For file downloads: write each chunk directly to disk inside the iteration.
+    4. For data processing: process each chunk as it arrives (streaming JSON parsing).
+    5. Never call await response.aread() inside a stream context — defeats streaming.
+    6. Set limits=httpx.Limits(max_connection_count=5) for services doing large downloads
+       to prevent pool saturation.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [httpx]
+  domains:
+    domain: [architecture, performance]
+    concern: [streaming, memory_management]
+  example_good: |
+    import httpx
+    import aiofiles
+
+    async def download_large_file(url: str, dest_path: str) -> int:
+        """Stream a large file to disk without loading into memory."""
+        bytes_written = 0
+
+        async with httpx.AsyncClient() as client:
+            async with client.stream("GET", url) as response:
+                response.raise_for_status()
+                async with aiofiles.open(dest_path, "wb") as f:
+                    async for chunk in response.aiter_bytes(chunk_size=65536):  # 64KB chunks
+                        await f.write(chunk)
+                        bytes_written += len(chunk)
+
+        return bytes_written
+
+    # Memory usage: constant ~64KB regardless of file size
+    # vs non-streaming: memory = file size (500MB file = 500MB heap)
+
+    async def stream_ndjson(url: str):
+        """Stream NDJSON response and process records as they arrive."""
+        async with httpx.AsyncClient() as client:
+            async with client.stream("GET", url) as response:
+                async for line in response.aiter_lines():
+                    record = json.loads(line)
+                    yield record  # Process immediately, don't accumulate
+  example_bad: |
+    import httpx
+
+    async def download_large_file(url: str) -> bytes:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url)  # Buffers ENTIRE file in memory
+            return resp.content  # 500MB in heap
+        # With 10 concurrent downloads: 5GB heap
+        # Python GC thrashes, latency spikes, OOM kill possible
+  when_applies: >
+    Any HTTP response expected to exceed 10MB: file downloads, data exports, ML model
+    downloads, binary blob streaming. Also applies to request bodies: use
+    client.post(url, content=async_generator()) for streaming uploads.
+  sources:
+    - "https://www.python-httpx.org/advanced/clients/#streaming-responses"
+    - "https://www.python-httpx.org/async/#streaming-responses"
+
+- id: HTTPX-009
+  text: >
+    Handle all three categories of httpx exceptions explicitly: transport errors
+    (ConnectError, TimeoutException), HTTP errors (HTTPStatusError), and request
+    errors (InvalidURL, CookieConflict). Never catch base Exception for HTTP calls —
+    you will silently swallow programming errors that look like network errors.
+  why: >
+    httpx.HTTPStatusError is only raised when you call response.raise_for_status().
+    Without that call, a 404 or 500 response is returned as a normal response with
+    no exception — a common source of silent failures. Conversely, catching base
+    Exception for HTTP calls will catch AttributeError, TypeError, and other programming
+    errors, making bugs look like network failures. The three exception categories have
+    different handling strategies: transport errors are retriable; HTTP status errors
+    require parsing the error response body; request construction errors are programming
+    bugs that should not be retried.
+  how_to_do_right: |
+    1. Always call response.raise_for_status() after awaiting the response.
+    2. Catch in this order (specific before general):
+       - httpx.TimeoutException: log + retry with backoff
+       - httpx.ConnectError: log + retry or circuit break
+       - httpx.HTTPStatusError: parse error body, map to domain exception
+       - httpx.RequestError: log as programming error, do NOT retry
+    3. Parse the error response body from HTTPStatusError: err.response.json()
+    4. Map HTTP status codes to domain exceptions:
+       - 404 → ResourceNotFoundError
+       - 409 → ConflictError
+       - 422 → ValidationError
+       - 500/503 → UpstreamError (retriable)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [httpx]
+  domains:
+    domain: [architecture, reliability]
+    concern: [error_handling, exception_handling]
+  example_good: |
+    import httpx
+    from myapp.exceptions import (
+        ResourceNotFoundError, UpstreamError, ValidationError
+    )
+
+    async def fetch_user(client: httpx.AsyncClient, user_id: int) -> dict:
+        try:
+            resp = await client.get(f"/api/users/{user_id}")
+            resp.raise_for_status()  # Raises HTTPStatusError for 4xx/5xx
+            return resp.json()
+
+        except httpx.TimeoutException as e:
+            logger.warning(f"Timeout fetching user {user_id}: {e}")
+            raise UpstreamError(f"Timeout", retriable=True) from e
+
+        except httpx.ConnectError as e:
+            logger.error(f"Connection failed for user {user_id}: {e}")
+            raise UpstreamError("Service unreachable", retriable=True) from e
+
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            try:
+                error_body = e.response.json()
+            except Exception:
+                error_body = {"message": e.response.text}
+
+            if status == 404:
+                raise ResourceNotFoundError(f"User {user_id} not found") from e
+            elif status == 422:
+                raise ValidationError(error_body.get("detail", "Validation failed")) from e
+            elif status >= 500:
+                logger.error(f"Upstream 5xx for user {user_id}: {error_body}")
+                raise UpstreamError(f"Upstream error: {status}", retriable=True) from e
+            else:
+                raise UpstreamError(f"Unexpected status: {status}") from e
+
+        except httpx.RequestError as e:
+            # Programming error — bad URL, invalid headers etc. Do NOT retry.
+            logger.exception(f"Request construction error for user {user_id}")
+            raise  # Propagate as-is — this is a bug, not a network error
+  example_bad: |
+    import httpx
+
+    async def fetch_user(client, user_id):
+        try:
+            resp = await client.get(f"/api/users/{user_id}")
+            return resp.json()  # No raise_for_status() — 404 returns None quietly
+        except Exception as e:
+            logger.error(f"Error: {e}")
+            return None  # Silent failure — calling code thinks user doesn't exist
+        # Bugs: TypeError, AttributeError are caught and swallowed as "network errors"
+  when_applies: >
+    Every function that makes an HTTP request. Exception handling strategy should be
+    defined at the service boundary layer, not in individual request functions.
+  sources:
+    - "https://www.python-httpx.org/exceptions/"
+    - "https://www.python-httpx.org/api/#response"
+
+- id: HTTPX-010
+  text: >
+    Configure certificate verification and custom CA bundles correctly for internal
+    services. Never use verify=False in production — it disables all TLS verification
+    and makes your service vulnerable to MITM attacks. For internal CAs, pass the
+    CA bundle path explicitly.
+  why: >
+    verify=False disables certificate chain validation entirely. A man-in-the-middle
+    attacker can present any certificate and your service will accept it, potentially
+    exfiltrating API keys, user tokens, and sensitive data. This is a P0 security
+    vulnerability. Internal microservices often use self-signed certificates or private
+    CAs issued by Vault or an internal PKI. The correct fix is to add your internal CA
+    certificate to the trust store, not to disable verification. OWASP Top 10 2021
+    A02 (Cryptographic Failures) explicitly lists improper certificate validation as a
+    critical vulnerability.
+  how_to_do_right: |
+    1. Never use verify=False. Use verify="/path/to/ca-bundle.pem" instead.
+    2. For internal PKI: export the root CA certificate from Vault/CFSSL and add to bundle.
+    3. In Kubernetes: mount the CA bundle as a ConfigMap and reference via env var.
+    4. Use ssl.create_default_context() with cafile= for custom CA bundles.
+    5. Verify TLS setup: openssl s_client -connect host:443 -CAfile ca-bundle.pem
+    6. For development only (never production): use truststore library to use system CAs.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [httpx]
+  domains:
+    domain: [architecture, security]
+    concern: [tls, certificate_validation]
+  example_good: |
+    import httpx
+    import ssl
+    import os
+
+    # Option 1: Custom CA bundle (internal PKI)
+    CA_BUNDLE = os.environ.get("TLS_CA_BUNDLE", "/etc/ssl/certs/internal-ca.pem")
+    client = httpx.AsyncClient(verify=CA_BUNDLE)
+
+    # Option 2: ssl.SSLContext for fine-grained control
+    ssl_ctx = ssl.create_default_context(cafile=CA_BUNDLE)
+    ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2  # Enforce minimum TLS 1.2
+    client = httpx.AsyncClient(verify=ssl_ctx)
+
+    # Option 3: System CAs (for external HTTPS, normal case)
+    client = httpx.AsyncClient()  # Default: uses certifi bundle, verify=True
+
+    # Verify TLS is working correctly:
+    resp = await client.get("https://internal-service.corp.example.com/health")
+    assert resp.status_code == 200
+  example_bad: |
+    import httpx
+
+    # NEVER do this — disables ALL TLS verification
+    client = httpx.AsyncClient(verify=False)  # P0 security vulnerability
+
+    # What attackers can do with verify=False:
+    # 1. ARP spoof the gateway, intercept traffic
+    # 2. Present self-signed cert for "internal-service.corp.example.com"
+    # 3. httpx accepts it (no verification)
+    # 4. Service sends API keys, user tokens to attacker's server
+    # 5. Production breach, GDPR notification required
+  when_applies: >
+    All production HTTP clients. verify=False is only acceptable in local development
+    against localhost services, never in staging or production environments. CI pipelines
+    running integration tests must also use proper certificates.
+  sources:
+    - "https://www.python-httpx.org/advanced/ssl/"
+    - "https://owasp.org/Top10/A02_2021-Cryptographic_Failures/"
+
+- id: HTTPX-011
+  text: >
+    Implement authentication as a custom httpx.Auth subclass, not by manually adding
+    headers in each request. Auth classes handle token refresh transparently, are
+    testable in isolation, and prevent authentication logic from leaking into business
+    code. Use bearer token auth for APIs, and implement token refresh for OAuth2.
+  why: >
+    Manually adding Authorization headers in every request function creates three problems:
+    1) Headers are forgotten — some endpoints get authenticated, some don't, silently.
+    2) Token refresh logic is duplicated or missing — services start failing after 1h when
+    OAuth2 tokens expire. 3) Business code is coupled to auth implementation — swapping
+    from API key to OAuth2 requires touching every HTTP call. httpx.Auth subclasses are
+    applied at the transport layer: every request gets auth headers automatically, token
+    refresh is centralized, and business code is decoupled from auth concerns.
+  how_to_do_right: |
+    1. Subclass httpx.Auth and implement auth_flow() as a generator.
+    2. yield the request (after modifying headers) — httpx sends it.
+    3. Receive the response — inspect for 401 to trigger refresh.
+    4. For OAuth2: on 401, yield a token refresh request, update the token, re-yield.
+    5. Store tokens in a thread-safe/async-safe way (asyncio.Lock for in-memory).
+    6. Test auth classes in isolation with respx mocks.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [httpx]
+  domains:
+    domain: [architecture, security]
+    concern: [authentication, oauth2]
+  example_good: |
+    import httpx
+    import asyncio
+    from datetime import datetime, timedelta
+
+    class BearerAuth(httpx.Auth):
+        """Simple static bearer token auth."""
+        def __init__(self, token: str):
+            self._token = token
+
+        def auth_flow(self, request: httpx.Request):
+            request.headers["Authorization"] = f"Bearer {self._token}"
+            yield request
+
+    class OAuth2ClientCredentialsAuth(httpx.Auth):
+        """OAuth2 with automatic token refresh on 401."""
+        def __init__(self, token_url: str, client_id: str, client_secret: str):
+            self._token_url = token_url
+            self._client_id = client_id
+            self._client_secret = client_secret
+            self._access_token: str | None = None
+            self._expires_at: datetime = datetime.min
+
+        def auth_flow(self, request: httpx.Request):
+            if self._needs_refresh():
+                token_request = self._build_token_request()
+                token_response = yield token_request
+                self._update_token(token_response)
+
+            request.headers["Authorization"] = f"Bearer {self._access_token}"
+            response = yield request
+
+            if response.status_code == 401:  # Token may have been revoked
+                token_request = self._build_token_request()
+                token_response = yield token_request
+                self._update_token(token_response)
+                request.headers["Authorization"] = f"Bearer {self._access_token}"
+                yield request  # Retry with fresh token
+
+        def _needs_refresh(self) -> bool:
+            return self._access_token is None or datetime.utcnow() >= self._expires_at
+
+        def _build_token_request(self) -> httpx.Request:
+            return httpx.Request("POST", self._token_url, data={
+                "grant_type": "client_credentials",
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+            })
+
+        def _update_token(self, response: httpx.Response):
+            data = response.json()
+            self._access_token = data["access_token"]
+            self._expires_at = datetime.utcnow() + timedelta(seconds=data["expires_in"] - 30)
+
+    # Usage
+    auth = OAuth2ClientCredentialsAuth(
+        token_url="https://auth.example.com/oauth/token",
+        client_id="my-service",
+        client_secret=os.environ["CLIENT_SECRET"],
+    )
+    client = httpx.AsyncClient(auth=auth)
+    resp = await client.get("https://api.example.com/protected")  # Token managed automatically
+  example_bad: |
+    import httpx
+
+    TOKEN = "hardcoded-token"  # Also bad — use env var
+
+    async def get_user(client, user_id):
+        # Manually adding auth header — coupled to business code
+        resp = await client.get(
+            f"/api/users/{user_id}",
+            headers={"Authorization": f"Bearer {TOKEN}"},  # Must remember in EVERY call
+        )
+
+    async def get_order(client, order_id):
+        # Forgot to add auth header on this one
+        resp = await client.get(f"/api/orders/{order_id}")  # 401 silently
+  when_applies: >
+    All HTTP clients that require authentication. Especially critical for OAuth2/OIDC
+    token management where token expiry must be handled automatically and transparently.
+  sources:
+    - "https://www.python-httpx.org/advanced/authentication/"
+    - "https://www.python-httpx.org/api/#auth"
+
+- id: HTTPX-012
+  text: >
+    Configure proxy settings via environment variables (HTTP_PROXY, HTTPS_PROXY, NO_PROXY)
+    rather than hardcoding proxy URLs in the client. httpx respects these environment
+    variables by default. Override only when services require different proxy routing
+    for different upstreams (e.g., internal services bypass proxy, external APIs go through proxy).
+  why: >
+    Hardcoded proxy URLs break when the service moves environments (dev→staging→prod),
+    when proxy configurations change, or when the same code must work with and without
+    a proxy. Environment variables are the twelve-factor app standard for network
+    configuration. httpx automatically reads HTTP_PROXY, HTTPS_PROXY, and NO_PROXY, which
+    is consistent with curl, wget, and other HTTP clients. Hardcoded proxies also risk
+    routing internal service calls through an external proxy, leaking internal API calls
+    and authentication tokens to a proxy operator.
+  how_to_do_right: |
+    1. Set proxy via environment: export HTTPS_PROXY=http://proxy.corp.example.com:3128
+    2. Set NO_PROXY for internal services: export NO_PROXY=*.internal.example.com,localhost
+    3. httpx reads these by default — no code change required.
+    4. For per-client override: httpx.AsyncClient(proxies={"https://": "http://proxy:3128"})
+    5. For mTLS proxy: use httpx.AsyncClient(proxies={"https://": mounts}) with custom transport.
+    6. Verify proxy routing: set HTTPX_LOG_LEVEL=debug to see proxy connection in logs.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [httpx]
+  domains:
+    domain: [architecture, security]
+    concern: [proxy, network_configuration]
+  example_good: |
+    # Environment configuration (docker-compose.yml or k8s ConfigMap)
+    # env:
+    #   HTTPS_PROXY: "http://proxy.corp.example.com:3128"
+    #   NO_PROXY: "*.internal.example.com,localhost,127.0.0.1"
+
+    import httpx
+
+    # httpx automatically uses HTTPS_PROXY and NO_PROXY env vars
+    # No code change needed for proxy routing
+    async with httpx.AsyncClient() as client:
+        # Goes through proxy (external)
+        resp = await client.get("https://api.stripe.com/v1/charges")
+
+        # Bypasses proxy (matches NO_PROXY pattern)
+        resp = await client.get("https://payments.internal.example.com/process")
+
+    # Override programmatically only when needed:
+    async with httpx.AsyncClient(
+        proxies={"https://special-api.example.com": "http://special-proxy:3128"}
+    ) as client:
+        pass
+  example_bad: |
+    import httpx
+
+    # Hardcoded proxy — breaks in prod (different proxy URL), breaks in CI (no proxy)
+    async with httpx.AsyncClient(proxies="http://localhost:3128") as client:
+        resp = await client.get("https://api.stripe.com/v1/charges")
+    # Also routes internal service calls through the proxy — security risk
+    # Also: hardcoded proxy port may not be accessible in all environments
+  when_applies: >
+    All production HTTP clients. Proxy configuration belongs in infrastructure
+    configuration (environment variables, Kubernetes ConfigMaps, docker-compose.env),
+    not in application code.
+  sources:
+    - "https://www.python-httpx.org/advanced/proxies/"
+    - "https://12factor.net/config"

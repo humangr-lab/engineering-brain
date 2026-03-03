@@ -1,0 +1,1492 @@
+layer: rules
+domain: agent_orchestration
+knowledge:
+- id: CREW-001
+  text: >
+    Define agent role, goal, and backstory as a tight triad — role scopes the agent's
+    capabilities, goal drives every decision, and backstory calibrates behavior and tone.
+    A vague goal ("do research") produces unpredictable behavior; a precise goal
+    ("find the three most recent peer-reviewed studies on X and extract their methodology
+    sections") makes the agent deterministic.
+  why: >
+    The LLM uses role/goal/backstory as the effective system prompt for the agent.
+    Vague definitions cause the agent to hallucinate scope, invent extra steps, or loop.
+    Production post-mortems on CrewAI systems consistently trace ~70% of hallucinations
+    back to underspecified goals. When the goal is a measurable outcome with explicit
+    deliverables, agents consistently converge in fewer iterations.
+  how_to_do_right: |
+    1. Role: Use a job title + domain + seniority, e.g. "Senior Financial Analyst specializing in SEC filings".
+    2. Goal: One sentence, ends with a measurable artifact, e.g. "Produce a 3-bullet summary of risk factors from the 10-K".
+    3. Backstory: 2-4 sentences establishing expertise level, methodological preferences, and style.
+    4. Set max_iter=10 (default 20 is too loose — agents spin).
+    5. Set max_execution_time=120 for any agent touching external APIs.
+    6. Set verbose=True during development; set False in production to avoid token waste.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [agent_design, convergence]
+  example_good: |
+    from crewai import Agent
+    from langchain_anthropic import ChatAnthropic
+
+    analyst = Agent(
+        role="Senior SEC Filing Analyst",
+        goal=(
+            "Extract the top 3 risk factors from the provided 10-K document "
+            "and return them as a structured list with one-sentence summaries."
+        ),
+        backstory=(
+            "You are a CFA-certified analyst with 15 years of experience reviewing "
+            "SEC filings. You prioritize quantitative risks over qualitative ones "
+            "and cite specific sections by page number."
+        ),
+        llm=ChatAnthropic(model="claude-opus-4-6"),
+        max_iter=10,
+        max_execution_time=120,
+        verbose=False,
+        allow_delegation=False,
+    )
+  example_bad: |
+    # Vague goal — agent will invent its own interpretation
+    analyst = Agent(
+        role="Analyst",
+        goal="Analyze the document",
+        backstory="You are an analyst.",
+        # max_iter defaults to 20 — allows 20 LLM calls per task
+        # No execution time limit — can spin indefinitely on network errors
+    )
+  when_applies: When defining any CrewAI agent that will be used in production. Especially critical for agents that access external tools or APIs.
+  sources:
+    - "https://docs.crewai.com/en/concepts/agents"
+    - "https://ondrej-popelka.medium.com/crewai-practical-lessons-learned-b696baa67242"
+
+- id: CREW-002
+  text: >
+    Assign tools to agents at the most restrictive level — give each agent only the
+    tools it needs for its role. An agent with 10 tools is confused; an agent with 2
+    tools is focused. Too many tools cause the LLM to call the wrong tool or call
+    tools unnecessarily, inflating cost and latency.
+  why: >
+    The LLM chooses tools based on descriptions and current task context. With more
+    than 5-7 tools, function-calling accuracy degrades measurably — the model starts
+    calling unrelated tools "just in case." In production systems, this causes agents
+    to make expensive API calls (e.g., web search) when simpler tools would suffice,
+    and can trigger destructive operations unintentionally. Restrict tools to the
+    minimum viable set per agent role.
+  how_to_do_right: |
+    1. List the agent's responsibilities. For each responsibility, identify exactly one tool.
+    2. Maximum 5 tools per agent in production (3 is ideal).
+    3. Use function_calling_llm with a cheaper model (gpt-4o-mini) for tool selection if your primary LLM is expensive.
+    4. Write tool descriptions as action verbs + input + output: "Searches the web given a query string, returns top 5 URLs with snippets."
+    5. If an agent needs many tools, split it into two agents with a task context dependency.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [tool_management, cost_control]
+  example_good: |
+    from crewai import Agent
+    from crewai_tools import SerperDevTool, WebsiteSearchTool
+
+    # Researcher agent: only 2 tools, both clearly scoped
+    researcher = Agent(
+        role="Research Specialist",
+        goal="Find authoritative sources for a given topic and return verified URLs.",
+        backstory="You specialize in academic and primary-source research.",
+        tools=[
+            SerperDevTool(),          # Web search
+            WebsiteSearchTool(),      # Page content extraction
+        ],
+        function_calling_llm="gpt-4o-mini",  # Cheaper model for tool dispatch
+        max_iter=8,
+    )
+  example_bad: |
+    # Agent with 8 tools — LLM will misfire
+    from crewai_tools import (
+        SerperDevTool, WebsiteSearchTool, FileReadTool,
+        CodeInterpreterTool, GithubSearchTool, PDFSearchTool,
+        YoutubeVideoSearchTool, EXASearchTool,
+    )
+
+    agent = Agent(
+        role="General Researcher",
+        goal="Help with research",
+        backstory="You are helpful.",
+        tools=[SerperDevTool(), WebsiteSearchTool(), FileReadTool(),
+               CodeInterpreterTool(), GithubSearchTool(), PDFSearchTool(),
+               YoutubeVideoSearchTool(), EXASearchTool()],
+    )
+    # Agent will call GithubSearchTool for a stock market query
+    # Agent will call YoutubeVideoSearchTool when a PDF is available
+    # Tool selection accuracy drops ~30% per additional tool beyond 5
+  when_applies: When defining agents that use tools. Any production agent that has more than 5 tools assigned must be reviewed.
+  sources:
+    - "https://docs.crewai.com/en/concepts/agents"
+    - "https://blog.crewai.com/agentic-systems-with-crewai/"
+
+- id: CREW-003
+  text: >
+    Tasks are the real unit of design in CrewAI — spend 80% of your effort on task
+    definition, not agent definition. A well-specified task compensates for an average
+    agent; a poorly specified task ruins an excellent agent. Every task must have an
+    unambiguous expected_output that reads like an acceptance criterion.
+  why: >
+    CrewAI task descriptions become part of the agent's prompt. Vague descriptions
+    produce vague outputs. The expected_output field is especially critical — it
+    defines what "done" means. Without a precise expected_output, agents produce
+    whatever they feel is appropriate, which varies between runs. Production systems
+    that specify exact output formats (JSON structure, word count, enumerated fields)
+    achieve >90% first-pass compliance; those with vague expected_outputs achieve <50%.
+  how_to_do_right: |
+    1. Write description as: "[Action verb] [object] [constraints] [format]".
+    2. Write expected_output as: "A [type] containing [fields] where [constraints]." Treat it as a unit test spec.
+    3. Use output_pydantic with a Pydantic model for structured data — LLM will be prompted to match the schema.
+    4. Use output_json for JSON outputs without full Pydantic validation.
+    5. Set context=[prior_task] explicitly when this task depends on another task's output.
+    6. Use guardrails for output validation: return (True, output) for pass, (False, "reason") for retry.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [task_design, output_quality]
+  example_good: |
+    from crewai import Task
+    from pydantic import BaseModel
+    from typing import List
+
+    class RiskFactor(BaseModel):
+        title: str
+        description: str
+        severity: str  # "high", "medium", "low"
+        page_reference: str
+
+    class RiskAnalysisOutput(BaseModel):
+        company_name: str
+        fiscal_year: int
+        top_risks: List[RiskFactor]
+
+    def validate_risk_output(output):
+        """Guardrail: ensure we have at least 3 risks"""
+        if hasattr(output, 'top_risks') and len(output.top_risks) >= 3:
+            return (True, output)
+        return (False, "Must identify at least 3 distinct risk factors")
+
+    risk_task = Task(
+        description=(
+            "Analyze the 10-K filing provided in the context. "
+            "Identify the top 5 risk factors from the 'Risk Factors' section. "
+            "For each, extract the title, a 1-sentence description, severity "
+            "(high/medium/low based on financial impact), and the page number."
+        ),
+        expected_output=(
+            "A RiskAnalysisOutput object with company_name, fiscal_year, "
+            "and a list of 5 RiskFactor objects. Each risk must have all 4 fields populated."
+        ),
+        output_pydantic=RiskAnalysisOutput,
+        agent=analyst,
+        guardrails=[validate_risk_output],
+        guardrail_max_retries=2,
+    )
+  example_bad: |
+    # Vague task — unpredictable output every run
+    risk_task = Task(
+        description="Analyze the document and find risks.",
+        expected_output="A list of risks.",
+        agent=analyst,
+        # No output schema — returns raw text in different formats each run
+        # No guardrails — no retry on bad output
+        # No context dependency — won't know what document to analyze
+    )
+  when_applies: When creating any CrewAI task. Especially critical for tasks whose output feeds downstream tasks.
+  sources:
+    - "https://docs.crewai.com/en/concepts/tasks"
+    - "https://www.analyticsvidhya.com/blog/2024/10/structuring-inputs-and-outputs-in-multi-agent-systems/"
+
+- id: CREW-004
+  text: >
+    Choose sequential process for deterministic, ordered workflows and hierarchical
+    process only when you need a manager to dynamically delegate tasks based on agent
+    capabilities. Do NOT default to hierarchical — it adds an LLM call per task
+    delegation, doubles cost, and the manager's routing can be unreliable.
+  why: >
+    Hierarchical process adds a manager agent layer that decides which worker agent
+    executes each task. This is a separate LLM call per task, doubling or tripling
+    API costs. Worse, the manager's routing is non-deterministic — it may assign
+    the wrong agent, or re-assign work that was already done. Sequential process is
+    predictable, faster, and cheaper. Real use case for hierarchical: when you have
+    5+ specialized agents and tasks whose assignment cannot be predetermined at design
+    time (e.g., routing support tickets to the correct department agent dynamically).
+  how_to_do_right: |
+    1. Default to Process.sequential for any pipeline with a predetermined task order.
+    2. Use Process.hierarchical only when: (a) number of agents > 5, (b) task-to-agent
+       assignment is data-dependent, (c) you have a genuine coordination need.
+    3. If using hierarchical, always provide a custom manager_agent (not manager_llm)
+       to control manager behavior precisely.
+    4. Always set manager_agent.allow_delegation=True and worker agents to False.
+    5. Monitor manager token usage in production — it can be 30-40% of total crew tokens.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [process_design, cost_control]
+  example_good: |
+    from crewai import Crew, Process, Agent
+
+    # Sequential: deterministic, cheap, predictable
+    sequential_crew = Crew(
+        agents=[researcher, analyst, writer],
+        tasks=[research_task, analysis_task, writing_task],
+        process=Process.sequential,
+        verbose=False,
+        output_log_file="logs/crew_run.json",
+    )
+
+    # Hierarchical: only when routing is genuinely dynamic
+    manager = Agent(
+        role="Project Coordinator",
+        goal="Delegate tasks to the most qualified specialist agent.",
+        backstory="You coordinate specialized analysts; never do work yourself.",
+        allow_delegation=True,
+        max_iter=5,
+    )
+
+    hierarchical_crew = Crew(
+        agents=[tax_agent, legal_agent, financial_agent],
+        tasks=[intake_task],  # Manager decomposes into sub-tasks
+        process=Process.hierarchical,
+        manager_agent=manager,  # Custom manager, not auto-generated
+    )
+  example_bad: |
+    # Using hierarchical by default without understanding the cost
+    crew = Crew(
+        agents=[researcher, analyst],  # Only 2 agents — no need for hierarchy
+        tasks=[research_task, analysis_task],
+        process=Process.hierarchical,
+        manager_llm="gpt-4o",  # Auto-generated manager adds ~$0.01 per task delegation
+        # 100 runs/day = ~$2/day in wasted manager overhead for 2 agents
+    )
+  when_applies: When configuring a Crew. Every process selection should be a conscious decision with documented rationale.
+  sources:
+    - "https://docs.crewai.com/en/concepts/processes"
+    - "https://help.crewai.com/ware-are-the-key-differences-between-hierarchical-and-sequential-processes-in-crewai"
+
+- id: CREW-005
+  text: >
+    Enable crew-level memory (memory=True) for multi-turn workflows that span more
+    than one kickoff call, and configure a custom storage path. Without specifying
+    storage_path, all crews share the default .crewai/memory directory — cross-crew
+    memory contamination is a silent bug that produces hard-to-reproduce hallucinations.
+  why: >
+    CrewAI's memory system uses LanceDB by default stored at ./.crewai/memory. When
+    you run multiple crews in the same project without specifying distinct paths, they
+    ALL share the same LanceDB instance. Crew A's entity memories bleed into Crew B's
+    context. This is one of the most subtle production bugs: intermittently correct
+    behavior that becomes incorrect as memory grows. Additionally, memory content is
+    sent to the configured LLM for analysis — use a local embedder for sensitive data.
+  how_to_do_right: |
+    1. Set CREWAI_STORAGE_DIR env var per crew: CREWAI_STORAGE_DIR=/data/crew_analytics
+    2. Or pass storage_path explicitly to the Memory object.
+    3. Configure embedder explicitly — never rely on the OpenAI default in production.
+    4. Use memory=True only for crews that genuinely need cross-session context.
+    5. Implement periodic cleanup for long-running systems — LanceDB grows unbounded.
+    6. For sensitive data, use a local Ollama embedder (mxbai-embed-large or nomic-embed-text).
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai, lancedb, chromadb]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [memory_management, data_isolation]
+  example_good: |
+    import os
+    from crewai import Crew, Process
+
+    os.environ["CREWAI_STORAGE_DIR"] = "/data/crews/financial_analysis"
+
+    crew = Crew(
+        agents=[researcher, analyst],
+        tasks=[research_task, analysis_task],
+        process=Process.sequential,
+        memory=True,
+        embedder={
+            "provider": "ollama",
+            "config": {"model_name": "mxbai-embed-large"},
+        },
+        verbose=False,
+    )
+
+    # Cleanup job (run weekly)
+    import shutil
+    from pathlib import Path
+
+    def cleanup_old_memories(storage_dir: str, days_threshold: int = 30):
+        """Remove LanceDB files older than threshold."""
+        import time
+        path = Path(storage_dir)
+        cutoff = time.time() - (days_threshold * 86400)
+        for db_file in path.glob("**/*.lance"):
+            if db_file.stat().st_mtime < cutoff:
+                shutil.rmtree(db_file.parent, ignore_errors=True)
+  example_bad: |
+    # Two crews sharing the same default LanceDB directory
+    financial_crew = Crew(
+        agents=[financial_agent],
+        tasks=[financial_task],
+        memory=True,  # Writes to .crewai/memory/
+    )
+
+    hr_crew = Crew(
+        agents=[hr_agent],
+        tasks=[hr_task],
+        memory=True,  # ALSO writes to .crewai/memory/ — contamination!
+        # hr_agent will see financial_agent's entity memories
+        # financial_agent will see hr_agent's entity memories
+    )
+  when_applies: When enabling memory for any crew in a project that runs more than one crew. Always specify isolated storage paths.
+  sources:
+    - "https://docs.crewai.com/en/concepts/memory"
+    - "https://deepwiki.com/crewAIInc/crewAI/7.2-memory-configuration-and-storage"
+
+- id: CREW-006
+  text: >
+    Use output_pydantic on the final task of a crew to get a typed, validated result
+    from crew.kickoff(). Never parse the raw string output of TaskOutput — the LLM
+    will hallucinate JSON structure, omit fields, or wrap output in markdown code fences.
+    Pydantic parsing with retry is the only reliable structured extraction pattern.
+  why: >
+    CrewAI's default task output is raw text. When you need structured data downstream,
+    parsing raw text with json.loads() fails 15-30% of the time in production because
+    the LLM adds preamble ("Sure! Here is the JSON:"), wraps in code fences (```json),
+    or omits fields it "decides" are optional. output_pydantic instructs the crew
+    framework to embed schema-based formatting instructions in the agent prompt AND
+    validates the output — if validation fails, the agent retries with clearer
+    instructions automatically (up to guardrail_max_retries times).
+  how_to_do_right: |
+    1. Define a Pydantic BaseModel for every task that produces structured data.
+    2. Assign output_pydantic=YourModel to the task.
+    3. Access the result via task_output.pydantic (a validated model instance).
+    4. Access raw string if needed via task_output.raw.
+    5. Set guardrail_max_retries=2 to handle first-attempt failures.
+    6. For the last task in a crew: result = crew.kickoff(); typed = result.pydantic
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai, pydantic]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [output_parsing, reliability]
+  example_good: |
+    from crewai import Task
+    from pydantic import BaseModel, Field
+    from typing import List, Optional
+
+    class CompanyProfile(BaseModel):
+        name: str
+        industry: str
+        revenue_usd_millions: Optional[float] = None
+        key_products: List[str] = Field(min_length=1)
+        headquarters: str
+
+    profile_task = Task(
+        description="Extract a company profile from the provided document.",
+        expected_output=(
+            "A CompanyProfile with name, industry, revenue (if mentioned), "
+            "at least 1 key product, and headquarters city."
+        ),
+        output_pydantic=CompanyProfile,
+        agent=analyst,
+        guardrail_max_retries=2,
+    )
+
+    result = crew.kickoff(inputs={"document": document_text})
+    # Typed, validated — no JSON parsing errors
+    profile: CompanyProfile = result.pydantic
+    print(f"Company: {profile.name}, Revenue: ${profile.revenue_usd_millions}M")
+  example_bad: |
+    result = crew.kickoff(inputs={"document": document_text})
+    raw = result.raw  # "Sure! Here's the company profile:\n```json\n{\"name\": ..."
+    import json, re
+
+    # Fragile regex to strip markdown fences
+    json_str = re.search(r'```json\s*(.*?)\s*```', raw, re.DOTALL)
+    if json_str:
+        data = json.loads(json_str.group(1))
+    else:
+        data = json.loads(raw)  # Fails 20% of the time in production
+
+    # No validation — missing fields cause KeyError downstream
+    company_name = data["name"]  # KeyError if LLM omitted it
+  when_applies: Any task that produces data consumed programmatically. Use output_pydantic instead of raw string parsing.
+  sources:
+    - "https://docs.crewai.com/en/concepts/tasks"
+    - "https://www.analyticsvidhya.com/blog/2024/10/structuring-inputs-and-outputs-in-multi-agent-systems/"
+
+- id: CREW-007
+  text: >
+    Build custom tools by inheriting from BaseTool with a Pydantic args_schema — never
+    use the @tool decorator for production code. The decorator lacks type enforcement,
+    error isolation, and caching control. Always raise ToolException (not generic
+    Exception) so CrewAI can handle tool failures gracefully without crashing the agent.
+  why: >
+    The @tool decorator is a convenience wrapper suitable for prototyping. In production,
+    BaseTool subclasses provide: (1) Pydantic input validation via args_schema that
+    prevents malformed inputs from reaching your API calls; (2) structured error handling
+    via ToolException that CrewAI catches and routes to the agent's retry logic;
+    (3) cache_function support for expensive operations. Without ToolException, a tool
+    failure raises to the agent level and can crash the entire crew run.
+  how_to_do_right: |
+    1. Create a Pydantic model for tool inputs as the args_schema.
+    2. Inherit from BaseTool, set name and description as class attributes.
+    3. Implement _run() for sync; _arun() for async (needed for non-blocking I/O).
+    4. Inside _run, catch domain exceptions and re-raise as ToolException("message").
+    5. Implement cache_function if the tool calls expensive APIs (return True to cache).
+    6. Write description as: "ACTION + OBJECT + what it returns" — this is the agent's tool selection guide.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai, pydantic]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [tool_design, error_handling]
+  example_good: |
+    from crewai.tools import BaseTool
+    from crewai.tools.tool_types import ToolException
+    from pydantic import BaseModel, Field
+    import httpx
+    from typing import Type
+
+    class StockPriceInput(BaseModel):
+        ticker: str = Field(..., description="Stock ticker symbol, e.g. 'AAPL'")
+        date: str = Field(..., description="Date in YYYY-MM-DD format")
+
+    class StockPriceTool(BaseTool):
+        name: str = "get_stock_price"
+        description: str = (
+            "Fetches the closing stock price for a given ticker and date. "
+            "Returns price as a float in USD."
+        )
+        args_schema: Type[BaseModel] = StockPriceInput
+
+        def _run(self, ticker: str, date: str) -> float:
+            try:
+                response = httpx.get(
+                    f"https://api.stockdata.com/v1/price/{ticker}",
+                    params={"date": date},
+                    timeout=10.0,
+                )
+                response.raise_for_status()
+                return response.json()["close"]
+            except httpx.TimeoutException:
+                raise ToolException(f"Stock API timeout for {ticker} on {date}")
+            except httpx.HTTPStatusError as e:
+                raise ToolException(f"Stock API error {e.response.status_code}: {ticker}")
+
+        def cache_function(self, args: StockPriceInput, result: float) -> bool:
+            return True  # Cache all results — historical prices never change
+  example_bad: |
+    from crewai import tool
+
+    @tool("Get Stock Price")
+    def get_stock_price(ticker: str, date: str) -> str:
+        """Get stock price"""  # Vague description — agent may not use correctly
+        import requests
+        r = requests.get(f"https://api.stockdata.com/v1/price/{ticker}?date={date}")
+        return r.json()["close"]  # No error handling — raises to agent level
+        # Timeout? r.timeout not set — hangs indefinitely
+        # HTTP 429? KeyError on ["close"] — crashes crew run
+        # No caching — calls API on every identical request
+  when_applies: When building any tool for production CrewAI agents. Especially critical for tools that call external APIs.
+  sources:
+    - "https://docs.crewai.com/en/learn/create-custom-tools"
+    - "https://deepwiki.com/crewAIInc/crewAI/5.4-custom-tool-development"
+
+- id: CREW-008
+  text: >
+    Set allow_delegation=False on all worker agents unless you have explicitly designed
+    a delegation topology. Default delegation (allow_delegation=True in older versions)
+    causes agents to hand off work to other agents mid-task, creating circular delegation
+    loops that spin until max_iter is exhausted.
+  why: >
+    When allow_delegation=True, an agent encountering a difficult task can delegate to
+    another agent. In a crew where multiple agents have delegation enabled, Agent A
+    delegates to Agent B, who delegates back to Agent A — a loop that burns all
+    max_iter steps before failing. This produces no useful output and costs full token
+    spend. In hierarchical crews, only the manager agent should have delegation enabled;
+    all workers must have it disabled. The delegation loop is one of the top 3 reported
+    production issues in CrewAI community forums.
+  how_to_do_right: |
+    1. Default ALL agents to allow_delegation=False.
+    2. In hierarchical crews: enable ONLY the manager_agent with allow_delegation=True.
+    3. If you need peer-to-peer delegation, model it as explicit task context dependencies
+       instead (task_b.context=[task_a]).
+    4. Monitor for loop symptoms: a task consuming all max_iter steps with no output.
+    5. Set max_iter=10 as a circuit breaker for delegation-heavy workflows.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [delegation_loops, cost_control]
+  example_good: |
+    from crewai import Agent, Crew, Process
+
+    # All workers: delegation disabled
+    researcher = Agent(
+        role="Research Specialist",
+        goal="Find and summarize sources.",
+        backstory="Expert researcher.",
+        allow_delegation=False,  # Explicit — will not hand off work
+        max_iter=10,
+    )
+    writer = Agent(
+        role="Content Writer",
+        goal="Write the final report.",
+        backstory="Expert technical writer.",
+        allow_delegation=False,
+        max_iter=8,
+    )
+
+    # Only manager in hierarchical crew gets delegation
+    manager = Agent(
+        role="Project Manager",
+        goal="Coordinate research and writing.",
+        backstory="Experienced PM.",
+        allow_delegation=True,   # Only the manager can delegate
+        max_iter=5,
+    )
+  example_bad: |
+    # Both agents have delegation enabled (old default or misconfiguration)
+    researcher = Agent(
+        role="Researcher",
+        goal="Do research",
+        backstory="...",
+        allow_delegation=True,  # Will delegate to writer when stuck
+    )
+    writer = Agent(
+        role="Writer",
+        goal="Write content",
+        backstory="...",
+        allow_delegation=True,  # Will delegate back to researcher when stuck
+    )
+    # Research task is hard → researcher delegates to writer
+    # Writer doesn't know how to research → delegates back to researcher
+    # Loop runs until max_iter=20 is exhausted — costs $0.50+ in tokens, produces nothing
+  when_applies: Always. Every agent definition must explicitly set allow_delegation. Never rely on the default value.
+  sources:
+    - "https://docs.crewai.com/en/concepts/agents"
+    - "https://community.deeplearning.ai/t/how-this-can-be-prevented-in-crewai/629727"
+
+- id: CREW-009
+  text: >
+    Use task context (context=[prior_task]) for sequential dependencies and kickoff inputs
+    (crew.kickoff(inputs={})) for runtime parameters. Never hardcode runtime data in task
+    descriptions — use {variable_name} template placeholders. Mixing hardcoded data
+    with templates makes crews brittle and untestable.
+  why: >
+    CrewAI tasks support {variable} placeholders in description and expected_output
+    that are substituted at kickoff time. This enables crews to be reusable pipelines
+    rather than single-use scripts. Teams that hardcode data in task descriptions create
+    a new crew object for every run — preventing caching, making logs unreadable, and
+    making testing impossible. Template placeholders + context dependencies make a crew
+    a reusable, testable, version-controlled artifact.
+  how_to_do_right: |
+    1. Use {var_name} placeholders for any value that changes between runs.
+    2. Pass runtime values via crew.kickoff(inputs={"var_name": value}).
+    3. Use task.context=[upstream_task] to access prior task outputs.
+    4. Access context in description as: "Using the research from the previous step, ..."
+       (CrewAI appends prior task outputs to context automatically when context= is set).
+    5. Validate all required inputs at the start of kickoff with a pre-flight check.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [crewai]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [reusability, task_design]
+  example_good: |
+    from crewai import Task, Crew
+
+    # Reusable task with template placeholders
+    research_task = Task(
+        description=(
+            "Research {company_name} in the {industry} industry. "
+            "Focus on their {analysis_focus} for fiscal year {fiscal_year}. "
+            "Use only sources from {trusted_sources}."
+        ),
+        expected_output=(
+            "A structured report on {company_name}'s {analysis_focus}, "
+            "with 5 key findings and source citations."
+        ),
+        agent=researcher,
+    )
+
+    analysis_task = Task(
+        description=(
+            "Using the research findings, analyze the competitive position of {company_name}."
+        ),
+        expected_output="A SWOT analysis with 3 items per quadrant.",
+        agent=analyst,
+        context=[research_task],  # Gets research_task.output as context
+    )
+
+    result = crew.kickoff(inputs={
+        "company_name": "Tesla",
+        "industry": "electric vehicles",
+        "analysis_focus": "market share and revenue growth",
+        "fiscal_year": "2024",
+        "trusted_sources": "SEC filings, Reuters, Bloomberg",
+    })
+  example_bad: |
+    # New task object for every company — hardcoded, untestable, unreusable
+    research_task_tesla = Task(
+        description="Research Tesla in the EV industry. Focus on revenue for 2024.",
+        expected_output="Report on Tesla.",
+        agent=researcher,
+    )
+
+    # Next company requires copy-paste of entire crew setup
+    research_task_rivian = Task(
+        description="Research Rivian in the EV industry. Focus on revenue for 2024.",
+        expected_output="Report on Rivian.",
+        agent=researcher,
+    )
+  when_applies: When building any crew that will run more than once with different data. Template design is mandatory for production crews.
+  sources:
+    - "https://docs.crewai.com/en/concepts/tasks"
+    - "https://docs.crewai.com/en/concepts/crews"
+
+- id: CREW-010
+  text: >
+    Use native async kickoff (crew.akickoff()) for concurrent crew execution, not
+    threading or asyncio.run() wrappers around synchronous kickoff(). Wrapping
+    synchronous kickoff() in threads causes event loop conflicts with async LLM
+    clients and produces hard-to-debug deadlocks under load.
+  why: >
+    CrewAI's kickoff_async() wraps synchronous execution in a thread pool. Under high
+    concurrency (10+ parallel crews), thread pool exhaustion causes timeouts. The native
+    akickoff() method uses proper async/await throughout the execution chain, including
+    async LLM calls. Production systems running 20+ parallel crew instances must use
+    akickoff_for_each() to avoid the thread-based concurrency ceiling. The async
+    implementation also supports proper cancellation via asyncio.CancelledError.
+  how_to_do_right: |
+    1. Use akickoff() for single async crew execution.
+    2. Use akickoff_for_each() for processing a list of inputs concurrently.
+    3. Control concurrency with asyncio.Semaphore to prevent API rate limit exhaustion.
+    4. Never mix crew.kickoff() inside async functions — always use akickoff().
+    5. Handle CancelledError explicitly for graceful shutdown.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [crewai, asyncio]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [concurrency, production_deployment]
+  example_good: |
+    import asyncio
+    from crewai import Crew
+
+    async def process_companies(companies: list[str]) -> list:
+        """Process multiple companies concurrently with rate limiting."""
+        semaphore = asyncio.Semaphore(5)  # Max 5 concurrent crew runs
+
+        async def run_one(company: str):
+            async with semaphore:
+                return await crew.akickoff(inputs={"company_name": company})
+
+        tasks = [run_one(c) for c in companies]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Filter out exceptions, log failures
+        successful = []
+        for company, result in zip(companies, results):
+            if isinstance(result, Exception):
+                print(f"ERROR: {company}: {result}")
+            else:
+                successful.append(result)
+        return successful
+
+    results = asyncio.run(process_companies(["Tesla", "Rivian", "Lucid"]))
+  example_bad: |
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+    from crewai import Crew
+
+    # Anti-pattern: threading around synchronous kickoff
+    async def process_companies(companies: list[str]) -> list:
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            # kickoff() uses its own event loop internally
+            # Running inside executor creates nested event loops
+            # Causes "Event loop is already running" errors under load
+            futures = [
+                loop.run_in_executor(
+                    executor,
+                    lambda c: crew.kickoff(inputs={"company_name": c}),
+                    company
+                )
+                for company in companies
+            ]
+            return await asyncio.gather(*futures)
+  when_applies: Any production system that runs more than one crew concurrently. Async execution is mandatory for high-throughput pipelines.
+  sources:
+    - "https://docs.crewai.com/en/concepts/crews"
+    - "https://github.com/crewAIInc/crewAI"
+
+- id: CREW-011
+  text: >
+    Enable output_log_file on every production crew and set up usage_metrics monitoring.
+    Without logs, debugging crew failures requires re-running the entire crew — which
+    costs money and time. Structured JSON logs (not .txt) enable automated parsing and
+    alerting on failure patterns.
+  why: >
+    Crew.kickoff() is expensive: a typical crew run costs $0.05-$0.50 in LLM tokens and
+    takes 30-300 seconds. When a run fails at step 7 of 10, without logs you cannot
+    determine which agent failed, what the prior agent produced, or which tool call
+    errored. output_log_file="logs/crew.json" captures every task output, agent action,
+    tool call, and error with timestamps. usage_metrics gives per-run token counts for
+    cost attribution. Both are zero-overhead to enable.
+  how_to_do_right: |
+    1. Set output_log_file=f"logs/crew_{run_id}.json" (unique per run).
+    2. Access usage_metrics after kickoff: metrics = result.token_usage
+    3. Log: metrics.total_tokens, metrics.prompt_tokens, metrics.completion_tokens.
+    4. Add step_callback to monitor long-running agents in real time.
+    5. Rotate logs — implement a log cleanup job (keep last 30 days).
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [crewai]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [observability, debugging]
+  example_good: |
+    import uuid
+    from crewai import Crew, Process
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    def step_monitor(step_output):
+        """Real-time monitoring of agent actions."""
+        logger.info(f"Agent step: {step_output}")
+
+    run_id = str(uuid.uuid4())[:8]
+
+    crew = Crew(
+        agents=[researcher, analyst, writer],
+        tasks=[research_task, analysis_task, writing_task],
+        process=Process.sequential,
+        output_log_file=f"logs/crew_{run_id}.json",
+        step_callback=step_monitor,
+        verbose=False,
+    )
+
+    result = crew.kickoff(inputs={"company": "Tesla"})
+
+    # Log usage metrics for cost attribution
+    metrics = result.token_usage
+    logger.info(
+        "Crew run complete",
+        extra={
+            "run_id": run_id,
+            "total_tokens": metrics.total_tokens,
+            "prompt_tokens": metrics.prompt_tokens,
+            "completion_tokens": metrics.completion_tokens,
+            "cost_usd_estimate": metrics.total_tokens * 0.000015,  # claude-opus-4-6
+        }
+    )
+  example_bad: |
+    crew = Crew(
+        agents=[researcher, analyst, writer],
+        tasks=[research_task, analysis_task, writing_task],
+        process=Process.sequential,
+        # No output_log_file — failures are black boxes
+        # No step_callback — no real-time visibility
+        verbose=True,  # Prints to stdout only — not parseable, not persistent
+    )
+
+    result = crew.kickoff()
+    # Run fails at step 5 of 9
+    # No way to see what agents 1-4 produced without re-running from scratch
+    # Cost: $0.30 per run × unknown number of re-runs to debug
+  when_applies: Every production crew run. Development crews should also log to catch regressions early.
+  sources:
+    - "https://docs.crewai.com/en/concepts/crews"
+    - "https://github.com/crewAIInc/crewAI"
+
+- id: CREW-012
+  text: >
+    Use CrewAI Flows (@start, @listen, @router) when you need conditional branching,
+    loops, or multi-crew orchestration. Use plain Crew + sequential process for simple
+    linear pipelines. Flows are the CrewAI answer to complex state machines — do not
+    implement these patterns with nested kickoff() calls.
+  why: >
+    Crews are stateless pipelines. Once kickoff() finishes, state is gone unless you
+    implement custom persistence. Flows add event-driven execution, persistent Pydantic
+    state, @router for conditional branching, and @persist for SQLite-backed state
+    recovery. Teams that implement loops and branching with nested Crew.kickoff() calls
+    create unmaintainable spaghetti — no state tracking, no resume-on-failure, no
+    visualization. Flows give you all of that with declarative Python decorators.
+  how_to_do_right: |
+    1. Use Flow when: pipeline has conditional branches, loops, or multiple crews.
+    2. Define state as a Pydantic BaseModel subclass for type safety.
+    3. Use @start() for entry points, @listen(method) for sequential steps.
+    4. Use @router() + @listen(route_name) for conditional branching.
+    5. Use @persist on the Flow class for automatic SQLite state recovery.
+    6. Call flow.plot() during development to visualize the execution graph.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [crewai]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [flow_design, state_management]
+  example_good: |
+    from crewai.flow import Flow, start, listen, router
+    from pydantic import BaseModel
+    from typing import Literal
+
+    class DocumentProcessingState(BaseModel):
+        document_text: str = ""
+        doc_type: str = ""
+        extraction_result: dict = {}
+        requires_human_review: bool = False
+
+    class DocumentProcessingFlow(Flow[DocumentProcessingState]):
+
+        @start()
+        def classify_document(self):
+            result = classifier_crew.kickoff(
+                inputs={"text": self.state.document_text}
+            )
+            self.state.doc_type = result.pydantic.doc_type
+
+        @router(classify_document)
+        def route_by_type(self) -> Literal["extract_contract", "extract_invoice", "flag_unknown"]:
+            if self.state.doc_type == "contract":
+                return "extract_contract"
+            elif self.state.doc_type == "invoice":
+                return "extract_invoice"
+            else:
+                return "flag_unknown"
+
+        @listen("extract_contract")
+        def extract_contract_data(self):
+            result = contract_crew.kickoff(
+                inputs={"text": self.state.document_text}
+            )
+            self.state.extraction_result = result.pydantic.dict()
+
+        @listen("extract_invoice")
+        def extract_invoice_data(self):
+            result = invoice_crew.kickoff(
+                inputs={"text": self.state.document_text}
+            )
+            self.state.extraction_result = result.pydantic.dict()
+
+        @listen("flag_unknown")
+        def flag_for_review(self):
+            self.state.requires_human_review = True
+
+    flow = DocumentProcessingFlow()
+    flow.kickoff(inputs={"document_text": raw_text})
+  example_bad: |
+    # Implementing branching with nested kickoff() calls — no state, no recovery
+    def process_document(document_text: str) -> dict:
+        doc_type_result = classifier_crew.kickoff(inputs={"text": document_text})
+        doc_type = doc_type_result.raw  # Fragile string parsing
+
+        if "contract" in doc_type.lower():
+            result = contract_crew.kickoff(inputs={"text": document_text})
+        elif "invoice" in doc_type.lower():
+            result = invoice_crew.kickoff(inputs={"text": document_text})
+        else:
+            return {"error": "unknown type"}
+
+        # If this crashes, no state to resume from
+        # No visualization possible
+        # Cannot add retry, loops, or parallel branches without rewriting everything
+        return result.raw
+  when_applies: When your workflow requires branching, loops, or coordination between multiple crews. Default to Flows for anything beyond a single linear pipeline.
+  sources:
+    - "https://docs.crewai.com/en/concepts/flows"
+    - "https://deepwiki.com/crewAIInc/crewAI/3.1-flow-creation-and-structure"
+
+- id: CREW-013
+  text: >
+    Set respect_context_window=True and use RAG tools for large documents — never
+    pass 50-page PDFs directly into task descriptions. The agent's context window
+    is a shared resource for role/backstory/task/tools/history. Oversized document
+    injection causes truncation, which silently degrades output quality.
+  why: >
+    An agent's effective context is: system_prompt + backstory + task_description +
+    tool_definitions + conversation_history + document_content. A 50-page PDF in
+    task_description alone consumes ~60K tokens, leaving no room for multi-turn
+    reasoning. With respect_context_window=True (default True in recent versions),
+    CrewAI auto-summarizes when limits are exceeded — but summarization loses detail.
+    Better: use a RAG tool (PDFSearchTool, WebsiteSearchTool) and let the agent
+    retrieve only the relevant chunks. This reduces per-task token cost by 60-90%
+    and improves answer quality.
+  how_to_do_right: |
+    1. Set respect_context_window=True on all agents (default in recent CrewAI versions).
+    2. For documents > 5 pages, use a RAG tool instead of inline text.
+    3. Use PDFSearchTool(pdf=path) for static PDFs.
+    4. Use a custom tool wrapping Qdrant/Chroma for dynamic document sets.
+    5. In task description, reference the document by name, not content: "Search the Tesla 10-K for risk factors."
+    6. The RAG tool handles chunking and retrieval — the agent gets only the relevant 500-1000 tokens.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [crewai, crewai_tools]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [context_management, token_efficiency]
+  example_good: |
+    from crewai_tools import PDFSearchTool
+
+    # Tool handles chunking and retrieval
+    sec_filing_tool = PDFSearchTool(
+        pdf="/data/tesla_10k_2024.pdf",
+        config={
+            "embedder": {
+                "provider": "ollama",
+                "config": {"model": "mxbai-embed-large"},
+            }
+        }
+    )
+
+    analyst = Agent(
+        role="SEC Filing Analyst",
+        goal="Answer questions about the provided 10-K using the search tool.",
+        backstory="Expert at financial document analysis.",
+        tools=[sec_filing_tool],
+        respect_context_window=True,  # Auto-summarize if context overflows
+        max_iter=10,
+    )
+
+    task = Task(
+        description=(
+            "Using the Tesla 10-K search tool, find and summarize "
+            "the top 5 risk factors mentioned in the Risk Factors section."
+        ),
+        agent=analyst,
+    )
+  example_bad: |
+    with open("/data/tesla_10k_2024.pdf", "rb") as f:
+        import PyPDF2
+        reader = PyPDF2.PdfReader(f)
+        full_text = "\n".join(page.extract_text() for page in reader.pages)
+        # full_text = ~120,000 characters = ~30,000 tokens
+
+    task = Task(
+        description=f"Analyze the following 10-K:\n\n{full_text}\n\nFind the top 5 risks.",
+        # 30,000 tokens just for document text
+        # + 2,000 for system prompt/backstory/tools
+        # = exceeds most LLM context windows
+        # Even if it fits, most of the 30K tokens are irrelevant to "top 5 risks"
+        agent=analyst,
+    )
+  when_applies: Any task that processes documents longer than 5 pages, web pages, or large text files. Always use RAG tools for large content.
+  sources:
+    - "https://docs.crewai.com/en/concepts/agents"
+    - "https://docs.crewai.com/en/learn/create-custom-tools"
+
+- id: CREW-014
+  text: >
+    Test CrewAI systems at three levels: unit-test individual tools in isolation,
+    integration-test task→agent pairs with VCR cassettes to replay LLM responses,
+    and end-to-end test the full crew with real (but cheap) models. Never test crews
+    by hand only — crew behavior is non-deterministic and requires statistical validation.
+  why: >
+    CrewAI's built-in crewai test command runs N iterations and scores each task 1-10
+    using an evaluator LLM, giving a statistical quality signal. But it only works with
+    OpenAI models. For Claude/Gemini-based crews, use VCR cassettes (recorded LLM
+    responses) for deterministic unit tests, and pytest fixtures that mock tool calls.
+    Teams that skip automated testing discover bugs only in production — where a crew
+    runs 50 times before someone notices 30% of outputs are malformed.
+  how_to_do_right: |
+    1. Unit test: Test each BaseTool._run() in isolation with mock HTTP responses.
+    2. Integration test: Use VCR cassettes to record/replay LLM calls for deterministic tests.
+    3. E2E smoke test: Run crew with 1 real LLM call on a minimal test case (fast + cheap).
+    4. Statistical test: Use `crewai test -n 5` weekly to track quality trends.
+    5. Assert on TaskOutput.pydantic fields, not on raw string content.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [crewai, pytest, vcrpy]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [testing, quality_assurance]
+  example_good: |
+    import pytest
+    from unittest.mock import MagicMock, patch
+    from crewai import Task, Agent, Crew, Process
+
+    # Unit test: tool in isolation
+    def test_stock_price_tool_success():
+        tool = StockPriceTool()
+        with patch("httpx.get") as mock_get:
+            mock_get.return_value.json.return_value = {"close": 185.50}
+            mock_get.return_value.raise_for_status = MagicMock()
+
+            result = tool._run(ticker="AAPL", date="2024-01-15")
+
+        assert result == 185.50
+
+    def test_stock_price_tool_timeout():
+        from crewai.tools.tool_types import ToolException
+        import httpx
+
+        tool = StockPriceTool()
+        with patch("httpx.get", side_effect=httpx.TimeoutException("timeout")):
+            with pytest.raises(ToolException, match="timeout"):
+                tool._run(ticker="AAPL", date="2024-01-15")
+
+    # Integration test: task output validation
+    def test_risk_analysis_task_output_structure(mock_llm):
+        """Use a fake LLM to verify task produces valid Pydantic output."""
+        mock_llm.invoke.return_value.content = '''{
+            "company_name": "Tesla",
+            "fiscal_year": 2024,
+            "top_risks": [
+                {"title": "Competition", "description": "EV market competition",
+                 "severity": "high", "page_reference": "p.12"}
+            ]
+        }'''
+        result = analyst.execute_task(risk_task)
+        assert isinstance(result.pydantic, RiskAnalysisOutput)
+        assert len(result.pydantic.top_risks) >= 1
+  example_bad: |
+    # Manual testing only
+    result = crew.kickoff(inputs={"company_name": "Tesla"})
+    print(result.raw)  # "Looks OK!" — no assertion, no regression detection
+
+    # 2 weeks later: a model update changes output format
+    # 30% of downstream JSON parsers break
+    # No test caught it because there were no tests
+  when_applies: For any crew that runs in production more than once. Automated testing is non-negotiable for production CrewAI deployments.
+  sources:
+    - "https://docs.crewai.com/en/concepts/testing"
+    - "https://deepwiki.com/crewAIInc/crewAI/9.1-cli-tools"
+
+- id: CREW-015
+  text: >
+    Set max_rpm on the Crew (not just individual agents) as a hard rate-limit ceiling.
+    Combine with an exponential backoff retry policy for LLM calls. Without max_rpm,
+    a hierarchical crew with 10 agents can burst 50 concurrent API calls and trigger
+    a 1-hour ban from OpenAI/Anthropic rate limits.
+  why: >
+    Each agent in a crew makes independent LLM calls. In hierarchical process, the
+    manager generates sub-tasks for worker agents simultaneously. 10 agents × 3 tasks
+    each = 30 concurrent LLM calls per second is easily achievable. Anthropic's Claude
+    API enforces a 429 rate limit and introduces exponential backoff time — a 30-second
+    burst ban after hitting rate limits stalls the entire crew. Setting max_rpm=10 at
+    the crew level caps total calls across all agents. This adds ~15% latency but
+    eliminates rate limit failures entirely.
+  how_to_do_right: |
+    1. Set max_rpm on the Crew object (overrides individual agent settings).
+    2. Rule of thumb: max_rpm = min(your_api_limit_rpm, num_agents * 3).
+    3. Configure your LLM client with retry on 429 and 529 status codes.
+    4. Monitor usage_metrics.total_tokens per run to catch runaway crews early.
+    5. For Claude: default Tier 1 limit is 50 RPM. Set max_rpm=40 for headroom.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai, anthropic, openai]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [rate_limiting, production_reliability]
+  example_good: |
+    from crewai import Crew, Process
+    from langchain_anthropic import ChatAnthropic
+
+    llm = ChatAnthropic(
+        model="claude-opus-4-6",
+        max_retries=3,          # Retry on 429/529
+        timeout=60.0,           # 60s timeout per call
+    )
+
+    crew = Crew(
+        agents=[agent1, agent2, agent3, agent4, agent5],
+        tasks=[...],
+        process=Process.hierarchical,
+        manager_llm=llm,
+        max_rpm=40,          # Crew-level cap: total across all agents
+        verbose=False,
+    )
+  example_bad: |
+    # No rate limiting — 5 agents in hierarchical mode
+    # Each agent makes ~3 LLM calls per task
+    # 5 agents × 3 tasks × 3 calls = 45 concurrent LLM requests
+    crew = Crew(
+        agents=[agent1, agent2, agent3, agent4, agent5],
+        tasks=[complex_task],
+        process=Process.hierarchical,
+        manager_llm="claude-opus-4-6",
+        # No max_rpm — will hit Anthropic rate limits within seconds
+        # Rate limit ban: up to 60 minutes
+        # User sees "Error: rate limit exceeded" with no automatic recovery
+    )
+  when_applies: Any production crew with 3+ agents. Max_rpm is non-optional for hierarchical crews at any scale.
+  sources:
+    - "https://docs.crewai.com/en/concepts/agents"
+    - "https://docs.crewai.com/en/concepts/crews"
+
+- id: CREW-016
+  text: >
+    Avoid giving agents access to code execution (allow_code_execution=True) in production
+    unless running in Docker sandbox mode. The "unsafe" direct execution mode runs agent-
+    generated code in the same process as your application — a prompt injection attack
+    can execute rm -rf or exfiltrate environment variables.
+  why: >
+    When allow_code_execution=True and code_execution_mode="unsafe", agent-generated Python
+    code runs directly in your server's Python process with full access to the filesystem,
+    environment variables, and network. An adversarial user can craft inputs that cause the
+    agent to generate malicious code. This is a critical security vulnerability. Docker
+    sandbox mode (code_execution_mode="safe") runs code in an isolated container with
+    no access to the host. Always use safe mode in production; restrict Docker's network
+    access too.
+  how_to_do_right: |
+    1. Default: do NOT enable allow_code_execution. Most agents don't need it.
+    2. If code execution is required: set code_execution_mode="safe" (Docker-based).
+    3. Configure Docker resource limits: memory=512m, cpus=0.5, no host network.
+    4. Validate agent-generated code has no subprocess, os.system, or open() calls.
+    5. Run code execution agents with a separate LLM API key with minimal permissions.
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [crewai, docker]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [security, code_execution]
+  example_good: |
+    from crewai import Agent
+
+    # Safe code execution in Docker sandbox
+    code_analyst = Agent(
+        role="Data Analyst",
+        goal="Analyze the provided CSV data using Python pandas.",
+        backstory="Expert data analyst using Python for statistical analysis.",
+        allow_code_execution=True,
+        code_execution_mode="safe",  # Docker-based isolation
+        max_execution_time=30,       # 30-second timeout on code execution
+    )
+
+    # Docker will run with:
+    # docker run --memory=512m --cpus=0.5 --network=none python:3.11
+    # No access to host filesystem, network, or environment
+  example_bad: |
+    # CRITICAL VULNERABILITY: unsafe code execution
+    code_analyst = Agent(
+        role="Data Analyst",
+        goal="Analyze data.",
+        backstory="...",
+        allow_code_execution=True,
+        code_execution_mode="unsafe",  # Runs in SAME Python process as server
+        # Adversarial input: "Analyze this data: import os; os.system('cat /etc/passwd')"
+        # Agent generates and executes this code — server compromise
+    )
+  when_applies: Any agent with allow_code_execution=True. Safe mode is non-negotiable for production. Never use unsafe mode outside a dedicated sandbox environment.
+  sources:
+    - "https://docs.crewai.com/en/concepts/agents"
+    - "https://owasp.org/www-project-top-ten/"
+
+- id: CREW-017
+  text: >
+    When using kickoff_for_each() or akickoff_for_each() on a list of inputs,
+    pre-validate all inputs before starting the loop. One invalid input in the middle
+    of a 100-item list causes a crash after 50 completed (and paid for) runs, with no
+    partial results preserved.
+  why: >
+    CrewAI's for_each variants iterate over a list and call kickoff for each item.
+    If item 51 of 100 has a missing field that causes a task template substitution
+    error (KeyError), the crew crashes. Items 1-50 are complete and their results are
+    lost (not returned as partial results). Items 51-100 never run. You have paid for
+    50 runs worth of LLM tokens and have nothing. Pre-validation with Pydantic models
+    catches all invalid inputs before the first run starts.
+  how_to_do_right: |
+    1. Define a Pydantic model for kickoff inputs.
+    2. Validate all items before calling kickoff_for_each.
+    3. Use asyncio.gather with return_exceptions=True to handle individual failures.
+    4. Store partial results to a file/database — not in memory — so restarts resume.
+    5. Log which items succeeded and failed with their inputs for retry.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai, pydantic]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [reliability, batch_processing]
+  example_good: |
+    from pydantic import BaseModel, field_validator
+    from typing import List
+    import json, asyncio
+
+    class AnalysisInput(BaseModel):
+        company_name: str
+        fiscal_year: int
+        document_path: str
+
+        @field_validator("document_path")
+        def path_must_exist(cls, v):
+            from pathlib import Path
+            if not Path(v).exists():
+                raise ValueError(f"Document not found: {v}")
+            return v
+
+    async def batch_analyze(inputs_raw: list[dict]) -> list:
+        # Step 1: Validate ALL inputs before starting
+        validated = []
+        errors = []
+        for i, inp in enumerate(inputs_raw):
+            try:
+                validated.append(AnalysisInput(**inp))
+            except Exception as e:
+                errors.append({"index": i, "input": inp, "error": str(e)})
+
+        if errors:
+            print(f"VALIDATION FAILED: {len(errors)} invalid inputs")
+            for err in errors:
+                print(f"  Item {err['index']}: {err['error']}")
+            raise ValueError(f"Fix {len(errors)} invalid inputs before running")
+
+        # Step 2: Run only after full validation
+        semaphore = asyncio.Semaphore(3)
+        results = []
+
+        async def run_one(item: AnalysisInput, idx: int):
+            async with semaphore:
+                result = await crew.akickoff(inputs=item.dict())
+                # Persist immediately — don't lose results on crash
+                with open(f"results/item_{idx}.json", "w") as f:
+                    json.dump({"input": item.dict(), "output": result.raw}, f)
+                return result
+
+        return await asyncio.gather(
+            *[run_one(item, i) for i, item in enumerate(validated)],
+            return_exceptions=True
+        )
+  example_bad: |
+    # No validation — crash at item 51 loses all results
+    results = crew.kickoff_for_each(inputs=[
+        {"company_name": "Tesla", "fiscal_year": 2024, "document_path": "/data/tesla.pdf"},
+        {"company_name": "Rivian", "fiscal_year": 2024},  # Missing document_path!
+        # ... 98 more items
+    ])
+    # Runs Tesla OK, then crashes on Rivian with KeyError
+    # Tesla result is in results[0] but returns as empty list on crash
+    # Items 3-100 never run — you've wasted 1 LLM call worth of tokens and time
+  when_applies: Any batch processing with kickoff_for_each or akickoff_for_each. Input validation is mandatory before batch runs.
+  sources:
+    - "https://docs.crewai.com/en/concepts/crews"
+    - "https://docs.pydantic.dev/latest/concepts/validators/"
+
+- id: CREW-018
+  text: >
+    Do not use CrewAI's built-in planning (planning=True) with expensive frontier models
+    as the planning_llm. The planning step generates a detailed execution plan before
+    task execution, adding 1-2 LLM calls using the planning_llm. Use a fast, cheap model
+    (gpt-4o-mini or claude-haiku) for planning and the full model for execution.
+  why: >
+    When planning=True without specifying planning_llm, CrewAI uses the crew's default LLM
+    (likely your most expensive model) to generate a pre-execution plan. This adds 1-2
+    extra LLM calls at full model cost before a single task runs. For a 5-task crew with
+    planning enabled and claude-opus-4-6 as the default LLM, planning costs an extra
+    ~$0.05-0.10 per run. Over 1000 runs, that is $50-100 in pure planning overhead.
+    Specify a cheap planning_llm explicitly.
+  how_to_do_right: |
+    1. Enable planning=True only for complex, multi-agent workflows (5+ tasks).
+    2. Always set planning_llm to a cheap, fast model.
+    3. Measure whether planning improves output quality — for simple sequential tasks, it adds cost with no benefit.
+    4. Benchmark: run 10 iterations with and without planning, compare output quality scores.
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [crewai]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [cost_optimization, planning]
+  example_good: |
+    from crewai import Crew, Process
+    from langchain_anthropic import ChatAnthropic
+    from langchain_openai import ChatOpenAI
+
+    # Cheap model for planning, expensive for execution
+    planning_model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    execution_model = ChatAnthropic(model="claude-opus-4-6")
+
+    crew = Crew(
+        agents=[agent1, agent2, agent3, agent4, agent5],
+        tasks=[task1, task2, task3, task4, task5],
+        process=Process.sequential,
+        planning=True,
+        planning_llm=planning_model,  # $0.00015/1K tokens instead of $0.015/1K
+    )
+  example_bad: |
+    # Planning enabled but no planning_llm — uses default (expensive) LLM
+    crew = Crew(
+        agents=[agent1, agent2, agent3],
+        tasks=[task1, task2, task3],
+        process=Process.sequential,
+        planning=True,
+        # planning_llm not set — uses claude-opus-4-6 for planning
+        # Planning adds 2 LLM calls × $0.015/1K tokens × ~2000 tokens = $0.06/run overhead
+        # For 3-task sequential crew, planning adds zero quality benefit
+    )
+  when_applies: When enabling CrewAI planning. Always specify planning_llm with a cost-efficient model.
+  sources:
+    - "https://docs.crewai.com/en/concepts/crews"
+    - "https://github.com/crewAIInc/crewAI"
+
+- id: CREW-019
+  text: >
+    Separate concern of "what the crew does" from "how results are stored" — never
+    write file I/O or database writes inside CrewAI task callbacks. Use task callback
+    only for lightweight post-processing; handle persistence in the calling code after
+    crew.kickoff() returns.
+  why: >
+    CrewAI task callbacks run synchronously after each task completes, blocking the
+    next task from starting. A callback that writes to a database, sends an HTTP request,
+    or processes a large file adds latency to every task in the crew. More critically,
+    an exception in a callback kills the entire crew run — the callback exception
+    propagates up and the remaining tasks never execute. Keep callbacks to metric
+    logging only; do heavy I/O after kickoff() returns.
+  how_to_do_right: |
+    1. Task callback signature: callback(task_output: TaskOutput) -> None
+    2. Callback should only: log metrics, update in-memory counters, emit a non-blocking event.
+    3. Never: database writes, HTTP calls, file I/O, or CPU-intensive processing.
+    4. After kickoff() returns, do all persistence with the full result.
+    5. If you need per-task persistence, use a non-blocking queue (asyncio.Queue, Redis Streams).
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [crewai]
+  domains:
+    domain: [agent_orchestration, crewai]
+    concern: [callback_design, reliability]
+  example_good: |
+    import time
+    from crewai import Task
+    from crewai.tasks.task_output import TaskOutput
+
+    task_metrics = {"completed": 0, "tokens": 0, "start_time": time.time()}
+
+    def lightweight_callback(output: TaskOutput) -> None:
+        """Only lightweight metric collection — no I/O."""
+        task_metrics["completed"] += 1
+        elapsed = time.time() - task_metrics["start_time"]
+        print(f"Task {task_metrics['completed']} complete in {elapsed:.1f}s")
+
+    task = Task(
+        description="...",
+        agent=analyst,
+        callback=lightweight_callback,  # Lightweight only
+    )
+
+    # All persistence AFTER kickoff returns
+    result = crew.kickoff(inputs={"company": "Tesla"})
+
+    # Now do heavy I/O
+    with open("results/output.json", "w") as f:
+        import json
+        json.dump({"result": result.raw, "metrics": task_metrics}, f)
+
+    await db.save_result(result.pydantic)  # Async DB write — fine after kickoff
+  example_bad: |
+    def blocking_callback(output: TaskOutput) -> None:
+        # WRONG: database write in callback blocks next task
+        import psycopg2
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.cursor().execute("INSERT INTO task_results VALUES (%s)", (output.raw,))
+        conn.commit()
+        conn.close()
+
+        # WRONG: HTTP call in callback adds latency
+        requests.post("https://api.monitoring.com/task", json={"output": output.raw})
+
+        # WRONG: exception here kills the entire crew run
+  when_applies: When using CrewAI task callbacks. All I/O must happen outside the callback.
+  sources:
+    - "https://docs.crewai.com/en/concepts/tasks"
+    - "https://community.crewai.com/t/task-callback-issue-no-pydantic-output/3809"
+
+- id: CREW-020
+  text: >
+    When a crew is used inside a LangGraph node, return the crew result as a state
+    update — never call crew.kickoff() inside a conditional edge function or a
+    LangGraph routing function. Expensive operations in routing functions cause
+    every conditional edge evaluation to trigger a full crew run.
+  why: >
+    LangGraph evaluates conditional edge functions synchronously to determine the next
+    node. If a conditional edge function calls crew.kickoff(), the LLM call happens
+    during routing — which is called after EVERY node completion, including re-evaluations
+    after checkpointing. This means the crew runs multiple times when only one execution
+    was intended. Additionally, routing functions must be pure and fast — their return
+    value determines graph topology, not output data. Always run crew.kickoff() in a
+    node function, store result in state, then route based on stored state.
+  how_to_do_right: |
+    1. Run crew.kickoff() ONLY inside LangGraph node functions (not routing functions).
+    2. Store crew result in graph state: return {"crew_result": result.pydantic}
+    3. Route in conditional edge based on stored state: state["crew_result"].needs_review
+    4. For async crews, make the node function async: async def run_crew_node(state).
+    5. Never call async crew.akickoff() inside a synchronous graph.
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [crewai, langgraph]
+  domains:
+    domain: [agent_orchestration, crewai, langgraph]
+    concern: [integration, routing_purity]
+  example_good: |
+    from langgraph.graph import StateGraph, END
+    from typing import TypedDict, Annotated, Optional
+
+    class PipelineState(TypedDict):
+        document_text: str
+        crew_result: Optional[dict]
+        requires_review: bool
+
+    # CORRECT: crew runs in a node function
+    async def run_analysis_crew(state: PipelineState) -> dict:
+        result = await analysis_crew.akickoff(
+            inputs={"document": state["document_text"]}
+        )
+        return {
+            "crew_result": result.pydantic.dict(),
+            "requires_review": result.pydantic.confidence < 0.8,
+        }
+
+    # CORRECT: routing is based on state, not on a new crew run
+    def route_after_analysis(state: PipelineState) -> str:
+        if state["requires_review"]:
+            return "human_review"
+        return "auto_approve"
+
+    graph = StateGraph(PipelineState)
+    graph.add_node("run_analysis", run_analysis_crew)
+    graph.add_conditional_edges("run_analysis", route_after_analysis)
+  example_bad: |
+    # WRONG: crew runs inside routing function
+    def route_based_on_analysis(state: PipelineState) -> str:
+        # This runs crew.kickoff() every time the routing function is evaluated
+        result = analysis_crew.kickoff(
+            inputs={"document": state["document_text"]}
+        )
+        # If graph checkpoints after this node and resumes, routing re-evaluates
+        # = second (or third) crew run for the same document
+        if result.pydantic.confidence < 0.8:
+            return "human_review"
+        return "auto_approve"
+  when_applies: When integrating CrewAI with LangGraph. Crew execution always belongs in node functions, never in routing functions.
+  sources:
+    - "https://docs.crewai.com/en/concepts/crews"
+    - "https://docs.langchain.com/oss/python/langgraph/graph-api"

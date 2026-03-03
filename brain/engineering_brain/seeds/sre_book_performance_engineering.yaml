@@ -1,0 +1,336 @@
+layer: rules
+technology: SRE
+domain: performance
+knowledge:
+- id: CR-SRE-PERF-001
+  text: |
+    Tail latency (p99, p99.9) matters far more than average latency for user-facing services. A service with 50ms average but 2s p99 means 1 in 100 users waits 40x longer, and in fan-out architectures the problem compounds exponentially.
+  why: |
+    Google's SRE practices, described across Chapters 18 and 21, emphasize that average latency is a misleading metric that hides severe user-facing problems. Consider a service with 50ms average latency and 2000ms p99 latency. The average looks healthy, but 1% of requests are 40x slower. Now consider a typical Google search page that fans out to 100 backend services in parallel. The page latency is determined by the slowest backend response. With 100 backends each having 1% chance of a 2s response, the probability that at least one backend is slow is 1 - (0.99)^100 = 63.4%. That means nearly two-thirds of user requests hit the tail latency of at least one backend. At p99.9 with 1000 backends, the problem is even worse. This is why Google measures p50, p95, p99, and p99.9 for every RPC, not averages. The SLO is typically set on the tail (e.g., "p99 latency under 200ms for 99.9% of 10-minute windows"). Fixing the average while ignoring the tail creates an illusion of health while users suffer. The tail is often caused by garbage collection pauses, lock contention, cache misses on cold data, or background maintenance tasks that occasionally block request processing. Identifying and reducing tail latency requires different techniques than reducing average latency — you need to trace the slowest requests specifically, not sample uniformly.
+  how_to_do_right: |
+    1. Instrument every RPC with histogram metrics capturing p50, p90, p95, p99, and p99.9 latency — never rely on averages alone.
+    2. Set SLOs on tail latency explicitly (e.g., "p99 < 200ms") and alert when the tail degrades, not just when the average increases.
+    3. Trace the slowest 1% of requests specifically using distributed tracing with tail-biased sampling — random sampling misses rare slow paths.
+    4. Calculate the fan-out amplification factor for your architecture — if your request touches N backends, your effective tail latency probability is 1 - (1 - p)^N where p is the per-backend tail probability.
+    5. Implement hedged requests for critical paths — send a duplicate request to a second backend after a timeout threshold (e.g., p95 latency) and use whichever responds first.
+    6. Profile tail latency sources separately from average latency — check GC pauses, lock contention, disk I/O stalls, and cold cache misses as distinct root causes rather than blending them into aggregate metrics.
+  example_good: "from prometheus_client import Histogram\n\n# Histogram with explicit buckets for tail latency visibility\nREQUEST_LATENCY = Histogram(\n    'http_request_duration_seconds',\n    'Request latency',\n    ['endpoint'],\n    buckets=[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0]\n)\n\n# SLO alert on p99, not average\n# alert: P99LatencyHigh\n# expr: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])) > 0.2\n# for: 5m\n\n# Hedged requests for critical fan-out paths\nasync def hedged_request(backends, timeout_p95=0.1):\n    primary = asyncio.create_task(backends[0].call())\n    await asyncio.sleep(timeout_p95)  # Wait p95 before hedge\n    if not primary.done():\n        hedge = asyncio.create_task(backends[1].call())\n        done, _ = await asyncio.wait({primary, hedge}, return_when=asyncio.FIRST_COMPLETED)\n        return done.pop().result()\n    return primary.result()\n"
+  example_bad: "# Only tracking average latency — hides tail problems\nimport time\n\nlatencies = []\ndef track_latency(duration):\n    latencies.append(duration)\n    avg = sum(latencies) / len(latencies)\n    print(f\"Average latency: {avg:.0f}ms\")  # Shows 50ms\n    # But p99 is 2000ms — 1% of users wait 40x longer\n    # In fan-out to 100 backends: 63% of requests hit the tail\n"
+  when_applies: "When measuring or optimizing latency for any user-facing service, especially those with fan-out to multiple backends."
+  severity: critical
+  technologies:
+    platform: [metrics, histograms, tracing, distributed, grpc, latency]
+  domains:
+    domain: [performance, reliability]
+    concern: [latency, tail_latency, p99, p999, slo]
+  sources:
+  - url: https://sre.google/sre-book/software-engineering-in-sre/
+    title: "Google SRE Book — Chapter 18: Software Engineering in SRE"
+  - url: https://sre.google/sre-book/handling-overload/
+    title: "Google SRE Book — Chapter 21: Handling Overload"
+  validation_status: cross_checked
+
+- id: CR-SRE-PERF-002
+  text: |
+    Load tests must use realistic traffic patterns replayed from production, not synthetic uniform benchmarks. Synthetic tests with identical request sizes, uniform distribution, and no concurrency contention prove nothing about production capacity.
+  why: |
+    Google's Chapter 17 (Testing for Reliability) and the load balancing chapters (19-21) consistently emphasize that capacity measurements are only valid under production-realistic conditions. The most common load testing mistakes invalidate results completely. First, using an empty or tiny database — queries are fast because all indexes fit in memory, but production has terabytes of data where index lookups cause disk seeks. Second, uniform request distribution — production traffic has hot spots where 10% of keys receive 90% of reads, causing cache thrashing that uniform synthetic traffic never reveals. Third, single-client testing — real production has thousands of concurrent clients causing lock contention, connection pool exhaustion, and thread scheduling overhead that a single client cannot reproduce. Fourth, mocking all downstream dependencies — if the database is the bottleneck (as it usually is), mocking it removes the actual constraint. Google replays sampled production traffic for load tests, including the natural mix of expensive queries (aggregations, full-text searches) and cheap queries (point lookups, cached results). They test with production-scale data copies and real downstream services (or stubs with calibrated latency distributions, not just fixed delays). A load test that reports "handles 10,000 QPS" means nothing if production traffic patterns cause the system to degrade at 3,000 QPS due to hot-spot contention that the synthetic test never triggered.
+  how_to_do_right: |
+    1. Record production traffic patterns (request types, sizes, inter-arrival times, user session sequences) and replay them during load tests at scaled-up rates.
+    2. Test against a database populated with production-scale data — at minimum, enough data that indexes do not fit entirely in memory, forcing realistic I/O patterns.
+    3. Simulate concurrent clients matching production's concurrency profile — thousands of connections, not a single-threaded loop sending sequential requests.
+    4. Include downstream dependencies with realistic latency distributions (not mocked to zero) — add jitter and occasional slowness to simulate real backends.
+    5. Run the load test long enough (hours, not minutes) to surface memory leaks, connection pool exhaustion, log rotation interference, and GC pressure that only appears under sustained load.
+    6. Measure and report p99 latency at target QPS, not maximum QPS at any latency — the capacity ceiling is the QPS where p99 latency exceeds the SLO, not where the server stops accepting connections.
+  example_good: "# Realistic load test: replay production traffic patterns\nimport locust\n\nclass ProductionReplayUser(locust.HttpUser):\n    # Replay recorded production traffic mix\n    @locust.task(70)  # 70% of traffic is reads\n    def get_product(self):\n        product_id = self.pick_from_zipf_distribution()  # Hot-spot distribution\n        self.client.get(f\"/api/products/{product_id}\")\n\n    @locust.task(20)  # 20% is search (expensive)\n    def search(self):\n        query = self.pick_real_search_query()  # From production logs\n        self.client.get(f\"/api/search?q={query}\")\n\n    @locust.task(10)  # 10% is writes\n    def create_order(self):\n        self.client.post(\"/api/orders\", json=self.realistic_order())\n\n# Run for 4 hours against production-scale database\n# Report: p99 latency at target QPS, not max QPS\n"
+  example_bad: "# Synthetic uniform benchmark — proves nothing about production\nimport requests\n\nfor i in range(10000):\n    requests.get(f\"http://localhost:8080/api/products/1\")  # Same product!\n    # Single client, no concurrency\n    # Empty database (all indexes in memory)\n    # No hot-spots, no expensive queries\n    # Result: '10,000 QPS!' — but production degrades at 3,000\n"
+  when_applies: "When conducting load tests or capacity planning for any production service."
+  severity: high
+  technologies:
+    library: [testing, load, replay, distributed]
+    platform: [metrics, throughput]
+  domains:
+    domain: [performance, testing, reliability, planning]
+    concern: [load_testing, methodology, capacity, measurement]
+  sources:
+  - url: https://sre.google/sre-book/testing-reliability/
+    title: "Google SRE Book — Chapter 17: Testing for Reliability"
+  validation_status: cross_checked
+
+- id: CR-SRE-PERF-003
+  text: |
+    Run continuous profiling in production with low-overhead sampling, not just during incident investigations. Most performance regressions are gradual and invisible without always-on profiling that captures CPU, memory allocation, and lock contention over weeks.
+  why: |
+    Google's internal continuous profiling system (referenced in Chapter 18 on Software Engineering in SRE and the broader SRE culture of measurement) runs on every production server, every second, with less than 1% CPU overhead. The reason is simple — performance problems that matter most are the ones you cannot reproduce in development or staging. Production traffic patterns, data sizes, and concurrency levels create hot paths that are invisible in controlled environments. Without continuous profiling, teams only profile during incidents, which means they see the symptoms (high latency, high CPU) but lack the historical baseline to identify when and why performance changed. Google's profiler samples stack traces at 100 Hz (every 10ms) across all production servers, aggregates by function, and shows differential flamegraphs comparing this week to last week. This catches regressions like "JSON parsing went from 5% to 15% of CPU after the deploy on Tuesday" before they hit SLO thresholds. The overhead concern is a common objection, but sampling-based profilers (not instrumentation-based) have been measured at 0.5-2% CPU overhead in production, which is negligible compared to the 20-50% CPU waste from undetected performance regressions that accumulate over months. Google considers continuous profiling as essential as monitoring — you would never turn off metrics collection to save CPU, and profiling should be treated the same way.
+  how_to_do_right: |
+    1. Deploy a sampling-based continuous profiler (e.g., pprof, async-profiler, Pyroscope, Google Cloud Profiler) on all production instances with a default sampling rate of 100 Hz.
+    2. Verify profiler overhead is below 2% CPU by comparing instance performance with and without the profiler enabled — if overhead exceeds 2%, reduce sampling frequency.
+    3. Store profiles with enough retention (at minimum 30 days) to correlate performance changes with specific deployments, configuration changes, or traffic shifts.
+    4. Build differential flamegraph views that compare current profiles against a baseline period (e.g., same time last week) to automatically surface functions whose CPU share has increased significantly.
+    5. Set up automated regression alerts — if a function's CPU share increases by more than 2x between releases, flag it in the deployment pipeline for review before full rollout.
+    6. Profile memory allocation rates (not just CPU) to catch allocation-heavy code paths that increase GC pressure and tail latency even when average CPU looks healthy.
+  example_good: "# Continuous profiling with Pyroscope — always-on, low overhead\nimport pyroscope\n\npyroscope.configure(\n    application_name=\"payment-service\",\n    server_address=\"http://pyroscope:4040\",\n    sample_rate=100,  # 100 Hz sampling\n)\n\n# Weekly diff flamegraph review:\n# 'JSON parsing went from 5% to 15% of CPU after Tuesday deploy'\n# Caught before SLO degradation, fixed proactively\n\n# Go: import _ \"net/http/pprof\"  (always-on in production)\n# JVM: -XX:+FlightRecorder -XX:StartFlightRecording=duration=0\n"
+  example_bad: "# Only profile during incidents — missing gradual regressions\n# Normal workflow:\n# 1. Latency is fine (no profiling running)\n# 2. 20 deploys over 2 months (each adds 3% CPU)\n# 3. Latency degrades 60% (nobody noticed gradual change)\n# 4. Incident declared, NOW start profiling\n# 5. See current state, but no baseline to compare against\n# 6. Cannot identify which deploy caused the regression\n"
+  when_applies: "When operating any production service where performance regressions could accumulate gradually across deploys."
+  severity: high
+  technologies:
+    platform: [profiling, continuous, flamegraph, sampling]
+  domains:
+    domain: [performance]
+    concern: [latency, profiling, production, cpu, continuous, memory, allocation]
+  sources:
+  - url: https://sre.google/sre-book/software-engineering-in-sre/
+    title: "Google SRE Book — Chapter 18: Software Engineering in SRE"
+  validation_status: cross_checked
+
+- id: CR-SRE-PERF-004
+  text: |
+    Performance regression detection requires automated statistical baselines, not human eyeballing of dashboards. A 5% latency regression per deploy is invisible to humans but compounds to 2x degradation after 14 deploys without automated detection.
+  why: |
+    Google's approach to reliability (Chapters 17 and 18) recognizes that gradual performance regressions are among the most insidious operational problems because they evade human attention. A single deploy that adds 3ms to average latency (from 100ms to 103ms) does not trigger any alert and looks identical on a dashboard. After 20 deploys, latency is 160ms — a 60% regression that nobody noticed because each step was within noise. Google combats this with automated performance benchmarks that run in CI/CD with statistical significance testing. The key insight is that performance measurements are inherently noisy — the same code produces different latency on each run due to context switching, cache state, network jitter, and garbage collection timing. Naive comparison ("this run was 5ms slower, regression!") produces excessive false positives. Instead, Google runs benchmarks multiple times (minimum 10 iterations), computes confidence intervals, and only flags a regression if the difference is statistically significant at p < 0.05 with an effect size exceeding a meaningful threshold (e.g., > 2% degradation). This approach catches real regressions while ignoring measurement noise. Without this discipline, teams either ignore benchmark results entirely (too many false alarms) or manually verify each one (too slow for continuous deployment). The automation must be in the deployment pipeline as a gate, not as a dashboard someone checks occasionally.
+  how_to_do_right: |
+    1. Run performance benchmarks on every commit or at minimum every release candidate — use dedicated benchmark machines with consistent hardware and minimal background load to reduce measurement variance.
+    2. Execute each benchmark a minimum of 10 times and compute mean, standard deviation, and 95% confidence interval — never compare single-run results.
+    3. Use a statistical test (e.g., Mann-Whitney U or bootstrap confidence intervals) to determine if the performance difference between the current and baseline version is statistically significant at p < 0.05.
+    4. Set a meaningful effect size threshold (e.g., > 2% regression in p99 latency or > 5% regression in throughput) to avoid flagging statistically significant but operationally irrelevant changes.
+    5. Maintain a rolling baseline from the last known-good release — update the baseline only when a release passes all performance gates, creating a ratchet that prevents gradual degradation.
+    6. Integrate regression detection as a blocking gate in the deployment pipeline — a statistically significant regression above the effect threshold blocks the deploy and requires explicit override with a justification.
+  example_good: "import numpy as np\nfrom scipy import stats\n\ndef detect_regression(baseline_runs: list, candidate_runs: list,\n                      threshold_pct: float = 2.0, alpha: float = 0.05):\n    \"\"\"Statistical regression detection with Mann-Whitney U test.\"\"\"\n    assert len(baseline_runs) >= 10 and len(candidate_runs) >= 10\n    stat, p_value = stats.mannwhitneyu(baseline_runs, candidate_runs,\n                                        alternative='less')\n    median_diff_pct = (\n        (np.median(candidate_runs) - np.median(baseline_runs))\n        / np.median(baseline_runs) * 100\n    )\n    is_regression = p_value < alpha and median_diff_pct > threshold_pct\n    return {\n        \"p_value\": p_value,\n        \"median_diff_pct\": median_diff_pct,\n        \"is_regression\": is_regression,\n        \"gate\": \"BLOCK\" if is_regression else \"PASS\",\n    }\n"
+  example_bad: "# Single-run comparison — noise mistaken for signal\ndef check_performance(before: float, after: float):\n    if after > before * 1.01:  # 1% slower? REGRESSION!\n        return 'FAIL'\n    return 'PASS'\n# Problem: single runs have 5-10% natural variance\n# This produces constant false positives -> team ignores the gate\n# OR: no automated check at all -> 3ms per deploy * 20 deploys = 60ms regression\n"
+  when_applies: "When running performance benchmarks in CI/CD pipelines to detect regressions before deployment."
+  severity: high
+  technologies:
+    library: [testing, performance, benchmarking]
+    platform: [gates, performance, metrics, statistical]
+  domains:
+    domain: [performance, testing, reliability, deployment]
+    concern: [regression, detection, automated, statistical_significance, gates]
+  sources:
+  - url: https://sre.google/sre-book/testing-reliability/
+    title: "Google SRE Book — Chapter 17: Testing for Reliability"
+  - url: https://sre.google/sre-book/software-engineering-in-sre/
+    title: "Google SRE Book — Chapter 18: Software Engineering in SRE"
+  validation_status: cross_checked
+
+- id: CR-SRE-PERF-005
+  text: |
+    Garbage collection pauses are the single largest source of tail latency in managed-language services. GC tuning must target maximum pause time, not throughput — a 500ms GC pause every 30 seconds destroys p99 latency even if total GC overhead is only 2%.
+  why: |
+    Google's handling of overload (Chapter 21) and cascading failures (Chapter 22) implicitly addresses the GC problem because GC pauses are a primary cause of the latency spikes that trigger cascading failures. Consider a Java service with 8GB heap running G1 GC with default settings. Under moderate load, young generation collections take 10-20ms (acceptable). But when the heap fills, a mixed collection or full GC can pause all request processing for 200-800ms. During that pause, all in-flight requests are delayed, health checks may fail (causing the load balancer to remove the instance), and queued requests pile up. When the GC finishes, the server faces a burst of queued requests that may trigger another GC, creating a vicious cycle. Google's approach is to tune GC for maximum pause time, not throughput. A GC configuration that uses 5% of CPU but never pauses longer than 20ms is vastly better for a latency-sensitive service than one using 2% CPU with occasional 500ms pauses. This means using concurrent collectors (G1, ZGC, Shenandoah) instead of throughput collectors, setting explicit pause time targets (-XX:MaxGCPauseMillis), sizing the young generation to keep minor GC pauses short, and monitoring GC pause distribution (not just average GC time). For critical services, Google often uses memory-efficient data structures and off-heap storage to reduce GC pressure entirely, trading code complexity for predictable latency.
+  how_to_do_right: |
+    1. Use a low-pause concurrent garbage collector (ZGC or Shenandoah for JVM, concurrent GC for Go) and set an explicit maximum pause time target (e.g., -XX:MaxGCPauseMillis=20 for G1).
+    2. Monitor GC pause duration as a histogram, not an average — alert on p99 GC pause time exceeding your latency SLO headroom (if SLO is 200ms and processing takes 150ms, max GC pause must be under 50ms).
+    3. Size the young generation large enough that minor GC frequency stays below 1 per second under peak load — frequent minor GCs compound into constant latency overhead.
+    4. Avoid allocation-heavy hot paths by reusing objects, using object pools for request/response buffers, and pre-allocating collections at expected capacity instead of growing dynamically.
+    5. Move large, long-lived data structures off-heap (e.g., memory-mapped files, off-heap caches like Chronicle Map or direct ByteBuffers) to reduce the GC's scanning burden.
+    6. Correlate GC pause logs with latency spikes in your monitoring — enable GC logging (-Xlog:gc* for modern JVM) and overlay GC events on your latency time-series to prove or disprove GC as the tail latency source.
+  example_good: "# JVM: ZGC with explicit pause target and GC logging\n# java -XX:+UseZGC -XX:MaxGCPauseMillis=10 \\\n#      -Xlog:gc*:file=gc.log:time,uptime:filecount=5,filesize=20m \\\n#      -Xmx4g -jar service.jar\n\n# Go: Monitor GC pause duration\nimport runtime\nimport runtime/debug\n\nfunc init() {\n    // Target max GC pause of 5ms\n    debug.SetGCPercent(50)  // More frequent, shorter collections\n}\n\nfunc reportGCMetrics() {\n    var stats debug.GCStats\n    debug.ReadGCStats(&stats)\n    for _, pause := range stats.Pause {\n        gcPauseHistogram.Observe(pause.Seconds())\n    }\n}\n"
+  example_bad: "# Default GC settings — 500ms pauses destroy p99 latency\n# java -jar service.jar  (default G1, no pause target)\n# Under load: mixed collections pause for 200-800ms\n# During pause: ALL in-flight requests delayed\n# Health checks fail -> LB removes instance -> restart -> cold cache\n# Vicious cycle: GC pause -> queue buildup -> more GC -> longer pause\n"
+  when_applies: "When running latency-sensitive services on managed-language runtimes (JVM, Go, .NET, Python) where GC pauses affect tail latency."
+  severity: high
+  technologies:
+    library: [runtime, jvm, gc, g1, zgc, golang]
+    platform: [metrics, gc]
+  domains:
+    domain: [performance]
+    concern: [latency, tail_latency, gc_pauses, memory, gc, tuning, concurrent]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: "Google SRE Book — Chapter 21: Handling Overload"
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: "Google SRE Book — Chapter 22: Addressing Cascading Failures"
+  validation_status: cross_checked
+
+- id: CR-SRE-PERF-006
+  text: |
+    Connection pool sizing must be calculated from measured concurrency and downstream latency, not guessed. A pool too small causes request queuing at your service; a pool too large overwhelms the downstream server with connections it cannot serve efficiently.
+  why: |
+    Google's load balancing chapters (19-20) and overload handling (Chapter 21) describe how connection management between services is a critical performance lever. The formula for optimal pool size is derived from Little's Law — connections_needed = requests_per_second * average_latency_seconds. If your service sends 500 requests per second to a database with 10ms average latency, you need 500 * 0.01 = 5 connections. With p99 latency of 50ms, you need headroom for bursts, so 500 * 0.05 = 25 connections covers the tail. Most teams set pool sizes by guessing (often 50 or 100 "because that seems reasonable"), creating two failure modes. Too small — when all connections are in use, new requests queue at the connection pool, adding latency that is invisible to downstream monitoring because the downstream sees normal load. The wait-for-connection time appears as application latency, not database latency, making it hard to diagnose. Too large — each connection consumes memory on both client and server (typically 5-10MB per connection in PostgreSQL). With 100 application instances each holding 100 connections, the database sees 10,000 connections, consuming 50-100GB of memory just for connection state. PostgreSQL performance degrades significantly above a few hundred active connections due to lock contention in the process-per-connection model. The solution is HikariCP's approach (or PgBouncer for PostgreSQL) — start with a small pool sized by Little's Law, measure connection wait time as a metric, and increase only when wait time exceeds a threshold.
+  how_to_do_right: |
+    1. Calculate initial pool size using Little's Law — pool_size = peak_rps * p99_downstream_latency_seconds, then add 20% headroom for bursts.
+    2. Monitor connection pool wait time as a first-class metric — any request that waits more than 1ms for a connection indicates the pool is too small for current load.
+    3. Monitor active connections at the downstream server (e.g., pg_stat_activity for PostgreSQL) — total connections from all clients should stay below the server's optimal concurrency (CPU cores * 2 for compute-bound, higher for I/O-bound workloads).
+    4. Use connection pooling proxies (PgBouncer, ProxySQL, Envoy) between application instances and databases to multiplex many application-side connections onto fewer database-side connections.
+    5. Set connection idle timeout aggressively (30-60 seconds) to release unused connections back to the pool during low-traffic periods instead of holding them indefinitely.
+    6. Load test with pool size as a variable — measure throughput and p99 latency at pool sizes of N/2, N, 2N, and 4N to find the inflection point where increasing pool size stops helping and starts hurting.
+  example_good: "# Connection pool sized by Little's Law with monitoring\nimport psycopg2.pool\n\nPEAK_RPS = 500\nP99_LATENCY_SECONDS = 0.05  # 50ms\nHEADROOM = 1.2\n\n# Little's Law: pool_size = RPS * latency\nPOOL_SIZE = int(PEAK_RPS * P99_LATENCY_SECONDS * HEADROOM)  # = 30\n\npool = psycopg2.pool.ThreadedConnectionPool(\n    minconn=5,\n    maxconn=POOL_SIZE,  # Calculated, not guessed\n)\n\n# Monitor connection wait time as a first-class metric\nCONN_WAIT = Histogram('db_connection_wait_seconds', 'Time waiting for connection')\n\ndef get_connection():\n    start = time.time()\n    conn = pool.getconn()\n    CONN_WAIT.observe(time.time() - start)  # Alert if > 1ms\n    return conn\n"
+  example_bad: "# Pool size guessed at 100 — too large for the database\nimport psycopg2.pool\n\npool = psycopg2.pool.ThreadedConnectionPool(\n    minconn=10,\n    maxconn=100,  # 'Seems reasonable'\n)\n# 50 app instances * 100 connections = 5,000 connections to PostgreSQL\n# PostgreSQL degrades above ~300 active connections\n# Each connection uses 5-10MB on the DB server = 25-50GB just for connections\n# No monitoring of connection wait time — invisible queuing\n"
+  when_applies: "When configuring connection pools for databases, caches, or any downstream service with a finite connection capacity."
+  severity: high
+  technologies:
+    platform: [postgresql, connection_pooling, mysql, grpc, connection_management, http]
+  domains:
+    domain: [performance]
+    concern: [throughput, connection_pool, sizing, tuning, latency, queuing, connection_wait]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: "Google SRE Book — Chapter 21: Handling Overload"
+  - url: https://sre.google/sre-book/load-balancing-datacenter/
+    title: "Google SRE Book — Chapter 20: Load Balancing in the Datacenter"
+  validation_status: cross_checked
+
+- id: CR-SRE-PERF-007
+  text: |
+    Memory leaks in production must be detected through continuous monitoring of resident set size (RSS) growth rate over hours, not by waiting for OOM kills. A leak of 1MB per hour is invisible in short tests but consumes 720MB per month and eventually kills the process.
+  why: |
+    Google's operational practices (Chapters 12 and 18) treat memory leaks as reliability problems, not just performance problems, because a leaked process eventually hits the memory limit and is OOM-killed, causing a service restart that drops all in-flight requests. In containerized environments, the OOM killer terminates the process with no graceful shutdown — open transactions are abandoned, connections are not cleanly closed, and downstream services see sudden connection resets. The insidious nature of memory leaks is that they are invisible in short tests. A leak of 100KB per request in a service handling 100 RPS leaks 10MB per second — catastrophic and caught immediately. But a leak of 100 bytes per unique user session in a service with 10,000 daily users leaks only 1MB per day — invisible in hourly metrics but accumulates to 30MB per month. Google's approach is to monitor the growth rate of heap size (or RSS for native code) over time, not the absolute value. A constant heap size under constant load is healthy. A linearly growing heap under constant load is a leak, regardless of the absolute size. The key metric is RSS growth rate normalized by request rate. Google also uses differential heap profiling — take a heap snapshot at time T, another at time T+1h, and diff them to find objects that were allocated but never freed. This is more effective than looking at absolute heap contents because it highlights the delta.
+  how_to_do_right: |
+    1. Monitor RSS (resident set size) and heap size as time-series metrics with at least 7 days of retention — a leak that grows 1MB/hour is only visible over multi-hour windows.
+    2. Alert on monotonically increasing RSS under stable load — use linear regression on the RSS time-series over a 6-hour window and alert if the slope is significantly positive (p < 0.05).
+    3. Implement periodic heap profiling (e.g., every 4 hours) in production for at least one canary instance, storing heap snapshots for differential analysis.
+    4. Compare heap snapshots over time using differential profiling tools (pprof --diff_base, jmap + Eclipse MAT comparison, Python tracemalloc) to identify object types growing without bound.
+    5. Set container memory limits with a safety margin (e.g., 80% of limit is the alert threshold) so you have time to diagnose and fix the leak before OOM kills occur.
+    6. Implement a graceful restart mechanism (rolling restart every 24h or when RSS exceeds 80% of limit) as a safety net — this is not a fix for leaks but prevents OOM kills while you find the root cause.
+  example_good: "import tracemalloc\nimport psutil\nimport logging\n\nlogger = logging.getLogger(__name__)\ntracemalloc.start()\n\ndef check_memory_health():\n    process = psutil.Process()\n    rss_mb = process.memory_info().rss / 1024 / 1024\n    RSS_GAUGE.set(rss_mb)\n\n    # Differential snapshot every 4 hours\n    snapshot = tracemalloc.take_snapshot()\n    top_stats = snapshot.compare_to(baseline_snapshot, 'lineno')\n    for stat in top_stats[:5]:\n        logger.info(f\"Memory growth: {stat}\")\n\n    # Alert if RSS growing linearly under stable load\n    if rss_mb > CONTAINER_LIMIT_MB * 0.8:\n        logger.warning(f\"RSS at {rss_mb}MB — approaching {CONTAINER_LIMIT_MB}MB limit\")\n        trigger_graceful_restart()  # Safety net, not a fix\n"
+  example_bad: "# No memory monitoring — wait for OOM kill\n# Day 1: RSS = 200MB (normal)\n# Day 5: RSS = 250MB (leak: 10MB/day, invisible in dashboards)\n# Day 30: RSS = 500MB (approaching 512MB limit)\n# Day 31: OOM-killed! No graceful shutdown, all in-flight requests lost\n# No heap snapshot, no tracemalloc — cannot identify the leaking object\n"
+  when_applies: "When operating any long-running production service where memory leaks can accumulate over hours or days."
+  severity: high
+  technologies:
+    library: [runtime, jvm, memory, python, tracemalloc]
+    platform: [metrics, memory, rss, profiling, heap]
+  domains:
+    domain: [performance, reliability]
+    concern: [memory, leak_detection, continuous, leak_prevention, patterns, stability, oom_prevention]
+  sources:
+  - url: https://sre.google/sre-book/troubleshooting/
+    title: "Google SRE Book — Chapter 12: Effective Troubleshooting"
+  - url: https://sre.google/sre-book/software-engineering-in-sre/
+    title: "Google SRE Book — Chapter 18: Software Engineering in SRE"
+  validation_status: cross_checked
+
+- id: CR-SRE-PERF-008
+  text: |
+    CPU saturation must be detected by measuring run queue depth and scheduling latency, not just CPU utilization percentage. A server at 70% CPU utilization with 20 threads in the run queue has completely different behavior than one at 70% with 2 threads queued.
+  why: |
+    Google's approach to overload (Chapter 21) and cascading failures (Chapter 22) reveals that CPU utilization is a misleading metric for detecting saturation. CPU utilization tells you what fraction of time the CPU was busy, but not how many threads are waiting to use it. Consider two scenarios, both showing 70% CPU utilization. Scenario A has 4 CPU cores with 4 active threads — each core is busy 70% of the time, threads run immediately when scheduled, and request latency is dominated by actual processing time. Scenario B has 4 CPU cores with 40 active threads — cores are busy 70% of the time but 36 threads are waiting in the run queue at any moment. Each thread waits an average of 9x its processing time just to be scheduled. A request that takes 10ms of CPU time takes 100ms wall-clock time because it waits 90ms in the queue. This is CPU saturation — the CPU is not at 100% utilization, but the run queue creates queuing delay that dominates latency. Google monitors run queue depth (or scheduling latency) as the primary CPU saturation signal, not utilization. The Linux kernel exposes this via /proc/schedstat and load average. When run queue depth exceeds 2x the CPU core count, latency degrades rapidly. The correct response to CPU saturation is not just "add more CPUs" — it is first to implement admission control (reject excess requests fast) and then investigate whether the CPU work is necessary (maybe you are re-parsing JSON on every request instead of caching the parsed result).
+  how_to_do_right: |
+    1. Monitor CPU run queue depth (Linux load average or /proc/schedstat) as your primary saturation metric — alert when run queue exceeds 2x the number of CPU cores for more than 30 seconds.
+    2. Monitor scheduling latency (time between a thread becoming runnable and actually running) — this directly measures the user-visible impact of CPU saturation, unlike utilization.
+    3. Implement admission control that activates when CPU saturation is detected — start rejecting low-priority requests with 503 to preserve latency for high-priority requests rather than degrading everything equally.
+    4. Use CPU profiling to identify whether saturated CPU time is spent on useful work (request processing) or waste (excessive serialization, redundant computation, logging) before adding capacity.
+    5. Set thread pool sizes to match available CPU cores for compute-bound work (not 10x cores) — more threads than cores just increases scheduling overhead and context switching without improving throughput.
+    6. Implement request queuing with timeout — if a request waits in the queue longer than the client's timeout, drop it immediately rather than processing a request whose result will be discarded.
+  example_good: "import os\n\ndef check_cpu_saturation():\n    # Monitor run queue depth (load average)\n    load_1, load_5, load_15 = os.getloadavg()\n    cpu_count = os.cpu_count()\n    run_queue_ratio = load_1 / cpu_count\n\n    RUN_QUEUE_RATIO.set(run_queue_ratio)\n\n    if run_queue_ratio > 2.0:  # 2x cores -> saturated\n        logger.warning(f\"CPU saturated: load={load_1}, cores={cpu_count}, ratio={run_queue_ratio:.1f}\")\n        # Activate admission control: reject low-priority requests\n        admission_controller.set_mode('shed_low_priority')\n\n# Thread pool sized to CPU cores for compute-bound work\nfrom concurrent.futures import ThreadPoolExecutor\nworker_pool = ThreadPoolExecutor(max_workers=os.cpu_count())  # Not 10x cores!\n"
+  example_bad: "# Only monitoring CPU utilization — misses saturation\ndef check_cpu():\n    cpu_pct = psutil.cpu_percent()\n    if cpu_pct > 90:\n        alert('High CPU')  # Only fires at 90%\n    # But at 70% utilization with 40 threads queued on 4 cores,\n    # requests wait 9x their processing time in the run queue.\n    # 10ms CPU work takes 100ms wall-clock — invisible to this check.\n\n# Thread pool 10x CPU cores — increases scheduling overhead\nworker_pool = ThreadPoolExecutor(max_workers=400)  # 4 cores * 100\n"
+  when_applies: "When monitoring CPU health of any production server, especially under variable load where queuing delays affect latency."
+  severity: high
+  technologies:
+    platform: [linux, scheduler, metrics, cpu, saturation, kubernetes, resources]
+  domains:
+    domain: [performance]
+    concern: [cpu, saturation, detection, runqueue, latency, queuing, scheduling]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: "Google SRE Book — Chapter 21: Handling Overload"
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: "Google SRE Book — Chapter 22: Addressing Cascading Failures"
+  validation_status: cross_checked
+
+- id: CR-SRE-PERF-009
+  text: |
+    Disk I/O performance depends on access pattern (sequential vs random) more than on hardware speed. A single spinning disk does 150 random IOPS but 200 MB/s sequential throughput — a 1300x difference. Even SSDs show 10-50x differences between random and sequential access patterns.
+  why: |
+    Google's data integrity chapter (Chapter 26) and the distributed systems chapters discuss storage performance in the context of reliable data handling. The fundamental physics of storage creates a massive gap between sequential and random I/O. A spinning disk must physically move the read/write head to a new location for each random access (seek time 3-10ms), limiting random IOPS to approximately 100-200 per second. But sequential reads avoid seeking, achieving 150-250 MB/s throughput — effectively thousands of equivalent IOPS. SSDs eliminate mechanical seeking but still show significant random vs sequential differences because of page alignment, write amplification, and controller queue depth effects. A typical NVMe SSD achieves 500K random read IOPS but 3-7 GB/s sequential throughput — at 4KB page size, random reads yield 2 GB/s while sequential reads yield 7 GB/s. The practical impact is enormous. A database with a B-tree index performing random lookups on spinning disks can serve 150 queries per second. The same data scanned sequentially (e.g., for analytics) reads at 200 MB/s. Many performance problems are caused by accidentally turning sequential I/O into random I/O. Examples include write-ahead logs fragmented by concurrent writers (should be single-writer sequential), database tables with random INSERT order on a clustered index (forces random page writes), and log files read by multiple consumers at different offsets simultaneously. Google designs storage-intensive systems around sequential access patterns — LSM trees instead of B-trees for write-heavy workloads, append-only data structures, and read-ahead buffers that pre-fetch sequential data.
+  how_to_do_right: |
+    1. Measure IOPS and throughput separately for your workload using fio or ioping — characterize whether your access pattern is random or sequential and size your storage accordingly (random-heavy workloads need high IOPS SSDs, sequential workloads can use cheaper high-throughput drives).
+    2. Use append-only write patterns wherever possible — write-ahead logs, event streams, and time-series data should be sequential appends, never random inserts into the middle of a file.
+    3. Enable read-ahead for sequential workloads (Linux readahead setting, typically 256KB-1MB) and disable it for random workloads where pre-fetched data will never be used.
+    4. Batch small random writes into larger sequential writes using write-behind buffers — accumulate writes in memory and flush periodically as a single sequential write rather than many small random writes.
+    5. Monitor I/O wait time (iowait in Linux) and disk queue depth (avgqu-sz from iostat) — high queue depth with low throughput indicates random I/O bottleneck, while high throughput with low queue depth indicates efficient sequential access.
+    6. Separate sequential and random I/O onto different storage devices — put the write-ahead log (sequential) on a dedicated disk from the data files (random) to prevent seek contention between the two access patterns.
+  example_good: "# PostgreSQL: separate WAL (sequential) from data (random)\n# postgresql.conf\n# data_directory = '/data/pgdata'       # SSD optimized for random IOPS\n# wal_directory = '/wal/pgwal'          # Separate SSD for sequential writes\n\n# Measure I/O pattern before sizing storage\n# fio --name=test --rw=randread --bs=4k --iodepth=32 --runtime=60\n# Result: 450K IOPS (random), 3.2 GB/s (sequential)\n\n# Application: append-only writes for event log\ndef write_event(event: dict):\n    with open('/data/events.log', 'a') as f:  # Sequential append\n        f.write(json.dumps(event) + '\\n')\n"
+  example_bad: "# Random inserts into clustered index — turns sequential into random I/O\n# INSERT INTO events (id, ...) VALUES (uuid4(), ...)\n# UUID primary key forces random page writes across the B-tree\n# On spinning disk: 150 random IOPS = 150 inserts/second max\n#\n# WAL and data on same disk — seek contention\n# WAL writes (sequential) interrupted by data reads (random)\n# Both patterns degraded by fighting over the same disk head\n"
+  when_applies: "When designing storage architecture for any I/O-intensive workload — databases, event logs, analytics, or file processing."
+  severity: high
+  technologies:
+    platform: [storage, ssd, nvme, filesystem, io_patterns, linux, io_scheduler]
+  domains:
+    domain: [performance]
+    concern: [io, disk, sequential_vs_random, iops_optimization, throughput]
+  sources:
+  - url: https://sre.google/sre-book/data-integrity/
+    title: "Google SRE Book — Chapter 26: Data Integrity"
+  validation_status: cross_checked
+
+- id: CR-SRE-PERF-010
+  text: |
+    Network throughput optimization requires tuning TCP buffer sizes, disabling Nagle's algorithm for latency-sensitive RPCs, and right-sizing socket buffers. Default OS network settings are optimized for general-purpose use, not for high-throughput or low-latency service-to-service communication.
+  why: |
+    Google's load balancing chapters (19-20) and the broader SRE infrastructure practices recognize that network performance between services is often limited by TCP configuration, not by physical network capacity. Three critical TCP settings affect service performance. First, TCP buffer sizes (SO_SNDBUF, SO_RCVBUF) determine how much data can be in-flight before the sender must wait for acknowledgment. The bandwidth-delay product formula is buffer_size = bandwidth * round_trip_time. For a 10 Gbps link with 1ms RTT (same datacenter), optimal buffer = 10 Gbps * 1ms = 1.25 MB. The default Linux socket buffer is 128KB, which caps throughput at 128KB / 1ms = 1 Gbps — using only 10% of available bandwidth. For cross-datacenter links (50ms RTT), the mismatch is worse: 128KB / 50ms = 20 Mbps on a 10 Gbps link. Second, Nagle's algorithm (enabled by default) buffers small writes and combines them into larger TCP segments to improve bandwidth utilization. For request/response RPCs, this adds up to 40ms of latency (the delayed-ACK timer) because the small response is held waiting for more data that never comes. Disabling Nagle (TCP_NODELAY) is mandatory for RPC-heavy services. Third, TCP congestion control algorithm affects burst tolerance. Google developed BBR (Bottleneck Bandwidth and Round-trip propagation time) as a replacement for CUBIC because CUBIC reacts to packet loss (which in modern networks is caused by buffer bloat, not congestion), while BBR probes actual bandwidth, achieving 2-25x higher throughput on lossy or high-latency links.
+  how_to_do_right: |
+    1. Set TCP_NODELAY on all RPC sockets (gRPC, HTTP API, Redis, database connections) to disable Nagle's algorithm — the 40ms delayed-ACK penalty is unacceptable for latency-sensitive service-to-service communication.
+    2. Calculate optimal TCP buffer sizes using the bandwidth-delay product formula (buffer = link_bandwidth * RTT) and set SO_SNDBUF/SO_RCVBUF accordingly — for same-datacenter (1ms RTT, 10 Gbps), use at minimum 1.25MB buffers.
+    3. Enable TCP BBR congestion control (sysctl net.ipv4.tcp_congestion_control=bbr) on Linux for services communicating across datacenters or any path with non-trivial packet loss.
+    4. Monitor TCP retransmission rate as a key network health metric — retransmission rate above 0.1% indicates network problems (congestion, faulty hardware, buffer overflow) that degrade throughput significantly.
+    5. Use TCP keepalive with appropriate intervals (10-30 seconds for service mesh, 60-120 seconds for client connections) to detect dead connections before they cause request timeouts.
+    6. Profile application-level send patterns to ensure you are not inadvertently creating many small writes — buffer application data and send in appropriately sized chunks (matching TCP MSS, typically 1460 bytes) to maximize TCP segment efficiency.
+  example_good: "import socket\n\n# Disable Nagle's algorithm for RPC sockets — mandatory for low-latency\nsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\nsock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)\n\n# Calculate optimal buffer size: bandwidth * RTT\n# 10 Gbps * 1ms = 1.25 MB\nBUFFER_SIZE = 1_310_720  # 1.25 MB for same-datacenter\nsock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUFFER_SIZE)\nsock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE)\n\n# Enable BBR congestion control (Linux sysctl)\n# sysctl net.ipv4.tcp_congestion_control=bbr\n# sysctl net.core.default_qdisc=fq\n"
+  example_bad: "import socket\n\n# Default TCP settings — suboptimal for service-to-service\nsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n# Nagle enabled (default) — 40ms delayed-ACK penalty on small RPCs\n# Default 128KB buffer on 10Gbps link with 1ms RTT:\n#   128KB / 1ms = 1 Gbps — using only 10% of available bandwidth\n# CUBIC congestion control (default) — reacts to loss, not bandwidth\n# Result: high latency RPCs, underutilized network capacity\n"
+  when_applies: "When optimizing network performance for service-to-service communication, especially across datacenters or on high-bandwidth links."
+  severity: high
+  technologies:
+    platform: [tcp, tuning, buffers, nagle, congestion_control, bbr]
+  domains:
+    domain: [performance]
+    concern: [network, throughput, tcp_tuning, latency, tcp_nodelay, optimization, buffer_sizing]
+  sources:
+  - url: https://sre.google/sre-book/load-balancing-frontend/
+    title: "Google SRE Book — Chapter 19: Load Balancing at the Frontend"
+  - url: https://sre.google/sre-book/load-balancing-datacenter/
+    title: "Google SRE Book — Chapter 20: Load Balancing in the Datacenter"
+  validation_status: cross_checked
+
+- id: CR-SRE-PERF-011
+  text: |
+    Cache warming strategies must be designed for cold starts — a service restart with an empty cache can receive 100% cache misses, overwhelming the backend database with a thundering herd of requests that would normally be served from cache.
+  why: |
+    Google's cascading failures chapter (Chapter 22) identifies cold cache thundering herds as a primary trigger for cascading outages. Consider a caching layer that achieves 95% hit rate in steady state, reducing database load from 10,000 QPS to 500 QPS. When the cache restarts (deployment, crash, scaling event), hit rate drops to 0%. All 10,000 QPS hit the database, which was provisioned for 500 QPS — a 20x overload that causes the database to time out, which causes the application to retry, which doubles the load to 40x. The database collapses, and the outage extends far beyond the cache restart. Google addresses this with multiple warming strategies. Pre-population loads hot keys into the cache before the instance starts serving traffic — using a snapshot of the previous cache contents or a pre-computed set of frequently accessed keys. Lazy warming with request coalescing ensures that when multiple requests arrive for the same uncached key simultaneously, only one request goes to the database and all waiters receive the result. Gradual traffic shifting moves traffic to a new cache instance slowly (1% then 5% then 25% then 100%) so the cache warms under controlled load rather than taking full traffic immediately. The choice between eager pre-population and lazy warming depends on whether you can predict hot keys. For user session caches, hot keys are unpredictable — lazy warming with coalescing is better. For product catalog caches, hot keys are stable — pre-population from a snapshot is better.
+  how_to_do_right: |
+    1. Implement request coalescing (singleflight pattern) so that concurrent cache misses for the same key result in a single backend request — all waiters share the result, preventing thundering herd on popular keys.
+    2. Use gradual traffic shifting for cache instance replacements — route 1% of traffic to the new instance, let it warm for 5 minutes, then increase to 10%, 25%, 50%, 100% over 30 minutes.
+    3. Pre-populate caches with hot keys on startup by replaying the top-N most frequently accessed keys from the previous instance's access log or from a periodic hot-key snapshot.
+    4. Implement stale-while-revalidate semantics — serve the stale cached value immediately while refreshing in the background, so cache expiration never causes a synchronous backend request in the hot path.
+    5. Set cache TTLs with jitter (e.g., base_ttl + random(0, 0.1 * base_ttl)) to prevent synchronized expiration of keys that were populated at the same time from causing periodic load spikes.
+    6. Monitor cache hit rate during and after deployments specifically — alert if hit rate drops below 80% for more than 2 minutes, which indicates a warming problem that is silently overloading the backend.
+  example_good: "import asyncio\nfrom functools import lru_cache\n\n# Singleflight pattern: coalesce concurrent cache misses for same key\n_in_flight = {}  # key -> Future\n\nasync def get_with_coalescing(key: str) -> dict:\n    cached = cache.get(key)\n    if cached:\n        return cached\n\n    if key in _in_flight:\n        return await _in_flight[key]  # Wait for existing fetch\n\n    future = asyncio.ensure_future(_fetch_and_cache(key))\n    _in_flight[key] = future\n    try:\n        result = await future\n        return result\n    finally:\n        del _in_flight[key]\n\n# TTL with jitter: prevent synchronized expiration\nimport random\ndef set_with_jitter(key, value, base_ttl=300):\n    jitter = random.uniform(0, base_ttl * 0.1)  # 10% jitter\n    cache.set(key, value, ttl=base_ttl + jitter)\n"
+  example_bad: "# No request coalescing — thundering herd on cold start\nasync def get_product(product_id: str):\n    cached = cache.get(product_id)\n    if not cached:\n        # 1000 concurrent requests for same popular product\n        # ALL 1000 hit the database simultaneously\n        result = await db.get_product(product_id)  # DB overloaded!\n        cache.set(product_id, result, ttl=300)\n        return result\n    return cached\n\n# All TTLs expire at the same time — periodic load spikes\ncache.set(key, value, ttl=300)  # No jitter\n"
+  when_applies: "When deploying, restarting, or scaling any service that relies on a cache layer to absorb database load."
+  severity: high
+  technologies:
+    library: [caching, redis, warming, memcached, cdn]
+  domains:
+    domain: [performance, reliability, deployment]
+    concern: [caching, cold_start, warming, thundering_herd, prevention, cache_warming]
+  sources:
+  - url: https://sre.google/sre-book/addressing-cascading-failures/
+    title: "Google SRE Book — Chapter 22: Addressing Cascading Failures"
+  validation_status: cross_checked
+
+- id: CR-SRE-PERF-012
+  text: |
+    Every user-facing request must have an explicit latency budget decomposed across each component in the critical path. Without per-component budgets, teams optimize locally while the end-to-end latency exceeds the SLO because nobody owns the total.
+  why: |
+    Google's SLO practices (Chapter 4) and software engineering approach (Chapter 18) establish that performance targets must be decomposed into per-component budgets, analogous to how error budgets decompose reliability targets. Consider a user-facing API with a 200ms p99 SLO. The request passes through an API gateway (authentication, rate limiting), an application server (business logic), a cache lookup, a database query (on cache miss), and a response serializer. Without explicit budgets, each team optimizes independently. The gateway team considers 50ms acceptable ("it's just auth"). The application team allows 80ms ("business logic is complex"). The cache team accepts 30ms ("network round-trip"). The database allows 100ms p99 ("complex query"). The serializer takes 20ms ("large response"). Total: 280ms — 40% over the 200ms SLO, but no single component violated its own (implicit, generous) budget. Google assigns explicit latency budgets per component that sum to less than the SLO, with headroom for variance. For a 200ms SLO: gateway gets 10ms budget, application gets 50ms, cache gets 5ms, database gets 80ms (on miss), serializer gets 10ms, leaving 45ms headroom for cross-component overhead (network hops, queuing, serialization). Each team monitors their component's latency against its budget and is accountable for staying within it. The budgets are documented, measured, and reviewed quarterly. When a component needs more budget, it must be negotiated by reducing another component's budget — forcing teams to make explicit tradeoffs rather than silently consuming shared headroom.
+  how_to_do_right: |
+    1. Decompose the end-to-end SLO latency into per-component budgets that sum to 80% of the SLO — the remaining 20% is headroom for network overhead, queuing, serialization, and unexpected variance.
+    2. Document the latency budget in a shared performance contract that every team on the critical path signs off on — the budget is not a suggestion, it is a binding SLO per component.
+    3. Instrument each component boundary with latency metrics (using distributed tracing span durations) that report against the allocated budget — create dashboards showing budget consumption percentage per component.
+    4. Alert when a component's p99 latency exceeds 80% of its budget for more than 10 minutes — this is an early warning that the budget is about to be violated, giving time to investigate before the end-to-end SLO is breached.
+    5. Review and renegotiate budgets quarterly based on actual measurements — if one component consistently uses only 50% of its budget, reallocate the surplus to components that need more headroom.
+    6. Add latency budget validation to the CI/CD pipeline — integration tests that exercise the critical path must verify that each component's contribution to end-to-end latency stays within its allocated budget under realistic load.
+  example_good: "# Latency budget decomposition for 200ms SLO\nLATENCY_BUDGETS = {\n    'api_gateway':    10,   # 10ms: auth, rate limiting\n    'app_logic':      50,   # 50ms: business logic\n    'cache_lookup':    5,   # 5ms: Redis round-trip\n    'db_query':       80,   # 80ms: PostgreSQL on cache miss\n    'serialization':  10,   # 10ms: JSON serialization\n    'headroom':       45,   # 45ms: network, queuing, variance\n}  # Total: 200ms = SLO\n\n# Monitor each component against its budget\nfor component, budget_ms in LATENCY_BUDGETS.items():\n    actual_p99 = get_p99(component)\n    if actual_p99 > budget_ms * 0.8:\n        alert(f\"{component} at {actual_p99}ms — 80% of {budget_ms}ms budget\")\n\n# CI gate: integration test verifies per-component budgets\ndef test_latency_budget():\n    resp = trace_request('/api/orders/123')\n    for span in resp.spans:\n        budget = LATENCY_BUDGETS[span.name]\n        assert span.duration_ms <= budget, f\"{span.name}: {span.duration_ms}ms > {budget}ms budget\"\n"
+  example_bad: "# No per-component budget — each team optimizes locally\n# Gateway team: '50ms is fine for auth'\n# App team: '80ms is fine for logic'\n# Cache team: '30ms is fine for cache'\n# DB team: '100ms is fine for queries'\n# Serializer: '20ms is fine for JSON'\n# Total: 280ms — 40% OVER the 200ms SLO\n# But no single component violated its own (implicit) budget\n# Nobody owns the end-to-end latency\n"
+  when_applies: "When a user-facing request traverses multiple components and the end-to-end latency SLO must be decomposed into per-component budgets."
+  severity: critical
+  technologies:
+    library: [architecture, api, latency_contracts]
+    platform: [tracing, distributed, budgets, metrics, latency, slo]
+  domains:
+    domain: [performance, reliability]
+    concern: [latency, budget, decomposition, critical_path, slo, per_component]
+  sources:
+  - url: https://sre.google/sre-book/service-level-objectives/
+    title: "Google SRE Book — Chapter 4: Service Level Objectives"
+  - url: https://sre.google/sre-book/software-engineering-in-sre/
+    title: "Google SRE Book — Chapter 18: Software Engineering in SRE"
+  validation_status: cross_checked

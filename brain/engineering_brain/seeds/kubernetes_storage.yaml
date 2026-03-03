@@ -1,0 +1,367 @@
+layer: rules
+technology: Kubernetes
+domain: storage
+knowledge:
+- id: CR-K8S-STOR-001
+  text: Use dynamic provisioning with StorageClasses — never create PersistentVolumes manually in production.
+  why: Manual PV creation requires an admin to pre-provision storage for every PVC — this doesn't scale, creates bottlenecks,
+    and leads to wasted storage (provisioned but unclaimed PVs). Dynamic provisioning creates PVs on-demand when PVCs are
+    created, matching the self-service model of Kubernetes. It also ensures consistent configuration (encryption, performance
+    tier) across all volumes.
+  how_to_do_right: Create StorageClasses for each storage tier (fast-ssd, standard, archive). Set one as the default with
+    storageclass.kubernetes.io/is-default-class=true. Use WaitForFirstConsumer volume binding to ensure PVs are created in
+    the same AZ as the pod. Test the StorageClass by creating a PVC and verifying the PV is auto-created.
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [infrastructure, operations, devops]
+    concern: [storage]
+  example_good: "# StorageClass for dynamic provisioning\napiVersion: storage.k8s.io/v1\nkind: StorageClass\nmetadata:\n \
+    \ name: fast-ssd\n  annotations:\n    storageclass.kubernetes.io/is-default-class: \"false\"\nprovisioner: ebs.csi.aws.com\n\
+    parameters:\n  type: gp3\n  encrypted: \"true\"\n  iopsPerGB: \"50\"\nreclaimPolicy: Delete\nvolumeBindingMode: WaitForFirstConsumer\n\
+    allowVolumeExpansion: true\n---\n# PVC requests storage — PV is created automatically\napiVersion: v1\nkind: PersistentVolumeClaim\n\
+    metadata:\n  name: postgres-data\nspec:\n  storageClassName: fast-ssd\n  accessModes: [ReadWriteOnce]\n  resources:\n\
+    \    requests:\n      storage: 100Gi\n"
+  example_bad: "# Manual PV creation — doesn't scale\napiVersion: v1\nkind: PersistentVolume\nmetadata:\n  name: pv-postgres-001\n\
+    spec:\n  capacity:\n    storage: 100Gi\n  hostPath:\n    path: /mnt/data    # hostPath in production = data loss on node\
+    \ failure\n  # Admin must create PVs before developers can request storage\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/storage/storage-classes/"]
+- id: CR-K8S-STOR-002
+  text: Set reclaimPolicy to Retain for production databases — Delete for ephemeral workloads.
+  why: With Delete policy (the default for most dynamic provisioners), deleting a PVC also deletes the underlying storage
+    volume — if someone accidentally deletes a PVC or namespace, the database is gone permanently. Retain policy keeps the
+    PV and its data after PVC deletion, giving you a chance to recover. This has caused real-world data loss incidents at
+    multiple companies.
+  how_to_do_right: 'Create two StorageClasses: one with reclaimPolicy=Retain for databases and stateful workloads, one with
+    reclaimPolicy=Delete for temporary/cacheable data. Patch existing PVs: ''kubectl patch pv <name> -p {"spec":{"persistentVolumeReclaimPolicy":"Retain"}}''.
+    Set up volume snapshot schedules as additional protection. Test PVC deletion in staging to verify behavior.'
+  severity: critical
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [infrastructure, security]
+    concern: [storage]
+  example_good: "# Production database StorageClass\napiVersion: storage.k8s.io/v1\nkind: StorageClass\nmetadata:\n  name:\
+    \ db-persistent\nprovisioner: ebs.csi.aws.com\nreclaimPolicy: Retain        # PV persists after PVC deletion\nvolumeBindingMode:\
+    \ WaitForFirstConsumer\nparameters:\n  type: gp3\n  encrypted: \"true\"\n"
+  example_bad: "apiVersion: storage.k8s.io/v1\nkind: StorageClass\nmetadata:\n  name: default\nprovisioner: ebs.csi.aws.com\n\
+    reclaimPolicy: Delete        # PVC deletion = data deletion\n# Accidental 'kubectl delete pvc' = permanent data loss\n"
+  when_applies: Any project using Kubernetes-orchestrated deployments
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects
+    not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/storage/persistent-volumes/#reclaiming"]
+- id: CR-K8S-STOR-003
+  text: Always use WaitForFirstConsumer volume binding mode to avoid cross-AZ scheduling failures.
+  why: With Immediate binding (default), the PV is provisioned as soon as the PVC is created — before any pod is scheduled.
+    If the PV lands in AZ-a but the pod is scheduled in AZ-b (due to affinity, resources, or topology spread), the pod cannot
+    mount the volume and gets stuck in Pending forever. WaitForFirstConsumer delays PV creation until a pod references the
+    PVC, ensuring they're in the same AZ.
+  how_to_do_right: 'Set volumeBindingMode: WaitForFirstConsumer on all StorageClasses in multi-AZ clusters. This is especially
+    critical for StatefulSets where each pod needs its own PV in the same AZ. Verify with ''kubectl describe pvc'' — status
+    should be ''WaitForFirstConsumer'' until a pod is scheduled.'
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [infrastructure, operations, devops]
+    concern: [storage]
+  example_good: "apiVersion: storage.k8s.io/v1\nkind: StorageClass\nmetadata:\n  name: fast-ssd\nprovisioner: ebs.csi.aws.com\n\
+    volumeBindingMode: WaitForFirstConsumer  # PV created in pod's AZ\n"
+  example_bad: "apiVersion: storage.k8s.io/v1\nkind: StorageClass\nmetadata:\n  name: fast-ssd\nprovisioner: ebs.csi.aws.com\n\
+    volumeBindingMode: Immediate  # PV created immediately\n# PV in AZ-a, pod scheduled in AZ-b = stuck Pending forever\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/storage/storage-classes/#volume-binding-mode"]
+- id: CR-K8S-STOR-004
+  text: Enable allowVolumeExpansion on StorageClasses to resize PVCs without downtime.
+  why: 'Databases grow over time. Without volume expansion, running out of disk space requires: creating a new PVC, stopping
+    the database, migrating data, updating all references — hours of downtime for what should be a 30-second operation. With
+    allowVolumeExpansion, you simply edit the PVC size and the CSI driver expands the volume online.'
+  how_to_do_right: 'Set allowVolumeExpansion: true on all StorageClasses (most CSI drivers support it). To resize: ''kubectl
+    edit pvc <name>'' and increase spec.resources.requests.storage. For file systems: expansion happens automatically on next
+    mount (or online for some drivers). You can ONLY increase size, never decrease. Monitor disk usage with Prometheus and
+    alert at 80%.'
+  severity: medium
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [infrastructure]
+    concern: [storage]
+  example_good: "apiVersion: storage.k8s.io/v1\nkind: StorageClass\nmetadata:\n  name: fast-ssd\nprovisioner: ebs.csi.aws.com\n\
+    allowVolumeExpansion: true     # Online resize enabled\n---\n# Resize: just edit the PVC\n# kubectl patch pvc postgres-data\
+    \ -p '{\"spec\":{\"resources\":{\"requests\":{\"storage\":\"200Gi\"}}}}'\n"
+  example_bad: "apiVersion: storage.k8s.io/v1\nkind: StorageClass\nmetadata:\n  name: fast-ssd\nprovisioner: ebs.csi.aws.com\n\
+    # allowVolumeExpansion not set — defaults to false\n# Running out of disk = hours of migration downtime\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/storage/storage-classes/#allow-volume-expansion"]
+- id: CR-K8S-STOR-005
+  text: Use immutable ConfigMaps for configuration that should not change after deployment.
+  why: Mutable ConfigMaps can be changed at any time — a bad config push updates ALL pods using that ConfigMap via the kubelet
+    sync loop (up to 1 minute delay, not atomic). This causes inconsistent behavior across replicas and makes rollback difficult
+    because there's no revision history for ConfigMaps. Immutable ConfigMaps prevent accidental changes and reduce kubelet
+    API server load (no watch needed).
+  how_to_do_right: 'Set immutable: true on ConfigMaps that should be locked after creation. For config updates, create a new
+    ConfigMap with a version suffix (app-config-v2) and update the Deployment to reference it — this triggers a rolling update
+    with proper rollback support. Use Helm or Kustomize to hash ConfigMap contents into the name automatically.'
+  severity: medium
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [infrastructure, operations, devops]
+    concern: [storage]
+  example_good: "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app-config-v3        # Versioned name\nimmutable: true\
+    \                # Cannot be modified\ndata:\n  DATABASE_POOL_SIZE: \"10\"\n  LOG_LEVEL: \"info\"\n---\n# Deployment references\
+    \ specific version\nspec:\n  template:\n    metadata:\n      annotations:\n        configmap-hash: \"abc123\"  # Forces\
+    \ rolling update on change\n    spec:\n      containers:\n        - envFrom:\n            - configMapRef:\n          \
+    \      name: app-config-v3\n"
+  example_bad: "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app-config           # No versioning\n# Not immutable\
+    \ — anyone can edit at any time\ndata:\n  DATABASE_POOL_SIZE: \"10\"\n# Config change propagates unevenly, no rollback,\
+    \ no audit trail\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/configuration/configmap/#configmap-immutable"]
+- id: CR-K8S-STOR-006
+  text: Mount ConfigMaps as volumes for files, use envFrom for environment variables — never embed large configs in env vars.
+  why: Environment variables have a hard limit of ~1MB total per process and are visible in 'kubectl describe pod' (security
+    risk for sensitive defaults). Volume-mounted ConfigMaps support files up to 1MB each, are updated by kubelet automatically
+    (if mutable), and can be consumed by applications that read config files. Mixing both approaches creates confusion about
+    the source of truth.
+  how_to_do_right: Use env/envFrom for small key-value configs (DATABASE_URL, LOG_LEVEL). Use volume mounts for config files
+    (nginx.conf, application.yaml). Set subPath to mount individual files without overwriting the entire directory. For sensitive
+    values, use Secrets not ConfigMaps. ConfigMap size limit is 1MB — if you hit it, your config is too big.
+  severity: medium
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [infrastructure, operations, devops]
+    concern: [storage]
+  example_good: "containers:\n  - name: api\n    env:\n      - name: LOG_LEVEL\n        valueFrom:\n          configMapKeyRef:\n\
+    \            name: app-config\n            key: LOG_LEVEL\n    volumeMounts:\n      - name: nginx-config\n        mountPath:\
+    \ /etc/nginx/nginx.conf\n        subPath: nginx.conf          # Mount single file, not whole dir\nvolumes:\n  - name:\
+    \ nginx-config\n    configMap:\n      name: nginx-config\n"
+  example_bad: "containers:\n  - name: api\n    env:\n      - name: NGINX_CONFIG\n        valueFrom:\n          configMapKeyRef:\n\
+    \            name: app-config\n            key: nginx.conf\n        # Entire nginx.conf in an environment variable —\n\
+    \        # visible in kubectl describe, hits env size limits\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/configuration/configmap/#using-configmaps"]
+- id: CR-K8S-STOR-007
+  text: Enable encryption at rest for Secrets and use external secret management for production.
+  why: Kubernetes Secrets are stored in etcd as base64-encoded (NOT encrypted) by default — anyone with etcd access can read
+    all secrets in plaintext. Base64 is encoding, not encryption. In a multi-tenant cluster, RBAC misconfiguration + unencrypted
+    etcd = full secret exposure. External secret managers (Vault, AWS Secrets Manager) provide encryption, rotation, auditing,
+    and access control.
+  how_to_do_right: 'Step 1: Enable etcd encryption at rest (EncryptionConfiguration with aescbc or secretbox provider). Step
+    2: Use external-secrets-operator or sealed-secrets for GitOps-compatible secret management. Step 3: Use KMS provider for
+    envelope encryption (AWS KMS, GCP KMS, Azure Key Vault). Step 4: Restrict Secret access via RBAC — only service accounts
+    that need specific secrets. Step 5: Rotate secrets regularly.'
+  severity: critical
+  technologies:
+    library: [external-secrets-operator]
+    platform: [kubernetes, vault]
+  domains:
+    domain: [infrastructure, security]
+    concern: [storage]
+  example_good: "# external-secrets-operator: pulls from AWS Secrets Manager\napiVersion: external-secrets.io/v1beta1\nkind:\
+    \ ExternalSecret\nmetadata:\n  name: db-credentials\nspec:\n  refreshInterval: 1h\n  secretStoreRef:\n    name: aws-secrets-manager\n\
+    \    kind: ClusterSecretStore\n  target:\n    name: db-credentials\n    creationPolicy: Owner\n  data:\n    - secretKey:\
+    \ password\n      remoteRef:\n        key: production/db/password\n---\n# EncryptionConfiguration for etcd\napiVersion:\
+    \ apiserver.config.k8s.io/v1\nkind: EncryptionConfiguration\nresources:\n  - resources: [secrets]\n    providers:\n  \
+    \    - aescbc:\n          keys:\n            - name: key1\n              secret: <base64-encoded-key>\n      - identity:\
+    \ {}\n"
+  example_bad: "# Secret in YAML — committed to git!\napiVersion: v1\nkind: Secret\nmetadata:\n  name: db-credentials\ntype:\
+    \ Opaque\ndata:\n  password: cGFzc3dvcmQxMjM=   # base64 of \"password123\"\n# 1. Committed to git = permanent secret\
+    \ exposure\n# 2. base64 is NOT encryption — anyone can decode\n# 3. No rotation, no audit trail\n"
+  when_applies: Any project using Kubernetes-orchestrated deployments, HashiCorp Vault secrets management, or external-secrets-operator
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities
+  sources: ["https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/"]
+- id: CR-K8S-STOR-008
+  text: Use projected volumes to combine Secrets, ConfigMaps, and service account tokens in a single mount.
+  why: Mounting multiple volumes for config, secrets, and tokens leads to complex podSpecs with many volume and volumeMount
+    entries. Projected volumes combine multiple sources into a single mount point with fine-grained file permissions. They
+    also enable bound service account tokens with automatic rotation and audience scoping, which is more secure than legacy
+    static tokens.
+  how_to_do_right: Use projected volumes to combine related ConfigMaps and Secrets into one mount. Set file permissions with
+    defaultMode. Use serviceAccountToken source with expirationSeconds and audience for short-lived, scoped tokens. Projected
+    volumes support ConfigMap, Secret, Downward API, and ServiceAccountToken sources.
+  severity: medium
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [infrastructure, security]
+    concern: [storage]
+  example_good: "volumes:\n  - name: app-config\n    projected:\n      defaultMode: 0440\n      sources:\n        - configMap:\n\
+    \            name: app-settings\n            items:\n              - key: config.yaml\n                path: config.yaml\n\
+    \        - secret:\n            name: app-credentials\n            items:\n              - key: api-key\n            \
+    \    path: credentials/api-key\n        - serviceAccountToken:\n            path: token\n            expirationSeconds:\
+    \ 3600\n            audience: api.example.com\n"
+  example_bad: "# Three separate volumes for what could be one projected volume\nvolumes:\n  - name: config\n    configMap:\n\
+    \      name: app-settings\n  - name: secrets\n    secret:\n      secretName: app-credentials\n  - name: token\n    secret:\n\
+    \      secretName: default-token-xxxxx  # Legacy static token!\n# Static token never expires, no audience binding\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects
+    not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/storage/projected-volumes/"]
+- id: CR-K8S-STOR-009
+  text: 'Always set sizeLimit on emptyDir volumes and use medium: Memory only for small caches.'
+  why: 'EmptyDir without sizeLimit can consume the entire node''s disk, causing eviction of all pods on that node. medium:
+    Memory uses tmpfs backed by RAM — without sizeLimit, a runaway process fills memory and triggers OOMKill of all containers
+    on the node. EmptyDir data is lost when the pod is deleted — it is NOT persistent storage.'
+  how_to_do_right: 'Set sizeLimit on every emptyDir volume. For disk-backed emptyDir, set sizeLimit to your expected max usage
+    + 20% buffer. For memory-backed (tmpfs), set sizeLimit and ensure it''s accounted for in container memory limits. Use
+    emptyDir for: scratch space, inter-container communication, cache that can be regenerated. Never use for data that must
+    survive pod restarts.'
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [infrastructure]
+    concern: [storage]
+  example_good: "volumes:\n  - name: scratch\n    emptyDir:\n      sizeLimit: 1Gi        # Bounded disk usage\n  - name: fast-cache\n\
+    \    emptyDir:\n      medium: Memory        # tmpfs for fast I/O\n      sizeLimit: 256Mi      # MUST be bounded — uses\
+    \ RAM\n"
+  example_bad: "volumes:\n  - name: scratch\n    emptyDir: {}             # No size limit — can fill entire disk\n  - name:\
+    \ cache\n    emptyDir:\n      medium: Memory         # Uses RAM with no limit!\n      # Runaway process fills memory =\
+    \ node-wide OOMKill\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/storage/volumes/#emptydir"]
+- id: CR-K8S-STOR-010
+  text: Implement scheduled VolumeSnapshots for all stateful workloads as your primary backup strategy.
+  why: Relying only on application-level backups (pg_dump, mongodump) is slow for large datasets, requires application awareness,
+    and can fail silently. VolumeSnapshots are storage-level, near-instantaneous (copy-on-write), and work for any workload
+    regardless of the application. They provide point-in-time recovery, cross-AZ restore, and can be used to clone databases
+    for testing.
+  how_to_do_right: Install the VolumeSnapshot CRDs and a CSI driver that supports snapshots. Create a VolumeSnapshotClass
+    with your CSI driver's snapshot provisioner. Schedule snapshots via CronJob or a snapshot controller (e.g., Gemini). Test
+    restoring from a snapshot in staging regularly. Keep retention policies (delete old snapshots). Combine with application-consistent
+    backups for databases (use pre/post hooks to flush WAL before snapshot).
+  severity: high
+  technologies:
+    library: [csi]
+    platform: [kubernetes]
+  domains:
+    domain: [infrastructure, reliability]
+    concern: [storage]
+  example_good: "# VolumeSnapshotClass\napiVersion: snapshot.storage.k8s.io/v1\nkind: VolumeSnapshotClass\nmetadata:\n  name:\
+    \ csi-snapclass\ndriver: ebs.csi.aws.com\ndeletionPolicy: Retain\n---\n# Take a snapshot\napiVersion: snapshot.storage.k8s.io/v1\n\
+    kind: VolumeSnapshot\nmetadata:\n  name: postgres-snap-20260217\nspec:\n  volumeSnapshotClassName: csi-snapclass\n  source:\n\
+    \    persistentVolumeClaimName: postgres-data\n---\n# Restore from snapshot\napiVersion: v1\nkind: PersistentVolumeClaim\n\
+    metadata:\n  name: postgres-data-restored\nspec:\n  storageClassName: fast-ssd\n  dataSource:\n    name: postgres-snap-20260217\n\
+    \    kind: VolumeSnapshot\n    apiGroup: snapshot.storage.k8s.io\n  accessModes: [ReadWriteOnce]\n  resources:\n    requests:\n\
+    \      storage: 100Gi\n"
+  example_bad: '# No VolumeSnapshots — backup relies only on pg_dump CronJob
+
+    # pg_dump for 500GB database takes 2 hours
+
+    # If it fails silently, no backup exists
+
+    # No point-in-time recovery capability
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments or CSI
+  when_not_applies: projects not using Kubernetes or CSI
+  sources: ["https://kubernetes.io/docs/concepts/storage/volume-snapshots/"]
+- id: CR-K8S-STOR-011
+  text: Use CSI drivers instead of in-tree volume plugins — in-tree plugins are deprecated.
+  why: In-tree volume plugins (kubernetes.io/aws-ebs, kubernetes.io/gce-pd) are frozen and being removed from Kubernetes core.
+    They receive no new features, no bug fixes, and will eventually stop working. CSI drivers are maintained by storage vendors,
+    support snapshots, expansion, topology, and cloning. The CSI migration flag automatically routes in-tree calls to CSI
+    drivers during transition.
+  how_to_do_right: Install the CSI driver for your cloud provider (aws-ebs-csi-driver, gce-pd-csi-driver, azuredisk-csi-driver).
+    Update StorageClasses to use CSI provisioner names (ebs.csi.aws.com instead of kubernetes.io/aws-ebs). Enable CSIMigration
+    feature gates if still using in-tree provisioners. Verify with 'kubectl get csidrivers'.
+  severity: high
+  technologies:
+    library: [csi]
+    platform: [kubernetes]
+  domains:
+    domain: [infrastructure, operations, devops]
+    concern: [storage]
+  example_good: "# CSI driver StorageClass\napiVersion: storage.k8s.io/v1\nkind: StorageClass\nmetadata:\n  name: fast-ssd\n\
+    provisioner: ebs.csi.aws.com     # CSI driver\nparameters:\n  type: gp3\n  encrypted: \"true\"\nvolumeBindingMode: WaitForFirstConsumer\n\
+    allowVolumeExpansion: true\n"
+  example_bad: "apiVersion: storage.k8s.io/v1\nkind: StorageClass\nmetadata:\n  name: fast-ssd\nprovisioner: kubernetes.io/aws-ebs\
+    \  # Deprecated in-tree plugin\nparameters:\n  type: gp3\n# No snapshot support, no expansion, will be removed\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments or CSI
+  when_not_applies: local development only, throwaway experiments. projects not using Kubernetes or CSI
+  sources: ["https://kubernetes-csi.github.io/docs/"]
+- id: CR-K8S-STOR-012
+  text: Use the minimum required access mode — ReadWriteOnce for most databases, ReadOnlyMany for shared configs.
+  why: 'ReadWriteMany (RWX) sounds convenient but has severe implications: it requires a network filesystem (EFS, NFS, CephFS)
+    which adds latency and complexity, most CSI drivers don''t support it, and concurrent writes without application-level
+    locking cause data corruption. Using RWX for a single-writer workload wastes money and adds failure modes.'
+  how_to_do_right: ReadWriteOnce (RWO) for databases, caches, and single-writer workloads — cheapest, fastest, most widely
+    supported. ReadOnlyMany (ROX) for static assets, ML models, and shared configuration. ReadWriteMany (RWX) only when multiple
+    pods MUST write to the same volume (rare — consider object storage or a database instead). ReadWriteOncePod (RWOP, Kubernetes
+    1.29+) for exclusive single-pod access.
+  severity: medium
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [infrastructure]
+    concern: [storage]
+  example_good: "# Database: single writer\napiVersion: v1\nkind: PersistentVolumeClaim\nspec:\n  accessModes: [ReadWriteOnce]\
+    \    # Single node, fast block storage\n  resources:\n    requests:\n      storage: 100Gi\n---\n# ML model: many readers\n\
+    apiVersion: v1\nkind: PersistentVolumeClaim\nspec:\n  accessModes: [ReadOnlyMany]     # All pods can read, no writes\n\
+    \  resources:\n    requests:\n      storage: 50Gi\n"
+  example_bad: "apiVersion: v1\nkind: PersistentVolumeClaim\nspec:\n  accessModes: [ReadWriteMany]    # Requires NFS/EFS —\
+    \ expensive\n  resources:\n    requests:\n      storage: 100Gi\n  # Only one pod writes to it — RWO would be faster and\
+    \ cheaper\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/storage/persistent-volumes/#access-modes"]
+- id: CR-K8S-STOR-013
+  text: Use ephemeral volumes for temporary data that should not persist beyond the pod lifecycle.
+  why: Using PVCs for temporary data (build artifacts, download caches, temp files) wastes storage resources, leaves orphaned
+    volumes when pods are deleted, and slows down pod scheduling (waiting for volume attachment). Ephemeral volumes (emptyDir,
+    generic ephemeral volumes) are created and destroyed with the pod, eliminating volume lifecycle management overhead.
+  how_to_do_right: Use emptyDir for scratch space shared between containers. Use generic ephemeral volumes (spec.volumes[].ephemeral)
+    when you need a specific StorageClass but don't want the volume to persist. Set resource limits on all ephemeral volumes.
+    Monitor ephemeral storage usage with kubelet metrics. Set ephemeral-storage requests/limits on containers to prevent node
+    disk exhaustion.
+  severity: medium
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [infrastructure]
+    concern: [storage]
+  example_good: "containers:\n  - name: builder\n    resources:\n      requests:\n        ephemeral-storage: \"2Gi\"\n   \
+    \   limits:\n        ephemeral-storage: \"5Gi\"\n    volumeMounts:\n      - name: build-cache\n        mountPath: /tmp/build\n\
+    volumes:\n  - name: build-cache\n    ephemeral:\n      volumeClaimTemplate:\n        spec:\n          accessModes: [ReadWriteOnce]\n\
+    \          storageClassName: fast-ssd\n          resources:\n            requests:\n              storage: 10Gi\n"
+  example_bad: "# PVC for temporary build cache — orphaned when pod is deleted\napiVersion: v1\nkind: PersistentVolumeClaim\n\
+    metadata:\n  name: build-cache-pod-abc123    # Must be manually cleaned up\nspec:\n  accessModes: [ReadWriteOnce]\n  resources:\n\
+    \    requests:\n      storage: 10Gi\n# Volume persists after pod deletion — waste of storage\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: projects not using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/storage/ephemeral-volumes/"]
+- id: CR-K8S-STOR-014
+  text: Use SealedSecrets or external-secrets-operator for GitOps-safe secret management.
+  why: GitOps requires all cluster state to be in git. Kubernetes Secrets contain base64-encoded (not encrypted) data — committing
+    them to git exposes all secrets in repository history forever, even if deleted later. SealedSecrets encrypts secrets with
+    the cluster's public key so they can only be decrypted by the target cluster's controller. External-secrets-operator syncs
+    secrets from external vaults.
+  how_to_do_right: 'For single-cluster GitOps: SealedSecrets (kubeseal encrypts locally, controller decrypts in-cluster).
+    For multi-cluster or enterprise: external-secrets-operator pulling from Vault, AWS Secrets Manager, or GCP Secret Manager.
+    Never commit plain Secrets to git. Use pre-commit hooks to detect unencrypted secrets. Rotate the SealedSecrets key annually.'
+  severity: critical
+  technologies:
+    library: [sealedsecrets, external-secrets-operator]
+    platform: [kubernetes]
+  domains:
+    domain: [infrastructure, security]
+    concern: [storage]
+  example_good: "# SealedSecret — safe to commit to git\napiVersion: bitnami.com/v1alpha1\nkind: SealedSecret\nmetadata:\n\
+    \  name: db-credentials\n  namespace: production\nspec:\n  encryptedData:\n    password: AgBOQOoh... # Encrypted with\
+    \ cluster public key\n    # Only the SealedSecrets controller can decrypt this\n"
+  example_bad: "# Plain Secret committed to git — NEVER DO THIS\napiVersion: v1\nkind: Secret\nmetadata:\n  name: db-credentials\n\
+    type: Opaque\ndata:\n  password: cGFzc3dvcmQxMjM=   # \"password123\" in base64\n# Visible in git history FOREVER, even\
+    \ after deletion\n"
+  when_applies: Any project using Kubernetes-orchestrated deployments, SealedSecrets, or external-secrets-operator
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities
+  sources: ["https://github.com/bitnami-labs/sealed-secrets#readme", "https://external-secrets.io/latest/"]

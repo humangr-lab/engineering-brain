@@ -1,0 +1,1252 @@
+layer: rules
+domain: prediction_markets
+knowledge:
+- id: PM-OB-001
+  text: "Price-time priority matching algorithm: orders are matched first by best price (highest bid, lowest ask), then by earliest arrival time at that price level. This is the universal standard for fair order matching in all regulated exchanges."
+  why: >
+    Price-time priority is required by virtually every financial regulator (CFTC, SEC, FCA, CVM)
+    because it ensures fairness: the best price always wins, and among equal prices, the earliest
+    order wins. Deviating from this (e.g., pro-rata matching, random selection) creates incentives
+    for gaming and destroys user trust. An exchange that implemented pro-rata matching saw large
+    traders split orders into thousands of tiny orders to increase their allocation percentage,
+    overwhelming the matching engine. Price-time priority is simple, fair, and battle-tested.
+  how_to_do_right: |
+    1. Sort bids descending by price, then ascending by timestamp at each price level
+    2. Sort asks ascending by price, then ascending by timestamp at each price level
+    3. Match: take best bid and best ask; if bid >= ask, execute at the earlier order's price
+    4. Partial fills: if bid quantity > ask quantity, fill the ask completely and reduce the bid
+    5. Continue matching until best bid < best ask (no more matchable orders)
+    6. Timestamp must be monotonically increasing — use database sequence, not wall clock
+    7. Test: 1000 random orders should produce deterministic matching results
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+    from dataclasses import dataclass, field
+    from datetime import datetime
+    from sortedcontainers import SortedList
+
+    @dataclass(order=True)
+    class Order:
+        price: Decimal
+        sequence: int  # Monotonic, NOT wall clock
+        order_id: str = field(compare=False)
+        user_id: str = field(compare=False)
+        side: str = field(compare=False)  # "bid" or "ask"
+        remaining: Decimal = field(compare=False)
+
+    class PriceTimeMatcher:
+        def match(self, bids: SortedList, asks: SortedList) -> list["Fill"]:
+            fills = []
+            while bids and asks:
+                best_bid = bids[-1]   # Highest price (SortedList ascending)
+                best_ask = asks[0]    # Lowest price
+                if best_bid.price < best_ask.price:
+                    break  # No match possible
+
+                fill_qty = min(best_bid.remaining, best_ask.remaining)
+                fill_price = best_bid.price if best_bid.sequence < best_ask.sequence else best_ask.price
+                fills.append(Fill(bid=best_bid, ask=best_ask, quantity=fill_qty, price=fill_price))
+
+                best_bid.remaining -= fill_qty
+                best_ask.remaining -= fill_qty
+                if best_bid.remaining == Decimal("0"):
+                    bids.remove(best_bid)
+                if best_ask.remaining == Decimal("0"):
+                    asks.remove(best_ask)
+            return fills
+  example_bad: |
+    # WRONG: Random matching — unfair and non-deterministic
+    import random
+    def match_orders(bids, asks):
+        random.shuffle(bids)
+        random.shuffle(asks)
+        # Whoever is lucky gets matched first
+  when_applies: Core matching engine implementation, order execution, exchange infrastructure
+  sources: ["https://www.cftc.gov/sites/default/files/idc/groups/public/@newsroom/documents/file/federalregister112415.pdf"]
+
+- id: PM-OB-002
+  text: "Order book data structures: use a sorted container (SortedDict/red-black tree) for O(log N) insertion, deletion, and best-price lookup. Do not use a list with linear search — it becomes a bottleneck at 10,000+ orders."
+  why: >
+    An order book with 10,000 resting orders that uses a Python list for lookup takes O(N) = 10,000
+    comparisons to find the best price, O(N) to insert, and O(N) to cancel. With a SortedDict
+    (backed by a B-tree or red-black tree), all operations are O(log N) = ~14 comparisons. At
+    100 orders/second, the list-based approach takes 1M comparisons/second (100ms latency) vs
+    1,400 comparisons/second (<1ms) for the tree. Use the sortedcontainers library in Python —
+    it's implemented in C and is faster than hand-rolled red-black trees for typical workloads.
+  how_to_do_right: |
+    1. Use sortedcontainers.SortedDict for price levels: key=price, value=deque of orders
+    2. Each price level holds a FIFO queue (deque) of orders at that price (time priority)
+    3. Best bid: sorted_bids.peekitem(-1) — O(log N)
+    4. Best ask: sorted_asks.peekitem(0) — O(log N)
+    5. Insert: O(log N) for price level lookup + O(1) for deque append
+    6. Cancel: O(log N) for price level + O(N_at_level) for deque removal (usually N_at_level < 10)
+    7. Benchmark: target <1ms for all operations up to 100,000 resting orders
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [sortedcontainers]
+  domains:
+    domain: [prediction_markets, fintech, performance]
+    concern: [domain_specific]
+  example_good: |
+    from collections import deque
+    from decimal import Decimal
+    from sortedcontainers import SortedDict
+
+    class OrderBookSide:
+        def __init__(self, is_bid: bool):
+            self.levels = SortedDict()  # price -> deque of Orders
+            self.is_bid = is_bid
+
+        def add_order(self, order: "Order"):
+            if order.price not in self.levels:
+                self.levels[order.price] = deque()
+            self.levels[order.price].append(order)
+
+        def best_price(self) -> Decimal | None:
+            if not self.levels:
+                return None
+            return self.levels.keys()[-1] if self.is_bid else self.levels.keys()[0]
+
+        def pop_best(self) -> "Order | None":
+            if not self.levels:
+                return None
+            price = self.best_price()
+            order = self.levels[price].popleft()
+            if not self.levels[price]:
+                del self.levels[price]
+            return order
+
+        def cancel_order(self, order: "Order") -> bool:
+            if order.price in self.levels:
+                try:
+                    self.levels[order.price].remove(order)
+                    if not self.levels[order.price]:
+                        del self.levels[order.price]
+                    return True
+                except ValueError:
+                    return False
+            return False
+  example_bad: |
+    # WRONG: List-based order book — O(N) everything
+    class SlowOrderBook:
+        def __init__(self):
+            self.orders = []  # unsorted list
+
+        def best_bid(self):
+            bids = [o for o in self.orders if o.side == "bid"]
+            return max(bids, key=lambda o: o.price)  # O(N) scan every time
+  when_applies: Order book implementation, matching engine, any system with sorted order storage
+  sources: ["https://docs.python.org/3/library/collections.html#collections.deque"]
+
+- id: PM-OB-003
+  text: "Order types implementation: MARKET (fill immediately at best available price), LIMIT (place at specific price, wait for match), STOP (activate when trigger price reached), IOC (fill what you can, cancel rest), FOK (fill entirely or cancel), GTC (persist until filled or canceled)."
+  why: >
+    Each order type serves a different trading strategy. MARKET orders provide certainty of execution
+    but not price. LIMIT orders provide price certainty but not execution. IOC and FOK are used by
+    algorithms that need atomic operations. GTC allows passive strategies. STOP orders enable
+    automated risk management (stop-loss). A prediction market that only supports MARKET orders
+    loses algorithmic and professional traders who need more sophisticated order types. Implement
+    at minimum MARKET + LIMIT + GTC; add IOC/FOK/STOP for competitive parity.
+  how_to_do_right: |
+    1. MARKET: Walk the book, fill at each price level until quantity is exhausted. Reject if insufficient liquidity.
+    2. LIMIT: If price is marketable (bid >= best ask or ask <= best bid), fill immediately. Otherwise, place in book.
+    3. IOC: Process like LIMIT, but after matching, cancel any unfilled portion (never enters book).
+    4. FOK: Check if entire quantity can be filled at the limit price or better. If yes, fill; if no, cancel entirely.
+    5. GTC: Place in book, persist until filled, canceled by user, or market closes.
+    6. STOP: Store in a separate list. When market price crosses stop_price, convert to MARKET order and submit.
+    7. All order types must produce the same audit trail: order_created, [order_triggered], fills, [order_canceled].
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from enum import Enum
+    from decimal import Decimal
+
+    class TimeInForce(Enum):
+        GTC = "good_till_canceled"
+        IOC = "immediate_or_cancel"
+        FOK = "fill_or_kill"
+
+    class OrderProcessor:
+        def process_order(self, order: "Order") -> "OrderResult":
+            if order.order_type == OrderType.MARKET:
+                return self._process_market(order)
+            elif order.order_type == OrderType.LIMIT:
+                return self._process_limit(order)
+            elif order.order_type == OrderType.STOP:
+                return self._register_stop(order)
+
+        def _process_limit(self, order: "Order") -> "OrderResult":
+            fills = self.matching_engine.match(order)
+            if order.time_in_force == TimeInForce.IOC:
+                if order.remaining > Decimal("0"):
+                    self._cancel_remaining(order)
+            elif order.time_in_force == TimeInForce.FOK:
+                if order.remaining > Decimal("0"):
+                    self._rollback_fills(fills)
+                    return OrderResult(status="canceled", reason="FOK not fully filled")
+            elif order.time_in_force == TimeInForce.GTC:
+                if order.remaining > Decimal("0"):
+                    self.order_book.add(order)
+            return OrderResult(status="processed", fills=fills)
+  example_bad: |
+    # WRONG: Only market orders — no price control
+    def buy(market_id, outcome, amount):
+        price = get_current_price(outcome)
+        execute_at(price, amount)  # What if price moved? No limit protection.
+  when_applies: Trading engine implementation, order management, API endpoint design
+  sources: ["https://www.cftc.gov/sites/default/files/idc/groups/public/@newsroom/documents/file/federalregister112415.pdf"]
+
+- id: PM-OB-004
+  text: "Order lifecycle states: NEW (received) -> OPEN (in book or matching) -> PARTIAL (partially filled) -> FILLED (completely filled) -> CANCELED (removed). Every state transition must be logged with timestamp and reason. Invalid transitions must be rejected."
+  why: >
+    Without a formal state machine, orders can end up in impossible states: an order that is both
+    FILLED and CANCELED, or an order that transitions from CANCELED back to OPEN. A trading platform
+    had a bug where canceled orders could be re-activated by a race condition, causing double-fills
+    and $200K in erroneous payouts. The state machine prevents this: define valid transitions
+    explicitly and reject anything else. Every transition is a logged, auditable event.
+  how_to_do_right: |
+    1. Define states as an enum: NEW, OPEN, PARTIAL, FILLED, CANCELED, REJECTED
+    2. Define valid transitions as a dict: {NEW: [OPEN, REJECTED], OPEN: [PARTIAL, FILLED, CANCELED], ...}
+    3. Every transition must pass through a transition function that validates and logs
+    4. Rejected transitions raise an exception — never silently ignore
+    5. Store state history: list of (state, timestamp, reason) tuples
+    6. CANCELED is terminal — no transitions out. FILLED is terminal. REJECTED is terminal.
+    7. PARTIAL can only go to FILLED or CANCELED (not back to OPEN)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from enum import Enum
+    from datetime import datetime
+
+    class OrderStatus(Enum):
+        NEW = "new"
+        OPEN = "open"
+        PARTIAL = "partial"
+        FILLED = "filled"
+        CANCELED = "canceled"
+        REJECTED = "rejected"
+
+    VALID_TRANSITIONS = {
+        OrderStatus.NEW: {OrderStatus.OPEN, OrderStatus.REJECTED},
+        OrderStatus.OPEN: {OrderStatus.PARTIAL, OrderStatus.FILLED, OrderStatus.CANCELED},
+        OrderStatus.PARTIAL: {OrderStatus.FILLED, OrderStatus.CANCELED},
+        OrderStatus.FILLED: set(),      # Terminal
+        OrderStatus.CANCELED: set(),    # Terminal
+        OrderStatus.REJECTED: set(),    # Terminal
+    }
+
+    class OrderStateMachine:
+        def transition(self, order: "Order", new_status: OrderStatus, reason: str):
+            if new_status not in VALID_TRANSITIONS[order.status]:
+                raise InvalidTransition(
+                    f"Cannot transition from {order.status} to {new_status}"
+                )
+            order.status_history.append((order.status, new_status, datetime.utcnow(), reason))
+            order.status = new_status
+  example_bad: |
+    # WRONG: No state machine — any transition is allowed
+    def update_order(order, new_status):
+        order.status = new_status  # CANCELED -> FILLED? Sure, why not!
+  when_applies: Order management system, trade lifecycle, audit compliance
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: PM-OB-005
+  text: "Partial fill handling: when an order matches against multiple resting orders or only partially fills, the remaining quantity stays in the book (for GTC) or is canceled (for IOC/FOK). Track filled_quantity and remaining_quantity separately — never derive one from the other."
+  why: >
+    A 100-share order that matches against a 30-share and a 40-share resting order results in 70
+    shares filled and 30 remaining. If filled_quantity is derived as original - remaining, a
+    concurrent modification could cause inconsistency. A crypto exchange had a bug where partial
+    fills during high concurrency caused filled + remaining > original_quantity, allowing users to
+    receive more shares than they paid for. Store both independently and verify the invariant:
+    filled + remaining == original.
+  how_to_do_right: |
+    1. Store three fields: original_quantity, filled_quantity, remaining_quantity
+    2. Invariant: filled_quantity + remaining_quantity == original_quantity (check after every fill)
+    3. On each fill: filled_quantity += fill_amount; remaining_quantity -= fill_amount
+    4. Transition to PARTIAL when filled_quantity > 0 and remaining_quantity > 0
+    5. Transition to FILLED when remaining_quantity == 0
+    6. Each partial fill generates a separate Fill record with its own price and quantity
+    7. Average fill price = sum(fill_price * fill_qty) / total_filled_qty
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [consistency]
+  example_good: |
+    from decimal import Decimal
+
+    class Order:
+        def __init__(self, quantity: Decimal):
+            self.original_quantity = quantity
+            self.filled_quantity = Decimal("0")
+            self.remaining_quantity = quantity
+            self.fills: list["Fill"] = []
+
+        def apply_fill(self, fill_qty: Decimal, fill_price: Decimal):
+            assert fill_qty <= self.remaining_quantity, "Fill exceeds remaining"
+            self.filled_quantity += fill_qty
+            self.remaining_quantity -= fill_qty
+            self.fills.append(Fill(quantity=fill_qty, price=fill_price))
+
+            # Invariant check
+            assert self.filled_quantity + self.remaining_quantity == self.original_quantity
+
+            if self.remaining_quantity == Decimal("0"):
+                self.status = OrderStatus.FILLED
+            elif self.filled_quantity > Decimal("0"):
+                self.status = OrderStatus.PARTIAL
+
+        def average_fill_price(self) -> Decimal:
+            if self.filled_quantity == Decimal("0"):
+                return Decimal("0")
+            weighted = sum(f.quantity * f.price for f in self.fills)
+            return weighted / self.filled_quantity
+  example_bad: |
+    # WRONG: Deriving filled from original - remaining — race condition
+    class BadOrder:
+        def filled_quantity(self):
+            return self.original - self.remaining  # Not atomic!
+  when_applies: Order fill processing, partial execution, position tracking
+  sources: ["https://www.cftc.gov/sites/default/files/idc/groups/public/@newsroom/documents/file/federalregister112415.pdf"]
+
+- id: PM-OB-006
+  text: "Self-trade prevention (STP): the matching engine must never match two orders from the same user (or same account group). Self-trades are a form of wash trading that inflates volume and can be used for market manipulation or tax evasion."
+  why: >
+    Self-trading is illegal under most regulatory frameworks (CFTC, MiFID II, CVM) because it
+    creates fake volume. Even unintentional self-trades (user places a bid, forgets, places an ask
+    that matches) must be prevented. Coinbase was fined $6.5M by the CFTC in 2021 partly for
+    allowing self-trading by an employee. Self-trade prevention is mandatory for any regulated or
+    regulation-aspiring prediction market. Implementation is simple but must be enforced at the
+    matching engine level, not the API level.
+  how_to_do_right: |
+    1. Check STP BEFORE every match: if incoming_order.user_id == resting_order.user_id, skip
+    2. Also check account groups: users with linked accounts (same KYC identity) cannot match
+    3. STP modes: CANCEL_NEWEST (cancel incoming), CANCEL_OLDEST (cancel resting), CANCEL_BOTH
+    4. Default to CANCEL_NEWEST — the incoming order is canceled, resting order stays
+    5. Log every STP trigger: timestamp, both order IDs, user_id, STP mode applied
+    6. Monitor STP frequency per user: >10 triggers/day suggests intentional gaming
+    7. Test: submit bid and ask from same user, verify they never match
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech, compliance]
+    concern: [domain_specific]
+  example_good: |
+    from enum import Enum
+
+    class STPMode(Enum):
+        CANCEL_NEWEST = "cancel_newest"
+        CANCEL_OLDEST = "cancel_oldest"
+        CANCEL_BOTH = "cancel_both"
+
+    class MatchingEngine:
+        def __init__(self, stp_mode: STPMode = STPMode.CANCEL_NEWEST):
+            self.stp_mode = stp_mode
+
+        def try_match(self, incoming: "Order", resting: "Order") -> "Fill | None":
+            # Self-trade prevention check
+            if self._is_self_trade(incoming, resting):
+                self._handle_stp(incoming, resting)
+                return None
+
+            # Normal matching logic
+            return self._execute_match(incoming, resting)
+
+        def _is_self_trade(self, a: "Order", b: "Order") -> bool:
+            if a.user_id == b.user_id:
+                return True
+            if self.account_groups.get(a.user_id) == self.account_groups.get(b.user_id):
+                return True
+            return False
+
+        def _handle_stp(self, incoming: "Order", resting: "Order"):
+            if self.stp_mode == STPMode.CANCEL_NEWEST:
+                incoming.cancel(reason="self_trade_prevention")
+            elif self.stp_mode == STPMode.CANCEL_OLDEST:
+                resting.cancel(reason="self_trade_prevention")
+            self.audit_log.record_stp(incoming, resting, self.stp_mode)
+  example_bad: |
+    # WRONG: No self-trade prevention — regulatory violation
+    def match(incoming, resting):
+        if incoming.price >= resting.price:
+            return Fill(incoming, resting)  # Same user on both sides? Don't care!
+  when_applies: Matching engine implementation, regulatory compliance, wash trading prevention
+  sources: ["https://www.cftc.gov/PressRoom/PressReleases/9183-26"]
+
+- id: PM-OB-007
+  text: "Every order action (create, match, partial fill, cancel, modify) must produce an immutable audit record. The audit trail must be sufficient to reconstruct the complete order book state at any point in time for regulatory review."
+  why: >
+    Financial regulators require exchanges to maintain complete records of all order activity for
+    5-7 years. CFTC Rule 1.31 requires "all books and records required to be kept" for 5 years.
+    MiFID II requires a 25-field audit trail for every order event. Beyond compliance, the audit
+    trail is essential for debugging: when a user says "my order disappeared", you need to show
+    exactly when, why, and by whom it was canceled. Without audit records, every user complaint
+    becomes a he-said-she-said situation.
+  how_to_do_right: |
+    1. Record for every event: event_id, order_id, event_type, timestamp, user_id, market_id,
+       side, price, quantity, filled_qty, remaining_qty, counterparty_order_id (if fill)
+    2. Event types: ORDER_CREATED, ORDER_MATCHED, ORDER_PARTIALLY_FILLED, ORDER_FILLED,
+       ORDER_CANCELED, ORDER_MODIFIED, ORDER_EXPIRED, ORDER_REJECTED
+    3. Store in append-only table with no UPDATE/DELETE permissions
+    4. Include a sequence number (monotonically increasing) for ordering
+    5. Hash chain: each event includes hash(previous_event) for tamper detection
+    6. Retention: 7 years minimum, encrypted at rest
+    7. Export capability: generate regulatory reports in standard format (FIX protocol)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [sqlalchemy]
+  domains:
+    domain: [prediction_markets, fintech, compliance]
+    concern: [domain_specific]
+  example_good: |
+    import hashlib
+    import json
+    from dataclasses import dataclass, asdict
+    from datetime import datetime
+    from decimal import Decimal
+
+    @dataclass(frozen=True)
+    class OrderEvent:
+        event_id: str
+        sequence: int
+        order_id: str
+        event_type: str
+        timestamp: datetime
+        user_id: str
+        market_id: str
+        side: str
+        price: Decimal
+        quantity: Decimal
+        filled_qty: Decimal
+        remaining_qty: Decimal
+        counterparty_order_id: str | None
+        previous_hash: str
+
+        def compute_hash(self) -> str:
+            data = json.dumps(asdict(self), default=str, sort_keys=True)
+            return hashlib.sha256(data.encode()).hexdigest()
+
+    class OrderAuditLog:
+        def __init__(self):
+            self._last_hash = "genesis"
+            self._sequence = 0
+
+        def record(self, **kwargs) -> OrderEvent:
+            self._sequence += 1
+            event = OrderEvent(
+                sequence=self._sequence,
+                previous_hash=self._last_hash,
+                **kwargs
+            )
+            self._last_hash = event.compute_hash()
+            self._store.append(event)  # Append-only
+            return event
+  example_bad: |
+    # WRONG: Mutable audit log — tamper-prone, non-compliant
+    def log_order(order):
+        db.orders.update({"order_id": order.id}, {"$set": {"status": order.status}})
+        # Previous status overwritten — history lost
+  when_applies: Every order operation, regulatory compliance, dispute resolution, forensic analysis
+  sources: ["https://martinfowler.com/eaaDev/EventSourcing.html"]
+
+- id: PM-OB-008
+  text: "Event-sourced order replay: the order book must be reconstructable from the event log alone. Implement a replay function that processes events sequentially to produce the order book state at any point in time. Run replay verification daily."
+  why: >
+    Event sourcing for order books is the industry standard (LMAX, NYSE, CME all use it). If the
+    in-memory order book crashes or corrupts, you can rebuild it from events in seconds. If a bug
+    is discovered, you can replay events with the fix to determine the correct state. Without
+    replay capability, a corrupted order book requires manual reconciliation — which is impossible
+    at scale. A crypto exchange lost 3 days of trading data in 2022 because they had no replay
+    capability after a database corruption.
+  how_to_do_right: |
+    1. Every order action is an immutable event (create, cancel, fill, modify)
+    2. Replay function: given events 0..N, produce order book state at event N
+    3. Snapshot every 1000 events: store full book state for faster replay
+    4. Recovery: load latest snapshot + replay subsequent events
+    5. Verification: replay all events from genesis, compare to current state (run nightly)
+    6. If replay produces different state than live book: HALT trading and investigate
+    7. Performance target: replay 100,000 events in <10 seconds
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech, databases]
+    concern: [domain_specific]
+  example_good: |
+    class EventSourcedOrderBook:
+        def __init__(self, market_id: str, event_store: "EventStore"):
+            self.market_id = market_id
+            self.event_store = event_store
+            self.bids = OrderBookSide(is_bid=True)
+            self.asks = OrderBookSide(is_bid=False)
+
+        def replay_from_events(self, up_to_sequence: int | None = None) -> "OrderBook":
+            """Reconstruct order book from event log."""
+            book = EventSourcedOrderBook(self.market_id, self.event_store)
+
+            # Load latest snapshot if available
+            snapshot = self.event_store.get_latest_snapshot(self.market_id)
+            if snapshot and (up_to_sequence is None or snapshot.sequence <= up_to_sequence):
+                book.load_snapshot(snapshot)
+                start_seq = snapshot.sequence + 1
+            else:
+                start_seq = 0
+
+            # Replay events from snapshot
+            events = self.event_store.get_events(
+                self.market_id, from_sequence=start_seq, to_sequence=up_to_sequence
+            )
+            for event in events:
+                book.apply_event(event)
+
+            return book
+
+        def verify_consistency(self) -> bool:
+            """Replay all events and compare to current state."""
+            replayed = self.replay_from_events()
+            return replayed.state_hash() == self.state_hash()
+  example_bad: |
+    # WRONG: State-only persistence — no replay possible
+    def save_order_book(book):
+        db.save(book.to_dict())  # If this corrupts, all history is lost
+
+    def load_order_book(market_id):
+        return db.load(market_id)  # No way to verify correctness
+  when_applies: Order book persistence, disaster recovery, state verification, debugging
+  sources: ["https://martinfowler.com/eaaDev/EventSourcing.html"]
+
+- id: PM-OB-009
+  text: "Order book depth visualization: show aggregated quantity at each price level for both bids and asks. The depth chart is the primary tool traders use to assess liquidity and plan order placement."
+  why: >
+    Traders need to see where liquidity is concentrated to decide their order placement strategy.
+    A depth chart showing 10,000 shares at $0.50 and only 100 shares at $0.51 tells the trader
+    that buying >100 shares will face significant slippage above $0.51. Without depth visualization,
+    traders place orders blindly and get unexpectedly bad fills. Polymarket and Kalshi both provide
+    real-time depth charts. In prediction markets, depth is bounded by [0, 1] on the x-axis, making
+    visualization more compact than equity markets.
+  how_to_do_right: |
+    1. Aggregate quantities by price level: group orders at same price, sum quantities
+    2. Return top 20 price levels for each side (bids and asks)
+    3. Include cumulative quantity: at each level, show total if all orders up to that level fill
+    4. Update in real-time via WebSocket when order book changes
+    5. Format for the depth chart: [{price, quantity, cumulative_quantity}] for each side
+    6. For prediction markets: x-axis is [0, 1] (probability), y-axis is quantity in shares
+    7. Cache depth snapshots for 100ms to reduce computation during high-frequency updates
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, react]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+    from dataclasses import dataclass
+
+    @dataclass
+    class DepthLevel:
+        price: Decimal
+        quantity: Decimal
+        cumulative_quantity: Decimal
+        order_count: int
+
+    class DepthCalculator:
+        def get_depth(self, book: "OrderBook", levels: int = 20) -> dict:
+            bids = self._aggregate_side(book.bids, levels, reverse=True)
+            asks = self._aggregate_side(book.asks, levels, reverse=False)
+            return {
+                "bids": bids,
+                "asks": asks,
+                "spread": asks[0].price - bids[0].price if bids and asks else None,
+                "mid_price": (asks[0].price + bids[0].price) / 2 if bids and asks else None,
+            }
+
+        def _aggregate_side(self, side: "OrderBookSide", levels: int,
+                           reverse: bool) -> list[DepthLevel]:
+            result = []
+            cumulative = Decimal("0")
+            prices = sorted(side.levels.keys(), reverse=reverse)[:levels]
+            for price in prices:
+                orders = side.levels[price]
+                qty = sum(o.remaining for o in orders)
+                cumulative += qty
+                result.append(DepthLevel(
+                    price=price, quantity=qty,
+                    cumulative_quantity=cumulative, order_count=len(orders)
+                ))
+            return result
+  example_bad: |
+    # WRONG: Returning raw orders — exposes user information, no aggregation
+    def get_depth(book):
+        return [{"user": o.user_id, "price": o.price, "qty": o.quantity} for o in book.orders]
+  when_applies: Trading UI, depth chart component, market data API, liquidity assessment
+  sources: ["https://d3js.org/"]
+
+- id: PM-OB-010
+  text: "Best bid/ask (BBO) calculation must be O(1) or O(log N). The BBO is the most frequently accessed data point — it drives price display, spread calculation, and market order routing. Cache it and update only on book changes."
+  why: >
+    The BBO is queried on every page load, every trade preview, every WebSocket tick, and every
+    matching attempt. If BBO calculation is O(N) (scanning all orders), it becomes the performance
+    bottleneck. A trading platform that calculated BBO by scanning 50,000 orders had 200ms latency
+    on price display, making the UI feel sluggish. With SortedDict, BBO is O(log N) via peekitem().
+    Caching brings it to O(1) for reads, with O(log N) update on book changes.
+  how_to_do_right: |
+    1. Use SortedDict.peekitem(-1) for best bid, .peekitem(0) for best ask — O(log N)
+    2. Cache BBO in memory, update only when the best price level changes
+    3. Invalidate cache on: new order at best price, fill/cancel of last order at best price
+    4. Spread = best_ask - best_bid (in probability terms: e.g., 0.02 = 2 percentage points)
+    5. Mid price = (best_bid + best_ask) / 2 — used for mark-to-market pricing
+    6. If no bids or no asks, report "no market" — do not default to 0 or 1
+    7. BBO should be available via both REST (GET /markets/{id}/bbo) and WebSocket (real-time)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech, performance]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+
+    class BestBidOffer:
+        def __init__(self, order_book: "OrderBook"):
+            self._book = order_book
+            self._cached_bid: Decimal | None = None
+            self._cached_ask: Decimal | None = None
+            self._dirty = True
+
+        def get_bbo(self) -> dict:
+            if self._dirty:
+                self._cached_bid = self._book.bids.best_price()
+                self._cached_ask = self._book.asks.best_price()
+                self._dirty = False
+
+            spread = None
+            mid = None
+            if self._cached_bid is not None and self._cached_ask is not None:
+                spread = self._cached_ask - self._cached_bid
+                mid = (self._cached_bid + self._cached_ask) / 2
+
+            return {
+                "best_bid": self._cached_bid,
+                "best_ask": self._cached_ask,
+                "spread": spread,
+                "mid_price": mid,
+            }
+
+        def invalidate(self):
+            self._dirty = True
+  example_bad: |
+    # WRONG: O(N) BBO calculation on every access
+    def best_bid(orders):
+        return max((o.price for o in orders if o.side == "bid"), default=None)  # Scans all orders
+  when_applies: Price display, trade preview, matching engine, WebSocket feeds, spread monitoring
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: PM-OB-011
+  text: "Spread calculation: the bid-ask spread is the difference between best ask and best bid. In prediction markets, spread is measured in probability points (e.g., 2% spread means best bid = 0.49, best ask = 0.51). Monitor spread as a market health indicator."
+  why: >
+    Wide spreads (>10%) indicate poor liquidity and discourage trading. Narrow spreads (<1%)
+    indicate healthy competition among market makers. Spread is the implicit cost of a round-trip
+    trade (buy then sell immediately), so it directly affects user experience. Polymarket targets
+    <2% spread on popular markets. If spread exceeds a threshold, the AMM should provide additional
+    liquidity to tighten it. Spread also signals information events: sudden spread widening often
+    precedes a large price move.
+  how_to_do_right: |
+    1. Spread = best_ask - best_bid (in Decimal, probability units)
+    2. Display as percentage: "Spread: 2.3%" (multiply by 100)
+    3. Monitor: alert if spread > 10% for markets with >$1K daily volume
+    4. If spread widens suddenly (>3x in 5 minutes), investigate — possible manipulation or news event
+    5. Track historical spread: average spread per hour for market health dashboards
+    6. Use spread as input to AMM parameter adjustment: wide spread -> increase b (more liquidity)
+    7. Report "no spread" if either side has zero orders (one-sided book)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, react]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+    from datetime import datetime
+
+    class SpreadMonitor:
+        ALERT_THRESHOLD = Decimal("0.10")  # 10%
+        WIDENING_FACTOR = Decimal("3")
+
+        def __init__(self):
+            self.spread_history: list[tuple[datetime, Decimal]] = []
+
+        def record_spread(self, spread: Decimal | None):
+            if spread is not None:
+                self.spread_history.append((datetime.utcnow(), spread))
+
+        def check_alerts(self, current_spread: Decimal | None) -> list[str]:
+            alerts = []
+            if current_spread is None:
+                alerts.append("One-sided book — no spread available")
+                return alerts
+            if current_spread > self.ALERT_THRESHOLD:
+                alerts.append(f"Wide spread: {current_spread*100:.1f}%")
+
+            # Check for sudden widening
+            recent = [s for t, s in self.spread_history if
+                      (datetime.utcnow() - t).seconds < 300]
+            if recent and current_spread > self.WIDENING_FACTOR * min(recent):
+                alerts.append(f"Spread widened {current_spread / min(recent):.1f}x in 5min")
+            return alerts
+  example_bad: |
+    # WRONG: No spread monitoring
+    # Users see a market, try to trade, and get 20% slippage because spread was 15%
+  when_applies: Market health monitoring, AMM parameter tuning, trading UI, alerting
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: PM-OB-012
+  text: "Order cancellation has two modes: normal (user-initiated) and force (system-initiated, e.g., market close or halt). Normal cancellation requires user authentication. Force cancellation must cancel ALL open orders atomically and log the reason."
+  why: >
+    When a market closes or is halted, all resting orders must be canceled immediately and atomically.
+    If some orders survive a market close, they could be filled after the outcome is known, creating
+    guaranteed losses for the counterparty. Force cancellation must be idempotent (canceling an
+    already-canceled order is a no-op) because it may be triggered multiple times during system
+    recovery. User-initiated cancellation must verify the user owns the order to prevent one user
+    from canceling another's orders.
+  how_to_do_right: |
+    1. Normal cancel: verify order.user_id == requesting_user_id, then cancel
+    2. Force cancel: system-level, no user auth required, must succeed even if user session is down
+    3. Force cancel all: cancel ALL open orders for a market in a single transaction
+    4. Idempotent: canceling an already-canceled order returns success, not error
+    5. State transition: OPEN/PARTIAL -> CANCELED, with reason logged
+    6. Refund: if order had partial fills, only refund the unfilled portion
+    7. Notification: notify user via WebSocket and email for force cancellations
+    8. Test: force cancel during active matching should not cause inconsistent state
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from enum import Enum
+    from decimal import Decimal
+
+    class CancelReason(Enum):
+        USER_REQUESTED = "user_requested"
+        MARKET_CLOSED = "market_closed"
+        MARKET_HALTED = "market_halted"
+        INSUFFICIENT_BALANCE = "insufficient_balance"
+        SELF_TRADE_PREVENTION = "stp"
+        ADMIN_FORCE = "admin_force"
+
+    class OrderCancellationService:
+        def cancel_order(self, order_id: str, user_id: str) -> bool:
+            order = self.get_order(order_id)
+            if order.user_id != user_id:
+                raise PermissionError("Cannot cancel another user's order")
+            return self._do_cancel(order, CancelReason.USER_REQUESTED)
+
+        def force_cancel_all(self, market_id: str, reason: CancelReason) -> int:
+            """Atomically cancel all open orders for a market."""
+            with self.session.begin():
+                orders = self.get_open_orders(market_id)
+                count = 0
+                for order in orders:
+                    if self._do_cancel(order, reason):
+                        count += 1
+                return count
+
+        def _do_cancel(self, order: "Order", reason: CancelReason) -> bool:
+            if order.status in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED):
+                return False  # Idempotent — already terminal
+            order.transition(OrderStatus.CANCELED, reason=reason.value)
+            self.order_book.remove(order)
+            self.notify_user(order.user_id, f"Order {order.id} canceled: {reason.value}")
+            return True
+  example_bad: |
+    # WRONG: No auth check, not idempotent, no force cancel
+    def cancel(order_id):
+        order = db.get(order_id)
+        order.status = "canceled"  # No auth check — anyone can cancel any order
+        db.save(order)
+  when_applies: Order cancellation, market close/halt procedures, system error recovery
+  sources: ["https://www.cftc.gov/sites/default/files/idc/groups/public/@newsroom/documents/file/federalregister112415.pdf"]
+
+- id: PM-OB-013
+  text: "Order modification uses cancel-replace semantics: the original order is canceled and a new order is created with modified parameters. This preserves time priority only if the price doesn't change. If price changes, the order loses its place in the queue."
+  why: >
+    Allowing in-place modification of orders (change price without losing queue position) enables
+    a manipulation tactic called "order spoofing": a trader places a large order at the best price
+    to attract others, then modifies the price away just before execution. Cancel-replace semantics
+    prevent this because a price change creates a new order at the back of the queue. NYSE, CME,
+    and all major exchanges use cancel-replace. The one exception: quantity reduction (decreasing
+    order size) can preserve time priority because it doesn't affect other orders.
+  how_to_do_right: |
+    1. Modification = atomic cancel of old order + creation of new order
+    2. If only quantity decreases: preserve time priority (same sequence number)
+    3. If price changes or quantity increases: new order gets new sequence number (back of queue)
+    4. Atomic: old cancel and new creation must be in the same transaction
+    5. New order inherits the old order's filled history for audit continuity
+    6. Link old and new orders via a modification_chain_id for traceability
+    7. Rate limit modifications: max 10 per order per minute (prevent quote stuffing)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    from decimal import Decimal
+
+    class OrderModificationService:
+        def modify_order(self, order_id: str, user_id: str,
+                        new_price: Decimal | None = None,
+                        new_quantity: Decimal | None = None) -> "Order":
+            with self.session.begin():
+                old_order = self.get_order(order_id)
+                assert old_order.user_id == user_id, "Not your order"
+                assert old_order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL)
+
+                # Quantity decrease preserves priority
+                quantity_only_decrease = (
+                    new_price is None and
+                    new_quantity is not None and
+                    new_quantity < old_order.remaining_quantity
+                )
+
+                if quantity_only_decrease:
+                    old_order.remaining_quantity = new_quantity
+                    old_order.original_quantity = old_order.filled_quantity + new_quantity
+                    return old_order
+
+                # Cancel-replace for price changes or quantity increases
+                self.cancel_service._do_cancel(old_order, CancelReason.USER_REQUESTED)
+                new_order = Order(
+                    price=new_price or old_order.price,
+                    quantity=new_quantity or old_order.remaining_quantity,
+                    user_id=user_id,
+                    market_id=old_order.market_id,
+                    side=old_order.side,
+                    modification_chain_id=old_order.modification_chain_id or old_order.id,
+                )
+                self.order_book.add(new_order)
+                return new_order
+  example_bad: |
+    # WRONG: In-place price modification preserving time priority — enables spoofing
+    def modify(order_id, new_price):
+        order = db.get(order_id)
+        order.price = new_price  # Keeps same queue position — spoofing!
+        db.save(order)
+  when_applies: Order modification API, cancel-replace implementation, anti-spoofing measures
+  sources: ["https://www.cftc.gov/sites/default/files/idc/groups/public/@newsroom/documents/file/federalregister112415.pdf"]
+
+- id: PM-OB-014
+  text: "Matching engine performance target: <1ms per match operation (price lookup + fill + state update) for 99th percentile latency. Profile and optimize the hot path: match(), fill(), and state_update() are called for every trade."
+  why: >
+    While prediction markets have lower frequency than equities (hundreds vs millions of trades/day),
+    burst periods (election night, sports events) can see 100+ orders per second. At 100 orders/sec
+    with 10ms matching latency, the queue grows by 1 order/ms — a 1-second burst creates a 1000-order
+    backlog. At <1ms, the engine keeps up in real-time. LMAX (the reference matching engine) processes
+    6M orders/second, but even modest Python implementations can achieve <1ms using SortedDict and
+    careful memory allocation. Profile before optimizing — the bottleneck is usually database I/O, not
+    matching logic.
+  how_to_do_right: |
+    1. Profile the matching engine with cProfile to identify hot path
+    2. Hot path: get_best_price() -> check_match() -> fill() -> update_state()
+    3. Target: <1ms for the hot path at 99th percentile
+    4. Use SortedDict (C implementation) — 10x faster than pure Python sorted structures
+    5. Batch database writes: collect fills in memory, flush to DB every 10ms or 100 fills
+    6. Avoid allocation in the hot path: reuse objects, pre-allocate buffers
+    7. Benchmark: run 10,000 random orders, measure p50/p90/p99/max latency
+    8. Alert if p99 > 5ms — indicates degradation
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech, performance]
+    concern: [domain_specific]
+  example_good: |
+    import time
+    from dataclasses import dataclass
+
+    @dataclass
+    class MatchingMetrics:
+        total_matches: int = 0
+        total_latency_us: int = 0
+        max_latency_us: int = 0
+        p99_latencies: list = None
+
+        def __post_init__(self):
+            self.p99_latencies = []
+
+    class InstrumentedMatcher:
+        def __init__(self, engine: "MatchingEngine"):
+            self.engine = engine
+            self.metrics = MatchingMetrics()
+
+        def match_order(self, order: "Order") -> list["Fill"]:
+            start = time.perf_counter_ns()
+            fills = self.engine.match(order)
+            elapsed_us = (time.perf_counter_ns() - start) // 1000
+
+            self.metrics.total_matches += 1
+            self.metrics.total_latency_us += elapsed_us
+            self.metrics.max_latency_us = max(self.metrics.max_latency_us, elapsed_us)
+            self.metrics.p99_latencies.append(elapsed_us)
+
+            if elapsed_us > 5000:  # 5ms
+                logger.warning(f"Slow match: {elapsed_us}us for order {order.id}")
+
+            return fills
+  example_bad: |
+    # WRONG: No performance monitoring — blind to latency degradation
+    def match(order):
+        # Is this taking 1ms or 100ms? Nobody knows.
+        fills = engine.match(order)
+        return fills
+  when_applies: Matching engine optimization, performance benchmarking, capacity planning
+  sources: ["https://www.cftc.gov/sites/default/files/idc/groups/public/@newsroom/documents/file/federalregister112415.pdf"]
+
+- id: PM-OB-015
+  text: "Order validation must check: price within [0, 1] bounds, quantity > 0, user balance sufficient for the trade, user position within position limits, and market is open for trading. Validate ALL conditions BEFORE modifying any state."
+  why: >
+    Validation after state modification creates the possibility of partial invalid states: balance
+    debited but order rejected, or order placed but balance check failed. A prediction market that
+    validated balance after placing the order had a race condition where two orders could both pass
+    validation before either deducted the balance, allowing double-spending. All validation must
+    happen atomically before any state change, within the same transaction that performs the trade.
+  how_to_do_right: |
+    1. Validate synchronously, in order: market_open -> price_valid -> quantity_valid -> balance_sufficient -> position_within_limits
+    2. Price: 0.01 <= price <= 0.99 for limit orders (allow some margin from 0 and 1)
+    3. Quantity: must be > 0, must be a multiple of minimum_increment (e.g., 0.01 shares)
+    4. Balance: user.available_balance >= estimated_cost (use worst-case cost estimate)
+    5. Position limits: user.position(market) + new_quantity <= max_position_per_market
+    6. Market status: must be OPEN (not CLOSED, HALTED, SETTLING)
+    7. All validations in a single function that returns list[ValidationError] — empty = valid
+    8. NEVER proceed to matching if ANY validation fails
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [consistency]
+  example_good: |
+    from decimal import Decimal
+    from dataclasses import dataclass
+
+    @dataclass
+    class ValidationError:
+        field: str
+        message: str
+        code: str
+
+    class OrderValidator:
+        MIN_PRICE = Decimal("0.01")
+        MAX_PRICE = Decimal("0.99")
+        MIN_QUANTITY = Decimal("0.01")
+
+        def validate(self, order: "Order", user: "User",
+                    market: "Market") -> list[ValidationError]:
+            errors = []
+
+            # 1. Market open
+            if market.status != MarketStatus.OPEN:
+                errors.append(ValidationError("market", f"Market is {market.status.value}", "MARKET_NOT_OPEN"))
+
+            # 2. Price bounds
+            if order.order_type == OrderType.LIMIT:
+                if not (self.MIN_PRICE <= order.price <= self.MAX_PRICE):
+                    errors.append(ValidationError("price", f"Price must be in [{self.MIN_PRICE}, {self.MAX_PRICE}]", "INVALID_PRICE"))
+
+            # 3. Quantity
+            if order.quantity <= Decimal("0"):
+                errors.append(ValidationError("quantity", "Quantity must be positive", "INVALID_QUANTITY"))
+
+            # 4. Balance
+            estimated_cost = order.quantity * (order.price or market.best_ask or Decimal("1"))
+            if user.available_balance < estimated_cost:
+                errors.append(ValidationError("balance", "Insufficient balance", "INSUFFICIENT_BALANCE"))
+
+            # 5. Position limits
+            current_position = self.get_user_position(user.id, market.id)
+            if current_position + order.quantity > market.max_position:
+                errors.append(ValidationError("position", "Exceeds position limit", "POSITION_LIMIT"))
+
+            return errors
+  example_bad: |
+    # WRONG: No validation — anything goes
+    def place_order(price, quantity, market_id):
+        order = Order(price=price, quantity=quantity)
+        book.add(order)  # Price = 5.0? Quantity = -100? Market closed? No checks!
+  when_applies: Order submission API, pre-trade validation, risk management
+  sources: ["https://www.bis.org/cpmi/publ/d101a.pdf"]
+
+- id: PM-OB-016
+  text: "Order book persistence: the order book state must survive process restarts. Use a combination of database persistence (for durability) and in-memory representation (for performance). Reconstruct in-memory state from the database on startup."
+  why: >
+    An order book that only lives in memory loses all resting orders on a process crash. Users who
+    placed GTC orders expect them to persist. A prediction market that lost its order book during
+    a deployment caused 5,000 resting orders to disappear, requiring manual reconciliation with
+    angry users. The pattern: persist to database within the trade transaction, but serve reads
+    from an in-memory representation. On startup, load all OPEN and PARTIAL orders from the database
+    into the in-memory structure.
+  how_to_do_right: |
+    1. Every order write (create, fill, cancel) is persisted to database within the trade transaction
+    2. In-memory order book is the authoritative source for matching (fast)
+    3. On startup: SELECT * FROM orders WHERE status IN ('OPEN', 'PARTIAL') ORDER BY sequence
+    4. Insert each loaded order into the in-memory SortedDict structure
+    5. Verify: count of in-memory orders == count of active orders in database
+    6. If mismatch: log error, use database as source of truth, rebuild in-memory
+    7. Recovery time target: <5 seconds for order books with up to 100,000 resting orders
+    8. Health check: periodically compare in-memory state to database (every 60 seconds)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+    library: [sqlalchemy, asyncpg]
+  domains:
+    domain: [prediction_markets, fintech, databases]
+    concern: [domain_specific]
+  example_good: |
+    class PersistentOrderBook:
+        def __init__(self, market_id: str, session_factory):
+            self.market_id = market_id
+            self.session_factory = session_factory
+            self.in_memory = OrderBook()
+
+        def startup_load(self):
+            """Reconstruct in-memory book from database."""
+            with self.session_factory() as session:
+                orders = session.query(OrderModel).filter(
+                    OrderModel.market_id == self.market_id,
+                    OrderModel.status.in_([OrderStatus.OPEN, OrderStatus.PARTIAL])
+                ).order_by(OrderModel.sequence).all()
+
+                for order_model in orders:
+                    order = Order.from_model(order_model)
+                    self.in_memory.add(order)
+
+                db_count = len(orders)
+                mem_count = self.in_memory.order_count()
+                assert db_count == mem_count, f"Mismatch: DB={db_count}, Memory={mem_count}"
+                logger.info(f"Loaded {db_count} orders for market {self.market_id}")
+
+        def add_order(self, session, order: "Order"):
+            """Persist to DB and add to in-memory atomically."""
+            session.add(order.to_model())
+            session.flush()  # Ensure DB write succeeds
+            self.in_memory.add(order)
+  example_bad: |
+    # WRONG: In-memory only — lost on crash
+    order_book = {}  # Global dict, lives in process memory only
+    def add_order(order):
+        order_book[order.id] = order  # Gone after restart
+  when_applies: Order book implementation, process recovery, deployment strategy
+  sources: ["https://martinfowler.com/eaaDev/EventSourcing.html"]
+
+- id: PM-OB-017
+  text: "Order book recovery from event log: after a crash, the order book must be reconstructable from the event log. The recovery process must be idempotent (running it twice produces the same result) and must complete before accepting new orders."
+  why: >
+    Database persistence stores the current state but may be inconsistent after a crash (transaction
+    in progress at crash time). The event log is the source of truth: it contains every order action
+    in sequence. Recovery replays events from the last known-good snapshot, producing a consistent
+    order book. Recovery must be idempotent because it may be interrupted and restarted. The system
+    must not accept new orders during recovery (flag: is_recovering=True) because partial state
+    would cause incorrect matching.
+  how_to_do_right: |
+    1. On startup: set is_recovering = True, reject all incoming orders
+    2. Load latest snapshot (if available)
+    3. Replay all events since snapshot in sequence order
+    4. Verify recovered state: run consistency checks (sum of quantities, order count, etc.)
+    5. Set is_recovering = False, begin accepting orders
+    6. Log recovery time and event count for monitoring
+    7. If recovery fails: alert operator, remain in recovery mode, do not accept orders
+    8. Make recovery idempotent: processing the same event twice has no effect (check event_id uniqueness)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [prediction_markets, fintech]
+    concern: [domain_specific]
+  example_good: |
+    import logging
+    import time
+
+    logger = logging.getLogger(__name__)
+
+    class OrderBookRecovery:
+        def __init__(self, event_store: "EventStore", market_id: str):
+            self.event_store = event_store
+            self.market_id = market_id
+            self.is_recovering = False
+            self.processed_event_ids: set[str] = set()
+
+        def recover(self) -> "OrderBook":
+            self.is_recovering = True
+            start = time.monotonic()
+
+            try:
+                # 1. Load snapshot
+                snapshot = self.event_store.get_latest_snapshot(self.market_id)
+                book = OrderBook()
+                start_seq = 0
+
+                if snapshot:
+                    book.load_from_snapshot(snapshot.data)
+                    start_seq = snapshot.sequence + 1
+                    self.processed_event_ids = set(snapshot.processed_ids)
+
+                # 2. Replay events (idempotent)
+                events = self.event_store.get_events(self.market_id, from_sequence=start_seq)
+                replayed = 0
+                for event in events:
+                    if event.event_id in self.processed_event_ids:
+                        continue  # Idempotent: skip already-processed
+                    book.apply_event(event)
+                    self.processed_event_ids.add(event.event_id)
+                    replayed += 1
+
+                # 3. Verify
+                assert book.is_consistent(), "Recovered book failed consistency check"
+
+                elapsed = time.monotonic() - start
+                logger.info(f"Recovery complete: {replayed} events in {elapsed:.2f}s")
+
+                return book
+            finally:
+                self.is_recovering = False
+
+        def accept_order(self, order: "Order") -> bool:
+            if self.is_recovering:
+                raise ServiceUnavailable("Order book is recovering, try again shortly")
+            return True
+  example_bad: |
+    # WRONG: No recovery — accept orders on stale/corrupt state
+    def startup():
+        book = load_from_db()  # May be inconsistent after crash
+        start_accepting_orders()  # Matching against corrupt state
+  when_applies: System startup, crash recovery, disaster recovery, deployment procedures
+  sources: ["https://martinfowler.com/eaaDev/EventSourcing.html"]
+
+- id: PM-OB-018
+  text: "Market data feed: publish real-time price, volume, and order book changes via WebSocket. Each message must include a sequence number for gap detection and a timestamp for latency monitoring. Consumers must handle out-of-order and duplicate messages."
+  why: >
+    Traders need real-time market data to make decisions. A delayed price feed causes traders to
+    submit orders based on stale information, leading to bad fills and complaints. WebSocket is the
+    standard for real-time market data (used by Binance, Coinbase, Polymarket). Sequence numbers
+    allow consumers to detect missed messages (gap = missed a message, request replay). Without
+    sequence numbers, consumers have no way to know if they missed an update, leading to silently
+    stale displays that erode trust.
+  how_to_do_right: |
+    1. Publish on every book change: type (trade, new_order, cancel), price, quantity, timestamp, sequence
+    2. Include monotonically increasing sequence number in every message
+    3. Consumers check: if received_seq != expected_seq, request snapshot (gap detected)
+    4. Message types: TRADE (execution), BBO_UPDATE (best bid/ask changed), DEPTH_UPDATE (book change)
+    5. Include server timestamp and allow consumers to calculate latency
+    6. Batch updates within 10ms window to avoid flooding consumers during bursts
+    7. Provide REST endpoint for snapshot: GET /markets/{id}/snapshot returns full book + last sequence
+    8. Handle consumer disconnect: buffer last 100 messages for reconnection replay
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, react]
+    library: [websockets]
+  domains:
+    domain: [prediction_markets, fintech, realtime]
+    concern: [domain_specific]
+  example_good: |
+    import json
+    import time
+    from dataclasses import dataclass, asdict
+    from decimal import Decimal
+
+    @dataclass
+    class MarketDataMessage:
+        sequence: int
+        message_type: str  # "trade", "bbo_update", "depth_update"
+        market_id: str
+        timestamp_ms: int
+        data: dict
+
+    class MarketDataFeed:
+        def __init__(self, market_id: str):
+            self.market_id = market_id
+            self.sequence = 0
+            self.subscribers: list = []
+            self.recent_messages: list = []  # Last 100 for reconnection
+
+        def publish_trade(self, price: Decimal, quantity: Decimal, side: str):
+            self.sequence += 1
+            msg = MarketDataMessage(
+                sequence=self.sequence,
+                message_type="trade",
+                market_id=self.market_id,
+                timestamp_ms=int(time.time() * 1000),
+                data={"price": str(price), "quantity": str(quantity), "side": side}
+            )
+            self._broadcast(msg)
+
+        def publish_bbo(self, best_bid: Decimal | None, best_ask: Decimal | None):
+            self.sequence += 1
+            msg = MarketDataMessage(
+                sequence=self.sequence,
+                message_type="bbo_update",
+                market_id=self.market_id,
+                timestamp_ms=int(time.time() * 1000),
+                data={"best_bid": str(best_bid), "best_ask": str(best_ask)}
+            )
+            self._broadcast(msg)
+
+        def _broadcast(self, msg: MarketDataMessage):
+            self.recent_messages.append(msg)
+            if len(self.recent_messages) > 100:
+                self.recent_messages.pop(0)
+            payload = json.dumps(asdict(msg), default=str)
+            for subscriber in self.subscribers:
+                subscriber.send(payload)
+
+        def get_snapshot(self) -> dict:
+            """REST endpoint for full book state + last sequence."""
+            return {
+                "market_id": self.market_id,
+                "last_sequence": self.sequence,
+                "order_book": self.order_book.get_depth(),
+                "timestamp_ms": int(time.time() * 1000),
+            }
+  example_bad: |
+    # WRONG: No sequence numbers, no timestamps — consumers can't detect gaps
+    def notify_trade(price, quantity):
+        for ws in websockets:
+            ws.send(json.dumps({"price": price, "qty": quantity}))
+            # Which update is this? Is it in order? How old is it? Unknown.
+  when_applies: Real-time market data, WebSocket infrastructure, trading UI, algorithmic trading APIs
+  sources: ["https://datatracker.ietf.org/doc/html/rfc6455"]

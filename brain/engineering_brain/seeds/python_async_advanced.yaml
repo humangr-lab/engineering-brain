@@ -1,0 +1,1331 @@
+layer: rules
+domain: architecture
+knowledge:
+
+- id: PYASYNC-001
+  text: "Use asyncio.TaskGroup (Python 3.11+) instead of asyncio.gather for concurrent async operations. TaskGroup provides structured concurrency: if any task raises an exception, all other tasks in the group are cancelled and the exception propagates cleanly. gather's return_exceptions=True silently swallows errors, leading to partial failures that are hard to debug."
+  why: >
+    asyncio.gather has a fundamental design flaw: when one task fails, the other tasks continue running
+    with no parent to collect their results. With return_exceptions=False (default), the first exception
+    cancels gather but leaves other tasks running as "fire and forget" — resource leaks, partial writes,
+    and orphaned connections. With return_exceptions=True, errors are mixed into the results list and
+    you must manually check each element with isinstance(result, Exception) — easy to forget. TaskGroup
+    (PEP 654, Python 3.11) fixes this with structured concurrency: all tasks have a clear owner, if
+    any task fails ALL sibling tasks are cancelled before the exception propagates, and ExceptionGroup
+    collects all errors. This matches Go's errgroup, Kotlin's coroutineScope, and Trio's nurseries.
+    The Python core team considers gather a legacy API — TaskGroup is the recommended replacement.
+  how_to_do_right: |
+    1. Use `async with asyncio.TaskGroup() as tg:` to create a task group.
+    2. Use `tg.create_task(coro)` to add tasks — NOT asyncio.create_task().
+    3. All tasks are awaited at the end of the `async with` block.
+    4. If any task raises: all other tasks are cancelled, ExceptionGroup is raised.
+    5. Use except* (PEP 654) to catch specific exceptions from the group.
+    6. For "best effort" (continue on partial failure): catch exceptions INSIDE each task.
+    7. Still use gather only for Python 3.10 compatibility or when you need return_exceptions behavior.
+  severity: high
+  technologies:
+    lang: [python, asyncio]
+  domains:
+    domain: [architecture, reliability]
+    concern: [concurrency, error_handling]
+  example_good: |
+    import asyncio
+    from dataclasses import dataclass
+
+    @dataclass
+    class UserProfile:
+        user: dict
+        orders: list
+        preferences: dict
+
+    async def fetch_user(user_id: str) -> dict:
+        await asyncio.sleep(0.1)  # Simulate API call
+        return {"id": user_id, "name": "Ada"}
+
+    async def fetch_orders(user_id: str) -> list:
+        await asyncio.sleep(0.2)  # Simulate DB query
+        return [{"id": "order_1", "total": 99.99}]
+
+    async def fetch_preferences(user_id: str) -> dict:
+        await asyncio.sleep(0.1)  # Simulate cache lookup
+        return {"theme": "dark", "lang": "en"}
+
+    async def get_user_profile(user_id: str) -> UserProfile:
+        """Fetch all data concurrently with structured concurrency."""
+        async with asyncio.TaskGroup() as tg:
+            user_task = tg.create_task(fetch_user(user_id))
+            orders_task = tg.create_task(fetch_orders(user_id))
+            prefs_task = tg.create_task(fetch_preferences(user_id))
+
+        # All tasks completed successfully (or ExceptionGroup raised)
+        return UserProfile(
+            user=user_task.result(),
+            orders=orders_task.result(),
+            preferences=prefs_task.result(),
+        )
+
+    async def main():
+        try:
+            profile = await get_user_profile("user_123")
+            print(f"User: {profile.user['name']}, Orders: {len(profile.orders)}")
+        except* ValueError as eg:
+            # PEP 654: catch specific exception types from the group
+            for exc in eg.exceptions:
+                print(f"ValueError: {exc}")
+        except* ConnectionError as eg:
+            for exc in eg.exceptions:
+                print(f"Connection failed: {exc}")
+
+    asyncio.run(main())
+  example_bad: |
+    import asyncio
+
+    async def get_user_profile_bad(user_id: str):
+        # BAD: gather with return_exceptions=True — errors hidden in results
+        results = await asyncio.gather(
+            fetch_user(user_id),
+            fetch_orders(user_id),       # This raises ConnectionError
+            fetch_preferences(user_id),
+            return_exceptions=True,
+        )
+        # results = [{"id": "user_123"}, ConnectionError("DB down"), {"theme": "dark"}]
+        # Must manually check each result — easy to forget:
+        user = results[0]       # dict — OK
+        orders = results[1]     # ConnectionError object — BUG if not checked!
+        prefs = results[2]      # dict — OK
+        # orders.items() → AttributeError: 'ConnectionError' has no attribute 'items'
+
+    async def get_user_profile_worse(user_id: str):
+        # BAD: gather without return_exceptions — orphaned tasks
+        results = await asyncio.gather(
+            fetch_user(user_id),       # Starts running
+            fetch_orders(user_id),     # Raises immediately
+            fetch_preferences(user_id), # Started but now orphaned — who cancels it?
+        )
+        # fetch_preferences keeps running with no parent to collect its result
+  when_applies: Any concurrent async operation with 2+ tasks where failure of one task should cancel the others (Python 3.11+)
+  sources:
+    - url: https://docs.python.org/3/library/asyncio-task.html#asyncio.TaskGroup
+      title: "Python Docs — asyncio.TaskGroup"
+    - url: https://peps.python.org/pep-0654/
+      title: "PEP 654 — Exception Groups and except*"
+
+- id: PYASYNC-002
+  text: "Always use asyncio.Semaphore to limit concurrent operations (HTTP requests, DB queries, file handles). Never use unlimited asyncio.gather or TaskGroup on unbounded inputs — 10,000 concurrent HTTP requests will exhaust file descriptors, trigger rate limits, and crash the process."
+  why: >
+    A common mistake in async Python: fetching 10,000 URLs with gather([fetch(url) for url in urls]).
+    This opens 10,000 TCP connections simultaneously, exhausting file descriptors (default ulimit is
+    1024 on macOS, 4096 on Linux), triggering server-side rate limits (429 Too Many Requests), and
+    causing OOM from 10,000 in-flight response buffers. Semaphore limits concurrency: Semaphore(20)
+    ensures at most 20 operations run simultaneously. The remaining operations queue automatically.
+    This is equivalent to a thread pool size in synchronous code. Production guidance: 10-50 for HTTP
+    APIs (respecting their rate limits), 5-20 for database connections (matching your pool size),
+    100-500 for file I/O (limited by OS file descriptor count). Always match the semaphore limit to
+    the bottleneck resource.
+  how_to_do_right: |
+    1. Create semaphore at the appropriate scope (module-level for global limit, per-operation for local).
+    2. Use `async with semaphore:` to acquire before the operation.
+    3. Set limit based on the bottleneck: connection pool size, rate limit, file descriptor limit.
+    4. For HTTP: match the semaphore to the server's rate limit or your connection pool size.
+    5. For DB: match the semaphore to your connection pool max_size.
+    6. Combine with TaskGroup: create tasks inside TaskGroup, each task acquires the semaphore.
+    7. Never create a new Semaphore inside the task function — it must be shared across all tasks.
+  severity: critical
+  technologies:
+    lang: [python, asyncio]
+    library: [aiohttp, httpx]
+  domains:
+    domain: [reliability, performance, architecture]
+    concern: [concurrency, resource_management, rate_limiting]
+  example_good: |
+    import asyncio
+    import httpx
+
+    async def fetch_with_limit(
+        client: httpx.AsyncClient,
+        semaphore: asyncio.Semaphore,
+        url: str,
+    ) -> dict:
+        async with semaphore:  # At most N concurrent requests
+            response = await client.get(url, timeout=10.0)
+            response.raise_for_status()
+            return response.json()
+
+    async def fetch_all(urls: list[str], max_concurrent: int = 20) -> list[dict]:
+        semaphore = asyncio.Semaphore(max_concurrent)
+        async with httpx.AsyncClient() as client:
+            async with asyncio.TaskGroup() as tg:
+                tasks = [
+                    tg.create_task(fetch_with_limit(client, semaphore, url))
+                    for url in urls
+                ]
+        return [task.result() for task in tasks]
+
+    async def main():
+        urls = [f"https://api.example.com/items/{i}" for i in range(10000)]
+        # Only 20 requests in-flight at any time — safe and efficient
+        results = await fetch_all(urls, max_concurrent=20)
+        print(f"Fetched {len(results)} items")
+
+    asyncio.run(main())
+  example_bad: |
+    import asyncio
+    import httpx
+
+    async def fetch(client: httpx.AsyncClient, url: str) -> dict:
+        response = await client.get(url)
+        return response.json()
+
+    async def fetch_all_bad(urls: list[str]) -> list[dict]:
+        # BAD: 10,000 concurrent requests — exhausts file descriptors
+        async with httpx.AsyncClient() as client:
+            results = await asyncio.gather(*[fetch(client, url) for url in urls])
+        return results
+        # OSError: [Errno 24] Too many open files
+        # or: httpx.PoolTimeout: timed out waiting for connection
+        # or: Server returns 429 Too Many Requests for all 10,000
+  when_applies: Any async operation that processes an unbounded number of items concurrently (HTTP fetching, DB queries, file processing, API calls)
+  sources:
+    - url: https://docs.python.org/3/library/asyncio-sync.html#asyncio.Semaphore
+      title: "Python Docs — asyncio.Semaphore"
+    - url: https://www.python-httpx.org/async/#pool-limit-configuration
+      title: "HTTPX Docs — Async Pool Limits"
+
+- id: PYASYNC-003
+  text: "Use async generators with async for and bounded asyncio.Queue for backpressure in streaming pipelines. Without backpressure, a fast producer overwhelms a slow consumer — memory grows unbounded until OOM. A bounded queue blocks the producer when the consumer falls behind."
+  why: >
+    Async streaming pipelines have a producer and consumer running at different speeds. Without
+    backpressure, the producer keeps generating data faster than the consumer processes it. Example:
+    an async generator yields 10,000 events/sec from Kafka, but the downstream HTTP POST can only
+    handle 100/sec. Without bounds, the queue grows by 9,900 items/sec — OOM in minutes. A bounded
+    asyncio.Queue(maxsize=100) blocks the producer's put() when the queue is full, automatically
+    slowing the producer to match the consumer's speed. This is the async equivalent of TCP flow
+    control. For async generators specifically: use `async for item in generator:` with internal
+    backpressure (the generator yields only when the consumer is ready to receive).
+  how_to_do_right: |
+    1. Use asyncio.Queue(maxsize=N) for bounded queues — producer blocks when full.
+    2. Set maxsize based on memory budget: maxsize=100 means at most 100 items buffered.
+    3. Use async generators for lazy production: items are generated on-demand.
+    4. For multi-stage pipelines: queue between each stage, each with its own bound.
+    5. Use sentinel value (None or a special object) to signal end-of-stream.
+    6. Monitor queue.qsize() for observability — growing queue means consumer is falling behind.
+    7. Never use asyncio.Queue() without maxsize (default is 0 = UNBOUNDED = OOM risk).
+  severity: high
+  technologies:
+    lang: [python, asyncio]
+  domains:
+    domain: [architecture, reliability]
+    concern: [streaming, backpressure, memory_management]
+  example_good: |
+    import asyncio
+    from typing import AsyncIterator
+
+    SENTINEL = object()  # Signals end of stream
+
+    async def produce_events(queue: asyncio.Queue, num_events: int) -> None:
+        """Fast producer — bounded queue provides backpressure."""
+        for i in range(num_events):
+            event = {"id": i, "data": f"event_{i}"}
+            await queue.put(event)  # Blocks if queue is full — backpressure!
+            if i % 1000 == 0:
+                print(f"Produced {i} events, queue size: {queue.qsize()}")
+        await queue.put(SENTINEL)  # Signal end of stream
+
+    async def process_events(queue: asyncio.Queue) -> int:
+        """Slow consumer — processes events one by one."""
+        count = 0
+        while True:
+            event = await queue.get()
+            if event is SENTINEL:
+                break
+            # Simulate slow processing (e.g., HTTP POST, DB write)
+            await asyncio.sleep(0.001)
+            count += 1
+            queue.task_done()
+        return count
+
+    async def main():
+        # Bounded queue: at most 100 items buffered — prevents OOM
+        queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(produce_events(queue, 10000))
+            consumer = tg.create_task(process_events(queue))
+
+        print(f"Processed {consumer.result()} events")
+
+    # Async generator with built-in backpressure
+    async def event_stream(n: int) -> AsyncIterator[dict]:
+        """Lazy async generator — yields on demand."""
+        for i in range(n):
+            yield {"id": i, "data": f"event_{i}"}
+
+    async def consume_stream():
+        async for event in event_stream(10000):
+            await asyncio.sleep(0.001)  # Generator pauses until we're ready
+
+    asyncio.run(main())
+  example_bad: |
+    import asyncio
+
+    async def produce_all(events: list) -> list:
+        # BAD: No backpressure — all events buffered in memory
+        results = []
+        for event in events:  # 10 million events
+            results.append(event)  # Unbounded list — OOM
+        return results
+
+    async def bad_pipeline():
+        # BAD: Unbounded queue — producer fills memory
+        queue = asyncio.Queue()  # maxsize=0 means UNBOUNDED
+        # Producer generates 10,000/sec, consumer processes 100/sec
+        # Queue grows by 9,900 items/sec — OOM in minutes
+  when_applies: Any async pipeline with a producer and consumer running at different speeds (event processing, data ingestion, streaming ETL)
+  sources:
+    - url: https://docs.python.org/3/library/asyncio-queue.html
+      title: "Python Docs — asyncio.Queue"
+    - url: https://peps.python.org/pep-0525/
+      title: "PEP 525 — Asynchronous Generators"
+
+- id: PYASYNC-004
+  text: "Use anyio instead of raw asyncio for portable, structured concurrent code. anyio provides cancel scopes (timeout blocks that cancel all child tasks), structured task groups, and works on both asyncio and Trio backends. FastAPI and Starlette already use anyio internally."
+  why: >
+    asyncio.wait_for() has a known design flaw: when the timeout fires, it cancels the task but if
+    the task catches CancelledError and doesn't re-raise, the cancellation is lost — the task continues
+    running past the timeout. anyio's cancel scopes fix this: cancel_scope.cancel() is non-catchable
+    at the scope level. anyio also provides move_on_after (returns None on timeout instead of raising)
+    and fail_after (raises TimeoutError). Beyond timeouts, anyio's task groups are the inspiration for
+    asyncio.TaskGroup (added in 3.11, based on anyio's design). anyio is already a dependency of
+    FastAPI/Starlette/httpx — you likely have it installed. Using anyio directly gives you: cancel
+    scopes, backend portability (asyncio/Trio), better task group API, and typed concurrency primitives.
+  how_to_do_right: |
+    1. Use anyio.create_task_group() for structured concurrency (works on asyncio and Trio).
+    2. Use fail_after(seconds) for hard timeouts: raises TimeoutError, cancels all child tasks.
+    3. Use move_on_after(seconds) for soft timeouts: returns None, cancels child tasks.
+    4. Use anyio.to_thread.run_sync(fn) instead of asyncio.to_thread().
+    5. Use anyio.sleep() instead of asyncio.sleep() for portability.
+    6. FastAPI already runs on anyio — using anyio in your code is zero-overhead.
+    7. Install: pip install anyio (likely already installed via httpx/starlette).
+  severity: medium
+  technologies:
+    lang: [python, asyncio]
+    library: [anyio, trio]
+    framework: [fastapi, starlette]
+  domains:
+    domain: [architecture, reliability]
+    concern: [concurrency, timeout, portability]
+  example_good: |
+    import anyio
+
+    async def fetch_with_timeout(url: str) -> dict | None:
+        """Cancel scope: if fetch takes >5s, cancel and return None."""
+        result = None
+        with anyio.move_on_after(5.0) as scope:
+            # Simulate slow HTTP request
+            await anyio.sleep(3.0)  # Takes 3s — within timeout
+            result = {"url": url, "status": 200}
+        if scope.cancelled_caught:
+            print(f"Timeout fetching {url}")
+            return None
+        return result
+
+    async def fetch_all_structured(urls: list[str]) -> list[dict]:
+        results: list[dict] = []
+
+        async with anyio.create_task_group() as tg:
+            async def fetch_one(url: str) -> None:
+                with anyio.fail_after(10.0):  # Hard timeout per request
+                    await anyio.sleep(0.1)
+                    results.append({"url": url, "status": 200})
+
+            for url in urls:
+                tg.start_soon(fetch_one, url)
+
+        return results
+
+    async def run_cpu_bound_safely():
+        """Run blocking function in a thread without blocking the event loop."""
+        def expensive_computation() -> int:
+            total = sum(i * i for i in range(10_000_000))
+            return total
+
+        result = await anyio.to_thread.run_sync(expensive_computation)
+        print(f"Result: {result}")
+
+    async def main():
+        urls = [f"https://api.example.com/{i}" for i in range(100)]
+        results = await fetch_all_structured(urls)
+        print(f"Fetched {len(results)} URLs")
+
+    anyio.run(main)  # Works with asyncio (default) or trio backend
+  example_bad: |
+    import asyncio
+
+    async def fetch_with_timeout_bad(url: str):
+        # BAD: asyncio.wait_for — if task catches CancelledError, timeout is lost
+        try:
+            result = await asyncio.wait_for(fetch(url), timeout=5.0)
+        except asyncio.TimeoutError:
+            return None
+
+    async def leaky_task(url: str):
+        try:
+            await asyncio.sleep(100)  # Long operation
+        except asyncio.CancelledError:
+            # BAD: Catches CancelledError and does NOT re-raise
+            # Task continues running past wait_for timeout!
+            await asyncio.sleep(100)  # Still running...
+            return "I survived cancellation"
+  when_applies: Any async Python project using FastAPI/Starlette, or any project that needs structured timeouts and portable concurrency
+  sources:
+    - url: https://anyio.readthedocs.io/en/stable/
+      title: "anyio Documentation"
+    - url: https://anyio.readthedocs.io/en/stable/cancellation.html
+      title: "anyio Docs — Cancellation and Timeouts"
+
+- id: PYASYNC-005
+  text: "Always implement async context managers (__aenter__/__aexit__) for resources that need cleanup: database connections, HTTP sessions, file handles, locks, and temporary resources. Use contextlib.asynccontextmanager for simple cases. A missing __aexit__ means resources leak on exceptions."
+  why: >
+    The number one cause of production async service degradation is resource leaks from missing cleanup.
+    Pattern: open connection, do work, close connection. If an exception occurs between open and close,
+    the connection leaks. With 100 RPS and 0.1% error rate, 0.1 connections leak per second = 8,640
+    per day = pool exhaustion within hours. async context managers guarantee cleanup via __aexit__
+    regardless of exceptions. The async with statement calls __aexit__ even on exception, cancellation,
+    or KeyboardInterrupt. For aiohttp, httpx, SQLAlchemy async, aiocache — ALWAYS use async with.
+    For custom resources: implement __aenter__ (acquire) and __aexit__ (release), or use the simpler
+    @asynccontextmanager decorator from contextlib.
+  how_to_do_right: |
+    1. ALWAYS use `async with` for: HTTP clients, DB connections, transactions, file handles, locks.
+    2. For custom resources: implement __aenter__ and __aexit__ on your class.
+    3. For simple cases: @asynccontextmanager yields the resource and cleans up after yield.
+    4. __aexit__ receives exception info (exc_type, exc_val, exc_tb) — use for conditional cleanup.
+    5. Return False from __aexit__ to propagate exceptions (default). Return True to suppress.
+    6. Use asyncio.Lock with `async with lock:` — never lock.acquire() without matching release().
+  severity: critical
+  technologies:
+    lang: [python, asyncio]
+    library: [aiohttp, httpx, sqlalchemy]
+  domains:
+    domain: [reliability, architecture]
+    concern: [resource_management, error_handling]
+  example_good: |
+    import asyncio
+    from contextlib import asynccontextmanager
+    from typing import AsyncIterator
+
+    # Custom async context manager with class
+    class DatabasePool:
+        def __init__(self, dsn: str, max_connections: int = 10):
+            self.dsn = dsn
+            self.max_connections = max_connections
+            self._pool = None
+
+        async def __aenter__(self) -> 'DatabasePool':
+            # Simulate pool creation
+            self._pool = {"dsn": self.dsn, "size": self.max_connections}
+            print(f"Pool opened: {self.max_connections} connections")
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
+            # ALWAYS runs — even on exception or cancellation
+            if self._pool:
+                self._pool = None
+                print("Pool closed — all connections released")
+            return False  # Don't suppress exceptions
+
+        async def execute(self, query: str) -> list:
+            if not self._pool:
+                raise RuntimeError("Pool not initialized — use 'async with'")
+            await asyncio.sleep(0.01)  # Simulate query
+            return [{"id": 1}]
+
+    # Simple async context manager with decorator
+    @asynccontextmanager
+    async def temporary_file(path: str) -> AsyncIterator[str]:
+        """Create temp file, yield path, delete on cleanup."""
+        import aiofiles
+        import os
+        try:
+            async with aiofiles.open(path, 'w') as f:
+                await f.write("")
+            yield path
+        finally:
+            # Cleanup runs even on exception
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"Cleaned up {path}")
+
+    async def main():
+        # Database pool — guaranteed cleanup
+        async with DatabasePool("postgresql://localhost/mydb") as pool:
+            results = await pool.execute("SELECT 1")
+            print(results)
+        # Pool is closed here, even if execute() raised an exception
+
+        # Lock — guaranteed release
+        lock = asyncio.Lock()
+        async with lock:
+            # Critical section
+            await asyncio.sleep(0.1)
+        # Lock released here, even on exception
+
+    asyncio.run(main())
+  example_bad: |
+    import asyncio
+
+    class DatabasePool:
+        async def connect(self):
+            self._pool = {"connected": True}
+
+        async def close(self):
+            self._pool = None
+
+    async def leaky_query():
+        pool = DatabasePool()
+        await pool.connect()
+        result = await pool.execute("SELECT 1")  # If this raises → pool never closed
+        await pool.close()  # Never reached on exception
+        return result
+
+    async def leaky_lock():
+        lock = asyncio.Lock()
+        await lock.acquire()
+        await do_work()  # If this raises → lock never released → deadlock
+        lock.release()   # Never reached on exception
+  when_applies: Any async code that acquires resources (connections, files, locks, sessions, transactions) that must be released
+  sources:
+    - url: https://docs.python.org/3/reference/datamodel.html#asynchronous-context-managers
+      title: "Python Docs — Asynchronous Context Managers"
+    - url: https://docs.python.org/3/library/contextlib.html#contextlib.asynccontextmanager
+      title: "Python Docs — asynccontextmanager"
+
+- id: PYASYNC-006
+  text: "Use uvloop as a drop-in event loop replacement for 2-4x throughput improvement in production async Python applications. uvloop is written in Cython/C and replaces asyncio's pure-Python event loop. One line change: asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())."
+  why: >
+    asyncio's default event loop is written in pure Python — it is correct but slow. uvloop is a
+    drop-in replacement written in Cython that wraps libuv (the same C library powering Node.js).
+    Benchmarks consistently show 2-4x throughput improvement for I/O-bound workloads: HTTP requests,
+    database queries, WebSocket connections. In a benchmark with 10,000 concurrent echo connections,
+    uvloop handles 100,000+ messages/sec vs asyncio's 40,000. For FastAPI/Starlette with uvicorn:
+    uvicorn already uses uvloop by default when installed. For standalone scripts: one line at the
+    top of your entry point enables it globally. uvloop is production-proven at companies like
+    EdgeDB, MagicStack, and is used by uvicorn, the standard ASGI server. Note: uvloop does NOT
+    work on Windows — use it only on Linux/macOS.
+  how_to_do_right: |
+    1. Install: pip install uvloop.
+    2. Enable globally: uvloop.install() (Python 3.12+) or asyncio.set_event_loop_policy(uvloop.EventLoopPolicy()).
+    3. For uvicorn: install uvloop — uvicorn uses it automatically.
+    4. For scripts: call uvloop.install() before asyncio.run().
+    5. Not available on Windows — use standard asyncio loop there.
+    6. Test with both loops in CI — uvloop should be a transparent speedup.
+    7. Profile with PYTHONASYNCIODEBUG=1 first to find real bottlenecks.
+  severity: medium
+  technologies:
+    lang: [python, asyncio]
+    library: [uvloop, uvicorn]
+    framework: [fastapi, starlette]
+  domains:
+    domain: [performance, operations]
+    concern: [throughput, event_loop]
+  example_good: |
+    # Option 1: Modern (Python 3.12+)
+    import uvloop
+
+    async def main():
+        # Your async application
+        import asyncio
+        print(f"Event loop: {type(asyncio.get_running_loop()).__name__}")
+        # Output: Event loop: Loop (uvloop's event loop)
+
+    uvloop.run(main())  # Python 3.12+: replaces asyncio.run()
+
+    # Option 2: Classic (Python 3.8+)
+    import asyncio
+    import uvloop
+
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
+    async def main():
+        print(f"Event loop: {type(asyncio.get_running_loop()).__name__}")
+
+    asyncio.run(main())
+
+    # Option 3: uvicorn (automatic when uvloop is installed)
+    # pip install uvicorn uvloop
+    # uvicorn app:app --host 0.0.0.0 --port 8000
+    # uvicorn auto-detects uvloop and uses it
+
+    # Benchmark comparison
+    import time
+
+    async def benchmark():
+        start = time.perf_counter()
+        for _ in range(100_000):
+            await asyncio.sleep(0)  # Measures event loop overhead
+        elapsed = time.perf_counter() - start
+        print(f"100K iterations: {elapsed:.3f}s ({100_000/elapsed:.0f} iter/sec)")
+
+    # asyncio default: ~0.8s (125K iter/sec)
+    # uvloop:          ~0.3s (333K iter/sec) — 2.7x faster
+  example_bad: |
+    import asyncio
+
+    # BAD: Not using uvloop in production — leaving 2-4x performance on the table
+    async def main():
+        # Running on pure-Python event loop
+        # For I/O-bound services, this means 2-4x fewer requests per second
+        pass
+
+    asyncio.run(main())
+
+    # BAD: Using uvloop on Windows
+    # import uvloop  # ImportError on Windows
+    # uvloop.install()
+  when_applies: Any production async Python application on Linux or macOS that is I/O-bound (HTTP servers, API gateways, data pipelines, WebSocket servers)
+  sources:
+    - url: https://github.com/MagicStack/uvloop
+      title: "uvloop GitHub Repository"
+    - url: https://uvloop.readthedocs.io/
+      title: "uvloop Documentation"
+
+- id: PYASYNC-007
+  text: "Use asyncio.to_thread() (Python 3.9+) to run blocking/CPU-bound functions in a thread pool without blocking the event loop. Never call blocking functions (file I/O, CPU computation, synchronous libraries) directly in async code — it freezes ALL concurrent tasks."
+  why: >
+    The async event loop is single-threaded. When you call a blocking function directly (time.sleep,
+    open().read(), requests.get(), json.loads on large data), the ENTIRE event loop freezes — all
+    other coroutines stop, all WebSocket connections hang, all HTTP requests time out. This is the
+    #1 performance bug in async Python applications. asyncio.to_thread() offloads the blocking call
+    to a thread pool, freeing the event loop to continue processing other tasks. Common offenders:
+    synchronous HTTP libraries (requests, urllib3), file I/O (open/read/write), CPU-heavy operations
+    (JSON parsing of large payloads, image processing, compression), and third-party SDKs that don't
+    have async variants. Rule: if a function doesn't have await, it might block the event loop.
+  how_to_do_right: |
+    1. asyncio.to_thread(blocking_fn, arg1, arg2) for blocking functions.
+    2. Use for: file I/O, CPU computation, synchronous libraries, DNS resolution.
+    3. Default thread pool is ThreadPoolExecutor(max_workers=min(32, os.cpu_count() + 4)).
+    4. For CPU-heavy work: consider ProcessPoolExecutor instead (GIL limits thread parallelism).
+    5. Detect blocking calls: PYTHONASYNCIODEBUG=1 warns when event loop is blocked >100ms.
+    6. anyio.to_thread.run_sync() is the portable alternative.
+    7. For synchronous libraries without async alternatives: wrap ALL calls with to_thread().
+  severity: critical
+  technologies:
+    lang: [python, asyncio]
+  domains:
+    domain: [performance, reliability, architecture]
+    concern: [concurrency, blocking, event_loop]
+  example_good: |
+    import asyncio
+    import json
+    from pathlib import Path
+
+    # Blocking file I/O — offload to thread
+    async def read_large_file(path: str) -> str:
+        return await asyncio.to_thread(Path(path).read_text)
+
+    # CPU-bound JSON parsing — offload to thread
+    async def parse_large_json(raw: str) -> dict:
+        return await asyncio.to_thread(json.loads, raw)
+
+    # Synchronous library without async variant
+    import hashlib
+    async def compute_hash(data: bytes) -> str:
+        def _hash() -> str:
+            return hashlib.sha256(data).hexdigest()
+        return await asyncio.to_thread(_hash)
+
+    # Synchronous HTTP library (when no async alternative exists)
+    async def call_legacy_sdk(params: dict) -> dict:
+        import requests  # Synchronous — would block event loop
+        def _call() -> dict:
+            resp = requests.post("https://legacy-api.example.com/v1/action", json=params)
+            resp.raise_for_status()
+            return resp.json()
+        return await asyncio.to_thread(_call)
+
+    async def main():
+        # All these run concurrently — none blocks the event loop
+        async with asyncio.TaskGroup() as tg:
+            file_task = tg.create_task(read_large_file("/tmp/large.json"))
+            hash_task = tg.create_task(compute_hash(b"hello world"))
+            sdk_task = tg.create_task(call_legacy_sdk({"key": "value"}))
+
+        content = file_task.result()
+        data = await parse_large_json(content)
+        print(f"Hash: {hash_task.result()}, SDK: {sdk_task.result()}")
+
+    asyncio.run(main())
+  example_bad: |
+    import asyncio
+    import json
+    import time
+
+    async def handler(request):
+        # BAD: Blocking the event loop — ALL other connections freeze
+        data = open("/tmp/huge_file.json").read()  # Blocks for 2 seconds
+        parsed = json.loads(data)                   # Blocks for 1 second
+        time.sleep(1)                               # Blocks for 1 second
+        return parsed
+        # Total: event loop frozen for 4 seconds
+        # All other WebSocket connections, HTTP requests, and timers are paused
+
+    async def bad_parallel():
+        # BAD: Looks concurrent, but json.loads blocks sequentially
+        results = await asyncio.gather(
+            process_file("a.json"),  # Blocks event loop for 2s
+            process_file("b.json"),  # Waits until a.json finishes, then blocks for 2s
+        )
+        # Total: 4s sequential, not 2s parallel
+  when_applies: Any async code that calls blocking functions (file I/O, CPU computation, synchronous HTTP libraries, third-party SDKs)
+  sources:
+    - url: https://docs.python.org/3/library/asyncio-task.html#asyncio.to_thread
+      title: "Python Docs — asyncio.to_thread()"
+    - url: https://docs.python.org/3/library/asyncio-dev.html#detect-never-awaited-coroutines
+      title: "Python Docs — Detecting Blocking Calls"
+
+- id: PYASYNC-008
+  text: "Implement the async iterator protocol (__aiter__/__anext__) for streaming responses, paginated API results, and event sources. Async iterators enable memory-efficient processing of large datasets because items are yielded one-at-a-time, not loaded into a list."
+  why: >
+    When fetching 1 million records from an API (paginated, 100 per page), loading all into a list
+    before processing wastes memory: 1M records * 1KB each = 1GB in memory. An async iterator fetches
+    page-by-page, yielding records as they arrive. The consumer processes each record and discards it —
+    memory usage stays constant at ~100KB (one page). This pattern is essential for: paginated APIs
+    (fetch next page only when current page is consumed), database cursors (stream rows without loading
+    entire result set), SSE/WebSocket event streams (process events as they arrive), and file streaming
+    (process lines without loading entire file). FastAPI uses async iterators for StreamingResponse.
+    Python 3.10+ async for syntax makes consumption clean and readable.
+  how_to_do_right: |
+    1. Implement __aiter__(self) -> self and __anext__(self) -> item for async iterator protocol.
+    2. Raise StopAsyncIteration in __anext__ when done.
+    3. Simpler: use async def with yield (async generator) — Python auto-implements the protocol.
+    4. For paginated APIs: yield items from current page, fetch next page when current is exhausted.
+    5. For streaming: yield chunks/events as they arrive from the network.
+    6. Consume with `async for item in iterator:` — clean and memory-efficient.
+  severity: medium
+  technologies:
+    lang: [python, asyncio]
+    library: [httpx, aiohttp]
+    framework: [fastapi]
+  domains:
+    domain: [architecture, performance]
+    concern: [streaming, memory_management, pagination]
+  example_good: |
+    import asyncio
+    from typing import AsyncIterator
+    import httpx
+
+    class PaginatedAPI:
+        """Async iterator that fetches pages on demand."""
+
+        def __init__(self, base_url: str, page_size: int = 100):
+            self.base_url = base_url
+            self.page_size = page_size
+            self._page = 0
+            self._items: list = []
+            self._exhausted = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> dict:
+            if not self._items:
+                if self._exhausted:
+                    raise StopAsyncIteration
+                await self._fetch_next_page()
+                if not self._items:
+                    raise StopAsyncIteration
+            return self._items.pop(0)
+
+        async def _fetch_next_page(self):
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    self.base_url,
+                    params={"page": self._page, "size": self.page_size},
+                )
+                data = resp.json()
+                self._items = data.get("items", [])
+                self._page += 1
+                if len(self._items) < self.page_size:
+                    self._exhausted = True
+
+    # Simpler: async generator (Python creates the iterator automatically)
+    async def stream_records(url: str) -> AsyncIterator[dict]:
+        page = 0
+        async with httpx.AsyncClient() as client:
+            while True:
+                resp = await client.get(url, params={"page": page, "size": 100})
+                items = resp.json().get("items", [])
+                if not items:
+                    break
+                for item in items:
+                    yield item  # One at a time — constant memory
+                page += 1
+
+    async def main():
+        # Memory-efficient: processes one record at a time
+        count = 0
+        async for record in stream_records("https://api.example.com/records"):
+            count += 1
+            # Process record here — previous records are garbage collected
+        print(f"Processed {count} records with constant memory")
+
+    asyncio.run(main())
+  example_bad: |
+    import httpx
+
+    async def fetch_all_records_bad(url: str) -> list[dict]:
+        # BAD: Loads ALL records into memory before processing
+        all_records = []
+        page = 0
+        async with httpx.AsyncClient() as client:
+            while True:
+                resp = await client.get(url, params={"page": page, "size": 100})
+                items = resp.json().get("items", [])
+                if not items:
+                    break
+                all_records.extend(items)  # 1M records = 1GB+ in memory
+                page += 1
+        return all_records  # OOM if dataset is large
+
+    async def main():
+        records = await fetch_all_records_bad("https://api.example.com/records")
+        for r in records:  # Processing starts only AFTER all records are fetched
+            process(r)
+  when_applies: Any async code that processes large datasets from paginated APIs, database cursors, event streams, or file streams
+  sources:
+    - url: https://docs.python.org/3/reference/datamodel.html#asynchronous-iterators
+      title: "Python Docs — Asynchronous Iterators"
+    - url: https://peps.python.org/pep-0492/#asynchronous-iterators-and-async-for
+      title: "PEP 492 — Asynchronous Iterators"
+
+- id: PYASYNC-009
+  text: "Always wrap I/O operations with asyncio.wait_for() or anyio.fail_after() to set explicit timeouts. Without timeouts, a hung server or network partition causes your coroutine to wait forever — leaking connections, blocking task groups, and eventually exhausting resources."
+  why: >
+    A network call without a timeout is a liability. If the remote server hangs (accepts connection
+    but never responds), your coroutine awaits forever. In a TaskGroup, one hung task prevents the
+    entire group from completing. In a web server, hung requests accumulate until the connection pool
+    is exhausted and no new requests can be served. A production incident: a payment service called
+    a fraud-detection API without a timeout. The fraud API became slow (30s responses), payment
+    service connections piled up, connection pool exhausted in 2 minutes, all payments failed. Fix:
+    timeout=5s, fallback to "allow" if fraud API is slow. Rule: EVERY network call, database query,
+    and external API call MUST have an explicit timeout. Default timeouts in libraries are often too
+    high (httpx: 5s connect + no read timeout, aiohttp: 300s total).
+  how_to_do_right: |
+    1. asyncio.wait_for(coro, timeout=5.0) — raises TimeoutError after 5 seconds.
+    2. anyio.fail_after(5.0) — cancel scope, cancels all child tasks on timeout.
+    3. Set timeouts at the library level: httpx.AsyncClient(timeout=httpx.Timeout(5.0)).
+    4. Use different timeouts for connect (short: 2-5s) and read (longer: 10-30s).
+    5. For databases: set statement_timeout at the connection level.
+    6. For background tasks: use a generous but finite timeout (60-300s).
+    7. Log timeouts with context (URL, operation, timeout value) for debugging.
+  severity: critical
+  technologies:
+    lang: [python, asyncio]
+    library: [httpx, aiohttp, anyio]
+  domains:
+    domain: [reliability, architecture]
+    concern: [timeout, resilience, error_handling]
+  example_good: |
+    import asyncio
+    import httpx
+
+    # Explicit timeouts on HTTP client
+    async def fetch_user(user_id: str) -> dict | None:
+        timeout = httpx.Timeout(
+            connect=2.0,   # 2s to establish connection
+            read=10.0,     # 10s to read response
+            write=5.0,     # 5s to send request body
+            pool=5.0,      # 5s to acquire connection from pool
+        )
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            try:
+                resp = await client.get(f"https://api.example.com/users/{user_id}")
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.TimeoutException:
+                print(f"Timeout fetching user {user_id}")
+                return None
+
+    # Timeout on arbitrary coroutine
+    async def fetch_with_fallback(user_id: str) -> dict:
+        try:
+            return await asyncio.wait_for(
+                fetch_from_primary_db(user_id),
+                timeout=3.0,
+            )
+        except asyncio.TimeoutError:
+            print("Primary DB slow, falling back to cache")
+            return await fetch_from_cache(user_id)
+
+    # anyio cancel scope (structured)
+    import anyio
+
+    async def fetch_with_cancel_scope(user_id: str) -> dict | None:
+        result = None
+        with anyio.move_on_after(5.0) as scope:
+            result = await fetch_from_primary_db(user_id)
+        if scope.cancelled_caught:
+            print("Timed out — returning cached data")
+            result = await fetch_from_cache(user_id)
+        return result
+
+    async def fetch_from_primary_db(user_id: str) -> dict:
+        await asyncio.sleep(0.1)
+        return {"id": user_id}
+
+    async def fetch_from_cache(user_id: str) -> dict:
+        return {"id": user_id, "cached": True}
+  example_bad: |
+    import asyncio
+    import httpx
+
+    async def fetch_user_bad(user_id: str) -> dict:
+        # BAD: No timeout — hangs forever if server is unresponsive
+        async with httpx.AsyncClient() as client:  # Default timeout is very generous
+            resp = await client.get(f"https://api.example.com/users/{user_id}")
+            return resp.json()
+
+    async def process_bad():
+        # BAD: TaskGroup waits forever because one task is hung
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(fetch_user_bad("1"))      # Returns in 0.1s
+            tg.create_task(fetch_user_bad("2"))      # Server hangs — no timeout
+            tg.create_task(fetch_user_bad("3"))      # Returns in 0.1s
+        # TaskGroup never completes because task 2 waits forever
+  when_applies: Every network call, database query, and external API call in async code — no exceptions
+  sources:
+    - url: https://docs.python.org/3/library/asyncio-task.html#asyncio.wait_for
+      title: "Python Docs — asyncio.wait_for()"
+    - url: https://www.python-httpx.org/advanced/timeouts/
+      title: "HTTPX Docs — Timeouts"
+
+- id: PYASYNC-010
+  text: "Use httpx.AsyncClient or aiohttp.ClientSession with connection pooling for async HTTP. Create the client ONCE and reuse across requests — creating a new client per request wastes TCP connections, skips HTTP/2 multiplexing, and is 10x slower. Set explicit pool limits matching your Semaphore."
+  why: >
+    HTTP connection pooling reuses TCP connections across requests to the same host. Without pooling
+    (new client per request), every request performs: DNS lookup (~5ms), TCP handshake (~10ms), TLS
+    handshake (~30ms) = 45ms overhead before the first byte. With pooling, subsequent requests to the
+    same host skip all three — just send the request on the existing connection. For 1000 requests to
+    the same API, pooling saves 45 seconds of overhead. Additionally, httpx supports HTTP/2
+    multiplexing: multiple requests share one TCP connection simultaneously. aiohttp supports
+    persistent connections with keepalive. A common mistake: creating httpx.AsyncClient() inside a
+    request handler — each handler invocation creates a new client, new connection pool, and new TLS
+    session. The client should be created ONCE at application startup and injected via dependency
+    injection.
+  how_to_do_right: |
+    1. Create AsyncClient/ClientSession ONCE at app startup, close at shutdown.
+    2. Use `async with` for lifecycle management: open on enter, close on exit.
+    3. Set pool limits: httpx.Limits(max_connections=100, max_keepalive_connections=20).
+    4. Match pool limits to your Semaphore: if Semaphore(20), set max_connections=20.
+    5. For FastAPI: use lifespan to create and close the client.
+    6. Enable HTTP/2 with httpx: httpx.AsyncClient(http2=True) — multiplexes requests.
+    7. Set base_url for repeated calls to the same API.
+  severity: high
+  technologies:
+    lang: [python, asyncio]
+    library: [httpx, aiohttp]
+    framework: [fastapi]
+  domains:
+    domain: [performance, reliability, architecture]
+    concern: [connection_pooling, http, resource_management]
+  example_good: |
+    import httpx
+    from contextlib import asynccontextmanager
+    from fastapi import FastAPI, Depends
+
+    # Application-scoped HTTP client with connection pooling
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Startup: create client with pool limits
+        app.state.http_client = httpx.AsyncClient(
+            base_url="https://api.example.com",
+            limits=httpx.Limits(
+                max_connections=100,        # Total concurrent connections
+                max_keepalive_connections=20, # Idle connections to keep alive
+            ),
+            timeout=httpx.Timeout(10.0),
+            http2=True,  # Enable HTTP/2 multiplexing
+        )
+        yield
+        # Shutdown: close client, release all connections
+        await app.state.http_client.aclose()
+
+    app = FastAPI(lifespan=lifespan)
+
+    async def get_client(app=Depends(lambda: app)):
+        return app.state.http_client
+
+    @app.get("/users/{user_id}")
+    async def get_user(user_id: str, client: httpx.AsyncClient = Depends(get_client)):
+        # Reuses pooled connection — no DNS/TCP/TLS overhead
+        resp = await client.get(f"/users/{user_id}")
+        return resp.json()
+
+    # Standalone usage (non-FastAPI)
+    async def main():
+        async with httpx.AsyncClient(
+            base_url="https://api.example.com",
+            limits=httpx.Limits(max_connections=20),
+        ) as client:
+            # All requests reuse pooled connections
+            for i in range(100):
+                resp = await client.get(f"/items/{i}")
+  example_bad: |
+    import httpx
+
+    async def get_user_bad(user_id: str) -> dict:
+        # BAD: New client per request — no connection pooling
+        async with httpx.AsyncClient() as client:
+            # DNS + TCP + TLS for EVERY request = 45ms overhead each time
+            resp = await client.get(f"https://api.example.com/users/{user_id}")
+            return resp.json()
+        # Connection closed immediately — next request starts from scratch
+
+    async def handle_requests_bad(user_ids: list[str]):
+        # BAD: 1000 requests × 45ms overhead = 45 seconds wasted
+        for uid in user_ids:
+            result = await get_user_bad(uid)
+  when_applies: Any async application that makes HTTP requests — especially when making multiple requests to the same host
+  sources:
+    - url: https://www.python-httpx.org/advanced/clients/#client-instances
+      title: "HTTPX Docs — Client Instances and Connection Pooling"
+    - url: https://docs.aiohttp.org/en/stable/client_advanced.html#persistent-session
+      title: "aiohttp Docs — Persistent Session"
+
+- id: PYASYNC-011
+  text: "Enable async debug mode (PYTHONASYNCIODEBUG=1 or asyncio.get_event_loop().set_debug(True)) during development and CI to detect unawaited coroutines, blocking calls that freeze the event loop, and tasks destroyed before completion. Never run debug mode in production — it adds significant overhead."
+  why: >
+    The most insidious async bugs are silent: an unawaited coroutine (forgot await) does nothing but
+    prints a RuntimeWarning that is easy to miss in logs. A blocking call (synchronous I/O in async
+    code) freezes the event loop but produces no error — just slower responses. A cancelled task with
+    no handler silently drops work. Debug mode catches all three: it logs warnings for unawaited
+    coroutines, detects when the event loop is blocked for >100ms (configurable), and warns about
+    tasks that are garbage collected without being awaited. Enable it in development and CI test runs
+    to catch these bugs before they reach production. A team found 47 unawaited coroutines in their
+    codebase after enabling debug mode — each one was a silent no-op that appeared to work.
+  how_to_do_right: |
+    1. Development: PYTHONASYNCIODEBUG=1 python app.py (environment variable).
+    2. Programmatic: asyncio.get_event_loop().set_debug(True) at startup.
+    3. CI: always run tests with PYTHONASYNCIODEBUG=1.
+    4. Customize slow callback threshold: loop.slow_callback_duration = 0.05 (50ms).
+    5. Check warnings: python -W error::RuntimeWarning to make unawaited coroutine warnings fatal.
+    6. Never in production: debug mode adds 10-30% overhead from tracing.
+    7. For pytest: set PYTHONASYNCIODEBUG=1 in pyproject.toml [tool.pytest.ini_options].
+  severity: medium
+  technologies:
+    lang: [python, asyncio]
+  domains:
+    domain: [code_quality, reliability]
+    concern: [debugging, testing, observability]
+  example_good: |
+    import asyncio
+    import os
+
+    # Enable debug mode in development/CI
+    if os.getenv("ENVIRONMENT") != "production":
+        asyncio.get_event_loop().set_debug(True)
+
+    # Or via environment variable:
+    # PYTHONASYNCIODEBUG=1 python app.py
+
+    # pyproject.toml for pytest:
+    # [tool.pytest.ini_options]
+    # env = ["PYTHONASYNCIODEBUG=1"]
+
+    async def process_data():
+        await asyncio.sleep(0.1)
+        return {"processed": True}
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        if loop.get_debug():
+            print("Debug mode ON — detecting unawaited coroutines and blocking calls")
+            loop.slow_callback_duration = 0.05  # Warn if event loop blocked >50ms
+
+        # Debug mode will warn about this:
+        # process_data()  # RuntimeWarning: coroutine 'process_data' was never awaited
+
+        # Correct usage:
+        result = await process_data()
+        print(result)
+
+    asyncio.run(main())
+
+    # Example CI configuration (.github/workflows/test.yml):
+    # - name: Run tests
+    #   env:
+    #     PYTHONASYNCIODEBUG: "1"
+    #   run: pytest tests/ -v
+  example_bad: |
+    import asyncio
+
+    async def save_to_db(data: dict):
+        await asyncio.sleep(0.1)
+        print(f"Saved: {data}")
+
+    async def handler(request: dict):
+        # BUG: Missing 'await' — save_to_db() returns a coroutine object, never executes
+        save_to_db(request)  # Silent no-op! Data is never saved.
+        # Without debug mode: no error, no warning (just a RuntimeWarning in stderr)
+        # With debug mode: loud warning with traceback showing where the coroutine was created
+        return {"status": "ok"}  # Response looks successful but data was lost
+
+    async def blocking_handler():
+        import time
+        time.sleep(2)  # Blocks event loop for 2 seconds — no error without debug mode
+        # With debug mode: "Executing <callback> took 2.001 seconds"
+  when_applies: All async Python development and CI environments — must be enabled in development and tests, disabled in production
+  sources:
+    - url: https://docs.python.org/3/library/asyncio-dev.html#debug-mode
+      title: "Python Docs — asyncio Debug Mode"
+    - url: https://docs.python.org/3/library/asyncio-dev.html#detect-never-awaited-coroutines
+      title: "Python Docs — Detect Unawaited Coroutines"
+
+- id: PYASYNC-012
+  text: "Implement graceful shutdown with signal handlers that cancel tasks in order: stop accepting new work, wait for in-flight tasks to complete (with timeout), then close resources. Without graceful shutdown, SIGTERM kills the process mid-request — corrupted data, lost messages, broken connections."
+  why: >
+    In production, your async service receives SIGTERM when deploying (Kubernetes pod termination,
+    Docker stop, systemd restart). Default behavior: Python exits immediately, killing all in-flight
+    requests. A payment being processed is interrupted mid-transaction — money deducted but order not
+    confirmed. A Kafka message is consumed but not committed — processed again on restart (duplicate).
+    A database transaction is neither committed nor rolled back — lock held until timeout. Graceful
+    shutdown: (1) stop accepting new requests, (2) wait for in-flight requests to finish (with
+    timeout), (3) close resources (DB pools, HTTP clients, message consumers). Kubernetes sends
+    SIGTERM and waits terminationGracePeriodSeconds (default 30s) before SIGKILL. Your shutdown
+    handler must complete within this window.
+  how_to_do_right: |
+    1. Register signal handlers for SIGTERM and SIGINT in the main async function.
+    2. On signal: set a shutdown flag, stop accepting new work.
+    3. Wait for in-flight tasks: asyncio.wait(tasks, timeout=25) (leave 5s margin before SIGKILL).
+    4. Cancel remaining tasks: task.cancel() for tasks that didn't complete in time.
+    5. Close resources: DB pools, HTTP clients, Kafka consumers, Redis connections.
+    6. For FastAPI/uvicorn: use lifespan with shutdown logic.
+    7. For Kubernetes: set terminationGracePeriodSeconds >= your shutdown timeout.
+  severity: high
+  technologies:
+    lang: [python, asyncio]
+    framework: [fastapi, uvicorn]
+  domains:
+    domain: [reliability, operations, architecture]
+    concern: [deployment, graceful_shutdown, data_integrity]
+  example_good: |
+    import asyncio
+    import signal
+    from contextlib import asynccontextmanager
+
+    class GracefulWorker:
+        def __init__(self):
+            self._shutdown_event = asyncio.Event()
+            self._active_tasks: set[asyncio.Task] = set()
+
+        async def start(self):
+            loop = asyncio.get_running_loop()
+
+            # Register signal handlers
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, self._signal_handler, sig)
+
+            print("Worker started — processing tasks")
+            try:
+                while not self._shutdown_event.is_set():
+                    task = asyncio.create_task(self._process_one())
+                    self._active_tasks.add(task)
+                    task.add_done_callback(self._active_tasks.discard)
+                    await asyncio.sleep(0.1)  # Simulate receiving work
+            finally:
+                await self._shutdown()
+
+        def _signal_handler(self, sig: signal.Signals):
+            print(f"\nReceived {sig.name} — initiating graceful shutdown")
+            self._shutdown_event.set()
+
+        async def _shutdown(self):
+            if not self._active_tasks:
+                print("No active tasks — clean shutdown")
+                return
+
+            print(f"Waiting for {len(self._active_tasks)} active tasks...")
+            # Wait up to 25 seconds for tasks to complete
+            done, pending = await asyncio.wait(
+                self._active_tasks, timeout=25.0
+            )
+            print(f"Completed: {len(done)}, still pending: {len(pending)}")
+
+            # Cancel tasks that didn't finish in time
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            print("Shutdown complete")
+
+        async def _process_one(self):
+            await asyncio.sleep(2.0)  # Simulate work
+
+    # FastAPI graceful shutdown via lifespan
+    @asynccontextmanager
+    async def lifespan(app):
+        # Startup
+        print("Starting up resources...")
+        yield
+        # Shutdown — runs on SIGTERM
+        print("Shutting down — closing connections...")
+        await app.state.db_pool.close()
+        await app.state.http_client.aclose()
+        print("Clean shutdown complete")
+
+    asyncio.run(GracefulWorker().start())
+  example_bad: |
+    import asyncio
+
+    async def worker():
+        while True:
+            await process_message()  # In-flight when SIGTERM arrives
+
+    asyncio.run(worker())
+    # SIGTERM → Python exits immediately
+    # In-flight message: consumed from Kafka but not committed → duplicate on restart
+    # In-flight DB transaction: lock held until server-side timeout
+    # HTTP client: connection reset → remote server sees broken pipe
+  when_applies: Any production async service that needs to handle SIGTERM (Kubernetes, Docker, systemd, direct deployment)
+  sources:
+    - url: https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.add_signal_handler
+      title: "Python Docs — Signal Handlers in asyncio"
+    - url: https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination
+      title: "Kubernetes Docs — Pod Termination"
+
+- id: PYASYNC-013
+  text: "Use the producer/consumer pattern with asyncio.Queue for decoupling async pipeline stages. Use a poison pill (sentinel value) to signal end-of-stream. Use multiple consumers for parallelism. Always handle exceptions in consumers to prevent silent task death."
+  why: >
+    Async pipelines often have stages running at different speeds: a Kafka consumer reads 10,000
+    messages/sec, a transformation stage processes 5,000/sec, and a database writer handles 1,000/sec.
+    Direct coupling (await process(await read())) bottlenecks the entire pipeline to the slowest stage.
+    asyncio.Queue decouples stages: each stage reads from its input queue and writes to its output
+    queue. Benefits: stages run independently, bounded queues provide backpressure (fast producer
+    waits when slow consumer falls behind), multiple consumers can process from the same queue for
+    parallelism (3 DB writers = 3,000/sec throughput). The poison pill pattern: when the producer is
+    done, it puts a sentinel value on the queue. Each consumer exits when it receives the sentinel.
+    For multiple consumers, put one sentinel per consumer.
+  how_to_do_right: |
+    1. Use asyncio.Queue(maxsize=N) between stages — bounded for backpressure.
+    2. Producer puts items with await queue.put(item) — blocks when full.
+    3. Consumer gets items with await queue.get() — blocks when empty.
+    4. Call queue.task_done() after processing each item — enables queue.join().
+    5. Use sentinel (None or STOP = object()) to signal end-of-stream.
+    6. For N consumers: put N sentinels (one per consumer).
+    7. Wrap consumer body in try/except to prevent silent death on exceptions.
+    8. Use queue.join() to wait until all items are processed.
+  severity: high
+  technologies:
+    lang: [python, asyncio]
+  domains:
+    domain: [architecture, reliability]
+    concern: [concurrency, pipeline, decoupling]
+  example_good: |
+    import asyncio
+    from dataclasses import dataclass
+
+    STOP = object()  # Poison pill sentinel
+
+    @dataclass
+    class RawEvent:
+        id: int
+        payload: str
+
+    @dataclass
+    class ProcessedEvent:
+        id: int
+        result: str
+
+    async def producer(raw_queue: asyncio.Queue, num_events: int):
+        """Reads events from source and puts them on the queue."""
+        for i in range(num_events):
+            event = RawEvent(id=i, payload=f"data_{i}")
+            await raw_queue.put(event)  # Blocks if queue full (backpressure)
+        # One poison pill per consumer
+        for _ in range(3):  # 3 consumers
+            await raw_queue.put(STOP)
+        print(f"Producer done: {num_events} events produced")
+
+    async def transformer(
+        raw_queue: asyncio.Queue,
+        result_queue: asyncio.Queue,
+        worker_id: int,
+    ):
+        """Processes events — multiple instances for parallelism."""
+        count = 0
+        while True:
+            event = await raw_queue.get()
+            if event is STOP:
+                raw_queue.task_done()
+                break
+            try:
+                # Simulate processing
+                await asyncio.sleep(0.001)
+                processed = ProcessedEvent(id=event.id, result=event.payload.upper())
+                await result_queue.put(processed)
+                count += 1
+            except Exception as e:
+                print(f"Worker {worker_id} error processing event {event.id}: {e}")
+            finally:
+                raw_queue.task_done()
+        print(f"Worker {worker_id} done: processed {count} events")
+
+    async def writer(result_queue: asyncio.Queue):
+        """Writes results to database/file."""
+        count = 0
+        while True:
+            event = await result_queue.get()
+            if event is STOP:
+                result_queue.task_done()
+                break
+            # Simulate DB write
+            await asyncio.sleep(0.002)
+            count += 1
+            result_queue.task_done()
+        print(f"Writer done: wrote {count} events")
+
+    async def main():
+        raw_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+        result_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+
+        async with asyncio.TaskGroup() as tg:
+            # 1 producer
+            tg.create_task(producer(raw_queue, 1000))
+            # 3 parallel transformers (for throughput)
+            for i in range(3):
+                tg.create_task(transformer(raw_queue, result_queue, i))
+            # 1 writer (add more for higher DB write throughput)
+            tg.create_task(writer(result_queue))
+
+            # Wait for all raw events to be processed
+            await raw_queue.join()
+            # Signal writer to stop
+            await result_queue.put(STOP)
+            await result_queue.join()
+
+    asyncio.run(main())
+  example_bad: |
+    import asyncio
+
+    async def process_pipeline_bad(events: list):
+        # BAD: Sequential processing — no concurrency between stages
+        for event in events:
+            raw = await read(event)           # Stage 1
+            processed = await transform(raw)  # Stage 2 waits for Stage 1
+            await write(processed)            # Stage 3 waits for Stage 2
+        # Total time = sum of all stages — no overlap
+
+    async def consumer_bad(queue: asyncio.Queue):
+        while True:
+            event = await queue.get()
+            result = await process(event)  # If process() raises, consumer dies silently
+            # No queue.task_done() — queue.join() waits forever
+            # No exception handling — one bad event kills the consumer
+            # No sentinel check — consumer loops forever after producer finishes
+  when_applies: Any multi-stage async pipeline (ETL, event processing, data ingestion) where stages run at different speeds
+  sources:
+    - url: https://docs.python.org/3/library/asyncio-queue.html
+      title: "Python Docs — asyncio.Queue"
+    - url: https://docs.python.org/3/library/asyncio-queue.html#examples
+      title: "Python Docs — asyncio.Queue Examples"

@@ -1,0 +1,1589 @@
+layer: rules
+domain: integration
+knowledge:
+- id: INT-WIS-001
+  text: "API contract evolution must be additive only: add new optional fields, never remove or rename existing fields, never change field types. A breaking change in a public API breaks every client simultaneously."
+  why: >
+    When you remove a field from an API response, every client that reads that field throws a KeyError
+    or NullPointerException. When you rename a field, every client silently gets null instead of data.
+    A fintech company renamed 'account_balance' to 'balance' in their API — 300 integration partners
+    broke simultaneously, processing took 4 hours to restore, and 3 partners lost trust and switched
+    providers. Additive-only changes are always safe: old clients ignore new fields, new clients use them.
+  how_to_do_right: |
+    1. New fields: always optional with default values (never required in response)
+    2. Deprecation: add 'deprecated' annotation, log usage, remove after 6 months with zero usage
+    3. Type changes: add new field with new type, deprecate old field
+    4. Rename: add new field, copy value from old field, deprecate old field after migration window
+    5. Breaking changes: new API version (/v2/) — never modify /v1/ in a breaking way
+    6. Contract tests: automated tests that verify old clients still work against new API
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, integration]
+    concern: [consistency]
+  example_good: |
+    # Additive change: add new optional field
+    class UserResponse(BaseModel):
+        id: int
+        name: str
+        email: str
+        # New field — old clients ignore it, new clients use it
+        avatar_url: str | None = None  # Optional with default
+
+    # Deprecation: keep old field, add new field
+    class UserResponse(BaseModel):
+        id: int
+        name: str  # Deprecated: use display_name instead
+        display_name: str  # New field
+        email: str
+  example_bad: |
+    # Breaking: removed field that clients depend on
+    class UserResponse(BaseModel):
+        id: int
+        # name: str  # REMOVED — every client that reads .name crashes
+        display_name: str  # Renamed — old clients get KeyError
+
+    # Breaking: changed field type
+    class UserResponse(BaseModel):
+        id: str  # Was int, now str — every client's parseInt() breaks
+  when_applies: "Any public or internal API changes, schema evolution, versioning decisions"
+  sources: ["https://stripe.com/docs/api/versioning"]
+
+- id: INT-WIS-002
+  text: "Database migrations at scale require three phases: (1) add column as nullable, (2) backfill existing rows with correct values, (3) add NOT NULL constraint. Never add a NOT NULL column without a default in a single migration — it locks the table."
+  why: >
+    Adding a NOT NULL column without a default to a table with 10M rows acquires an ACCESS EXCLUSIVE
+    lock on the entire table. In PostgreSQL, this blocks ALL reads and writes until every row is updated.
+    For a 10M row table, this can take 30-60 seconds — during which your application returns 500 errors
+    because every query to that table times out. The 3-phase approach keeps the table accessible throughout:
+    phase 1 is instant (nullable column), phase 2 runs in batches (no lock), phase 3 is instant (constraint
+    on already-backfilled data).
+  how_to_do_right: |
+    1. Phase 1: ALTER TABLE ADD COLUMN new_col TYPE NULL — instant, no lock
+    2. Phase 2: UPDATE in batches of 1000 rows with a sleep(0.1) between batches — no lock contention
+    3. Phase 3: ALTER TABLE ALTER COLUMN new_col SET NOT NULL — instant if all rows are non-null
+    4. Always test migrations against a copy of production data (same size)
+    5. Set statement_timeout to 5s for migration DDL — if it takes longer, it is probably locking
+    6. Use pg_stat_activity to monitor locks during migration
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [databases, integration]
+    concern: [migration]
+  example_good: |
+    # Phase 1: Add nullable column (instant, no lock)
+    # alembic migration 001
+    op.add_column("users", sa.Column("display_name", sa.String(), nullable=True))
+
+    # Phase 2: Backfill in batches (no table lock)
+    # alembic migration 002 (data migration)
+    from sqlalchemy import text
+    conn = op.get_bind()
+    batch_size = 1000
+    while True:
+        result = conn.execute(text(
+            "UPDATE users SET display_name = name "
+            "WHERE display_name IS NULL "
+            "LIMIT :batch"
+        ), {"batch": batch_size})
+        if result.rowcount == 0:
+            break
+        time.sleep(0.1)  # Let other queries through
+
+    # Phase 3: Add NOT NULL constraint (instant — all rows already filled)
+    # alembic migration 003
+    op.alter_column("users", "display_name", nullable=False)
+  example_bad: |
+    # Single migration: locks table for 30-60 seconds on 10M rows
+    op.add_column("users", sa.Column("display_name", sa.String(), nullable=False))
+    # ACCESS EXCLUSIVE lock acquired — ALL queries to users table block
+    # Application returns 500 errors until migration completes
+  when_applies: "Any database schema change on tables with more than 100K rows, production migrations"
+  sources: ["https://www.postgresql.org/docs/current/ddl-alter.html"]
+
+- id: INT-WIS-003
+  text: "Every mutating API endpoint must be idempotent: use an idempotency key (client-generated UUID), a dedup table to detect retries, and a response cache to return the same result for duplicate requests. Without this, network retries create duplicate records."
+  why: >
+    HTTP is unreliable. A POST request can succeed on the server but the response can be lost due to
+    a network timeout. The client retries, and now you have two orders, two payments, two user accounts.
+    Stripe processes billions of dollars and makes every mutation idempotent via an Idempotency-Key header.
+    Without idempotency, every retry is a potential duplicate operation. A payment processor without
+    idempotency double-charged 2,300 customers in one weekend due to mobile app retry logic.
+  how_to_do_right: |
+    1. Client sends Idempotency-Key header (UUID) with every mutating request
+    2. Server checks dedup table: if key exists, return cached response (200, not error)
+    3. If key is new: execute operation, store result in dedup table, return response
+    4. Dedup table columns: idempotency_key (PK), response_status, response_body, created_at
+    5. TTL on dedup entries: 24 hours (client should not reuse keys after 24h)
+    6. Use database transaction: check dedup + execute operation + store result atomically
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, integration]
+    concern: [consistency]
+  example_good: |
+    from fastapi import Header, HTTPException
+    import json
+
+    @app.post("/payments", status_code=201)
+    async def create_payment(
+        payment: PaymentCreate,
+        idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    ):
+        # Check dedup table
+        existing = await db.execute(
+            select(IdempotencyRecord).where(
+                IdempotencyRecord.key == idempotency_key
+            )
+        )
+        if existing:
+            # Return cached response — same status, same body
+            return Response(
+                content=existing.response_body,
+                status_code=existing.response_status,
+                media_type="application/json",
+            )
+
+        # Execute operation atomically
+        async with db.begin():
+            result = await process_payment(payment)
+            await db.execute(
+                insert(IdempotencyRecord).values(
+                    key=idempotency_key,
+                    response_status=201,
+                    response_body=json.dumps(result.dict()),
+                    created_at=datetime.utcnow(),
+                )
+            )
+        return result
+  example_bad: |
+    @app.post("/payments")
+    async def create_payment(payment: PaymentCreate):
+        # No idempotency — retry creates duplicate payment
+        result = await process_payment(payment)
+        return result
+    # Client timeout → retry → two payments created
+    # Customer charged twice, support ticket, refund needed
+  when_applies: "Any mutating API endpoint, payment processing, order creation, any operation that cannot be safely repeated"
+  sources: ["https://stripe.com/docs/api/idempotent_requests"]
+
+- id: INT-WIS-004
+  text: "Retry calibration: base_delay=1s, exponential factor=2, jitter=0-30% of delay, max_retries=5, max_delay=60s. These values work for 90% of integrations. Only tune when you have data showing they do not."
+  why: >
+    Retries without backoff cause thundering herd: 1000 clients retry simultaneously every 1s, overwhelming
+    the recovering server. Retries without jitter cause synchronized waves: all clients retry at exactly 2s,
+    4s, 8s, creating periodic spikes. Retries without a max delay mean: after 10 retries with factor=2, the
+    delay is 1024s (17 minutes) — the user gave up 16 minutes ago. The calibration values above provide:
+    progressive backoff (1s, 2s, 4s, 8s, 16s), randomized timing (jitter prevents waves), and bounded
+    total wait time (sum of all delays < 2 minutes).
+  how_to_do_right: |
+    1. Base delay: 1s (fast enough for first retry, slow enough to not hammer)
+    2. Factor: 2 (double each time: 1s, 2s, 4s, 8s, 16s)
+    3. Jitter: random uniform 0-30% of current delay (prevents synchronized retries)
+    4. Max retries: 5 (total attempts = 6, including original)
+    5. Max delay: 60s (cap to prevent absurd waits: 1s, 2s, 4s, 8s, 16s, 32s → capped at 60s)
+    6. Only retry on transient errors: 429, 502, 503, 504, ConnectionError, Timeout
+    7. Never retry on: 400, 401, 403, 404, 422 (permanent failures)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [integration, reliability]
+    concern: [failure]
+  example_good: |
+    from tenacity import (
+        retry, stop_after_attempt, wait_exponential_jitter,
+        retry_if_exception_type,
+    )
+    import httpx
+
+    TRANSIENT_EXCEPTIONS = (
+        httpx.ConnectTimeout,
+        httpx.ReadTimeout,
+        httpx.ConnectError,
+    )
+
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential_jitter(
+            initial=1,        # base_delay=1s
+            max=60,            # max_delay=60s
+            exp_base=2,        # factor=2
+            jitter=5,          # up to 5s of jitter
+        ),
+        retry=retry_if_exception_type(TRANSIENT_EXCEPTIONS),
+    )
+    async def call_external_api(url: str, payload: dict) -> dict:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload)
+            if resp.status_code in (429, 502, 503, 504):
+                raise httpx.ConnectError(f"Transient error: {resp.status_code}")
+            resp.raise_for_status()
+            return resp.json()
+  example_bad: |
+    # Retry without backoff — thundering herd
+    for attempt in range(10):
+        try:
+            response = requests.post(url, json=payload, timeout=5)
+            break
+        except Exception:
+            time.sleep(1)  # Fixed 1s delay, no backoff, no jitter
+            # All 1000 clients retry at the same second
+  when_applies: "Any external API integration, HTTP client configuration, retry strategy design"
+  sources: ["https://cloud.google.com/architecture/rate-limiting-strategies-techniques"]
+
+- id: INT-WIS-005
+  text: "Connection pool tuning for PostgreSQL: min_size=5, max_size=20, connection_timeout=30s, max_lifetime=1800s (30 min). Use PgBouncer in front of PostgreSQL when total connections across all app instances exceed max_connections (default 100)."
+  why: >
+    Each PostgreSQL connection uses ~5-10MB of RAM. The default max_connections is 100. If you have 5 app
+    instances with max_pool=30 each, that is 150 connections — exceeding PostgreSQL limits, causing
+    "too many connections" errors. Conversely, too few connections causes request queuing. min_size=5
+    keeps warm connections ready, max_size=20 limits resource usage. max_lifetime=1800s forces connection
+    recycling to prevent stale connections after PostgreSQL restarts or failovers. PgBouncer in transaction
+    mode multiplexes hundreds of app connections onto 20-30 PostgreSQL connections.
+  how_to_do_right: |
+    1. min_size=5: always have 5 warm connections ready (no cold-start latency)
+    2. max_size=20: limit per-instance connections (5 instances = 100 total, within PostgreSQL default)
+    3. connection_timeout=30s: fail if a connection is not available in 30s (prevent infinite wait)
+    4. max_lifetime=1800s: recycle connections every 30min (handles failovers, memory leaks)
+    5. Monitor: active connections, idle connections, wait time for connection
+    6. If total connections > max_connections: add PgBouncer in transaction pooling mode
+    7. PgBouncer config: default_pool_size=20, max_client_conn=200
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [databases, integration]
+    concern: [connection_pooling]
+  example_good: |
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(
+        "postgresql+asyncpg://user:pass@localhost/mydb",
+        pool_size=5,           # min_size equivalent
+        max_overflow=15,       # max_size = pool_size + max_overflow = 20
+        pool_timeout=30,       # connection_timeout=30s
+        pool_recycle=1800,     # max_lifetime=1800s (30 min)
+        pool_pre_ping=True,    # Verify connection is alive before using
+    )
+
+    # Monitor connection pool
+    @app.get("/health/db")
+    async def db_health():
+        pool = engine.pool
+        return {
+            "pool_size": pool.size(),
+            "checked_in": pool.checkedin(),
+            "checked_out": pool.checkedout(),
+            "overflow": pool.overflow(),
+        }
+  example_bad: |
+    # No pool tuning — defaults may not match your workload
+    engine = create_async_engine("postgresql+asyncpg://user:pass@localhost/mydb")
+    # Default pool_size=5, max_overflow=10 — may be too low or too high
+    # No pool_recycle — stale connections after PostgreSQL restart
+    # No pool_pre_ping — "connection reset" errors on stale connections
+    # No monitoring — no idea if pool is exhausted
+  when_applies: "PostgreSQL setup, connection pool configuration, database performance tuning"
+  sources: ["https://www.pgbouncer.org/config.html"]
+
+- id: INT-WIS-006
+  text: "Zero-downtime deployment requires: rolling deploy with health checks, connection draining (finish in-flight requests before stopping), and backward-compatible code (new code must work with old data and old code must work with new data during transition)."
+  why: >
+    During a rolling deploy, old and new versions run simultaneously for minutes. If the new version
+    adds a required column that old code does not populate, old instances break. If the deploy stops an
+    instance mid-request without draining, users see 502 errors. A team deployed a schema change and code
+    change simultaneously — during the rolling update, old code could not write to the new required column,
+    causing a 15-minute partial outage. Zero-downtime requires that the transition period (old + new running
+    together) is explicitly safe.
+  how_to_do_right: |
+    1. Deploy code changes that are backward-compatible (read new fields but do not require them)
+    2. Rolling update: replace 1 instance at a time, wait for health check before next
+    3. Connection draining: on SIGTERM, stop accepting new requests, finish in-flight (30s grace period)
+    4. Database changes: always 3-phase (add nullable → backfill → add constraint) — see INT-WIS-002
+    5. Health checks: liveness (process alive) at /health/live, readiness (can serve) at /health/ready
+    6. Readiness goes false during shutdown → load balancer stops sending traffic → drain → stop
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [deployment, integration]
+    concern: [migration]
+  example_good: |
+    import signal
+    import asyncio
+    from contextlib import asynccontextmanager
+
+    is_shutting_down = False
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Startup
+        yield
+        # Shutdown: graceful drain
+        global is_shutting_down
+        is_shutting_down = True
+        await asyncio.sleep(30)  # Wait for in-flight requests to complete
+
+    app = FastAPI(lifespan=lifespan)
+
+    @app.get("/health/ready")
+    async def readiness():
+        if is_shutting_down:
+            return Response(status_code=503)  # Stop receiving traffic
+        return {"status": "ready"}
+
+    @app.get("/health/live")
+    async def liveness():
+        return {"status": "alive"}  # Always alive until process dies
+  example_bad: |
+    # No graceful shutdown — in-flight requests get killed
+    # No readiness check — load balancer sends traffic to stopping instance
+    # Code requires new DB column that old instances don't populate
+    # Result: 502 errors during every deploy
+  when_applies: "Production deployment setup, CI/CD pipeline configuration, service lifecycle management"
+  sources: ["https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#container-probes"]
+
+- id: INT-WIS-007
+  text: "Backwards-compatible API changes: use API versioning for breaking changes (/v1/, /v2/), feature flags for gradual rollout of non-breaking changes, and a deprecation policy (6-month sunset with monitoring) for retiring old versions."
+  why: >
+    API consumers (mobile apps, third-party integrations) cannot be force-updated simultaneously.
+    A mobile app released 6 months ago still calls /v1/. If you change /v1/ behavior, that app breaks.
+    Versioning lets you evolve independently: /v1/ is frozen, /v2/ has new behavior. Feature flags
+    let you test new behavior with a subset of clients before making it the default. Without a
+    deprecation policy, you maintain /v1/, /v2/, /v3/ forever — 3x the maintenance burden.
+  how_to_do_right: |
+    1. Version in URL path: /v1/users, /v2/users (simplest, most explicit)
+    2. Non-breaking changes: no version bump needed (additive fields, new endpoints)
+    3. Breaking changes: new version (/v2/), old version (/v1/) continues working
+    4. Deprecation policy: announce 6 months before sunset, monitor usage, notify active consumers
+    5. Feature flags: test new behavior with opt-in header (X-Use-New-Scoring: true)
+    6. Max active versions: 2 (current + previous) — 3 is a maintenance nightmare
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, integration]
+    concern: [migration]
+  example_good: |
+    from fastapi import APIRouter
+
+    v1_router = APIRouter(prefix="/v1")
+    v2_router = APIRouter(prefix="/v2")
+
+    # V1: frozen behavior — do not modify
+    @v1_router.get("/users/{user_id}")
+    async def get_user_v1(user_id: int) -> UserResponseV1:
+        user = await user_service.get(user_id)
+        return UserResponseV1(id=user.id, name=user.name)
+
+    # V2: new behavior with additional fields
+    @v2_router.get("/users/{user_id}")
+    async def get_user_v2(user_id: int) -> UserResponseV2:
+        user = await user_service.get(user_id)
+        return UserResponseV2(
+            id=user.id, name=user.name,
+            display_name=user.display_name,  # New in V2
+            avatar_url=user.avatar_url,       # New in V2
+        )
+
+    # Deprecation monitoring
+    @v1_router.middleware("http")
+    async def deprecation_warning(request, call_next):
+        response = await call_next(request)
+        response.headers["Deprecation"] = "true"
+        response.headers["Sunset"] = "2026-09-01"
+        metrics.increment("api.v1.usage", tags={"path": request.url.path})
+        return response
+  example_bad: |
+    # Modifying v1 behavior in place — breaks existing clients
+    @app.get("/v1/users/{user_id}")
+    async def get_user(user_id: int):
+        # Changed response format without versioning
+        return {"user_data": {"id": user_id}}  # Was {"id": user_id, "name": "..."}
+  when_applies: "API evolution, versioning strategy, breaking change management"
+  sources: ["https://martinfowler.com/bliki/CanaryRelease.html"]
+
+- id: INT-WIS-008
+  text: "Circuit breaker pattern: start Closed (normal), trip to Open after 5 failures in 60 seconds, wait 30 seconds then move to Half-Open (try one request), close if it succeeds, reopen if it fails. This prevents cascading failures."
+  why: >
+    Without a circuit breaker, a failing downstream service causes every request to wait for the timeout
+    (e.g., 30s) before failing. 100 concurrent requests × 30s timeout = 100 threads blocked, connection
+    pool exhausted, your service is now down too. A circuit breaker fails fast (milliseconds) when the
+    downstream is known to be unhealthy. Netflix created Hystrix because a single slow dependency brought
+    down their entire streaming platform — circuit breakers prevent this cascade.
+  how_to_do_right: |
+    1. Closed state: requests pass through normally, count failures
+    2. Trip threshold: 5 failures in 60 seconds → Open
+    3. Open state: all requests fail immediately (no waiting), return cached/default response
+    4. Recovery timer: after 30s in Open → Half-Open
+    5. Half-Open state: allow 1 request through as a probe
+    6. If probe succeeds → Closed (reset failure count)
+    7. If probe fails → Open (restart recovery timer)
+    8. Monitor: circuit state, trip count, recovery time
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [reliability, integration]
+    concern: [failure]
+  example_good: |
+    import time
+    from enum import Enum
+
+    class CircuitState(Enum):
+        CLOSED = "closed"
+        OPEN = "open"
+        HALF_OPEN = "half_open"
+
+    class CircuitBreaker:
+        def __init__(self, failure_threshold=5, recovery_timeout=30, window=60):
+            self.failure_threshold = failure_threshold
+            self.recovery_timeout = recovery_timeout
+            self.window = window
+            self.state = CircuitState.CLOSED
+            self.failures: list[float] = []
+            self.last_failure_time = 0.0
+
+        async def call(self, func, *args, fallback=None, **kwargs):
+            if self.state == CircuitState.OPEN:
+                if time.time() - self.last_failure_time > self.recovery_timeout:
+                    self.state = CircuitState.HALF_OPEN
+                else:
+                    return fallback() if fallback else None
+
+            try:
+                result = await func(*args, **kwargs)
+                if self.state == CircuitState.HALF_OPEN:
+                    self.state = CircuitState.CLOSED
+                    self.failures.clear()
+                return result
+            except Exception as e:
+                self._record_failure()
+                raise
+
+        def _record_failure(self):
+            now = time.time()
+            self.failures = [t for t in self.failures if now - t < self.window]
+            self.failures.append(now)
+            self.last_failure_time = now
+            if len(self.failures) >= self.failure_threshold:
+                self.state = CircuitState.OPEN
+
+    # Usage
+    payment_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30)
+
+    async def charge_customer(payment):
+        return await payment_breaker.call(
+            payment_gateway.charge, payment,
+            fallback=lambda: {"status": "queued", "message": "Payment will be retried"}
+        )
+  example_bad: |
+    # No circuit breaker — cascading failure
+    async def charge_customer(payment):
+        # If payment gateway is down, every request waits 30s timeout
+        # 100 requests/s × 30s = 3000 blocked connections = your service dies too
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            return await client.post(PAYMENT_URL, json=payment)
+  when_applies: "External service integration, microservice communication, resilience patterns"
+  sources: ["https://microservices.io/patterns/reliability/circuit-breaker.html"]
+
+- id: INT-WIS-009
+  text: "Bulkhead pattern: isolate critical operations (authentication, payments) from non-critical ones (recommendations, analytics) using separate connection pools, thread pools, or even separate service instances. A failure in non-critical should never take down critical."
+  why: >
+    If authentication and recommendation engine share the same connection pool (20 connections), and
+    the recommendation engine has a slow query that holds all 20 connections, authentication stops
+    working — users cannot log in because of a recommendation bug. Bulkheads (like watertight compartments
+    in a ship) isolate failure domains. When the non-critical compartment floods, the critical compartment
+    stays dry. Amazon uses bulkheads extensively: each AWS service runs in isolated infrastructure.
+  how_to_do_right: |
+    1. Identify critical paths: authentication, payment processing, core data reads
+    2. Identify non-critical paths: recommendations, analytics, reporting, notifications
+    3. Separate connection pools: critical pool (10 connections), non-critical pool (10 connections)
+    4. Separate thread/worker pools: critical workers cannot be starved by non-critical work
+    5. Monitor each pool independently: alert when critical pool is >80% utilized
+    6. Graceful degradation: if non-critical pool is exhausted, return defaults, do not touch critical pool
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [reliability, integration]
+    concern: [failure]
+  example_good: |
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    # Separate connection pools for critical and non-critical
+    critical_engine = create_async_engine(
+        DATABASE_URL,
+        pool_size=10,
+        max_overflow=5,
+        pool_timeout=10,  # Fail fast for critical operations
+    )
+
+    non_critical_engine = create_async_engine(
+        DATABASE_URL,
+        pool_size=10,
+        max_overflow=5,
+        pool_timeout=30,  # Can wait longer for non-critical
+    )
+
+    # Critical: auth always works even if recommendations are down
+    @app.post("/auth/login")
+    async def login(credentials: Credentials):
+        async with critical_engine.begin() as conn:
+            return await authenticate(conn, credentials)
+
+    # Non-critical: recommendations use separate pool
+    @app.get("/recommendations/{user_id}")
+    async def get_recommendations(user_id: int):
+        try:
+            async with non_critical_engine.begin() as conn:
+                return await fetch_recommendations(conn, user_id)
+        except Exception:
+            return {"items": POPULAR_ITEMS}  # Graceful fallback
+  example_bad: |
+    # Single connection pool for everything
+    engine = create_async_engine(DATABASE_URL, pool_size=20)
+
+    # Auth and recommendations share the same pool
+    # Slow recommendation query holds all 20 connections
+    # Auth requests queue and timeout — nobody can log in
+  when_applies: "Service architecture, resilience design, critical path protection, resource isolation"
+  sources: ["https://docs.microsoft.com/en-us/azure/architecture/patterns/bulkhead"]
+
+- id: INT-WIS-010
+  text: "Timeout hierarchy: client timeout > gateway timeout > service timeout > database timeout, with each layer 20% shorter than the one above. If the database times out at 5s, the service should timeout at 6s, gateway at 8s, client at 10s."
+  why: >
+    If client timeout is shorter than server timeout, the client gives up but the server keeps processing
+    (wasting resources). If all layers have the same timeout, they all fail simultaneously with
+    confusing error messages. The hierarchy ensures: the innermost layer (database) fails first with a
+    clear error, each outer layer has time to handle the error gracefully, and the client gets a
+    meaningful error (not a generic timeout). Without this, you get: client timeout → retry → server
+    is still processing the first request → now two requests running.
+  how_to_do_right: |
+    1. Database query timeout: 5s (innermost, fails first)
+    2. Service HTTP timeout: 6s (has 1s to handle DB timeout gracefully)
+    3. Gateway timeout: 8s (has 2s to handle service timeout)
+    4. Client timeout: 10s (has 2s to handle gateway timeout)
+    5. Each layer adds ~20% buffer over the layer below
+    6. On timeout: return degraded response (cached data, default values), not a generic error
+    7. Log the layer that timed out — helps identify which component is slow
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [reliability, integration]
+    concern: [failure]
+  example_good: |
+    # Database: 5s timeout
+    engine = create_async_engine(
+        DATABASE_URL,
+        connect_args={"command_timeout": 5},  # 5s query timeout
+    )
+
+    # Service: 6s timeout for downstream HTTP calls
+    async def call_downstream(url: str, payload: dict):
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            return await client.post(url, json=payload)
+
+    # Gateway: 8s timeout (configured in Traefik/Nginx)
+    # proxy_read_timeout 8s;
+
+    # Client: 10s timeout
+    # fetch('/api/data', { signal: AbortSignal.timeout(10000) })
+  example_bad: |
+    # All timeouts the same — confusing failures
+    engine = create_async_engine(DATABASE_URL, connect_args={"command_timeout": 30})
+    client = httpx.AsyncClient(timeout=30.0)
+    # Gateway: proxy_read_timeout 30s;
+    # Client: 30s
+    # Everything times out at 30s simultaneously — unclear which layer is the bottleneck
+  when_applies: "Timeout configuration, distributed system design, latency optimization"
+  sources: ["https://sre.google/sre-book/handling-overload/"]
+
+- id: INT-WIS-011
+  text: "Propagate a correlation ID (UUID) from the API edge through all services, queues, and logs. Generate it at the gateway if the client does not provide one. Without correlation IDs, debugging a request across 5 services is like finding a needle in 5 haystacks."
+  why: >
+    A user reports "my payment failed." Without a correlation ID, you search logs of 5 services for
+    events around the same timestamp — but timestamps differ by clock skew, and 100 other requests
+    happened at the same time. With a correlation ID, you search for one UUID across all services and
+    get the complete request journey in seconds. Google, Amazon, and every major distributed system
+    uses correlation IDs. It is the single most impactful debugging tool for distributed architectures.
+  how_to_do_right: |
+    1. Generate UUID at the API edge (gateway or first service) if client does not send one
+    2. Pass via HTTP header: X-Correlation-ID (or X-Request-ID)
+    3. Include in all log entries: logger.info("event", correlation_id=correlation_id)
+    4. Include in event/message metadata when publishing to queues
+    5. Include as database field for auditable operations (payments, state changes)
+    6. Return to client in response headers — they can use it for support tickets
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [observability, integration]
+    concern: [tracing]
+  example_good: |
+    import uuid
+    import structlog
+    from contextvars import ContextVar
+
+    correlation_id_var: ContextVar[str] = ContextVar("correlation_id", default="")
+
+    @app.middleware("http")
+    async def correlation_id_middleware(request: Request, call_next):
+        # Get from client or generate
+        cid = request.headers.get("X-Correlation-ID", str(uuid.uuid4()))
+        correlation_id_var.set(cid)
+
+        # Bind to all log entries in this request
+        structlog.contextvars.bind_contextvars(correlation_id=cid)
+
+        response = await call_next(request)
+        response.headers["X-Correlation-ID"] = cid  # Return to client
+        return response
+
+    # Propagate to downstream service calls
+    async def call_downstream(url: str, payload: dict):
+        async with httpx.AsyncClient() as client:
+            return await client.post(
+                url, json=payload,
+                headers={"X-Correlation-ID": correlation_id_var.get()},
+            )
+
+    # Propagate to message queue
+    async def publish_event(topic: str, data: dict):
+        await queue.publish(topic, {
+            **data,
+            "correlation_id": correlation_id_var.get(),
+        })
+  example_bad: |
+    # No correlation ID — debugging nightmare
+    logger.info("Processing payment")  # Which payment? Which request?
+    logger.info("Payment failed")      # Can't correlate with upstream or downstream logs
+    # Search by timestamp: 50 log entries in the same second, from different requests
+  when_applies: "Distributed system design, logging setup, debugging infrastructure, microservice architecture"
+  sources: ["https://opentelemetry.io/docs/concepts/signals/traces/"]
+
+- id: INT-WIS-012
+  text: "Health check design: liveness probe checks if the process is alive (should almost never fail), readiness probe checks if the service can serve traffic (depends on database, cache, dependencies). If readiness fails, stop routing traffic but do not restart the pod."
+  why: >
+    Conflating liveness and readiness causes cascading restarts. If a database goes down and your
+    liveness check queries the database, Kubernetes restarts your pods — but they come back up and
+    still cannot reach the database, so they restart again, in an infinite crash loop. With proper
+    separation: readiness fails → traffic stops → pod stays alive and reconnects when DB is back.
+    Liveness fails → pod is truly stuck (deadlock, OOM) → Kubernetes restarts it. A team had 500
+    pod restarts in 10 minutes because their liveness check depended on Redis.
+  how_to_do_right: |
+    1. Liveness (/health/live): return 200 if process is running — do NOT check external dependencies
+    2. Readiness (/health/ready): check database connection, cache connection, critical dependencies
+    3. Liveness: check every 10s, fail threshold 3 (restart only after 30s of being truly dead)
+    4. Readiness: check every 5s, fail threshold 1 (stop traffic immediately if unhealthy)
+    5. Startup probe: for slow-starting apps, give extra time before liveness kicks in
+    6. Never include non-critical dependencies in readiness (if analytics is down, you can still serve)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [operations, integration]
+    concern: [failure]
+  example_good: |
+    @app.get("/health/live")
+    async def liveness():
+        """Process is alive. Never check external dependencies here."""
+        return {"status": "alive"}
+
+    @app.get("/health/ready")
+    async def readiness():
+        """Can serve traffic. Check critical dependencies."""
+        checks = {}
+        try:
+            await db.execute(text("SELECT 1"))
+            checks["database"] = "ok"
+        except Exception:
+            checks["database"] = "failed"
+            return Response(
+                content=json.dumps({"status": "not_ready", "checks": checks}),
+                status_code=503,
+            )
+        try:
+            await redis_client.ping()
+            checks["redis"] = "ok"
+        except Exception:
+            checks["redis"] = "failed"
+            return Response(
+                content=json.dumps({"status": "not_ready", "checks": checks}),
+                status_code=503,
+            )
+        return {"status": "ready", "checks": checks}
+  example_bad: |
+    @app.get("/health")
+    async def health():
+        # Single health check that queries the DB
+        # If DB is down → liveness fails → pod restarts → still can't reach DB → restart loop
+        await db.execute(text("SELECT 1"))
+        return {"status": "ok"}
+  when_applies: "Kubernetes deployment, health check setup, service reliability, container orchestration"
+  sources: ["https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/"]
+
+- id: INT-WIS-013
+  text: "Graceful degradation: when a non-critical dependency is unavailable, serve a degraded but functional response instead of an error. Show popular items when recommendations are down, show cached data when the source is slow, show static content when personalization fails."
+  why: >
+    Users prefer a slightly degraded experience over a broken one. When Amazon's recommendation engine
+    is slow, they show bestsellers — the user does not notice. When Netflix's personalization is down,
+    they show trending content. A degraded response that loads in 200ms is better than a spinner for
+    30s followed by an error. The key insight: most users do not notice degradation if the page loads
+    and something reasonable is displayed. But they definitely notice errors and blank pages.
+  how_to_do_right: |
+    1. Identify non-critical dependencies: recommendations, personalization, analytics, search suggestions
+    2. For each, define a fallback: popular items, cached data, static default, empty list
+    3. Implement with circuit breaker + fallback: try real data, fall back on failure
+    4. Set aggressive timeouts on non-critical calls (2s max — user should not wait)
+    5. Log degradation events for monitoring (alert if degradation > 5% of requests)
+    6. Test degradation paths: kill the dependency in staging, verify fallback works
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [reliability, integration]
+    concern: [failure]
+  example_good: |
+    POPULAR_ITEMS = [...]  # Updated daily, stored in Redis or code
+
+    @app.get("/feed/{user_id}")
+    async def get_feed(user_id: int):
+        # Critical: always works
+        posts = await post_service.get_latest(limit=50)
+
+        # Non-critical: degrade gracefully
+        try:
+            recommendations = await asyncio.wait_for(
+                recommendation_service.get(user_id), timeout=2.0
+            )
+        except (asyncio.TimeoutError, Exception):
+            recommendations = POPULAR_ITEMS  # Fallback
+            logger.warning("recommendations.degraded", user_id=user_id)
+
+        try:
+            ads = await asyncio.wait_for(
+                ad_service.get_targeted(user_id), timeout=1.0
+            )
+        except (asyncio.TimeoutError, Exception):
+            ads = []  # No ads is better than broken page
+            logger.warning("ads.degraded", user_id=user_id)
+
+        return {"posts": posts, "recommendations": recommendations, "ads": ads}
+  example_bad: |
+    @app.get("/feed/{user_id}")
+    async def get_feed(user_id: int):
+        posts = await post_service.get_latest()
+        recommendations = await recommendation_service.get(user_id)  # 30s timeout
+        ads = await ad_service.get_targeted(user_id)                 # 30s timeout
+        # If recommendations is down: entire feed fails with 500 error
+        # User sees: "Something went wrong" instead of posts they came for
+        return {"posts": posts, "recommendations": recommendations, "ads": ads}
+  when_applies: "Service integration, resilience design, user experience during outages"
+  sources: ["https://docs.microsoft.com/en-us/azure/architecture/patterns/circuit-breaker"]
+
+- id: INT-WIS-014
+  text: "Rate limiting implementation: use token bucket algorithm (capacity=100 tokens, refill_rate=10 tokens/second) at the API gateway. Include standard headers in responses: X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset. Return 429 with Retry-After header."
+  why: >
+    Without rate limiting, a single misbehaving client can exhaust your server's resources and cause
+    denial of service for all clients. Token bucket is the standard algorithm because it allows bursts
+    (up to capacity) while enforcing a sustained rate (refill_rate). Fixed-window rate limiting has a
+    boundary problem: a client can send 100 requests at 11:59:59 and 100 more at 12:00:00 — 200 in
+    2 seconds. Token bucket handles this naturally. Standard headers let clients implement proper
+    backoff without guessing.
+  how_to_do_right: |
+    1. Token bucket: capacity=100 (max burst), refill_rate=10/s (sustained rate)
+    2. Key by: API key for authenticated clients, IP address for anonymous
+    3. Response headers: X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset (epoch seconds)
+    4. On limit exceeded: return 429 with Retry-After header (seconds until tokens available)
+    5. Use Redis for distributed rate limiting (INCR + EXPIRE or Redis Cell module)
+    6. Different limits per tier: free=10/s, pro=100/s, enterprise=1000/s
+    7. Exempt health checks and internal service-to-service calls from rate limiting
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, integration]
+    concern: [web]
+  example_good: |
+    import time
+    import redis.asyncio as redis
+
+    r = redis.Redis()
+
+    async def check_rate_limit(api_key: str, limit: int = 100, window: int = 60) -> dict:
+        key = f"ratelimit:{api_key}:{int(time.time()) // window}"
+        count = await r.incr(key)
+        if count == 1:
+            await r.expire(key, window)
+
+        remaining = max(0, limit - count)
+        reset_at = (int(time.time()) // window + 1) * window
+
+        return {
+            "allowed": count <= limit,
+            "limit": limit,
+            "remaining": remaining,
+            "reset": reset_at,
+        }
+
+    @app.middleware("http")
+    async def rate_limit_middleware(request: Request, call_next):
+        api_key = request.headers.get("X-API-Key", request.client.host)
+        result = await check_rate_limit(api_key)
+
+        if not result["allowed"]:
+            return Response(
+                status_code=429,
+                content=json.dumps({"error": "Rate limit exceeded"}),
+                headers={
+                    "X-RateLimit-Limit": str(result["limit"]),
+                    "X-RateLimit-Remaining": "0",
+                    "X-RateLimit-Reset": str(result["reset"]),
+                    "Retry-After": str(result["reset"] - int(time.time())),
+                },
+            )
+
+        response = await call_next(request)
+        response.headers["X-RateLimit-Limit"] = str(result["limit"])
+        response.headers["X-RateLimit-Remaining"] = str(result["remaining"])
+        response.headers["X-RateLimit-Reset"] = str(result["reset"])
+        return response
+  example_bad: |
+    # No rate limiting — any client can send unlimited requests
+    @app.get("/api/data")
+    async def get_data():
+        return await expensive_query()
+    # One client sends 10K requests/second → database overwhelmed → all clients affected
+  when_applies: "API security, abuse prevention, fair usage enforcement, public API design"
+  sources: ["https://tools.ietf.org/html/rfc6585#section-4"]
+
+- id: INT-WIS-015
+  text: "Webhook reliability: deliver webhooks with retry and exponential backoff, sign payloads with HMAC-SHA256 for authenticity, and require idempotent handlers on the receiver side. Webhooks are HTTP requests to external systems — they will fail and must be retried safely."
+  why: >
+    Webhook receivers go down, have network issues, or respond slowly. If you fire-and-forget, the
+    receiver never gets the event. If you retry without signing, anyone can forge a webhook request.
+    If the receiver is not idempotent, retries create duplicate side effects. Stripe and GitHub both
+    use HMAC signatures + retry with backoff + idempotent handling — this is the proven pattern.
+    A payment platform without webhook retries lost 8% of payment notifications, causing merchants
+    to miss orders worth $50K in one week.
+  how_to_do_right: |
+    1. Sign payload: HMAC-SHA256(secret + body) in X-Webhook-Signature header
+    2. Retry with backoff: 1s, 5s, 30s, 5min, 30min, 2h (max 6 attempts over ~3 hours)
+    3. Receiver: verify signature first, reject if invalid (401)
+    4. Receiver: use event ID as idempotency key — if already processed, return 200
+    5. Return 200 quickly — do heavy processing async after acknowledging
+    6. Dead letter: after all retries exhausted, store in dead letter queue for manual review
+    7. Provide webhook logs UI: let receivers see delivery attempts, response codes
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, integration]
+    concern: [web]
+  example_good: |
+    import hmac
+    import hashlib
+
+    # Sender: sign and deliver with retry
+    async def deliver_webhook(url: str, event: dict, secret: str):
+        body = json.dumps(event)
+        signature = hmac.new(
+            secret.encode(), body.encode(), hashlib.sha256
+        ).hexdigest()
+
+        for attempt, delay in enumerate([1, 5, 30, 300, 1800, 7200]):
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.post(
+                        url, content=body,
+                        headers={
+                            "Content-Type": "application/json",
+                            "X-Webhook-Signature": f"sha256={signature}",
+                            "X-Webhook-ID": event["id"],
+                        },
+                    )
+                    if resp.status_code == 200:
+                        return  # Delivered successfully
+            except Exception:
+                pass
+            await asyncio.sleep(delay)
+        # All retries exhausted — move to dead letter queue
+        await dead_letter_queue.publish("webhook.failed", event)
+
+    # Receiver: verify signature and handle idempotently
+    @app.post("/webhooks/payment")
+    async def receive_webhook(request: Request):
+        body = await request.body()
+        signature = request.headers.get("X-Webhook-Signature", "")
+        expected = f"sha256={hmac.new(WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()}"
+        if not hmac.compare_digest(signature, expected):
+            raise HTTPException(401, "Invalid signature")
+
+        event = json.loads(body)
+        if await db.webhook_already_processed(event["id"]):
+            return {"status": "already_processed"}  # Idempotent
+
+        await db.mark_webhook_processed(event["id"])
+        await background_queue.publish("process_payment_webhook", event)
+        return {"status": "accepted"}
+  example_bad: |
+    # Fire and forget — no retry, no signature, no idempotency
+    async def send_webhook(url: str, event: dict):
+        await httpx.post(url, json=event)  # If it fails, event is lost forever
+  when_applies: "Webhook implementation, event-driven integration, third-party notifications"
+  sources: ["https://stripe.com/docs/webhooks"]
+
+- id: INT-WIS-016
+  text: "API pagination: use cursor-based pagination for real-time data (feeds, messages, event streams) where rows are inserted frequently. Use offset-based pagination only for static or slowly-changing data (admin tables, reports). Cursor is O(1), offset is O(N)."
+  why: >
+    Offset pagination (LIMIT 20 OFFSET 10000) forces the database to scan and discard 10,000 rows
+    before returning 20 — it gets slower as the user pages deeper. With 1M rows, page 5000 takes
+    seconds. Cursor pagination (WHERE id > last_seen_id LIMIT 20) uses an index seek and is constant
+    time regardless of position. Additionally, offset pagination breaks when rows are inserted: if a
+    new row is inserted on page 1 while the user is on page 2, they see a duplicate item. Cursor
+    pagination is immune to this because it anchors on a specific row, not a position.
+  how_to_do_right: |
+    1. Cursor-based: return next_cursor in response, client sends it back for next page
+    2. Cursor value: encode (id, created_at) as base64 — opaque to client, decoded by server
+    3. Query: WHERE (created_at, id) > (cursor_time, cursor_id) ORDER BY created_at, id LIMIT 20
+    4. Index: CREATE INDEX idx_pagination ON table (created_at, id)
+    5. Offset-based only for: admin tables, reports, data exports (where deep pagination is rare)
+    6. Always include total_count for offset-based (SELECT COUNT(*) in parallel)
+    7. Default page size: 20, max page size: 100 (prevent clients from fetching 10K rows)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, integration]
+    concern: [web]
+  example_good: |
+    import base64
+    import json
+
+    @app.get("/messages")
+    async def list_messages(cursor: str | None = None, limit: int = 20):
+        limit = min(limit, 100)  # Cap at 100
+
+        if cursor:
+            decoded = json.loads(base64.b64decode(cursor))
+            rows = await db.execute(text("""
+                SELECT * FROM messages
+                WHERE (created_at, id) > (:cursor_time, :cursor_id)
+                ORDER BY created_at, id
+                LIMIT :limit
+            """), {"cursor_time": decoded["t"], "cursor_id": decoded["id"], "limit": limit})
+        else:
+            rows = await db.execute(text("""
+                SELECT * FROM messages ORDER BY created_at, id LIMIT :limit
+            """), {"limit": limit})
+
+        items = rows.all()
+        next_cursor = None
+        if len(items) == limit:
+            last = items[-1]
+            next_cursor = base64.b64encode(json.dumps(
+                {"t": last.created_at.isoformat(), "id": last.id}
+            ).encode()).decode()
+
+        return {"items": items, "next_cursor": next_cursor}
+  example_bad: |
+    @app.get("/messages")
+    async def list_messages(page: int = 1, limit: int = 20):
+        offset = (page - 1) * limit
+        # Page 5000: scans 100,000 rows, discards 99,980 — takes 5 seconds
+        rows = await db.execute(text(
+            "SELECT * FROM messages ORDER BY created_at OFFSET :offset LIMIT :limit"
+        ), {"offset": offset, "limit": limit})
+        return {"items": rows.all(), "page": page}
+  when_applies: "API pagination design, feed/timeline implementation, any endpoint returning lists of data"
+  sources: ["https://slack.engineering/evolving-api-pagination-at-slack/"]
+
+- id: INT-WIS-017
+  text: "Batch API design: accept an array of operations in a single request, process each individually, and return individual results for each item. Never make the entire batch fail because one item fails — partial success is the correct behavior."
+  why: >
+    If a batch of 100 operations fails entirely because item #47 has invalid data, the client has to
+    identify the problem, fix it, and resubmit all 100 — including the 99 that were fine. With individual
+    results, the client knows exactly which items succeeded and which failed, and only needs to fix and
+    retry the failures. Google, Stripe, and AWS all use partial-success batch APIs. A data import API
+    that failed all-or-nothing caused a customer to retry a 10,000-row import 15 times before they found
+    the 1 bad row.
+  how_to_do_right: |
+    1. Accept: POST /batch with {"operations": [{...}, {...}, ...]}
+    2. Process each operation independently (own try/except)
+    3. Return: {"results": [{"status": "success", ...}, {"status": "error", "error": {...}}, ...]}
+    4. HTTP status: 207 Multi-Status (some succeeded, some failed) or 200 if all succeeded
+    5. Limit batch size: max 100 items per request (prevent OOM and timeout)
+    6. Process in order: results[i] corresponds to operations[i]
+    7. Each operation should be idempotent (support safe retries of failed items)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, integration]
+    concern: [web]
+  example_good: |
+    from pydantic import BaseModel
+
+    class BatchOperation(BaseModel):
+        action: str
+        data: dict
+
+    class BatchRequest(BaseModel):
+        operations: list[BatchOperation]
+
+    @app.post("/batch")
+    async def batch_process(batch: BatchRequest):
+        if len(batch.operations) > 100:
+            raise HTTPException(400, "Max 100 operations per batch")
+
+        results = []
+        for i, op in enumerate(batch.operations):
+            try:
+                result = await process_single_operation(op)
+                results.append({"index": i, "status": "success", "data": result})
+            except ValidationError as e:
+                results.append({"index": i, "status": "error", "error": {"code": "validation", "message": str(e)}})
+            except Exception as e:
+                results.append({"index": i, "status": "error", "error": {"code": "internal", "message": "Processing failed"}})
+
+        all_success = all(r["status"] == "success" for r in results)
+        status_code = 200 if all_success else 207
+        return Response(
+            content=json.dumps({"results": results}),
+            status_code=status_code,
+            media_type="application/json",
+        )
+  example_bad: |
+    @app.post("/batch")
+    async def batch_process(operations: list[dict]):
+        results = []
+        for op in operations:
+            result = await process_operation(op)  # If one fails, entire batch fails with 500
+            results.append(result)
+        return results  # Client never gets partial results
+  when_applies: "Bulk operation endpoints, data import APIs, batch processing interfaces"
+  sources: ["https://google.aip.dev/233"]
+
+- id: INT-WIS-018
+  text: "Long-running operations: accept the request and return 202 Accepted with a job ID and status URL immediately. The client polls the status URL or registers a webhook for completion. Never block an HTTP request for more than 30 seconds."
+  why: >
+    HTTP requests that take minutes block threads, exhaust connection pools, and trigger client timeouts.
+    Load balancers (ALB, CloudFront) have default timeouts of 30-60 seconds. A report generation request
+    that takes 5 minutes will be killed by the load balancer, the client retries, now two reports are
+    generating. The async pattern (accept → poll/webhook → result) is how every cloud provider handles
+    long operations: AWS starts an EC2 instance and returns immediately, you poll for the running state.
+  how_to_do_right: |
+    1. Accept request: validate input, create job record, return 202 Accepted with job URL
+    2. Process in background: worker picks up job from queue, updates status as it progresses
+    3. Status endpoint: GET /jobs/{id} returns {status: "processing"|"completed"|"failed", progress: 75}
+    4. Completion: webhook callback to registered URL, or client polls status endpoint
+    5. Result: GET /jobs/{id}/result returns the output when status is "completed"
+    6. Timeout: if job does not complete in max_duration, mark as "failed" with error
+    7. Retention: keep job results for 24 hours, then clean up
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, integration]
+    concern: [web]
+  example_good: |
+    import uuid
+
+    @app.post("/reports", status_code=202)
+    async def create_report(report: ReportRequest):
+        job_id = str(uuid.uuid4())
+        await db.create_job(id=job_id, status="queued", type="report")
+        await background_queue.publish("generate_report", {
+            "job_id": job_id,
+            "params": report.dict(),
+        })
+        return {
+            "job_id": job_id,
+            "status": "queued",
+            "status_url": f"/jobs/{job_id}",
+        }
+
+    @app.get("/jobs/{job_id}")
+    async def get_job_status(job_id: str):
+        job = await db.get_job(job_id)
+        if not job:
+            raise HTTPException(404, "Job not found")
+        response = {"job_id": job_id, "status": job.status, "progress": job.progress}
+        if job.status == "completed":
+            response["result_url"] = f"/jobs/{job_id}/result"
+        elif job.status == "failed":
+            response["error"] = job.error_message
+        return response
+
+    @app.get("/jobs/{job_id}/result")
+    async def get_job_result(job_id: str):
+        job = await db.get_job(job_id)
+        if job.status != "completed":
+            raise HTTPException(409, "Job not completed yet")
+        return job.result
+  example_bad: |
+    @app.post("/reports")
+    async def create_report(report: ReportRequest):
+        # Blocks for 5 minutes — load balancer kills it at 60s
+        result = await generate_report(report)  # Takes 5 minutes
+        return result  # Client never sees this — connection already timed out
+  when_applies: "Report generation, data exports, file processing, any operation taking more than 30 seconds"
+  sources: ["https://tools.ietf.org/html/rfc7231#section-6.3.3"]
+
+- id: INT-WIS-019
+  text: "File upload pattern: generate a presigned URL for direct upload to S3, client uploads directly to S3, then notifies the backend. This keeps large files off your application servers and enables uploads of any size without server memory pressure."
+  why: >
+    Uploading a 500MB file through your API server means: 500MB in server memory, a blocked connection
+    for the duration of the upload, and the file must be re-uploaded to S3 anyway. With presigned URLs,
+    the file goes directly from client to S3 — your server is never in the data path. This is how Slack,
+    Discord, and every file-heavy application handles uploads. A startup that proxied uploads through
+    their server hit memory limits at 50 concurrent uploads of 100MB files (5GB of RAM consumed by
+    file buffers).
+  how_to_do_right: |
+    1. Client requests upload URL: POST /uploads → returns presigned S3 URL + upload_id
+    2. Client uploads directly to S3 using presigned URL (PUT request)
+    3. Client notifies backend: POST /uploads/{upload_id}/complete
+    4. Backend validates file in S3 (size, type, virus scan) and creates database record
+    5. Presigned URL expiry: 15 minutes (enough for upload, not enough for abuse)
+    6. Limit file size via presigned URL conditions (Content-Length-Range header)
+    7. Virus scan: trigger Lambda or worker to scan after upload, before making available
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, integration]
+    concern: [web]
+  example_good: |
+    import boto3
+    import uuid
+
+    s3 = boto3.client("s3")
+
+    @app.post("/uploads")
+    async def request_upload(file_info: FileUploadRequest):
+        upload_id = str(uuid.uuid4())
+        key = f"uploads/{upload_id}/{file_info.filename}"
+
+        presigned = s3.generate_presigned_url(
+            "put_object",
+            Params={
+                "Bucket": "my-uploads",
+                "Key": key,
+                "ContentType": file_info.content_type,
+            },
+            ExpiresIn=900,  # 15 minutes
+        )
+
+        await db.create_upload(id=upload_id, key=key, status="pending")
+        return {"upload_id": upload_id, "upload_url": presigned, "expires_in": 900}
+
+    @app.post("/uploads/{upload_id}/complete")
+    async def complete_upload(upload_id: str):
+        upload = await db.get_upload(upload_id)
+        # Verify file exists in S3
+        head = s3.head_object(Bucket="my-uploads", Key=upload.key)
+        if head["ContentLength"] > 100 * 1024 * 1024:  # 100MB max
+            s3.delete_object(Bucket="my-uploads", Key=upload.key)
+            raise HTTPException(413, "File too large")
+
+        await db.update_upload(upload_id, status="completed", size=head["ContentLength"])
+        await background_queue.publish("scan_file", {"upload_id": upload_id})
+        return {"status": "completed", "file_url": f"/files/{upload_id}"}
+  example_bad: |
+    @app.post("/uploads")
+    async def upload_file(file: UploadFile):
+        contents = await file.read()  # 500MB in memory
+        # Server RAM: 2GB → 50 concurrent uploads = OOM
+        s3.put_object(Bucket="my-uploads", Key=file.filename, Body=contents)
+        return {"status": "uploaded"}
+  when_applies: "File upload features, media handling, document management, any endpoint accepting large files"
+  sources: ["https://docs.aws.amazon.com/AmazonS3/latest/userguide/PresignedUrlUploadObject.html"]
+
+- id: INT-WIS-020
+  text: "Cross-service transactions use the saga pattern: each step reserves a resource (order→reserve_inventory→charge_payment→ship), and on failure, compensating actions undo previous steps in reverse order. Set a saga timeout of 30 minutes — never leave resources reserved indefinitely."
+  why: >
+    Distributed transactions (2PC) are slow, fragile, and do not scale. If the payment service is in
+    a different database than the inventory service, you cannot use a database transaction across both.
+    The saga pattern replaces transactions with a sequence of local transactions + compensating actions.
+    If step 3 fails, steps 1 and 2 are reversed via compensation (release inventory, cancel order).
+    Without sagas, partial failures leave the system in inconsistent states: inventory reserved but
+    payment failed, order created but nothing shipped.
+  how_to_do_right: |
+    1. Define saga steps: [create_order, reserve_inventory, charge_payment, schedule_shipping]
+    2. Each step has a compensating action: [cancel_order, release_inventory, refund_payment, cancel_shipping]
+    3. On step failure: execute compensating actions for all completed steps in reverse order
+    4. Saga timeout: 30 minutes — if not completed, run all compensating actions
+    5. Each step is idempotent (safe to retry) and each compensation is idempotent (safe to re-compensate)
+    6. Log saga state: which steps completed, which compensated — for debugging
+    7. Dead letter: if compensation itself fails, alert and queue for manual resolution
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [architecture, integration]
+    concern: [consistency]
+  example_good: |
+    from dataclasses import dataclass, field
+
+    @dataclass
+    class SagaStep:
+        name: str
+        execute: callable
+        compensate: callable
+
+    class OrderSaga:
+        def __init__(self):
+            self.steps = [
+                SagaStep("create_order", self._create_order, self._cancel_order),
+                SagaStep("reserve_inventory", self._reserve_inventory, self._release_inventory),
+                SagaStep("charge_payment", self._charge_payment, self._refund_payment),
+                SagaStep("schedule_shipping", self._schedule_shipping, self._cancel_shipping),
+            ]
+            self.completed_steps: list[SagaStep] = []
+
+        async def execute(self, order_data: dict) -> dict:
+            try:
+                context = {"order_data": order_data}
+                for step in self.steps:
+                    result = await asyncio.wait_for(
+                        step.execute(context), timeout=60  # Per-step timeout
+                    )
+                    context[step.name] = result
+                    self.completed_steps.append(step)
+                return {"status": "completed", "context": context}
+            except Exception as e:
+                await self._compensate(context)
+                return {"status": "failed", "error": str(e)}
+
+        async def _compensate(self, context: dict):
+            for step in reversed(self.completed_steps):
+                try:
+                    await step.compensate(context)
+                except Exception as e:
+                    logger.error("compensation_failed", step=step.name, error=str(e))
+                    await dead_letter.publish("saga.compensation_failed", {
+                        "step": step.name, "context": context,
+                    })
+  example_bad: |
+    # No saga — partial failure leaves inconsistent state
+    async def process_order(order):
+        await create_order(order)           # Step 1: succeeds
+        await reserve_inventory(order)       # Step 2: succeeds
+        await charge_payment(order)          # Step 3: FAILS
+        # Order exists, inventory reserved, payment not charged
+        # Inventory stuck in "reserved" forever — customer can't order again
+  when_applies: "Multi-service transactions, order processing, payment flows, any workflow spanning multiple services"
+  sources: ["https://microservices.io/patterns/data/saga.html"]
+
+- id: INT-WIS-021
+  text: "Service discovery: use DNS-based discovery for static services (load balancer + DNS record), and a service mesh (Consul, Istio) for dynamic environments where services scale up/down frequently. Never hardcode service URLs in application code."
+  why: >
+    Hardcoded URLs (http://10.0.1.5:8080) break when the service moves, scales, or fails over. DNS-based
+    discovery (http://user-service.internal) is simple and works for most cases — the load balancer handles
+    health checks and routing. A service mesh adds: automatic retries, circuit breaking, mTLS, and
+    traffic splitting — but at the cost of sidecar proxies and operational complexity. Start with DNS,
+    add a mesh when you need traffic management features that DNS cannot provide.
+  how_to_do_right: |
+    1. Use environment variables for service URLs: USER_SERVICE_URL=http://user-service.internal
+    2. DNS-based: each service has a DNS record pointing to its load balancer
+    3. Service mesh: add when you need mTLS, canary routing, or cross-service circuit breaking
+    4. Never hardcode IPs — services move, scale, and failover
+    5. Health checks at the load balancer: remove unhealthy instances from DNS/routing
+    6. Client-side: retry with circuit breaker, do not depend on discovery being perfect
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [operations, integration]
+    concern: [failure]
+  example_good: |
+    import os
+
+    # Service URLs from environment — never hardcoded
+    USER_SERVICE = os.getenv("USER_SERVICE_URL", "http://user-service.internal")
+    PAYMENT_SERVICE = os.getenv("PAYMENT_SERVICE_URL", "http://payment-service.internal")
+
+    async def get_user(user_id: int):
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{USER_SERVICE}/users/{user_id}")
+            return resp.json()
+  example_bad: |
+    # Hardcoded IP addresses — breaks on any infrastructure change
+    async def get_user(user_id: int):
+        resp = await httpx.get(f"http://10.0.1.5:8080/users/{user_id}")
+        return resp.json()
+    # Server gets new IP → all callers break → manual update in 20 files
+  when_applies: "Microservice architecture, service-to-service communication, infrastructure design"
+  sources: ["https://microservices.io/patterns/service-registry.html"]
+
+- id: INT-WIS-022
+  text: "Feature flag lifecycle: create flag → test in staging → enable for 1% → enable for 10% → enable for 50% → enable for 100% → remove flag code → remove flag from system. Every flag must have an owner and a planned removal date. Stale flags are technical debt."
+  why: >
+    Feature flags without lifecycle management accumulate as dead code. A codebase with 200 feature flags
+    where nobody knows which are active is worse than no feature flags at all — every code path has
+    conditional branches, testing becomes combinatorial, and bugs hide behind flags. A team had a bug
+    that only manifested when flag A was on AND flag B was off — a combination nobody tested. The
+    lifecycle ensures flags are temporary tools, not permanent complexity. Flag removal is as important
+    as flag creation.
+  how_to_do_right: |
+    1. Create flag with: name, owner, planned_removal_date, description
+    2. Test in staging: verify both on and off paths work correctly
+    3. Gradual rollout: 1% → 10% → 50% → 100% with metrics monitoring at each step
+    4. At 100%: wait 2 weeks for stability, then schedule code removal
+    5. Remove: delete if/else branches, keep only the "on" path, remove flag from system
+    6. Audit quarterly: any flag older than 3 months without activity → owner must justify or remove
+    7. Max active flags: 20 per service (hard limit — forces cleanup)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [deployment, integration]
+    concern: [decision_making]
+  example_good: |
+    # Feature flag with metadata and lifecycle
+    class FeatureFlag:
+        def __init__(self, name: str, owner: str, removal_date: str):
+            self.name = name
+            self.owner = owner
+            self.removal_date = removal_date
+
+    # Usage with clear lifecycle intent
+    NEW_SCORING = FeatureFlag("new_scoring_v2", "alice@company.com", "2026-04-01")
+
+    async def get_score(claim_id: int):
+        if await flags.is_enabled(NEW_SCORING.name, rollout_percentage=10):
+            return await new_scoring_v2(claim_id)
+        return await legacy_scoring(claim_id)
+
+    # After 100% rollout and 2 weeks stable:
+    # Remove the flag, keep only new_scoring_v2
+    async def get_score(claim_id: int):
+        return await new_scoring_v2(claim_id)
+  example_bad: |
+    # Flags without lifecycle — accumulate as dead code
+    if feature_flags.get("new_ui"):  # Created 2 years ago, nobody knows if it's still needed
+        if feature_flags.get("new_ui_v2"):  # Created 1 year ago
+            if feature_flags.get("new_ui_v2_fix"):  # Created 6 months ago
+                render_new_ui_v2_fixed()
+    # 3 nested flags, 8 possible combinations, only 1 is tested
+  when_applies: "Feature flag implementation, release management, gradual rollout planning"
+  sources: ["https://martinfowler.com/articles/feature-toggles.html"]
+
+- id: INT-WIS-023
+  text: "API documentation: use OpenAPI (Swagger) spec as the single source of truth for your API contract. Generate client SDKs from the spec. FastAPI generates OpenAPI automatically — leverage this instead of maintaining separate documentation."
+  why: >
+    Manual API documentation drifts from the actual implementation within weeks. A client reads the
+    docs, sends a request with the documented format, and gets a 422 because the actual API expects
+    different fields. OpenAPI as source of truth means: the spec IS the code (in FastAPI), clients
+    can auto-generate SDK code, and contract tests verify the spec matches reality. Teams that generate
+    SDKs from OpenAPI specs report 60% fewer integration bugs because clients and servers agree on the
+    contract by construction.
+  how_to_do_right: |
+    1. FastAPI: define Pydantic models → OpenAPI spec is generated automatically
+    2. Serve docs at /docs (Swagger UI) and /redoc (ReDoc) — FastAPI does this by default
+    3. Export spec: GET /openapi.json → use for client SDK generation
+    4. Generate client SDKs: openapi-generator for TypeScript, Python, Java, etc.
+    5. Contract tests: validate that spec matches actual API behavior (use schemathesis)
+    6. Version the spec: /v1/openapi.json, /v2/openapi.json
+    7. Never maintain separate Markdown docs for API endpoints — they will drift
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [api, integration]
+    concern: [web]
+  example_good: |
+    from pydantic import BaseModel, Field
+    from fastapi import FastAPI
+
+    app = FastAPI(
+        title="My API",
+        version="1.0.0",
+        description="API documentation auto-generated from code",
+    )
+
+    class UserCreate(BaseModel):
+        """Create a new user."""
+        name: str = Field(..., min_length=1, max_length=100, description="User's display name")
+        email: str = Field(..., description="User's email address")
+
+    class UserResponse(BaseModel):
+        """User resource."""
+        id: int = Field(..., description="Unique user identifier")
+        name: str
+        email: str
+        created_at: str = Field(..., description="ISO 8601 timestamp")
+
+    @app.post("/users", response_model=UserResponse, status_code=201,
+              summary="Create a user", tags=["users"])
+    async def create_user(user: UserCreate):
+        """Create a new user. Returns the created user with server-generated fields."""
+        ...
+
+    # OpenAPI spec auto-generated at /openapi.json
+    # Swagger UI at /docs
+    # ReDoc at /redoc
+  example_bad: |
+    # Separate Markdown docs maintained manually
+    # docs/api.md says: POST /users expects {"username": "str"}
+    # Actual code expects: {"name": "str", "email": "str"}
+    # Client follows docs → gets 422 → files bug report → 2 hours wasted
+  when_applies: "API design, documentation setup, client SDK generation, developer experience"
+  sources: ["https://fastapi.tiangolo.com/tutorial/metadata/"]
+
+- id: INT-WIS-024
+  text: "Dependency management: lock all dependency versions in a lockfile, audit for vulnerabilities monthly, auto-update patch versions, and manually review minor/major upgrades. A single unpatched dependency is how most breaches start."
+  why: >
+    The Log4Shell vulnerability (CVE-2021-44228) affected millions of applications because teams did not
+    know they had log4j as a transitive dependency. Without locked versions, a build on Monday works
+    differently from a build on Tuesday because a dependency released a new version. Without auditing,
+    known vulnerabilities sit in your dependency tree for months. A financial services company was breached
+    through an unpatched npm package — the vulnerability had a patch for 6 months, but nobody ran
+    npm audit.
+  how_to_do_right: |
+    1. Lock versions: poetry.lock (Python), package-lock.json (Node) — commit to git
+    2. Audit monthly: pip-audit, npm audit, snyk, or GitHub Dependabot
+    3. Auto-update patches: dependabot/renovate for patch versions (1.2.3 → 1.2.4)
+    4. Manual review for minor/major: read changelog, check breaking changes, run tests
+    5. Block PRs with critical CVEs: CI pipeline checks for known vulnerabilities
+    6. Track transitive dependencies: know what your dependencies depend on
+    7. Prefer dependencies with: active maintenance, >1000 stars, recent commits, clear license
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [security, integration]
+    concern: [failure]
+  example_good: |
+    # pyproject.toml: pin to compatible ranges
+    # [tool.poetry.dependencies]
+    # fastapi = "^0.109.0"     # Compatible updates within 0.109.x
+    # pydantic = "^2.6.0"      # Compatible updates within 2.x
+    # sqlalchemy = "^2.0.25"   # Compatible updates within 2.x
+
+    # CI pipeline: audit on every PR
+    # .github/workflows/security.yml
+    # - name: Audit dependencies
+    #   run: |
+    #     pip install pip-audit
+    #     pip-audit --strict --fix  # Fail on known vulnerabilities
+
+    # Dependabot auto-updates patches
+    # .github/dependabot.yml
+    # updates:
+    #   - package-ecosystem: pip
+    #     schedule:
+    #       interval: weekly
+    #     open-pull-requests-limit: 10
+  example_bad: |
+    # requirements.txt with no version pins
+    # fastapi
+    # sqlalchemy
+    # pydantic
+    # Build today: works. Build tomorrow: broken because pydantic released 3.0
+    # No audit: CVE in a transitive dependency sits unpatched for 8 months
+  when_applies: "Project setup, security hardening, CI/CD pipeline configuration, dependency updates"
+  sources: ["https://docs.github.com/en/code-security/dependabot/dependabot-version-updates"]
+
+- id: INT-WIS-025
+  text: "Monitor integration points with three alerts: error rate exceeding 1% over 5 minutes, latency p99 exceeding 2 seconds, and throughput dropping more than 30% compared to the same hour yesterday. These three signals catch 90% of integration failures before users report them."
+  why: >
+    Integration points (external APIs, databases, message queues) are where most production incidents
+    originate. A downstream API starts returning 500s, but without alerting, nobody notices until
+    customers complain 30 minutes later. Latency increases gradually (p99 goes from 500ms to 5s) but
+    averages look fine — p99 alerting catches this. Throughput drops because a queue consumer crashed,
+    but no errors are logged — throughput alerting catches silent failures. These three signals provide
+    comprehensive coverage with minimal alert fatigue.
+  how_to_do_right: |
+    1. Error rate alert: if error_count / total_count > 1% for 5 consecutive minutes → page
+    2. Latency alert: if p99 latency > 2s for 5 consecutive minutes → page
+    3. Throughput alert: if requests_per_minute < 70% of same_hour_yesterday → warn
+    4. Per integration point: each external API, database, queue gets its own set of 3 alerts
+    5. Dashboard: show all integration health on one screen (green/yellow/red)
+    6. Runbook: each alert links to a runbook with diagnosis steps
+    7. Suppress during maintenance windows to prevent false alerts
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [observability, integration]
+    concern: [metrics, dashboards]
+  example_good: |
+    from prometheus_client import Counter, Histogram, Gauge
+
+    # Metrics per integration point
+    integration_requests = Counter(
+        "integration_requests_total",
+        "Total requests to integration",
+        ["service", "method", "status"],
+    )
+    integration_latency = Histogram(
+        "integration_latency_seconds",
+        "Latency of integration calls",
+        ["service", "method"],
+        buckets=[0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
+    )
+
+    async def call_with_metrics(service: str, method: str, func, *args, **kwargs):
+        with integration_latency.labels(service=service, method=method).time():
+            try:
+                result = await func(*args, **kwargs)
+                integration_requests.labels(service=service, method=method, status="success").inc()
+                return result
+            except Exception as e:
+                integration_requests.labels(service=service, method=method, status="error").inc()
+                raise
+
+    # Usage
+    user = await call_with_metrics(
+        "user-service", "get_user",
+        httpx_client.get, f"{USER_SERVICE}/users/{user_id}"
+    )
+
+    # Prometheus alert rules:
+    # - alert: IntegrationHighErrorRate
+    #   expr: rate(integration_requests_total{status="error"}[5m]) / rate(integration_requests_total[5m]) > 0.01
+    #   for: 5m
+    # - alert: IntegrationHighLatency
+    #   expr: histogram_quantile(0.99, rate(integration_latency_seconds_bucket[5m])) > 2
+    #   for: 5m
+  example_bad: |
+    # No monitoring on integration points
+    async def call_payment_service(payment):
+        return await httpx.post(PAYMENT_URL, json=payment)
+    # Payment service returns 500 for 30 minutes
+    # Nobody notices until customers call support
+    # No metrics → can't tell when it started or how many requests were affected
+  when_applies: "Production monitoring setup, integration health dashboards, SRE practices, incident prevention"
+  sources: ["https://sre.google/sre-book/monitoring-distributed-systems/"]

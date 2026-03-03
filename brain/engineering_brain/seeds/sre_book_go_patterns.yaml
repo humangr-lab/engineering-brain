@@ -1,0 +1,239 @@
+layer: rules
+technology: Go
+domain: reliability
+knowledge:
+- id: CR-SRE-GO-001
+  text: Go's goroutine leaks are the equivalent of memory leaks — a goroutine that blocks forever on a channel read or HTTP
+    call consumes memory and a stack slot. Monitor goroutine count as a primary health metric. A growing goroutine count without
+    growing traffic is a leak.
+  why: 'Google developed Go for exactly the kind of concurrent, networked services that SRE manages. Goroutines are lightweight
+    (~2KB initial stack) but not free. A leaked goroutine: consumes memory (stack grows under load), holds references to objects
+    (preventing GC), and may hold locks or connections (causing contention). Common leak patterns: goroutine reads from a
+    channel that nobody writes to (blocks forever), goroutine makes an HTTP request without a timeout (blocks if server never
+    responds), goroutine in a select without a done channel (no way to signal cancellation). At 100 QPS with a 0.1% leak rate,
+    0.1 goroutines leak per second = 360/hour = 8640/day. With 8KB per goroutine, that''s 67MB/day of leaked memory.
+
+    '
+  how_to_do_right: '1. Monitor runtime.NumGoroutine() as a health metric. Alert if goroutine count grows continuously without
+    traffic growth.
+
+    2. Use context.Context for cancellation: every goroutine should accept a context and check ctx.Done() to exit cleanly.
+
+    3. Every HTTP request must have a timeout: http.Client{Timeout: 10 * time.Second}. No unbounded network calls.
+
+    4. Every channel operation should have a select with ctx.Done(): `select { case msg := <-ch: ... case <-ctx.Done(): return
+    }`.
+
+    5. Use goleak in tests: `goleak.VerifyNone(t)` detects goroutine leaks in unit tests.
+
+    6. Profile goroutines in production: `runtime/pprof` goroutine profile shows where goroutines are blocked.
+
+    '
+  example_good: "func worker(ctx context.Context, ch <-chan Job) {\n    for {\n        select {\n        case job := <-ch:\n            process(job)\n        case <-ctx.Done():\n            return // Exits cleanly when context is canceled\n        }\n    }\n}\n\nfunc main() {\n    ctx, cancel := context.WithCancel(context.Background())\n    defer cancel()\n    ch := make(chan Job)\n    go worker(ctx, ch)\n    // When done, cancel() signals the goroutine to exit\n}\n"
+  example_bad: "func worker(ch <-chan Job) {\n    for {\n        job := <-ch // Blocks forever if nobody sends on ch\n        process(job) // No context, no cancellation, goroutine leaks\n    }\n}\n\nfunc main() {\n    ch := make(chan Job)\n    go worker(ch) // Leaked goroutine — no way to stop it\n}\n"
+  when_applies: "When launching goroutines that read from channels, make HTTP calls, or perform any blocking I/O operation."
+  severity: high
+  technologies:
+    lang: [general, go]
+    platform: [kubernetes]
+  domains:
+    domain: [code_quality, performance, reliability]
+    concern: [concurrency]
+  sources:
+  - url: https://sre.google/sre-book/software-engineering-in-sre/
+    title: 'Google SRE Book — Chapter 18: Software Engineering in SRE'
+  validation_status: cross_checked
+- id: CR-SRE-GO-002
+  text: 'Go error handling — always check errors, never ignore them with `_`. An ignored error is a silent failure. The `if
+    err != nil { return err }` pattern is verbose but correct. Wrapping errors with `fmt.Errorf("context: %w", err)` preserves
+    the chain for debugging.'
+  why: 'Go''s explicit error handling is a deliberate design choice that aligns with SRE''s preference for explicit failure
+    handling over exception-based implicit propagation. The danger of `_`: `result, _ := doSomething()` — if doSomething fails,
+    result is zero-value (empty string, 0, nil), and the program continues with incorrect data. This is worse than a crash
+    because: the system appears to work (no error, no panic), the output is wrong (zero-value propagates), and the bug is
+    nearly impossible to trace (no error message, no stack trace). Google''s Go style guide mandates: every error must be
+    either handled (logged, retried, returned with context) or explicitly documented as intentionally ignored (rare).
+
+    '
+  how_to_do_right: '1. Always check errors: if err != nil { return fmt.Errorf("doing X: %w", err) }. Never use _ for errors.
+
+    2. Wrap errors with context: fmt.Errorf("fetching user %d: %w", userID, err). Each layer adds context to the chain.
+
+    3. Use errors.Is() and errors.As() for type checking: don''t use string matching on error messages.
+
+    4. Define sentinel errors for expected conditions: var ErrNotFound = errors.New("not found"). Check with errors.Is(err,
+    ErrNotFound).
+
+    5. Log errors at the top level (handler), not at every layer. Wrapping preserves the chain; logging at every layer creates
+    duplicate logs.
+
+    6. Use linters: errcheck detects ignored errors. golangci-lint includes errcheck by default.
+
+    '
+  example_good: "func GetUser(ctx context.Context, id int) (*User, error) {\n    row, err := db.QueryRowContext(ctx, \"SELECT * FROM users WHERE id=$1\", id)\n    if err != nil {\n        return nil, fmt.Errorf(\"fetching user %d: %w\", id, err)\n    }\n    var u User\n    if err := row.Scan(&u.ID, &u.Name); err != nil {\n        if errors.Is(err, sql.ErrNoRows) {\n            return nil, ErrNotFound\n        }\n        return nil, fmt.Errorf(\"scanning user %d: %w\", id, err)\n    }\n    return &u, nil\n}\n"
+  example_bad: "func GetUser(id int) *User {\n    row, _ := db.QueryRow(\"SELECT * FROM users WHERE id=$1\", id) // Error ignored!\n    var u User\n    row.Scan(&u.ID, &u.Name) // Error ignored! u may be zero-value\n    return &u // Returns empty user with no indication of failure\n}\n"
+  when_applies: "When writing any Go function that calls a method returning an error value."
+  severity: high
+  technologies:
+    lang: [general, go]
+  domains:
+    domain: [code_quality, reliability]
+    concern: [error_handling]
+  sources:
+  - url: https://sre.google/sre-book/simplicity/
+    title: 'Google SRE Book — Chapter 9: Simplicity'
+  validation_status: cross_checked
+- id: CR-SRE-GO-003
+  text: Go's context.Context must propagate through every function call that does I/O or may block — HTTP handlers, database
+    queries, RPC calls, and goroutines. Without context propagation, there is no way to cancel in-flight work when the client
+    disconnects or a deadline expires.
+  why: 'Google designed Go''s context package specifically for the deadline propagation and cancellation patterns described
+    in the SRE Book (Chapter 21). Without context: client disconnects → server continues processing the request → server finishes
+    and tries to respond → write to closed connection fails → wasted work. With context: client disconnects → context is canceled
+    → all in-flight operations (database queries, RPC calls, goroutines) detect cancellation via ctx.Done() → work is abandoned
+    immediately → resources freed. Context also carries deadlines: if the original request has a 5-second deadline and 3 seconds
+    are spent in service A, service B receives a context with 2 seconds remaining — not a fresh timeout.
+
+    '
+  how_to_do_right: '1. Every function that does I/O must accept context.Context as its first parameter: func GetUser(ctx context.Context,
+    id int) (*User, error).
+
+    2. Pass the request context to all downstream calls: db.QueryContext(ctx, ...), http.NewRequestWithContext(ctx, ...).
+
+    3. Check context cancellation in long-running loops: if ctx.Err() != nil { return ctx.Err() }.
+
+    4. Set deadlines at the edge: ctx, cancel := context.WithTimeout(ctx, 10*time.Second). Always defer cancel().
+
+    5. Never store context in structs: pass it as a function parameter. Storing it breaks the lifecycle model.
+
+    6. Use context values sparingly: only for request-scoped data (trace ID, user ID). Never for optional parameters.
+
+    '
+  example_good: "func HandleRequest(w http.ResponseWriter, r *http.Request) {\n    ctx := r.Context() // Propagate request context\n    ctx, cancel := context.WithTimeout(ctx, 10*time.Second)\n    defer cancel() // Always defer cancel\n\n    user, err := userService.GetUser(ctx, userID) // Context passed\n    if err != nil {\n        if ctx.Err() == context.DeadlineExceeded {\n            http.Error(w, \"request timeout\", http.StatusGatewayTimeout)\n            return\n        }\n        http.Error(w, \"internal error\", http.StatusInternalServerError)\n        return\n    }\n    json.NewEncoder(w).Encode(user)\n}\n"
+  example_bad: "func HandleRequest(w http.ResponseWriter, r *http.Request) {\n    // Context not propagated — no cancellation, no deadline\n    user, err := userService.GetUser(userID) // No context!\n    if err != nil {\n        http.Error(w, \"error\", 500)\n        return\n    }\n    // If client disconnects, server keeps processing wastefully\n    json.NewEncoder(w).Encode(user)\n}\n"
+  when_applies: "When writing any Go function that performs I/O, makes RPC calls, queries a database, or may block."
+  severity: high
+  technologies:
+    lang: [general, go]
+    platform: [grpc]
+  domains:
+    domain: [code_quality, reliability]
+    concern: [concurrency, fault_tolerance, timeout]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-GO-004
+  text: Go's defer for resource cleanup is mandatory — database connections, file handles, HTTP response bodies, and mutexes
+    must be deferred for release immediately after acquisition. A missing defer creates a resource leak that manifests as
+    connection pool exhaustion or file descriptor exhaustion.
+  why: 'Go''s defer statement guarantees cleanup when the function returns — whether normally, by return, or by panic. Without
+    defer: code that opens a resource and closes it at the end of the function leaks the resource if any code path between
+    open and close returns early or panics. In a web service processing 1000 QPS, a 0.1% leak rate (1 per second) exhausts
+    a 100-connection database pool in under 2 minutes. The pattern is: acquire resource → defer release → use resource. This
+    is Go''s equivalent of Python''s context managers or Java''s try-with-resources.
+
+    '
+  how_to_do_right: '1. Database connections: conn, err := db.Conn(ctx); if err != nil { return err }; defer conn.Close().
+
+    2. HTTP response bodies: resp, err := http.Get(url); if err != nil { return err }; defer resp.Body.Close().
+
+    3. File handles: f, err := os.Open(path); if err != nil { return err }; defer f.Close().
+
+    4. Mutexes: mu.Lock(); defer mu.Unlock(). Never lock without deferred unlock.
+
+    5. Defer IMMEDIATELY after successful acquisition — before any code that could return or panic.
+
+    6. Be aware of defer in loops: defer inside a loop defers until the function returns, not the loop iteration. Use a closure
+    or explicit close in loops.
+
+    '
+  example_good: "func fetchData(ctx context.Context, url string) ([]byte, error) {\n    resp, err := http.Get(url)\n    if err != nil {\n        return nil, fmt.Errorf(\"fetching %s: %w\", url, err)\n    }\n    defer resp.Body.Close() // Deferred IMMEDIATELY after successful acquisition\n\n    body, err := io.ReadAll(resp.Body)\n    if err != nil {\n        return nil, fmt.Errorf(\"reading body from %s: %w\", url, err)\n    }\n    return body, nil\n}\n"
+  example_bad: "func fetchData(url string) ([]byte, error) {\n    resp, err := http.Get(url)\n    if err != nil {\n        return nil, err\n    }\n    // No defer resp.Body.Close()!\n    body, err := io.ReadAll(resp.Body)\n    if err != nil {\n        return nil, err // Body never closed — connection leaked\n    }\n    resp.Body.Close() // Only closed on success path — leaks on error\n    return body, nil\n}\n"
+  when_applies: "When acquiring any resource in Go — database connections, file handles, HTTP response bodies, mutexes, or network connections."
+  severity: high
+  technologies:
+    lang: [general, go]
+  domains:
+    domain: [code_quality, reliability]
+    concern: [resource_management]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-GO-005
+  text: Go HTTP servers must set explicit timeouts — ReadTimeout, WriteTimeout, and IdleTimeout. The default Go HTTP server
+    has NO timeouts, meaning a slow client can hold a connection open indefinitely, eventually exhausting all available connections.
+  why: 'Go''s net/http server defaults to zero timeouts (wait forever), which is appropriate for development but dangerous
+    in production. Without timeouts: a slow client (or an attacker using Slowloris) sends data one byte at a time, holding
+    the connection open. Each slow connection consumes a goroutine and a file descriptor. With 10,000 slow connections, the
+    server has 10,000 blocked goroutines and hits the file descriptor limit. New legitimate connections are rejected. Google
+    mandates explicit timeouts on all network operations because unbounded waits are the primary cause of resource exhaustion.
+
+    '
+  how_to_do_right: '1. Set all three timeouts: ReadTimeout (time to read the full request), WriteTimeout (time to write the
+    full response), IdleTimeout (time a keep-alive connection stays open).
+
+    2. Typical values: ReadTimeout=5s, WriteTimeout=10s, IdleTimeout=120s. Adjust based on your API characteristics.
+
+    3. For file upload endpoints: use ReadHeaderTimeout (short, 5s) separately from ReadTimeout (longer, for body).
+
+    4. Use http.TimeoutHandler for per-handler timeouts: wraps a handler with a deadline, returning 503 if exceeded.
+
+    5. Set client-side timeouts too: http.Client{Timeout: 30 * time.Second}. This covers the entire request lifecycle.
+
+    6. Monitor timeout events: log when requests hit timeouts. Frequent timeouts indicate either slow clients or an undersized
+    server.
+
+    '
+  example_good: "srv := &http.Server{\n    Addr:              \":8080\",\n    ReadTimeout:       5 * time.Second,\n    WriteTimeout:      10 * time.Second,\n    IdleTimeout:       120 * time.Second,\n    ReadHeaderTimeout: 2 * time.Second,\n}\nlog.Fatal(srv.ListenAndServe())\n"
+  example_bad: "// Default Go HTTP server — NO timeouts at all\nhttp.ListenAndServe(\":8080\", handler)\n// A slow client (or Slowloris attacker) holds connections open forever,\n// eventually exhausting file descriptors and blocking all new connections.\n"
+  when_applies: "When creating any Go HTTP server that will be exposed to external or untrusted traffic in production."
+  severity: high
+  technologies:
+    lang: [general, go]
+  domains:
+    domain: [quality, reliability, security]
+    concern: [code, network]
+  sources:
+  - url: https://sre.google/sre-book/handling-overload/
+    title: 'Google SRE Book — Chapter 21: Handling Overload'
+  validation_status: cross_checked
+- id: CR-SRE-GO-006
+  text: Go's race detector (-race flag) must be used in CI — data races in Go are undefined behavior that can corrupt memory,
+    produce wrong results, and crash the process. The race detector finds races at runtime by instrumenting memory accesses.
+  why: 'Google mandates race detector usage in Go testing because data races are among the most dangerous bugs in concurrent
+    programs. A data race occurs when two goroutines access the same variable concurrently and at least one access is a write.
+    The consequences are undefined: the program may work correctly 99% of the time and corrupt data 1% of the time, making
+    the bug nearly impossible to reproduce. Go''s race detector instruments memory accesses at compile time and detects races
+    at runtime. It slows execution by 2-10x (acceptable for tests, not for production) but catches races that no amount of
+    code review can find. Google runs all Go tests with -race in CI.
+
+    '
+  how_to_do_right: '1. Run tests with race detector: go test -race ./... in every CI pipeline.
+
+    2. Treat race detector findings as critical bugs: fix immediately, don''t suppress.
+
+    3. Use sync.Mutex or sync.RWMutex for shared state. Prefer RWMutex when reads >> writes.
+
+    4. Use channels for communication between goroutines. Prefer "share memory by communicating" over "communicate by sharing
+    memory."
+
+    5. Use sync.Map for concurrent map access, or protect maps with a mutex. Maps are NOT safe for concurrent use.
+
+    6. Use atomic operations (sync/atomic) for simple counters and flags. Atomic is faster than mutex for single-value access.
+
+    '
+  example_good: "// Protect shared state with a mutex\ntype Counter struct {\n    mu    sync.Mutex\n    count int\n}\n\nfunc (c *Counter) Increment() {\n    c.mu.Lock()\n    defer c.mu.Unlock()\n    c.count++\n}\n\n// CI pipeline: go test -race ./...\n// goleak.VerifyNone(t) in every test\n"
+  example_bad: "// Unprotected shared state — data race!\ntype Counter struct {\n    count int // No mutex\n}\n\nfunc (c *Counter) Increment() {\n    c.count++ // Two goroutines writing concurrently = undefined behavior\n}\n\n// Tests run without -race flag — race never detected\n// go test ./...  (missing -race)\n"
+  when_applies: "When writing Go code with any concurrent access to shared state, and when configuring CI pipelines for Go projects."
+  severity: high
+  technologies:
+    lang: [general, go]
+  domains:
+    domain: [code_quality, reliability, testing]
+    concern: [concurrency]
+  sources:
+  - url: https://sre.google/sre-book/testing-reliability/
+    title: 'Google SRE Book — Chapter 17: Testing for Reliability'
+  validation_status: cross_checked

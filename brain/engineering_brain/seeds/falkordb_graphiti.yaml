@@ -1,0 +1,959 @@
+layer: rules
+domain: databases
+knowledge:
+- id: FALK-001
+  text: >
+    Connect to FalkorDB via redis-py or the official falkordb-py client using a Redis URI.
+    FalkorDB runs as a Redis module, so all graph commands are dispatched through the Redis
+    protocol. Use the FalkorDB Python client (falkordb-py) for typed Graph objects; fall back
+    to redis-py only when the typed client is unavailable. Never use Neo4j Bolt drivers — they
+    are incompatible with FalkorDB despite both databases using Cypher.
+  why: >
+    FalkorDB is NOT a standalone process; it is a Redis module exposing GRAPH.QUERY, GRAPH.EXPLAIN,
+    and GRAPH.BULK commands via the Redis command interface. Attempts to connect with Neo4j drivers
+    will fail at the TCP handshake level because FalkorDB does not implement the Bolt binary protocol.
+    The falkordb-py client wraps redis-py and provides Graph, Node, and Edge typed responses,
+    preventing raw string parsing bugs that cause silent data corruption.
+  how_to_do_right: |
+    1. pip install falkordb  # installs falkordb-py + redis-py
+    2. from falkordb import FalkorDB
+    3. db = FalkorDB(host="localhost", port=6379, password=os.getenv("REDIS_PASSWORD"))
+    4. graph = db.select_graph("my_graph")  # creates or opens named graph
+    5. result = graph.query("MATCH (n) RETURN n LIMIT 10")
+    6. For connection pools: pass connection_pool=redis.ConnectionPool(...) to FalkorDB()
+    7. Verify connection: graph.query("RETURN 1") — should not raise
+    8. For TLS: use ssl=True, ssl_certfile=, ssl_keyfile= in the constructor
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [redis, falkordb]
+  domains:
+    domain: [databases, graph_databases]
+    concern: [connectivity, configuration]
+  example_good: |
+    import os
+    from falkordb import FalkorDB
+
+    # Correct: use falkordb-py, not Neo4j driver
+    db = FalkorDB(
+        host=os.getenv("FALKORDB_HOST", "localhost"),
+        port=int(os.getenv("FALKORDB_PORT", 6379)),
+        password=os.getenv("FALKORDB_PASSWORD"),
+    )
+    graph = db.select_graph("knowledge_graph")
+
+    # Health check
+    graph.query("RETURN 1 AS ok")
+    print("FalkorDB connected")
+  example_bad: |
+    # WRONG: Neo4j driver fails silently or with confusing handshake errors
+    from neo4j import GraphDatabase
+
+    driver = GraphDatabase.driver("bolt://localhost:7687")  # Bolt != FalkorDB protocol
+    # ConnectionError: [Errno 111] Connection refused OR protocol mismatch
+  when_applies: >
+    Any Python service initializing a FalkorDB connection, including Graphiti-based agents
+    and direct graph query services.
+  sources:
+    - "FalkorDB Python Client Documentation — https://docs.falkordb.com/clients/python.html"
+    - "FalkorDB Getting Started — https://docs.falkordb.com/getting-started/"
+    - "GitHub: falkordb/falkordb-py — https://github.com/FalkorDB/falkordb-py"
+
+- id: FALK-002
+  text: >
+    Always create range indexes on high-cardinality node and relationship properties before
+    running production workloads. FalkorDB index creation is NOT concurrent by default — it
+    blocks the graph for its duration. Create indexes at graph initialization time (before
+    data load) or during a maintenance window, never on live traffic.
+  why: >
+    Without indexes, MATCH queries on node properties perform full graph scans. On a graph with
+    100K nodes, an unindexed MATCH (n:Person {email: $email}) scans all Person nodes. With an
+    index, the lookup is O(log n). FalkorDB index creation acquires an exclusive lock on the
+    graph, meaning in-flight queries are blocked until the index build completes. A range index
+    on 1M nodes can take 10–30 seconds, causing a full availability gap in production.
+  how_to_do_right: |
+    1. Create range index: CALL db.idx.create.range("Person", "email")
+    2. Create fulltext index: CALL db.idx.create.fulltext("Document", ["title", "body"])
+    3. Create vector index: CALL db.idx.create.vector("Chunk", "embedding", 1536, "cosine")
+    4. List existing indexes: CALL db.indexes()
+    5. Drop index: CALL db.idx.delete.range("Person", "email")
+    6. Build order: create index BEFORE bulk loading data (index auto-populates during load)
+    7. In code: check if index exists (db.indexes()) before calling create to avoid duplicates
+  severity: high
+  technologies:
+    lang: [python, cypher]
+    framework: [falkordb]
+  domains:
+    domain: [databases, performance]
+    concern: [indexing, query_performance]
+  example_good: |
+    from falkordb import FalkorDB
+
+    db = FalkorDB(host="localhost", port=6379)
+    graph = db.select_graph("knowledge_graph")
+
+    # Check existing indexes first to avoid re-creation errors
+    existing = {idx["label"] + "." + idx["properties"][0]
+                for idx in graph.query("CALL db.indexes()").result_set}
+
+    if "Person.email" not in existing:
+        graph.query("CALL db.idx.create.range('Person', 'email')")
+        print("Index created: Person.email")
+
+    # After index creation, queries are fast:
+    result = graph.query(
+        "MATCH (p:Person {email: $email}) RETURN p",
+        {"email": "alice@example.com"}
+    )
+  example_bad: |
+    # WRONG: Query without index on large graph — full scan, 10s+ latency
+    result = graph.query(
+        "MATCH (p:Person) WHERE p.email = 'alice@example.com' RETURN p"
+    )
+    # Also wrong: creating index at runtime under live traffic
+    # causes exclusive lock, blocking all concurrent queries
+    graph.query("CALL db.idx.create.range('Person', 'email')")
+  when_applies: >
+    Graph initialization scripts, migration procedures, and any time a new node label or
+    property is introduced that will be used in MATCH WHERE conditions.
+  sources:
+    - "FalkorDB Indexing Documentation — https://docs.falkordb.com/indexing.html"
+    - "FalkorDB Cypher Functions — https://docs.falkordb.com/cypher/functions.html"
+
+- id: FALK-003
+  text: >
+    Use MERGE instead of CREATE when inserting nodes or relationships that must be idempotent.
+    MERGE matches the pattern if it exists or creates it if it does not, and it requires a
+    property that uniquely identifies the node within its label. Always specify the merge key
+    as the minimum identifying property set; add all other properties in ON CREATE SET or
+    ON MATCH SET clauses to avoid partial-property merge traps.
+  why: >
+    Using CREATE in an import pipeline that may run multiple times will produce duplicate nodes.
+    In knowledge graphs, duplicate Person("Alice") nodes cause bifurcated relationship traversals
+    — agent A connects to one Alice, agent B to another — splitting the graph's semantic coherence.
+    MERGE with an under-specified key (e.g., MERGE (p:Person {name: "Alice", city: "NYC"}))
+    will create duplicates when the same person appears with a different city. We saw this in
+    production: 3,000 duplicate entity nodes after a failed idempotent re-import.
+  how_to_do_right: |
+    1. Identify the minimum unique key for each label (e.g., Person.email, Entity.uuid)
+    2. MERGE on that key only: MERGE (p:Person {email: $email})
+    3. Set other properties in ON CREATE SET / ON MATCH SET:
+       ON CREATE SET p.name = $name, p.created_at = timestamp()
+       ON MATCH SET p.name = $name, p.updated_at = timestamp()
+    4. For relationships: MERGE (a)-[r:KNOWS]->(b) ON CREATE SET r.since = timestamp()
+    5. Never MERGE on mutable properties (name, status) — only on immutable IDs
+    6. Create a range index on the merge key BEFORE running MERGE at scale
+  severity: high
+  technologies:
+    lang: [python, cypher]
+    framework: [falkordb]
+  domains:
+    domain: [databases, graph_databases]
+    concern: [data_integrity, idempotency]
+  example_good: |
+    # CORRECT: Merge on immutable ID only, set other properties conditionally
+    query = """
+    MERGE (p:Person {uuid: $uuid})
+    ON CREATE SET
+        p.name = $name,
+        p.email = $email,
+        p.created_at = timestamp()
+    ON MATCH SET
+        p.name = $name,
+        p.email = $email,
+        p.updated_at = timestamp()
+    RETURN p
+    """
+    graph.query(query, {"uuid": "abc-123", "name": "Alice", "email": "alice@x.com"})
+  example_bad: |
+    # WRONG: Merge on name creates duplicate if name changes or has typo
+    graph.query(
+        "MERGE (p:Person {name: $name}) RETURN p",
+        {"name": "Alice Smith"}
+    )
+    # ALSO WRONG: CREATE in idempotent pipeline — produces duplicates on re-run
+    graph.query("CREATE (p:Person {uuid: $uuid, name: $name})", {"uuid": "abc-123", "name": "Alice"})
+  when_applies: >
+    All graph data ingestion pipelines, entity extraction from LLM outputs, and knowledge graph
+    construction workflows where the same data source may be processed more than once.
+  sources:
+    - "FalkorDB MERGE Documentation — https://docs.falkordb.com/cypher/merge.html"
+    - "FalkorDB CREATE Documentation — https://docs.falkordb.com/cypher/create.html"
+
+- id: FALK-004
+  text: >
+    Use WITH clauses to chain query stages and pass intermediate results. Do not use multiple
+    MATCH statements without WITH to scope intermediate variables — unscoped multi-MATCH produces
+    a Cartesian product of all matched paths. Always alias aggregated values with WITH before
+    using them in subsequent MATCH or RETURN clauses.
+  why: >
+    In FalkorDB (and Cypher generally), MATCH without WITH between two MATCH clauses joins every
+    result from the first MATCH against every result from the second MATCH. A graph with 1,000
+    Person nodes and 1,000 Event nodes produces 1,000,000 combinations before any WHERE filter
+    is applied. We observed a query that ran in 8ms for small graphs take 45 seconds on production
+    data due to an implicit Cartesian product — a single WITH (n) between the two MATCH clauses
+    fixed it.
+  how_to_do_right: |
+    1. After every MATCH that produces results you want to carry forward, add:
+       WITH n, r  -- explicitly list what to keep
+    2. After aggregation, use WITH to name the aggregate:
+       WITH count(r) AS total
+    3. Use WITH n WHERE ... to filter before the next MATCH (cheaper than post-MATCH WHERE)
+    4. Use GRAPH.EXPLAIN "your query" to verify no Cartesian product in the execution plan
+    5. Limit intermediate result sets early: WITH n LIMIT 100 before expensive traversal
+  severity: high
+  technologies:
+    lang: [cypher]
+    framework: [falkordb]
+  domains:
+    domain: [databases, performance]
+    concern: [query_performance, correctness]
+  example_good: |
+    # CORRECT: WITH scopes results and prevents Cartesian product
+    query = """
+    MATCH (p:Person {email: $email})
+    WITH p
+    MATCH (p)-[:AUTHORED]->(doc:Document)
+    WITH p, doc
+    WHERE doc.published_at > $since
+    RETURN p.name, doc.title, doc.published_at
+    ORDER BY doc.published_at DESC
+    LIMIT 20
+    """
+    graph.query(query, {"email": "alice@x.com", "since": 1700000000})
+  example_bad: |
+    # WRONG: Two MATCH without WITH = Cartesian product
+    query = """
+    MATCH (p:Person {email: $email})
+    MATCH (doc:Document)
+    WHERE p.uuid = doc.author_id
+    RETURN p.name, doc.title
+    """
+    # This matches ALL Documents and cross-joins with Person before filtering.
+    # 1K persons × 100K documents = 100M intermediate rows.
+  when_applies: >
+    Any Cypher query with more than one MATCH clause, aggregations, or multi-hop traversals
+    in FalkorDB or any Cypher-compatible graph database.
+  sources:
+    - "FalkorDB MATCH Documentation — https://docs.falkordb.com/cypher/match.html"
+    - "FalkorDB WHERE Documentation — https://docs.falkordb.com/cypher/where.html"
+
+- id: FALK-005
+  text: >
+    Use variable-length relationship patterns with explicit bounds for multi-hop graph traversals.
+    Pattern: (a)-[:REL*1..3]->(b) traverses 1 to 3 hops. Never use unbounded patterns (*) in
+    production without a LIMIT or a maximum depth guard — they can walk the entire graph. For
+    shortest path queries, use shortestPath() which stops at the first found path.
+  why: >
+    An unbounded variable-length pattern ()-[:CONNECTS*]->() on a densely connected knowledge
+    graph can enumerate millions of paths. We benchmarked a 50K-node graph: bounded (1..4) took
+    12ms; unbounded took 8+ seconds before timing out. FalkorDB executes depth-first traversal for
+    variable-length patterns, so even moderate graphs with cycles can cause query timeout or OOM
+    in the Redis module process.
+  how_to_do_right: |
+    1. Always specify explicit bounds: (a)-[:REL*1..5]->(b)
+    2. For shortest path: shortestPath((a)-[:REL*]->(b))
+       — shortestPath() has an internal early-exit, safe on large graphs
+    3. For all shortest paths: allShortestPaths((a)-[:REL*]->(b)) with LIMIT
+    4. Set query timeout: GRAPH.QUERY graph "TIMEOUT 5000 MATCH ..." (5 second timeout)
+    5. Use EXPLAIN to preview traversal depth before running on production data
+    6. For recursive hierarchies, prefer max depth 6; above 6 hops rarely meaningful in practice
+  severity: high
+  technologies:
+    lang: [cypher]
+    framework: [falkordb]
+  domains:
+    domain: [databases, performance]
+    concern: [query_performance, safety]
+  example_good: |
+    # CORRECT: Bounded variable-length path
+    result = graph.query(
+        "MATCH path = (a:Entity {uuid: $from})-[:RELATED*1..4]->(b:Entity {uuid: $to}) "
+        "RETURN length(path), [n IN nodes(path) | n.name]",
+        {"from": "uuid-a", "to": "uuid-b"}
+    )
+
+    # CORRECT: shortestPath for path finding
+    result = graph.query(
+        "MATCH (a:Entity {uuid: $from}), (b:Entity {uuid: $to}) "
+        "RETURN shortestPath((a)-[:RELATED*]->(b))",
+        {"from": "uuid-a", "to": "uuid-b"}
+    )
+  example_bad: |
+    # WRONG: Unbounded traversal — walks entire connected component
+    result = graph.query(
+        "MATCH (a:Entity {uuid: $from})-[:RELATED*]->(b:Entity) "
+        "RETURN b.name",
+        {"from": "uuid-a"}
+    )
+    # On 50K node graph: query timeout, potential Redis OOM
+  when_applies: >
+    Graph traversal queries requiring multi-hop relationship following, such as finding
+    connected entities, computing influence paths, or resolving knowledge graph neighborhoods.
+  sources:
+    - "FalkorDB MATCH Documentation — https://docs.falkordb.com/cypher/match.html"
+    - "FalkorDB GRAPH.QUERY — https://docs.falkordb.com/commands/graph.query.html"
+
+- id: FALK-006
+  text: >
+    Profile slow queries using GRAPH.EXPLAIN to get the logical execution plan and
+    GRAPH.PROFILE to get the actual runtime statistics including node/edge scans per step.
+    Run EXPLAIN on every new query type before deploying to production. Queries with
+    "Node By Label Scan" or "All Node Scan" in the plan need indexes.
+  why: >
+    FalkorDB's query planner uses available indexes but makes mistakes on complex multi-label
+    queries. We deployed a 3-hop query that passed EXPLAIN analysis but on real data with
+    skewed degree distribution took 4 seconds because the planner chose a high-cardinality
+    starting label. GRAPH.PROFILE shows actual rows processed per step, revealing the hot
+    step immediately. Without profiling, performance issues surface only in production under load.
+  how_to_do_right: |
+    1. EXPLAIN (plan only, no execution):
+       GRAPH.EXPLAIN graph_name "MATCH (n:Person {email: $e}) RETURN n"
+    2. PROFILE (execute + runtime stats):
+       GRAPH.PROFILE graph_name "MATCH (n:Person {email: $e}) RETURN n" --params "e=alice@x.com"
+    3. Look for: "Index Scan" (good) vs "Node By Label Scan" (add index) vs "All Nodes Scan" (critical)
+    4. Check "Records produced" per step — a step producing 10M records is your bottleneck
+    5. via falkordb-py: graph.explain(query) and graph.profile(query, params)
+    6. Add slowlog monitoring: CONFIG SET slowlog-log-slower-than 100 (100ms threshold)
+  severity: medium
+  technologies:
+    lang: [python, cypher]
+    framework: [falkordb]
+  domains:
+    domain: [databases, performance]
+    concern: [query_optimization, observability]
+  example_good: |
+    from falkordb import FalkorDB
+
+    db = FalkorDB(host="localhost", port=6379)
+    graph = db.select_graph("knowledge_graph")
+
+    query = "MATCH (p:Person {email: $email})-[:KNOWS]->(q) RETURN q.name"
+
+    # Get execution plan BEFORE deploying
+    plan = graph.explain(query, {"email": "alice@x.com"})
+    print("\n".join(plan))
+    # Look for: Index Scan(Person:email) — good
+    # If you see: Node By Label Scan — add index first
+
+    # Profile on staging data to see actual row counts
+    profile = graph.profile(query, {"email": "alice@x.com"})
+    print(profile)
+  example_bad: |
+    # WRONG: No profiling, deploy query directly, discover slowness in production
+    result = graph.query(
+        "MATCH (p:Person {email: $email})-[:KNOWS]->(q:Person)-[:AUTHORED]->(d:Document) "
+        "RETURN d.title",
+        {"email": "alice@x.com"}
+    )
+    # Observed in prod: 12 seconds because KNOWS has 50K edges and no index on Person.email
+  when_applies: >
+    Every new Cypher query type before production deployment, and when investigating
+    latency regressions on existing queries.
+  sources:
+    - "FalkorDB GRAPH.QUERY — https://docs.falkordb.com/commands/graph.query.html"
+    - "FalkorDB Algorithms — https://docs.falkordb.com/algorithms/"
+
+- id: FALK-007
+  text: >
+    Use GRAPH.BULK (via falkordb-bulk-loader or the binary protocol) for initial data loading
+    of graphs larger than 10,000 nodes. GRAPH.BULK is 10-50x faster than sequential MERGE/CREATE
+    queries because it bypasses the query parser, skips index updates during load, and uses
+    binary-encoded batches. Rebuild indexes after bulk load, not before.
+  why: >
+    Loading 100K nodes via individual MERGE queries over a Python loop takes ~5 minutes at
+    500 nodes/second. The same load via GRAPH.BULK completes in under 10 seconds because:
+    (1) no query parse overhead per row, (2) indexes are not updated incrementally during load
+    (they are rebuilt at the end), (3) batches are sent as a single Redis command pipeline.
+    We observed 47x speedup on a 200K node knowledge graph import from CSV.
+  how_to_do_right: |
+    1. pip install falkordb-bulk-loader
+    2. Prepare CSV files: nodes.csv (ID, label, properties), edges.csv (src, dst, type, properties)
+    3. Run: falkordb-bulk-loader graph_name --host localhost --port 6379 \
+                                  --nodes nodes.csv --relations edges.csv
+    4. After bulk load, rebuild indexes:
+       CALL db.idx.create.range("Person", "email")
+    5. For programmatic use: use the binary GRAPH.BULK endpoint specification
+    6. GRAPH.BULK only creates NEW graphs — cannot update existing graphs
+    7. For incremental updates after initial load: use MERGE queries
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [falkordb]
+  domains:
+    domain: [databases, data_engineering]
+    concern: [performance, data_loading]
+  example_good: |
+    import subprocess
+    import os
+
+    # nodes.csv: ID:ID,name:STRING,email:STRING,:LABEL
+    # edges.csv: :START_ID,:END_ID,:TYPE
+
+    # Bulk load initial graph (10x-50x faster than MERGE loop)
+    result = subprocess.run([
+        "falkordb-bulk-loader", "knowledge_graph",
+        "--host", "localhost",
+        "--port", "6379",
+        "--nodes", "data/persons.csv",
+        "--nodes", "data/documents.csv",
+        "--relations", "data/authored.csv",
+    ], check=True, capture_output=True)
+    print(f"Loaded: {result.stdout.decode()}")
+
+    # Rebuild indexes AFTER load
+    from falkordb import FalkorDB
+    db = FalkorDB(host="localhost", port=6379)
+    graph = db.select_graph("knowledge_graph")
+    graph.query("CALL db.idx.create.range('Person', 'email')")
+  example_bad: |
+    # WRONG: Loop of MERGE queries for bulk load — 100x slower
+    for row in csv.DictReader(open("persons.csv")):
+        graph.query(
+            "MERGE (p:Person {uuid: $uuid}) ON CREATE SET p.name = $name",
+            {"uuid": row["uuid"], "name": row["name"]}
+        )
+    # 100K rows at 500 queries/sec = 3.3 minutes vs 4 seconds with bulk loader
+  when_applies: >
+    Initial knowledge graph construction from CSV, database migration from another graph DB,
+    or bootstrapping seed data with more than 10,000 entities.
+  sources:
+    - "FalkorDB GRAPH.BULK Specification — https://docs.falkordb.com/design/bulk-spec.html"
+    - "GitHub: falkordb-bulk-loader — https://github.com/FalkorDB/falkordb-bulk-loader"
+
+- id: FALK-008
+  text: >
+    Run FalkorDB community detection (CDLP — Community Detection via Label Propagation) as a
+    graph algorithm call, not by hand-crafting traversal queries. Call it as:
+    CALL algo.communityDetection() and use the returned community IDs to tag nodes with a
+    community property. Re-run community detection periodically as the graph grows, since
+    community membership is not maintained automatically after new edges are added.
+  why: >
+    Label propagation community detection converges in O(edges) per iteration and typically
+    converges in fewer than 10 iterations, making it practical on graphs up to ~1M edges.
+    Implementing community detection via Cypher traversals (BFS, expanding neighborhoods)
+    would be orders of magnitude slower and more complex. Community IDs enable downstream
+    retrieval patterns: fetch all nodes in community X, then narrow by semantic similarity
+    — a 10-100x reduction in vector search space before the expensive cosine comparison step.
+  how_to_do_right: |
+    1. Ensure graph has edges before running (CDLP on empty graph = no-op)
+    2. Run CDLP: CALL algo.communityDetection() YIELD node, communityId
+    3. Persist community IDs: WITH node, communityId SET node.community_id = communityId
+    4. Create index on community_id for fast community-scoped queries
+    5. Schedule re-computation: run after every N new edges (e.g., every 1000 edge inserts)
+    6. Community size histogram: MATCH (n) RETURN n.community_id, count(*) AS size ORDER BY size DESC
+  severity: medium
+  technologies:
+    lang: [python, cypher]
+    framework: [falkordb]
+  domains:
+    domain: [databases, graph_algorithms]
+    concern: [knowledge_graph, retrieval]
+  example_good: |
+    from falkordb import FalkorDB
+
+    db = FalkorDB(host="localhost", port=6379)
+    graph = db.select_graph("knowledge_graph")
+
+    # Run community detection and persist results
+    graph.query("""
+        CALL algo.communityDetection()
+        YIELD node, communityId
+        SET node.community_id = communityId
+    """)
+
+    # Index community_id for fast scoped queries
+    graph.query("CALL db.idx.create.range('Entity', 'community_id')")
+
+    # Query: get all nodes in the same community as a given node
+    result = graph.query("""
+        MATCH (seed:Entity {uuid: $uuid})
+        WITH seed.community_id AS cid
+        MATCH (member:Entity {community_id: cid})
+        RETURN member.name, member.uuid
+        LIMIT 50
+    """, {"uuid": "target-uuid"})
+  example_bad: |
+    # WRONG: Hand-crafted BFS for community detection — O(n^2), times out on large graphs
+    result = graph.query("""
+        MATCH (a:Entity)-[:RELATED*1..5]-(b:Entity {uuid: $uuid})
+        RETURN DISTINCT a.name
+    """, {"uuid": "target-uuid"})
+    # This is NOT community detection — it's just neighborhood expansion with arbitrary depth
+  when_applies: >
+    Knowledge graphs used for retrieval augmented generation, agent memory systems, or
+    any graph where semantic clustering improves query efficiency.
+  sources:
+    - "FalkorDB Community Detection — https://docs.falkordb.com/algorithms/cdlp.html"
+    - "FalkorDB Algorithms — https://docs.falkordb.com/algorithms/"
+
+- id: FALK-009
+  text: >
+    Initialize Graphiti with FalkorDB as the backend by passing a FalkorDB URI and using
+    the Graphiti class from the graphiti-core package. Add episodes via graphiti.add_episode()
+    with explicit reference_time parameters. Never omit reference_time — when omitted, Graphiti
+    defaults to ingestion time, which corrupts temporal queries when processing historical data
+    out of sequence.
+  why: >
+    Graphiti maintains a bi-temporal model: valid_at (when the fact was true) and created_at
+    (when the system learned about it). If you process a chat transcript from 3 days ago without
+    setting reference_time=datetime(3_days_ago), Graphiti records valid_at=now, making all
+    time-scoped queries ("what did Alice prefer last week?") return wrong results. We observed
+    this in a customer support bot: replaying historical conversations produced a knowledge graph
+    where all historical facts appeared to be current, causing the agent to provide stale answers.
+  how_to_do_right: |
+    1. pip install graphiti-core falkordb
+    2. Initialize:
+       from graphiti_core import Graphiti
+       graphiti = Graphiti("falkor://localhost:6379", llm_client=your_llm_client)
+    3. Add episode with explicit time:
+       await graphiti.add_episode(
+           name="conversation_123",
+           episode_body="Alice said she prefers Python over JavaScript",
+           source_description="support_chat_2025-01-15",
+           reference_time=datetime(2025, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+       )
+    4. Search with temporal scoping:
+       results = await graphiti.search("Alice's programming preferences",
+                                       reference_time=datetime(2025, 1, 16, ...))
+    5. For fresh real-time data, reference_time=datetime.now(timezone.utc) is correct
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [graphiti, falkordb]
+  domains:
+    domain: [databases, knowledge_graph, ai_agents]
+    concern: [temporal_correctness, data_integrity]
+  example_good: |
+    import asyncio
+    from datetime import datetime, timezone
+    from graphiti_core import Graphiti
+    from graphiti_core.llm_client import OpenAIClient
+
+    async def ingest_historical_conversation(conv: dict):
+        graphiti = Graphiti(
+            "falkor://localhost:6379",
+            llm_client=OpenAIClient(model="gpt-4o-mini"),
+        )
+        await graphiti.build_indices_and_constraints()
+
+        # CORRECT: pass the actual event time, not current time
+        event_time = datetime.fromisoformat(conv["timestamp"]).replace(tzinfo=timezone.utc)
+        await graphiti.add_episode(
+            name=f"conv_{conv['id']}",
+            episode_body=conv["transcript"],
+            source_description=f"support_chat_{conv['channel']}",
+            reference_time=event_time,  # Critical: historical time, not datetime.now()
+        )
+  example_bad: |
+    # WRONG: Omitting reference_time on historical data — sets valid_at = now
+    await graphiti.add_episode(
+        name="conv_old_2025_01_15",
+        episode_body=old_conversation_text,
+        source_description="support_chat",
+        # No reference_time — defaults to ingestion time (today)
+        # All historical facts appear to have been true as of today
+    )
+  when_applies: >
+    Any Graphiti episode ingestion pipeline that processes historical data, replays logs,
+    or backfills from external data sources with known timestamps.
+  sources:
+    - "GitHub: getzep/graphiti — https://github.com/getzep/graphiti"
+    - "Graphiti Documentation — https://help.getzep.com/graphiti/getting-started/overview"
+    - "Zep Temporal Knowledge Graph Paper (arXiv:2501.13956) — https://arxiv.org/abs/2501.13956"
+
+- id: FALK-010
+  text: >
+    Use Graphiti's entity resolution to deduplicate nodes by defining custom entity classes
+    as Pydantic models. Without custom entity definitions, Graphiti uses generic Entity nodes
+    and LLM-based similarity matching for deduplication, which is slower and less reliable.
+    Define entity types that map to your domain ontology; Graphiti will enforce deduplication
+    within each type.
+  why: >
+    Generic entity resolution requires an LLM call per candidate pair to decide whether two
+    entities are the same. With 10,000 episodes and 50 unique entities, generic resolution
+    triggers ~500K LLM comparisons (O(n^2) in the worst case). Custom Pydantic entity types
+    with unique identifier fields reduce this to deterministic UUID matching, dropping resolution
+    cost from minutes to milliseconds. We reduced entity resolution time from 40 minutes to
+    under 2 seconds by adding custom entity types on a production Graphiti instance.
+  how_to_do_right: |
+    1. Define entity classes as Pydantic BaseModel subclasses:
+       class Person(BaseModel):
+           name: str
+           role: Optional[str] = None
+           organization: Optional[str] = None
+    2. Pass entity_types to add_episode:
+       await graphiti.add_episode(..., entity_types={"Person": Person, "Project": Project})
+    3. Graphiti uses the class name + key fields as the deduplication key
+    4. Add source_description consistently — it is used as provenance for edge attributes
+    5. For high-volume ingestion: set SEMAPHORE_LIMIT env var (default 10) to control LLM concurrency
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [graphiti, falkordb]
+  domains:
+    domain: [databases, knowledge_graph, ai_agents]
+    concern: [performance, data_quality, entity_resolution]
+  example_good: |
+    from pydantic import BaseModel
+    from typing import Optional
+    from graphiti_core import Graphiti
+
+    # Define domain-specific entity types for deterministic deduplication
+    class Engineer(BaseModel):
+        name: str
+        team: Optional[str] = None
+        github_handle: Optional[str] = None
+
+    class Repository(BaseModel):
+        name: str
+        language: Optional[str] = None
+        owner: Optional[str] = None
+
+    async def process_standup(standup_notes: str, recorded_at: datetime):
+        await graphiti.add_episode(
+            name=f"standup_{recorded_at.isoformat()}",
+            episode_body=standup_notes,
+            source_description="daily_standup",
+            reference_time=recorded_at,
+            entity_types={"Engineer": Engineer, "Repository": Repository},
+        )
+        # Graphiti now deduplicates Engineer nodes by (name, team) deterministically
+  example_bad: |
+    # WRONG: No entity types — falls back to generic Entity + expensive LLM deduplication
+    await graphiti.add_episode(
+        name="standup_2025_01_15",
+        episode_body=standup_notes,
+        source_description="daily_standup",
+        reference_time=recorded_at,
+        # No entity_types — all entities will be generic, deduplication is expensive
+    )
+  when_applies: >
+    All production Graphiti deployments that ingest structured domain data where entities
+    have known types, such as users, projects, events, or organizations.
+  sources:
+    - "GitHub: getzep/graphiti — https://github.com/getzep/graphiti"
+    - "FalkorDB + Graphiti Integration — https://docs.falkordb.com/agentic-memory/graphiti.html"
+
+- id: FALK-011
+  text: >
+    For Graphiti's bi-temporal search, pass reference_time to retrieve the state of the
+    knowledge graph as-of a specific point in time. Use the center_node_uuid parameter
+    to anchor searches to a specific entity's neighborhood. Graphiti hybrid search combines
+    semantic (embedding), BM25 (keyword), and graph traversal — do not bypass it with raw
+    FalkorDB Cypher queries for agent memory retrieval.
+  why: >
+    Graphiti's hybrid retrieval re-ranks across semantic, keyword, and structural dimensions.
+    A raw Cypher MATCH query only does exact/range matching — it cannot combine "Alice prefers
+    Python" (semantic) with "last modified Alice entity" (temporal + structural). Teams that
+    bypass graphiti.search() in favor of hand-crafted Cypher lose the hybrid ranking entirely,
+    and agent responses degrade in relevance. The temporal component also ensures stale facts
+    (invalidated edges) are not surfaced for past reference_time queries.
+  how_to_do_right: |
+    1. Always use graphiti.search() for agent memory retrieval:
+       results = await graphiti.search(query, reference_time=datetime.now(UTC), num_results=10)
+    2. To focus on a known entity: results = await graphiti.search(query,
+       center_node_uuid="person-uuid-here", num_results=10)
+    3. results is a list of SearchResult with fields: uuid, name, summary, fact, valid_at
+    4. For node-only queries: graphiti.retrieve_nodes(query, num_results=5)
+    5. For episode retrieval: graphiti.retrieve_episodes(reference_time, last_n=20)
+    6. Only drop to raw Cypher for graph structure analytics (community detection, degree centrality)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [graphiti, falkordb]
+  domains:
+    domain: [databases, knowledge_graph, ai_agents]
+    concern: [retrieval_quality, temporal_correctness]
+  example_good: |
+    from datetime import datetime, timezone
+
+    # CORRECT: Use Graphiti's hybrid search for agent memory retrieval
+    results = await graphiti.search(
+        query="Alice's current project preferences",
+        reference_time=datetime.now(timezone.utc),
+        num_results=10,
+        center_node_uuid=alice_uuid,  # Anchor to Alice's entity neighborhood
+    )
+    for r in results:
+        print(f"{r.fact} (valid from {r.valid_at})")
+        # Inject into agent context: "Alice prefers async Python frameworks (since 2025-01-10)"
+  example_bad: |
+    # WRONG: Raw Cypher bypasses temporal filtering and hybrid ranking
+    results = graph.query(
+        "MATCH (a:Entity {name: 'Alice'})-[r]->(b) RETURN b.summary",
+    )
+    # This returns ALL edges including invalidated/historical ones
+    # No semantic relevance ranking — just structural neighborhood
+    # No temporal scoping — includes facts that are no longer valid
+  when_applies: >
+    Every agent memory retrieval call where the agent needs factual context about entities,
+    preferences, past events, or relationships stored in the Graphiti knowledge graph.
+  sources:
+    - "GitHub: getzep/graphiti — https://github.com/getzep/graphiti"
+    - "Zep Temporal KG Architecture — https://blog.getzep.com/graphiti-knowledge-graphs-for-agents/"
+    - "Zep arXiv Paper — https://arxiv.org/abs/2501.13956"
+
+- id: FALK-012
+  text: >
+    Use multi-tenancy in Graphiti+FalkorDB by passing distinct graph_name values per user,
+    session, or agent. Each graph_name creates an isolated FalkorDB graph namespace — there
+    is no data bleed between namespaces. Do not implement multi-tenancy via WHERE clauses on
+    a shared graph (e.g., WHERE n.user_id = $uid), because a single compromised query can
+    return cross-user data.
+  why: >
+    WHERE-clause tenant isolation in a shared graph is a security misconfiguration. A missing
+    tenant filter in any query — due to a developer forgetting to add it, or an LLM-generated
+    query omitting it — leaks data across tenants. Graph-level isolation is enforced at the
+    FalkorDB command level: a GRAPH.QUERY against "user_alice_graph" cannot read nodes from
+    "user_bob_graph" regardless of the Cypher query content. This eliminates an entire class
+    of data leakage bugs at zero query-complexity cost.
+  how_to_do_right: |
+    1. Name graphs per user/agent: graph_name = f"agent_{agent_id}" or f"user_{user_id}"
+    2. Graphiti initialization per tenant:
+       graphiti = Graphiti(f"falkor://localhost:6379/{graph_name}", llm_client=llm)
+    3. Alternatively, pass graph_name to all operations:
+       graphiti = Graphiti("falkor://localhost:6379", llm_client=llm)
+       await graphiti.add_episode(..., group_id=user_id)
+    4. List all graphs: db.list_graphs()
+    5. Delete a tenant's graph: db.select_graph(graph_name).delete()
+    6. Never store multi-tenant data in a single shared graph with property-based filtering
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [graphiti, falkordb]
+  domains:
+    domain: [databases, security, multi_tenancy]
+    concern: [data_isolation, security]
+  example_good: |
+    from falkordb import FalkorDB
+    from graphiti_core import Graphiti
+
+    def get_agent_graphiti(agent_id: str, llm_client) -> Graphiti:
+        """Each agent gets an isolated FalkorDB graph namespace."""
+        graph_name = f"agent_{agent_id}"
+        return Graphiti(
+            f"falkor://localhost:6379",
+            llm_client=llm_client,
+            graph_name=graph_name,  # Namespace isolation at DB level
+        )
+
+    # Agent A's data is in graph "agent_agent_a_uuid"
+    agent_a = get_agent_graphiti("agent_a_uuid", llm)
+    # Agent B's data is in graph "agent_agent_b_uuid" — zero overlap possible
+    agent_b = get_agent_graphiti("agent_b_uuid", llm)
+  example_bad: |
+    # WRONG: Shared graph with WHERE-clause tenant isolation
+    # A missing WHERE n.owner_id = $uid in any query = data breach
+    graphiti = Graphiti("falkor://localhost:6379", llm_client=llm)
+
+    # This relies on every query having WHERE user_id = $uid — fragile
+    results = graph.query(
+        "MATCH (n:Entity) WHERE n.owner_id = $uid RETURN n",
+        {"uid": current_user_id}
+    )
+    # If ANY agent's LLM-generated query omits WHERE n.owner_id, full data exposure
+  when_applies: >
+    Multi-agent systems, multi-user applications, or any deployment where agent memory
+    must be isolated across different principals.
+  sources:
+    - "FalkorDB Multi-Tenancy — https://docs.falkordb.com/agentic-memory/graphiti.html"
+    - "Graphiti + FalkorDB Multi-Agent — https://www.falkordb.com/blog/graphiti-falkordb-multi-agent-performance/"
+
+- id: FALK-013
+  text: >
+    FalkorDB delivers 500x faster p99 latency than Neo4j for aggregate expansion queries
+    (sub-140ms vs 46.9s at p99) due to its GraphBLAS sparse matrix representation. However,
+    FalkorDB runs entirely in Redis memory — graph size is bounded by available RAM. Model
+    your knowledge graph to stay within 60% of available Redis memory; above that threshold
+    Redis will start evicting keys if maxmemory policy is not set to noeviction.
+  why: >
+    FalkorDB stores the entire graph in Redis working memory using adjacency matrices backed
+    by GraphBLAS. If Redis maxmemory policy is allkeys-lru (the common default for caching
+    Redis instances), and the graph data pushes Redis above the memory limit, Redis will
+    silently evict graph data. The result is not an error — it is silent data loss: nodes or
+    relationships disappear from the graph without any exception being raised. This has caused
+    production knowledge graphs to lose 20-30% of their edges silently.
+  how_to_do_right: |
+    1. Set Redis maxmemory-policy to noeviction for FalkorDB instances:
+       redis-cli CONFIG SET maxmemory-policy noeviction
+    2. Set maxmemory to 80% of available RAM:
+       redis-cli CONFIG SET maxmemory 12gb  (on a 16GB machine)
+    3. Monitor memory: GRAPH.MEMORY graph_name (returns bytes used)
+    4. Alert when Redis used_memory > 60% of maxmemory
+    5. For large graphs (>50M nodes): consider FalkorDB Cloud or a dedicated Redis instance
+    6. Separate FalkorDB Redis from caching Redis — never share an eviction-enabled instance
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [falkordb, redis]
+  domains:
+    domain: [databases, infrastructure]
+    concern: [reliability, memory_management]
+  example_good: |
+    import redis
+
+    r = redis.Redis(host="localhost", port=6379)
+
+    # ALWAYS set noeviction for graph data
+    r.config_set("maxmemory-policy", "noeviction")
+    r.config_set("maxmemory", "12gb")  # Set appropriate limit
+
+    # Monitor graph memory usage
+    info = r.info("memory")
+    used_mb = info["used_memory"] / (1024 * 1024)
+    max_mb = info.get("maxmemory", 0) / (1024 * 1024)
+    utilization = used_mb / max_mb if max_mb > 0 else 0
+
+    if utilization > 0.6:
+        alert(f"FalkorDB Redis memory at {utilization:.0%} — approaching eviction risk")
+  example_bad: |
+    # WRONG: Default Redis on a shared caching instance with LRU eviction
+    # docker run -d redis:7  # Default: no maxmemory-policy set
+    # OR: Redis configured with allkeys-lru for a caching workload
+    # FalkorDB graph data gets silently evicted when cache pressure is high
+    # Result: graph.query("MATCH (n) RETURN count(n)") returns 0 — all nodes gone
+  when_applies: >
+    All FalkorDB deployments, especially when co-located with cache workloads or on
+    memory-constrained machines. Critical for production knowledge graphs.
+  sources:
+    - "FalkorDB vs Neo4j Performance — https://www.falkordb.com/blog/graph-database-performance-benchmarks-falkordb-vs-neo4j/"
+    - "FalkorDB GitHub — https://github.com/FalkorDB/FalkorDB"
+    - "Redis Eviction Policies — https://redis.io/docs/manual/eviction/"
+
+- id: FALK-014
+  text: >
+    When evolving a FalkorDB graph schema (adding new labels, properties, or relationship types),
+    use the OPTIONAL MATCH pattern to maintain backward compatibility in queries that mix old and
+    new schema versions. FalkorDB does not enforce schema — nodes can have different properties
+    within the same label. Standardize schema evolution with a migration script that backfills
+    missing properties on existing nodes.
+  why: >
+    FalkorDB is schema-free: a Person node from last month may have {name, email} while a Person
+    node added today has {name, email, uuid, created_at}. A query that does RETURN p.uuid on an
+    old node returns null, not an error. If your application code treats null uuid as a missing
+    entity and tries to create it again, you get a duplicate node. We fixed this with a
+    backfill migration that set uuid = randomUUID() on all Person nodes lacking it, followed
+    by a MERGE-on-uuid deduplication pass.
+  how_to_do_right: |
+    1. Use OPTIONAL MATCH or COALESCE for mixed-schema queries:
+       MATCH (p:Person) RETURN p.name, COALESCE(p.uuid, 'legacy-'+p.email) AS uuid
+    2. Schema backfill migration pattern:
+       MATCH (p:Person) WHERE p.uuid IS NULL SET p.uuid = p.email + '-migrated'
+    3. Run backfill BEFORE deploying code that assumes the new schema
+    4. Check schema state: MATCH (p:Person) RETURN keys(p) — verify property uniformity
+    5. For large graphs: backfill in batches with LIMIT + SKIP to avoid timeouts:
+       MATCH (p:Person) WHERE p.uuid IS NULL WITH p LIMIT 1000 SET p.uuid = p.email
+    6. After backfill: CALL db.idx.create.range('Person', 'uuid') for the new property
+  severity: medium
+  technologies:
+    lang: [python, cypher]
+    framework: [falkordb]
+  domains:
+    domain: [databases, graph_databases]
+    concern: [schema_evolution, data_migration]
+  example_good: |
+    from falkordb import FalkorDB
+    import time
+
+    db = FalkorDB(host="localhost", port=6379)
+    graph = db.select_graph("knowledge_graph")
+
+    # Schema migration: add uuid to legacy Person nodes (batch to avoid timeout)
+    batch_size = 1000
+    migrated = 0
+    while True:
+        result = graph.query(f"""
+            MATCH (p:Person) WHERE p.uuid IS NULL
+            WITH p LIMIT {batch_size}
+            SET p.uuid = p.email + '-migrated'
+            RETURN count(p) AS updated
+        """)
+        batch_count = result.result_set[0][0] if result.result_set else 0
+        migrated += batch_count
+        if batch_count == 0:
+            break
+        print(f"Migrated {migrated} nodes...")
+
+    # Index the new property
+    graph.query("CALL db.idx.create.range('Person', 'uuid')")
+    print(f"Migration complete: {migrated} nodes updated")
+  example_bad: |
+    # WRONG: Assumes all nodes have uuid — fails silently on legacy nodes
+    result = graph.query("MATCH (p:Person) RETURN p.uuid")
+    for row in result.result_set:
+        uuid = row[0]  # This is None for legacy nodes — causes NullPointerError downstream
+        process_entity(uuid)  # process_entity("None") creates garbage data
+  when_applies: >
+    Any time a new required property is added to an existing node label, especially in
+    iteratively developed knowledge graphs that have been running in production.
+  sources:
+    - "FalkorDB Cypher Coverage — https://docs.falkordb.com/cypher/cypher-support.html"
+    - "FalkorDB Data Types — https://docs.falkordb.com/datatypes.html"
+
+- id: FALK-015
+  text: >
+    Build Graphiti's indices and constraints once at startup using
+    await graphiti.build_indices_and_constraints() before any episode ingestion. Skipping
+    this step causes gradual performance degradation as the graph grows — full node label
+    scans replace index lookups. Call this method idempotently (it is safe to call repeatedly);
+    it will not recreate existing indexes.
+  why: >
+    Graphiti requires specific FalkorDB indexes on its internal node types (Episodic, Entity,
+    Community) and constraint definitions for UUID uniqueness. Without calling
+    build_indices_and_constraints(), the first 100 episodes may ingest quickly, but by episode
+    10,000 the entity deduplication query (which does MATCH (e:Entity {uuid: ...})) performs
+    a full label scan instead of an index lookup. This caused a 300x slowdown on a production
+    deployment after ~5,000 episodes were ingested.
+  how_to_do_right: |
+    1. Call once at application startup (idempotent):
+       await graphiti.build_indices_and_constraints()
+    2. Safe to call in health check endpoint to self-heal if indexes are dropped
+    3. In a FastAPI lifespan:
+       @asynccontextmanager
+       async def lifespan(app):
+           await graphiti.build_indices_and_constraints()
+           yield
+    4. Verify: CALL db.indexes() should show indexes on Episodic, Entity, Community labels
+    5. After a graph delete/recreation, always call build_indices_and_constraints() again
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [graphiti, falkordb]
+  domains:
+    domain: [databases, knowledge_graph]
+    concern: [performance, initialization]
+  example_good: |
+    from contextlib import asynccontextmanager
+    from fastapi import FastAPI
+    from graphiti_core import Graphiti
+    from graphiti_core.llm_client import OpenAIClient
+
+    graphiti = Graphiti(
+        "falkor://localhost:6379",
+        llm_client=OpenAIClient(model="gpt-4o-mini"),
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # CORRECT: Build indexes at startup, before any episode ingestion
+        await graphiti.build_indices_and_constraints()
+        yield
+        # Optionally close connection
+        await graphiti.close()
+
+    app = FastAPI(lifespan=lifespan)
+  example_bad: |
+    # WRONG: Skip build_indices_and_constraints — works fine for first 100 episodes,
+    # then degrades to full-label scans after thousands of entities
+    graphiti = Graphiti("falkor://localhost:6379", llm_client=llm_client)
+    # Start ingesting immediately without building indexes
+    await graphiti.add_episode(name="ep1", episode_body=text, ...)
+    # By episode 5000: entity deduplication takes 2s instead of 2ms
+  when_applies: >
+    Every Graphiti deployment initialization, including development environments —
+    the performance issue manifests at scale but the habit should be consistent.
+  sources:
+    - "GitHub: getzep/graphiti README — https://github.com/getzep/graphiti"
+    - "FalkorDB Graphiti Integration — https://docs.falkordb.com/agentic-memory/graphiti.html"
+    - "Graphiti Getting Started — https://help.getzep.com/graphiti/getting-started/overview"

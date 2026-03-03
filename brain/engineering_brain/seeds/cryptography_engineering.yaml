@@ -1,0 +1,915 @@
+layer: rules
+domain: security
+knowledge:
+- id: CRYPTO-001
+  text: >
+    Use Argon2id as the default password hashing algorithm with minimum parameters:
+    memory=64MB (65536 KB), iterations=3, parallelism=4. Never use MD5, SHA-1, SHA-256,
+    or bcrypt alone for password hashing in new systems. Argon2id is the winner of the
+    Password Hashing Competition (2015) and the OWASP-recommended default as of 2024.
+  why: >
+    SHA-256 hashes passwords at 8 billion attempts/second on a consumer GPU (RTX 4090).
+    bcrypt at cost=12 yields ~200 attempts/second — much better, but still crackable for
+    common passwords with cloud GPU farms. Argon2id at m=65536 yields ~5 attempts/second
+    per thread and requires 64MB RAM per attempt — eliminating GPU-parallel attacks because
+    GPU VRAM cannot hold thousands of simultaneous 64MB workloads. The LinkedIn breach (2012,
+    117M hashes) was cracked because they used unsalted SHA-1 — 90% of hashes cracked in 72h.
+    bcrypt-using sites (e.g., Adobe 2013 breach) had much lower crack rates for the same reason
+    Argon2id surpasses bcrypt: memory hardness.
+  how_to_do_right: |
+    1. Install: pip install argon2-cffi
+    2. Hash: ph = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4, hash_len=32)
+    3. Hash a password: hash = ph.hash(password)
+    4. Verify: try: ph.verify(hash, password); except VerifyMismatchError: reject
+    5. Check for rehash need: if ph.check_needs_rehash(hash): rehash and update DB
+    6. Store the full encoded string (includes algorithm, params, salt) — never store raw hash
+    7. Migration from bcrypt: on next successful login, rehash with Argon2id transparently
+    8. Never store plaintext passwords even temporarily (logging, debug output)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security]
+    concern: [authentication, password_hashing, cryptography]
+  example_good: |
+    from argon2 import PasswordHasher
+    from argon2.exceptions import VerifyMismatchError, VerificationError
+
+    # OWASP-recommended parameters (2024)
+    ph = PasswordHasher(
+        time_cost=3,        # 3 iterations
+        memory_cost=65536,  # 64MB RAM per hash
+        parallelism=4,      # 4 parallel threads
+        hash_len=32,        # 256-bit output
+        salt_len=16,        # 128-bit salt (auto-generated)
+    )
+
+    def hash_password(password: str) -> str:
+        return ph.hash(password)
+        # Returns: $argon2id$v=19$m=65536,t=3,p=4$<salt>$<hash>
+
+    def verify_password(stored_hash: str, password: str) -> bool:
+        try:
+            ph.verify(stored_hash, password)
+            return True
+        except (VerifyMismatchError, VerificationError):
+            return False
+
+    def needs_rehash(stored_hash: str) -> bool:
+        return ph.check_needs_rehash(stored_hash)
+  example_bad: |
+    import hashlib
+
+    # CRITICAL FAILURES:
+    def hash_password_bad_1(password: str) -> str:
+        return hashlib.sha256(password.encode()).hexdigest()
+        # No salt: identical passwords produce identical hashes → rainbow table attack
+
+    def hash_password_bad_2(password: str, salt: str) -> str:
+        return hashlib.sha256((salt + password).encode()).hexdigest()
+        # Salted SHA-256: still ~8 billion/sec on RTX 4090 → brute force feasible
+
+    import bcrypt
+    def hash_password_old(password: str) -> str:
+        return bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=10))
+        # bcrypt rounds=10: ~100ms, fine but not memory-hard
+        # bcrypt rounds=12 (2024 minimum): ~400ms, still no memory hardness
+  when_applies: Any system that stores user passwords or credentials. Mandatory for new systems; migration from bcrypt is advisable but not urgent if bcrypt cost >= 12.
+  sources:
+    - "OWASP Password Storage Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html"
+    - "argon2-cffi documentation: https://argon2-cffi.readthedocs.io/en/stable/"
+    - "Password Hashing Competition results: https://www.password-hashing.net/"
+
+- id: CRYPTO-002
+  text: >
+    Use AES-256-GCM (Authenticated Encryption with Associated Data) for symmetric encryption
+    of data at rest and in transit when TLS is not available. Never use AES-CBC without a
+    separate HMAC layer, and never use AES-ECB under any circumstances. GCM provides both
+    confidentiality and authenticity in a single pass.
+  why: >
+    AES-CBC without MAC is vulnerable to padding oracle attacks (POODLE, Lucky13, BEAST).
+    The padding oracle attack recovers plaintext from ciphertext without the key by sending
+    crafted ciphertext and observing decryption errors — attackers recovered millions of
+    session cookies from real applications via this technique. AES-ECB is broken by design:
+    identical plaintext blocks produce identical ciphertext blocks, leaking data structure
+    (the ECB penguin image is the canonical demonstration). AES-256-GCM eliminates both
+    issues: the authentication tag detects tampering before decryption, and GCM mode is
+    semantically secure (no block repetition patterns).
+  how_to_do_right: |
+    1. Install: pip install cryptography
+    2. Key: os.urandom(32)  # 256-bit key, store in HSM/KMS
+    3. Nonce: os.urandom(12)  # 96-bit nonce (NEVER reuse a nonce with the same key)
+    4. Encrypt:
+       from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+       aesgcm = AESGCM(key)
+       ciphertext = aesgcm.encrypt(nonce, plaintext, associated_data)
+       # Returns: ciphertext || auth_tag (16 bytes appended)
+    5. Store: nonce + ciphertext (prepend nonce to ciphertext)
+    6. Decrypt:
+       stored = nonce_bytes + ciphertext_with_tag
+       nonce = stored[:12]; ct = stored[12:]
+       plaintext = aesgcm.decrypt(nonce, ct, associated_data)
+       # Raises InvalidTag if ciphertext was tampered
+    7. Nonce uniqueness: use a counter or timestamp+random for high-volume encryption
+    8. Key rotation: implement envelope encryption so data keys can be rotated without re-encrypting all data
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security]
+    concern: [encryption, cryptography, data_protection]
+  example_good: |
+    import os
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    def encrypt(key: bytes, plaintext: bytes, aad: bytes = b'') -> bytes:
+        """AES-256-GCM authenticated encryption. Returns nonce||ciphertext||tag."""
+        if len(key) != 32:
+            raise ValueError("AES-256 requires 32-byte key")
+        nonce = os.urandom(12)  # 96-bit nonce — never reuse!
+        aesgcm = AESGCM(key)
+        ct = aesgcm.encrypt(nonce, plaintext, aad or None)
+        return nonce + ct  # Prepend nonce for storage
+
+    def decrypt(key: bytes, token: bytes, aad: bytes = b'') -> bytes:
+        """Decrypts and verifies authenticity. Raises InvalidTag if tampered."""
+        from cryptography.exceptions import InvalidTag
+        nonce, ct = token[:12], token[12:]
+        aesgcm = AESGCM(key)
+        return aesgcm.decrypt(nonce, ct, aad or None)
+        # InvalidTag raised automatically if ct modified — no separate MAC needed
+  example_bad: |
+    from Crypto.Cipher import AES
+    import hashlib
+
+    def encrypt_cbc_bad(key: bytes, plaintext: bytes) -> bytes:
+        # WRONG 1: AES-CBC without MAC → padding oracle attack
+        cipher = AES.new(key, AES.MODE_CBC)
+        ct = cipher.encrypt(pad(plaintext, 16))
+        return cipher.iv + ct  # No authentication = malleable ciphertext
+
+    def encrypt_ecb_worse(key: bytes, plaintext: bytes) -> bytes:
+        # WRONG 2: ECB mode — NEVER use
+        cipher = AES.new(key, AES.MODE_ECB)
+        return cipher.encrypt(pad(plaintext, 16))
+        # Identical 16-byte blocks produce identical ciphertext blocks
+        # Leaks all patterns in plaintext → structural information disclosure
+  when_applies: Any symmetric encryption of sensitive data at rest (database fields, file storage) or in application-layer encrypted channels outside of TLS.
+  sources:
+    - "NIST SP 800-38D (GCM specification): https://csrc.nist.gov/publications/detail/sp/800-38d/final"
+    - "cryptography.io AESGCM docs: https://cryptography.io/en/latest/hazmat/primitives/aead/#cryptography.hazmat.primitives.ciphers.aead.AESGCM"
+    - "OWASP Cryptographic Failures: https://owasp.org/Top10/A02_2021-Cryptographic_Failures/"
+
+- id: CRYPTO-003
+  text: >
+    Choose asymmetric key algorithm based on use case: Ed25519 for signatures (JWT, SSH, code
+    signing), ECDH P-256 for key exchange, RSA-2048 minimum for legacy compatibility only.
+    Never generate new RSA-1024 keys. For 2030+ security horizon, plan migration to
+    NIST post-quantum standards (ML-KEM, ML-DSA).
+  why: >
+    RSA-1024 was broken in 2010 (factoring record). RSA-2048 provides security until ~2030
+    per NIST SP 800-57. Ed25519 provides equivalent security to RSA-3072 with 32-byte keys,
+    constant-time operations (immune to timing side-channels), and 5x faster signing than
+    RSA-2048. ECDSA (especially with P-256) requires a high-quality random nonce per signature
+    — Sony's PlayStation 3 was broken in 2010 because they reused the same nonce for every
+    ECDSA signature, exposing the private key. Ed25519 is deterministic (nonce derived from
+    key+message), eliminating this entire attack class.
+  how_to_do_right: |
+    1. For JWT signing: use ES256 (ECDSA P-256) or EdDSA (Ed25519) — never HS256 for
+       distributed systems where multiple services need to verify tokens
+    2. For SSH keys: ssh-keygen -t ed25519 -C "user@host" (not RSA, not DSA)
+    3. For code signing: Ed25519 (sigstore/cosign uses Ed25519)
+    4. For TLS certificates: ECDSA P-256 (faster handshake than RSA, smaller certs)
+    5. Key sizes (minimum 2024): RSA-3072 (legacy), EC P-384, Ed25519
+    6. Generate Ed25519 in Python:
+       from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+       private_key = Ed25519PrivateKey.generate()
+       public_key = private_key.public_key()
+    7. Start post-quantum inventory: identify all RSA/ECDSA uses for migration planning
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [security]
+    concern: [cryptography, key_management, signatures]
+  example_good: |
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, PublicFormat, PrivateFormat, NoEncryption
+    )
+
+    # Generate Ed25519 keypair (secure, deterministic, no nonce required)
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+
+    # Sign a message — deterministic, no random nonce needed
+    message = b"canonical message to sign"
+    signature = private_key.sign(message)  # 64 bytes
+
+    # Verify — raises InvalidSignature if tampered
+    from cryptography.exceptions import InvalidSignature
+    try:
+        public_key.verify(signature, message)
+        print("Valid signature")
+    except InvalidSignature:
+        print("Tampered!")
+
+    # Serialize for storage (protect private key with KMS, not NoEncryption in prod)
+    pub_pem = public_key.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+  example_bad: |
+    from cryptography.hazmat.primitives.asymmetric import rsa, padding
+    from cryptography.hazmat.backends import default_backend
+
+    # WRONG 1: RSA-1024 — broken since 2010
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=1024,  # BROKEN — do not use under any circumstances
+        backend=default_backend()
+    )
+
+    # WRONG 2: Using ECDSA without verifying nonce uniqueness
+    # ECDSA with repeated k (nonce) → private key recovery
+    # Use Ed25519 (deterministic) instead to eliminate this risk entirely
+  when_applies: Generating any new asymmetric keypair for signatures, JWT tokens, TLS certificates, SSH access, or code signing. Audit all existing RSA-1024 usages and replace immediately.
+  sources:
+    - "NIST SP 800-57 Part 1 Rev 5 — Key management: https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final"
+    - "cryptography.io Ed25519 docs: https://cryptography.io/en/latest/hazmat/primitives/asymmetric/ed25519/"
+    - "NIST Post-Quantum Cryptography standards: https://csrc.nist.gov/projects/post-quantum-cryptography"
+
+- id: CRYPTO-004
+  text: >
+    Implement envelope encryption for all application-managed encryption: encrypt data with a
+    per-record Data Encryption Key (DEK), then encrypt the DEK with a Key Encryption Key (KEK)
+    stored in a KMS (AWS KMS, GCP KMS, HashiCorp Vault). Store the encrypted DEK alongside
+    the encrypted data. Never store unencrypted DEKs in databases.
+  why: >
+    Envelope encryption solves two critical operational problems simultaneously: key rotation
+    and breach containment. Without envelope encryption, rotating the master key requires
+    re-encrypting every encrypted record in the database — operationally infeasible at scale
+    (millions of records). With envelope encryption, key rotation only requires re-encrypting
+    DEKs (small number, fast), not all data. For breach containment: if an attacker exfiltrates
+    the database, they get encrypted data + encrypted DEKs but NOT the KEK (in KMS) — data is
+    unreadable. AWS, Google, and Azure all use envelope encryption for their own storage services.
+  how_to_do_right: |
+    1. Architecture:
+       KMS (KEK) ← encrypts → DEK (per-record) ← encrypts → plaintext data
+    2. Encrypt flow:
+       a. Generate DEK: dek = os.urandom(32)
+       b. Encrypt data with DEK using AES-256-GCM
+       c. Encrypt DEK with KEK via KMS: encrypted_dek = kms.encrypt(dek, key_id=kek_id)
+       d. Store: {encrypted_data, encrypted_dek, kek_id, nonce, aad}
+    3. Decrypt flow:
+       a. Fetch encrypted_dek + kek_id from DB
+       b. Decrypt DEK: dek = kms.decrypt(encrypted_dek, key_id=kek_id)
+       c. Decrypt data with DEK
+    4. Key rotation: re-encrypt only DEKs with new KEK version (not data)
+    5. Cache decrypted DEKs in memory with TTL=5min (reduces KMS API calls)
+    6. Audit log every KMS decrypt operation — anomalies indicate breach
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security]
+    concern: [key_management, encryption, kms]
+  example_good: |
+    import os
+    import boto3
+    from base64 import b64encode, b64decode
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    class EnvelopeEncryption:
+        def __init__(self, kms_key_id: str):
+            self.kms = boto3.client('kms', region_name='us-east-1')
+            self.kms_key_id = kms_key_id
+
+        def encrypt(self, plaintext: bytes) -> dict:
+            dek = os.urandom(32)  # Generate ephemeral DEK
+            nonce = os.urandom(12)
+            aesgcm = AESGCM(dek)
+            ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+
+            # Encrypt DEK with KEK via KMS (DEK never touches disk unencrypted)
+            encrypted_dek = self.kms.encrypt(
+                KeyId=self.kms_key_id,
+                Plaintext=dek
+            )['CiphertextBlob']
+
+            dek = b'\x00' * 32  # Zero DEK from memory immediately
+            return {
+                'ciphertext': b64encode(nonce + ciphertext).decode(),
+                'encrypted_dek': b64encode(encrypted_dek).decode(),
+                'kek_id': self.kms_key_id,
+            }
+
+        def decrypt(self, record: dict) -> bytes:
+            encrypted_dek = b64decode(record['encrypted_dek'])
+            dek = self.kms.decrypt(CiphertextBlob=encrypted_dek)['Plaintext']
+            token = b64decode(record['ciphertext'])
+            nonce, ct = token[:12], token[12:]
+            return AESGCM(dek).decrypt(nonce, ct, None)
+  example_bad: |
+    import os
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    # Single key stored in environment variable — WRONG
+    MASTER_KEY = bytes.fromhex(os.environ['ENCRYPTION_KEY'])
+
+    def encrypt_bad(plaintext: bytes) -> bytes:
+        nonce = os.urandom(12)
+        return nonce + AESGCM(MASTER_KEY).encrypt(nonce, plaintext, None)
+
+    # Problems:
+    # 1. No key rotation possible without re-encrypting ALL data
+    # 2. MASTER_KEY in env var — logged by monitoring tools, visible in process listing
+    # 3. All data encrypted with same key — compromise = all data compromised
+    # 4. No audit log of decryption operations
+  when_applies: Any application-level encryption of sensitive data (PII, PHI, financial data) stored in databases or object storage. Mandatory when handling regulated data under LGPD, GDPR, HIPAA.
+  sources:
+    - "AWS Envelope Encryption: https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#enveloping"
+    - "Google Cloud KMS envelope encryption: https://cloud.google.com/kms/docs/envelope-encryption"
+    - "NIST SP 800-57 Part 1 Rev 5: https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final"
+
+- id: CRYPTO-005
+  text: >
+    Configure TLS 1.3 as the minimum protocol version. Disable TLS 1.0 and TLS 1.1
+    (deprecated by RFC 8996, March 2021). For TLS 1.2 compatibility mode (transitional
+    period), allow only strong cipher suites: ECDHE for key exchange, AES-128-GCM or
+    AES-256-GCM for encryption, SHA-256 or SHA-384 for MAC.
+  why: >
+    TLS 1.0 is vulnerable to POODLE, BEAST, and CRIME attacks. TLS 1.1 is vulnerable to
+    POODLE (CBC variant). PCI DSS v4.0 (effective March 2024) mandates TLS 1.2 minimum
+    with strong cipher suites — non-compliance for cardholder data environments results in
+    failed audits. TLS 1.3 eliminates all CBC-mode cipher suites (and their padding oracle
+    risks), removes RSA key exchange (enabling forward secrecy by default), reduces handshake
+    to 1 RTT vs TLS 1.2's 2 RTT, and has no negotiable weak options — the attack surface
+    is fundamentally smaller.
+  how_to_do_right: |
+    1. Nginx configuration:
+       ssl_protocols TLSv1.3 TLSv1.2;  # Drop 1.0 and 1.1
+       ssl_ciphers ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256;
+       ssl_prefer_server_ciphers off;  # Let client choose in TLS 1.3 (required)
+       ssl_session_timeout 1d;
+       ssl_session_cache shared:MozSSL:10m;
+       add_header Strict-Transport-Security "max-age=63072000" always;
+    2. Python httpx client:
+       import ssl, httpx
+       ctx = ssl.create_default_context()
+       ctx.minimum_version = ssl.TLSVersion.TLSv1_2  # Never lower
+       client = httpx.Client(verify=ctx)
+    3. Test with: sslyze --regular your-domain.com
+    4. Verify cipher suites: nmap --script ssl-enum-ciphers -p 443 your-domain.com
+    5. HSTS header: max-age >= 1 year (63072000s), includeSubDomains, preload
+    6. Certificate: use Let's Encrypt with 90-day rotation via certbot
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, nginx]
+  domains:
+    domain: [security]
+    concern: [tls, transport_security, cryptography]
+  example_good: |
+    import ssl
+    import httpx
+
+    def create_secure_client() -> httpx.Client:
+        """Creates an HTTPS client with TLS 1.2 minimum (prefers TLS 1.3)."""
+        ctx = ssl.create_default_context()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        # Python's ssl module uses system's OpenSSL — TLS 1.3 used automatically if available
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        ctx.check_hostname = True
+        return httpx.Client(verify=ctx, timeout=30.0)
+
+    # FastAPI with uvicorn TLS 1.3
+    # uvicorn app:app --ssl-keyfile key.pem --ssl-certfile cert.pem \
+    #   --ssl-version 3  # = TLS 1.3 in OpenSSL terms
+  example_bad: |
+    import ssl
+    import httpx
+
+    # WRONG: Disabling SSL verification — common in "test" code that reaches production
+    client = httpx.Client(verify=False)  # Allows MITM attacks
+
+    # WRONG: Accepting TLS 1.0
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1  # POODLE and BEAST attacks possible
+
+    # WRONG: Not pinning certificates for internal service communication
+    # Any CA-signed cert accepted → internal MITM possible if CA is compromised
+  when_applies: Every HTTPS server, API client, and service-to-service communication. Validate TLS configuration before every production deployment using sslyze or testssl.sh.
+  sources:
+    - "RFC 8996 — TLS 1.0/1.1 deprecation: https://www.rfc-editor.org/rfc/rfc8996"
+    - "Mozilla TLS configuration generator: https://ssl-config.mozilla.org/"
+    - "PCI DSS v4.0 requirement 4.2.1: https://www.pcisecuritystandards.org/document_library/"
+
+- id: CRYPTO-006
+  text: >
+    Sign JWTs with RS256 (RSA-2048+ PKCS#1 v1.5), ES256 (ECDSA P-256), or EdDSA (Ed25519)
+    for distributed systems where multiple services verify tokens. Never use HS256
+    (HMAC-SHA256) when tokens cross service trust boundaries. Never accept `alg: none`
+    in token validation — this CVE (CVE-2015-9235) still appears in production systems.
+  why: >
+    HS256 uses a shared secret — every service that needs to VERIFY a token must also hold
+    the signing secret, meaning any compromised service can forge tokens for all users.
+    In microservice architectures with 10+ services, the probability of secret exposure scales
+    with the number of services holding it. Auth0 documented that the `alg: none` attack
+    bypassed authentication in dozens of libraries until 2020 — an attacker strips the
+    signature, sets `alg: none`, and the library accepts the unsigned token as valid.
+    RS256/ES256/EdDSA allow public key distribution: services verify with the public key
+    (safe to distribute) while only the auth service holds the private key.
+  how_to_do_right: |
+    1. Generate Ed25519 keypair for JWT signing (best choice for new systems):
+       from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+       private_key = Ed25519PrivateKey.generate()
+    2. Sign: encode with python-jose or PyJWT
+       import jwt
+       token = jwt.encode(payload, private_key, algorithm='EdDSA')
+    3. Verify: use public key only (safe to distribute to all services)
+       jwt.decode(token, public_key, algorithms=['EdDSA'])
+    4. ALWAYS set algorithms parameter explicitly — never allow 'none' or * wildcard
+    5. Validate claims: exp (expiration), iss (issuer), aud (audience) — all mandatory
+    6. Token TTL: access tokens = 15min, refresh tokens = 7 days
+    7. JWKS endpoint: expose public key at /.well-known/jwks.json for service discovery
+    8. Key rotation: support multiple key IDs (kid) in JWKS, rotate quarterly
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [security]
+    concern: [authentication, jwt, cryptography]
+  example_good: |
+    import jwt
+    from datetime import datetime, timedelta, timezone
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, PublicFormat, PrivateFormat, NoEncryption
+    )
+
+    class JWTService:
+        def __init__(self, private_key: Ed25519PrivateKey):
+            self.private_key = private_key
+            self.public_key = private_key.public_key()
+
+        def issue_token(self, user_id: str, audience: str) -> str:
+            now = datetime.now(timezone.utc)
+            payload = {
+                "sub": user_id,
+                "iss": "auth.example.com",
+                "aud": audience,
+                "iat": now,
+                "exp": now + timedelta(minutes=15),  # Short-lived access token
+            }
+            return jwt.encode(payload, self.private_key, algorithm="EdDSA")
+
+        def verify_token(self, token: str, audience: str) -> dict:
+            # algorithms is an explicit allowlist — 'none' cannot be injected
+            return jwt.decode(
+                token,
+                self.public_key,
+                algorithms=["EdDSA"],  # NEVER use ['*'] or omit this
+                audience=audience,
+                issuer="auth.example.com",
+            )
+  example_bad: |
+    import jwt
+    import os
+
+    SECRET = os.environ.get('JWT_SECRET', 'secret')  # WRONG: weak default
+
+    def verify_token_bad(token: str) -> dict:
+        # WRONG 1: algorithms not specified → accepts 'none' algorithm (CVE-2015-9235)
+        return jwt.decode(token, SECRET)
+
+        # WRONG 2: HS256 with shared secret in microservices
+        # return jwt.decode(token, SECRET, algorithms=['HS256'])
+        # Every microservice holding SECRET can forge tokens
+
+        # WRONG 3: audience not validated → token for service A accepted by service B
+  when_applies: Any system issuing authentication tokens, especially in microservice architectures where tokens are verified by multiple services.
+  sources:
+    - "CVE-2015-9235 alg:none JWT vulnerability: https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2015-9235"
+    - "RFC 7519 JSON Web Token: https://www.rfc-editor.org/rfc/rfc7519"
+    - "OWASP JWT Security Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html"
+
+- id: CRYPTO-007
+  text: >
+    Implement HMAC-SHA256 for message integrity verification on any data that crosses a
+    trust boundary (webhooks, queue messages, signed URLs, API callbacks). The HMAC key
+    must be at least 32 bytes, stored in a secrets manager, and rotated at least annually.
+    Always use `hmac.compare_digest()` for comparison — never `==`.
+  why: >
+    Stripe, GitHub, Shopify, and Twilio all use HMAC-SHA256 to sign webhook payloads because
+    without message authentication, any attacker who knows your webhook URL can send forged
+    events (e.g., fake payment confirmations). The `==` comparison leaks timing information
+    that allows timing attacks to recover the expected HMAC byte-by-byte.
+    `hmac.compare_digest()` runs in constant time regardless of where strings differ.
+    In 2022, a payment processing company had $4M in fraudulent refunds processed because
+    their webhook handler accepted unsigned callbacks and processed them without HMAC verification.
+  how_to_do_right: |
+    1. Generate HMAC key: secret = secrets.token_bytes(32)  # 256-bit key
+    2. Sign: sig = hmac.new(secret, payload, hashlib.sha256).hexdigest()
+    3. Verify:
+       expected = hmac.new(secret, payload, hashlib.sha256).hexdigest()
+       if not hmac.compare_digest(expected, received_sig):
+           raise SecurityError("HMAC verification failed")
+    4. For webhooks: include timestamp in signed payload to prevent replay attacks:
+       signed_payload = f"{timestamp}.{json.dumps(body)}".encode()
+    5. Reject requests older than 5 minutes (timestamp validation)
+    6. Include in headers: X-Signature-256: sha256=<hex_hmac>
+    7. Never log HMAC keys or signatures (they enable forgery if the key is compromised)
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security]
+    concern: [integrity, authentication, webhooks]
+  example_good: |
+    import hmac
+    import hashlib
+    import time
+    from fastapi import Request, HTTPException
+
+    WEBHOOK_SECRET = b"<32-byte-secret-from-secrets-manager>"
+    MAX_AGE_SECONDS = 300  # Reject payloads older than 5 minutes
+
+    async def verify_webhook(request: Request) -> bytes:
+        signature = request.headers.get("X-Signature-256", "")
+        timestamp = request.headers.get("X-Timestamp", "")
+
+        # Replay attack prevention
+        if abs(time.time() - int(timestamp)) > MAX_AGE_SECONDS:
+            raise HTTPException(400, "Request too old — possible replay attack")
+
+        body = await request.body()
+        signed_payload = f"{timestamp}.".encode() + body
+
+        expected_sig = "sha256=" + hmac.new(
+            WEBHOOK_SECRET, signed_payload, hashlib.sha256
+        ).hexdigest()
+
+        # Constant-time comparison — prevents timing attack
+        if not hmac.compare_digest(expected_sig, signature):
+            raise HTTPException(403, "Invalid webhook signature")
+        return body
+  example_bad: |
+    async def verify_webhook_bad(request: Request) -> bytes:
+        body = await request.body()
+        received = request.headers.get("X-Signature")
+        expected = hmac.new(b"secret", body, hashlib.sha256).hexdigest()
+
+        # WRONG: == comparison enables timing attack
+        if expected == received:
+            return body
+
+        # WRONG: no timestamp validation → replay attacks possible
+        # WRONG: key hardcoded as literal string → visible in source code
+  when_applies: All webhook endpoints, queue message consumers, signed URL generators, and any API callback that accepts data from external systems.
+  sources:
+    - "Python hmac module: https://docs.python.org/3/library/hmac.html"
+    - "Stripe webhook signature verification: https://stripe.com/docs/webhooks/signatures"
+    - "OWASP Transport Layer Security Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Transport_Layer_Security_Cheat_Sheet.html"
+
+- id: CRYPTO-008
+  text: >
+    Implement crypto-shredding for GDPR/LGPD right-to-erasure compliance: encrypt each user's
+    data with a user-specific DEK, store the DEK in a separate key store. On deletion request,
+    destroy only the DEK — the encrypted data becomes computationally irretrievable without
+    re-encrypting the entire dataset. This enables cryptographic deletion in 100ms regardless
+    of data volume.
+  why: >
+    Truly deleting data from distributed systems is operationally hard: backups, replicas,
+    analytical tables, data warehouses, and log archives all hold copies. Crypto-shredding
+    makes deletion provably complete — once the DEK is destroyed, all copies of the encrypted
+    data are permanently inaccessible regardless of where they reside. LGPD Article 16 and
+    GDPR Article 17 require deletion to be "without undue delay." Crypto-shredding satisfies
+    this requirement as confirmed by multiple DPAs including the CNIL (France) and the ICO (UK).
+  how_to_do_right: |
+    1. At user data ingestion:
+       a. Generate user-specific DEK: dek = os.urandom(32)
+       b. Encrypt all PII fields with this DEK (AES-256-GCM per field or per record)
+       c. Encrypt DEK with master KEK in KMS: encrypted_dek = kms.encrypt(dek)
+       d. Store encrypted_dek in a dedicated key table (user_id → encrypted_dek)
+    2. On erasure request (LGPD Art. 18 / GDPR Art. 17):
+       a. Delete encrypted_dek from key table → data becomes computationally irretrievable
+       b. Record deletion in audit log with timestamp and legal basis
+       c. Optionally: zero-fill encrypted_data columns (defense in depth)
+    3. Verify: attempt decrypt after DEK deletion → should fail with KMS key not found
+    4. Include DEK destruction in backup deletion policy
+    5. Document crypto-shredding approach in privacy policy (acceptable per most DPAs)
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [fastapi, django]
+  domains:
+    domain: [security, compliance]
+    concern: [data_deletion, gdpr, lgpd, encryption]
+  example_good: |
+    import os
+    import boto3
+    from sqlalchemy.orm import Session
+    from datetime import datetime, timezone
+
+    class CryptoShredder:
+        def __init__(self, kms_key_id: str):
+            self.kms = boto3.client('kms')
+            self.kms_key_id = kms_key_id
+
+        def create_user_dek(self, user_id: str, db: Session) -> bytes:
+            dek = os.urandom(32)
+            encrypted_dek = self.kms.encrypt(
+                KeyId=self.kms_key_id, Plaintext=dek
+            )['CiphertextBlob']
+            # Store encrypted DEK, not plaintext DEK
+            db.execute(
+                "INSERT INTO user_keys (user_id, encrypted_dek) VALUES (:uid, :dek)",
+                {"uid": user_id, "dek": encrypted_dek}
+            )
+            return dek
+
+        def shred_user(self, user_id: str, db: Session) -> None:
+            """Cryptographic deletion — all encrypted user data becomes irretrievable."""
+            # 1. Destroy DEK (the only way to decrypt user's data)
+            db.execute("DELETE FROM user_keys WHERE user_id = :uid", {"uid": user_id})
+            # 2. Audit log — required for LGPD Art. 16 / GDPR Art. 17 compliance
+            db.execute(
+                "INSERT INTO deletion_log (user_id, deleted_at, method) VALUES (:uid, :ts, 'crypto-shred')",
+                {"uid": user_id, "ts": datetime.now(timezone.utc)}
+            )
+            db.commit()
+  example_bad: |
+    def delete_user_bad(user_id: str, db: Session) -> None:
+        # WRONG: SQL DELETE does not actually remove data from:
+        # 1. Database WAL / transaction logs
+        # 2. Backup snapshots (S3, RDS automated backups)
+        # 3. Read replicas that haven't applied DELETE yet
+        # 4. Analytics database synced via CDC
+        # 5. Elasticsearch indexes with user data
+        db.execute("DELETE FROM users WHERE id = :uid", {"uid": user_id})
+        # "Deleted" user data may persist for months in backups
+        # This does NOT satisfy LGPD Art. 18 / GDPR Art. 17
+  when_applies: Any system processing personal data under LGPD, GDPR, CCPA, or any regulation that grants users deletion rights. Especially critical for systems with backups, data warehouses, or multi-region replication.
+  sources:
+    - "OWASP Cryptographic Shredding: https://owasp.org/www-community/vulnerabilities/Cryptographic_Failures"
+    - "ENISA Guidelines on Cryptographic Controls: https://www.enisa.europa.eu/publications/algorithms-key-size-and-parameters-report-2014"
+    - "AWS blog on crypto-shredding: https://aws.amazon.com/blogs/security/how-to-delete-user-data-in-an-amazon-kinesis-data-streams-application/"
+
+- id: CRYPTO-009
+  text: >
+    Use HKDF (HMAC-based Key Derivation Function) to derive multiple purpose-specific keys
+    from a single master secret, and PBKDF2-SHA256 with minimum 310,000 iterations when
+    forced to use PBKDF2 for password hashing (legacy compatibility). HKDF is for deriving
+    keys from existing key material; PBKDF2 is for stretching low-entropy secrets.
+  why: >
+    Using a single master key for multiple purposes (encryption + signing + MAC) is
+    cryptographically unsafe — an attack that recovers context from one usage can potentially
+    attack another. HKDF allows a single master key to derive unlimited purpose-specific
+    subkeys with cryptographic separation: HKDF(master, "email-encryption") ≠
+    HKDF(master, "jwt-signing"). NIST SP 800-56C Rev 2 recommends HKDF for key derivation
+    in all new systems. PBKDF2 at 310,000 iterations (OWASP 2023 recommendation) takes
+    ~1 second on commodity hardware — acceptable for password hashing when Argon2id is not
+    available (FIPS-constrained environments).
+  how_to_do_right: |
+    1. HKDF for key derivation (recommended over KDF directly):
+       from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+       from cryptography.hazmat.primitives import hashes
+       hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"email-encryption")
+       derived_key = hkdf.derive(master_key)
+    2. PBKDF2 (FIPS-compliant environments only):
+       from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+       kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=310000)
+       key = kdf.derive(password.encode())
+    3. Never use iterations < 310,000 for PBKDF2 in 2025 (OWASP recommendation)
+    4. For each distinct purpose, use a distinct info label in HKDF
+    5. Salt must be random (16+ bytes) and unique per derivation operation
+    6. HKDF for per-session keys, PBKDF2 for password stretching — never mix use cases
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [security]
+    concern: [key_derivation, cryptography]
+  example_good: |
+    import os
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives import hashes
+
+    class KeyDerivationService:
+        def __init__(self, master_key: bytes):
+            if len(master_key) < 32:
+                raise ValueError("Master key must be at least 32 bytes")
+            self.master_key = master_key
+
+        def derive_key(self, purpose: str, length: int = 32) -> bytes:
+            """Derive purpose-specific key from master using HKDF."""
+            hkdf = HKDF(
+                algorithm=hashes.SHA256(),
+                length=length,
+                salt=None,  # Master key is already high-entropy
+                info=purpose.encode(),  # Purpose label ensures key separation
+            )
+            return hkdf.derive(self.master_key)
+
+    # Usage: separate keys for each purpose
+    kds = KeyDerivationService(master_key=os.urandom(32))
+    email_enc_key = kds.derive_key("email-field-encryption-v1")
+    phone_enc_key = kds.derive_key("phone-field-encryption-v1")
+    # email_enc_key != phone_enc_key even though derived from same master
+  example_bad: |
+    import os
+
+    master = os.urandom(32)
+
+    # WRONG: Using same key for multiple purposes
+    email_enc_key = master  # WRONG
+    jwt_signing_key = master  # WRONG: same key for different purposes
+    # If email encryption is broken, JWT signing is also compromised
+
+    # WRONG: PBKDF2 with too few iterations
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+    kdf = PBKDF2HMAC(hashes.SHA256(), 32, salt=b'fixed-salt', iterations=1000)
+    # iterations=1000: hashable at 10 million/sec → brute force in seconds
+    # fixed salt: identical passwords produce identical outputs → rainbow table attack
+  when_applies: Deriving multiple application keys from a master secret (KMS-managed), session key generation, and any FIPS-constrained environment where Argon2id is not approved.
+  sources:
+    - "RFC 5869 HKDF specification: https://www.rfc-editor.org/rfc/rfc5869"
+    - "OWASP Password Storage Cheat Sheet (PBKDF2 iterations): https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html"
+    - "NIST SP 800-56C Rev 2 KDF: https://csrc.nist.gov/publications/detail/sp/800-56c/rev-2/final"
+
+- id: CRYPTO-010
+  text: >
+    Implement X.509 certificate lifecycle automation: use Let's Encrypt (ACME protocol) for
+    public-facing certificates with auto-renewal at 60 days remaining (certificates expire
+    at 90 days). For internal services, use HashiCorp Vault PKI secrets engine. Alert at
+    30 days remaining, hard-alert at 14 days. Never manually manage certificate renewals.
+  why: >
+    Cloudflare, Fastly, and AWS all have had major outages caused by expired TLS certificates
+    — even at companies with dedicated security teams. In 2023, Microsoft Azure had an outage
+    caused by an expired certificate that had been manually managed. Let's Encrypt's ACME
+    protocol automates the entire lifecycle; certbot --standalone or certbot --nginx handle
+    everything. Certificate expiry monitoring must be independent of the certificate itself
+    (check from external service, not the server being monitored).
+  how_to_do_right: |
+    1. Let's Encrypt automation:
+       certbot certonly --standalone -d domain.com --non-interactive --agree-tos
+       # Add to cron: 0 0,12 * * * certbot renew --quiet
+    2. Nginx configuration:
+       ssl_certificate /etc/letsencrypt/live/domain/fullchain.pem;
+       ssl_certificate_key /etc/letsencrypt/live/domain/privkey.pem;
+    3. External monitoring (independent of server):
+       python3 -c "
+       import ssl, socket, datetime
+       ctx = ssl.create_default_context()
+       with ctx.wrap_socket(socket.socket(), server_hostname='domain.com') as s:
+           s.connect(('domain.com', 443))
+           cert = s.getpeercert()
+           expiry = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+           days_left = (expiry - datetime.datetime.utcnow()).days
+           if days_left < 30: print(f'ALERT: cert expires in {days_left} days')
+       "
+    4. Internal PKI: Vault PKI secrets engine with 1-year intermediate CA, 90-day leaf certs
+    5. Never ignore SSL verification warnings in any environment — they indicate real failures
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi, nginx]
+  domains:
+    domain: [security]
+    concern: [certificates, tls, pki]
+  example_good: |
+    import ssl
+    import socket
+    from datetime import datetime, timezone
+
+    def check_cert_expiry(hostname: str, port: int = 443) -> int:
+        """Returns days until certificate expiry. Raises on error."""
+        ctx = ssl.create_default_context()
+        with ctx.wrap_socket(socket.socket(), server_hostname=hostname) as s:
+            s.settimeout(10)
+            s.connect((hostname, port))
+            cert = s.getpeercert()
+
+        expiry = datetime.strptime(
+            cert['notAfter'], '%b %d %H:%M:%S %Y %Z'
+        ).replace(tzinfo=timezone.utc)
+
+        days_remaining = (expiry - datetime.now(timezone.utc)).days
+        return days_remaining
+
+    def alert_if_expiring(hostname: str, threshold_days: int = 30) -> None:
+        days = check_cert_expiry(hostname)
+        if days < threshold_days:
+            raise AlertException(f"CERT EXPIRY: {hostname} expires in {days} days!")
+  example_bad: |
+    # WRONG: Manual certificate management with calendar reminders
+    # "I'll set a calendar reminder to renew the cert in 60 days"
+    # Reality: calendar gets ignored, monitoring gaps occur, cert expires at 3am Sunday
+
+    # WRONG: Ignoring SSL verification in health checks
+    import httpx
+    response = httpx.get('https://internal-service.com', verify=False)
+    # This masks expired certificates — you'll never know until clients fail
+  when_applies: Every public-facing HTTPS endpoint and internal service using TLS. Set up automation before the first certificate is issued — never operate in manual renewal mode.
+  sources:
+    - "Let's Encrypt ACME documentation: https://letsencrypt.org/docs/client-options/"
+    - "certbot documentation: https://certbot.eff.org/docs/"
+    - "HashiCorp Vault PKI secrets engine: https://developer.hashicorp.com/vault/docs/secrets/pki"
+
+- id: CRYPTO-011
+  text: >
+    Log all cryptographic operations that involve key access: KMS decrypt calls, private key
+    usage, DEK generation, and certificate issuance. Cryptographic audit logs must be
+    tamper-evident (append-only, integrity-protected) and retained for at least 1 year.
+    Anomalies — bulk decrypt calls, off-hours key usage, unusual geographic patterns — must
+    trigger real-time alerts.
+  why: >
+    The Solar Winds and Colonial Pipeline attacks both involved long-dwell-time attackers who
+    accessed encrypted data repeatedly over weeks before detection. Cryptographic audit logging
+    is the primary detection mechanism for insider threats and credential compromise: an
+    attacker with a stolen database encryption key will generate KMS decrypt API calls that
+    are anomalous in volume and timing. AWS CloudTrail KMS event logging is free and can
+    detect mass decryption events (e.g., exfiltration of an entire user database).
+  how_to_do_right: |
+    1. Enable AWS CloudTrail for all KMS API calls (free, automatic with CloudTrail)
+    2. Create CloudWatch alarm for: >100 KMS Decrypt calls in 1 minute from single IP
+    3. Python audit logging wrapper:
+       def kms_decrypt_audited(encrypted_dek, context):
+           result = kms.decrypt(CiphertextBlob=encrypted_dek, EncryptionContext=context)
+           audit_logger.info("KMS_DECRYPT", extra={
+               "key_id": context.get("key_id"),
+               "caller": get_current_user(),
+               "timestamp": datetime.utcnow().isoformat(),
+               "success": True,
+           })
+           return result['Plaintext']
+    4. Store audit logs in append-only storage (CloudWatch Logs with deletion protection,
+       or write to immutable S3 bucket with Object Lock)
+    5. Baseline normal decrypt volume per service per hour; alert on 3-sigma deviations
+    6. Never log plaintext DEKs or decrypted data — only operation metadata
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [fastapi]
+  domains:
+    domain: [security]
+    concern: [audit_logging, key_management, detection]
+  example_good: |
+    import logging
+    from datetime import datetime, timezone
+    from functools import wraps
+
+    audit_logger = logging.getLogger("crypto.audit")
+    # Configure audit_logger to write to append-only, integrity-protected store
+
+    def audit_kms_operation(operation_name: str):
+        def decorator(func):
+            @wraps(func)
+            def wrapper(*args, **kwargs):
+                start = datetime.now(timezone.utc)
+                success = False
+                try:
+                    result = func(*args, **kwargs)
+                    success = True
+                    return result
+                except Exception as e:
+                    audit_logger.error("CRYPTO_OP_FAILED", extra={
+                        "operation": operation_name,
+                        "error_type": type(e).__name__,
+                        "timestamp": start.isoformat(),
+                    })
+                    raise
+                finally:
+                    audit_logger.info("CRYPTO_OP", extra={
+                        "operation": operation_name,
+                        "success": success,
+                        "timestamp": start.isoformat(),
+                        "duration_ms": (datetime.now(timezone.utc) - start).total_seconds() * 1000,
+                    })
+            return wrapper
+        return decorator
+
+    @audit_kms_operation("kms_decrypt")
+    def decrypt_user_dek(encrypted_dek: bytes) -> bytes:
+        return kms.decrypt(CiphertextBlob=encrypted_dek)['Plaintext']
+  example_bad: |
+    def decrypt_user_dek_bad(encrypted_dek: bytes) -> bytes:
+        # No audit logging — no detection if attacker uses this function 10,000 times
+        return kms.decrypt(CiphertextBlob=encrypted_dek)['Plaintext']
+
+    # ALSO WRONG: Logging the decrypted key
+    def decrypt_log_bad(encrypted_dek: bytes) -> bytes:
+        dek = kms.decrypt(CiphertextBlob=encrypted_dek)['Plaintext']
+        print(f"Decrypted DEK: {dek.hex()}")  # CRITICAL: logs the key material
+        return dek
+  when_applies: All production cryptographic operations involving KMS, HSMs, private keys, and certificate authorities. Required for SOC 2 Type II, ISO 27001, PCI DSS, LGPD Article 46 compliance.
+  sources:
+    - "AWS CloudTrail KMS logging: https://docs.aws.amazon.com/kms/latest/developerguide/logging-using-cloudtrail.html"
+    - "NIST SP 800-57 Part 2 Rev 1 — Key management practices: https://csrc.nist.gov/publications/detail/sp/800-57-part-2/rev-1/final"
+    - "OWASP Logging Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html"

@@ -1,0 +1,424 @@
+layer: rules
+technology: Kubernetes
+domain: performance
+knowledge:
+- id: CR-K8S-SCALE-001
+  text: Configure HPA with both CPU and memory metrics, and set behavior scaling policies to prevent flapping.
+  why: 'HPA on CPU alone misses memory-bound workloads (Java heap, ML models, caches) — they OOMKill before CPU-based scaling
+    kicks in. Default scaling behavior is too aggressive: a single traffic spike scales up rapidly, then scales down too fast
+    when the spike passes, causing request drops during the scale-down. Scaling policies control how fast scaling happens
+    in each direction.'
+  how_to_do_right: Set both CPU (target 70%) and memory (target 80%) targets. Use behavior.scaleUp with stabilizationWindowSeconds=0
+    (scale up immediately) and policies limiting scale-up to 100% of current replicas per 60s. Use behavior.scaleDown with
+    stabilizationWindowSeconds=300 (5-minute cooldown) and policies limiting scale-down to 1 pod per 60s. Always set minReplicas
+    >= 2 for availability.
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [performance, reliability]
+  example_good: "apiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nmetadata:\n  name: api-hpa\nspec:\n  scaleTargetRef:\n\
+    \    apiVersion: apps/v1\n    kind: Deployment\n    name: api\n  minReplicas: 3\n  maxReplicas: 20\n  metrics:\n    -\
+    \ type: Resource\n      resource:\n        name: cpu\n        target:\n          type: Utilization\n          averageUtilization:\
+    \ 70\n    - type: Resource\n      resource:\n        name: memory\n        target:\n          type: Utilization\n    \
+    \      averageUtilization: 80\n  behavior:\n    scaleUp:\n      stabilizationWindowSeconds: 0\n      policies:\n     \
+    \   - type: Percent\n          value: 100\n          periodSeconds: 60\n    scaleDown:\n      stabilizationWindowSeconds:\
+    \ 300\n      policies:\n        - type: Pods\n          value: 1\n          periodSeconds: 60\n"
+  example_bad: "apiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nspec:\n  scaleTargetRef:\n    apiVersion: apps/v1\n\
+    \    kind: Deployment\n    name: api\n  minReplicas: 1          # Single point of failure\n  maxReplicas: 100        #\
+    \ No reasonable upper bound\n  metrics:\n    - type: Resource\n      resource:\n        name: cpu\n        target:\n \
+    \         type: Utilization\n          averageUtilization: 50\n  # No memory metric, no behavior policies\n  # Scales\
+    \ up/down aggressively — flapping replicas\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Kubernetes
+  sources: ["https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/"]
+- id: CR-K8S-SCALE-002
+  text: Use custom and external metrics in HPA for application-specific scaling signals.
+  why: CPU and memory are infrastructure metrics — they don't reflect application load. A queue worker with 10,000 pending
+    messages has low CPU (it's waiting for I/O) but needs more replicas. An API with 500ms latency at 30% CPU needs scaling
+    before CPU hits 70%. Custom metrics (from Prometheus) and external metrics (from cloud services) scale based on what matters
+    to your users.
+  how_to_do_right: 'Deploy prometheus-adapter or KEDA for custom metrics. Scale on: request rate (rps), queue depth, response
+    latency (P99), connection count, or business metrics. Use the Pods metric type for per-pod averages and Object type for
+    total values. Combine resource metrics (floor) with custom metrics (ceiling). Test scaling behavior under load before
+    production.'
+  severity: medium
+  technologies:
+    library: [keda]
+    platform: [kubernetes, prometheus]
+  domains:
+    domain: [performance]
+  example_good: "apiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nspec:\n  metrics:\n    # Scale on CPU (baseline)\n\
+    \    - type: Resource\n      resource:\n        name: cpu\n        target:\n          type: Utilization\n          averageUtilization:\
+    \ 70\n    # Scale on request rate (from Prometheus)\n    - type: Pods\n      pods:\n        metric:\n          name: http_requests_per_second\n\
+    \        target:\n          type: AverageValue\n          averageValue: 100    # Scale at 100 rps per pod\n    # Scale\
+    \ on queue depth (external)\n    - type: External\n      external:\n        metric:\n          name: sqs_queue_length\n\
+    \          selector:\n            matchLabels:\n              queue: orders\n        target:\n          type: AverageValue\n\
+    \          averageValue: 50     # 50 messages per pod\n"
+  example_bad: "# Only CPU-based scaling for a queue worker\nmetrics:\n  - type: Resource\n    resource:\n      name: cpu\n\
+    \      target:\n        type: Utilization\n        averageUtilization: 70\n# Worker at 10% CPU with 50,000 pending messages\n\
+    # HPA says \"everything is fine\" — doesn't scale\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments, Prometheus metrics collection, or KEDA
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant
+  sources: ["https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale-walkthrough/#autoscaling-on-multiple-metrics-and-custom-metrics"]
+- id: CR-K8S-SCALE-003
+  text: Use VPA in recommendation mode first — never enable Auto mode without understanding its restart behavior.
+  why: VPA in Auto mode evicts running pods to apply new resource values — this causes disruptions and can trigger cascading
+    restarts if combined with HPA. In Recreate mode, pods are also evicted. Only in Off mode does VPA simply provide recommendations
+    without any action. Most teams should use Off mode with a periodic review process to update Deployment manifests based
+    on VPA recommendations.
+  how_to_do_right: 'Deploy VPA with updateMode: Off for all workloads initially. Review VPA recommendations weekly with ''kubectl
+    describe vpa''. Apply recommendations by updating Deployment resource requests/limits. Set minAllowed and maxAllowed to
+    prevent extreme recommendations. Never use VPA Auto mode with HPA on the same Deployment for the same metric (CPU) — they
+    conflict.'
+  severity: medium
+  technologies:
+    library: [vpa]
+    platform: [kubernetes]
+  domains:
+    domain: [performance]
+  example_good: "apiVersion: autoscaling.k8s.io/v1\nkind: VerticalPodAutoscaler\nmetadata:\n  name: api-vpa\nspec:\n  targetRef:\n\
+    \    apiVersion: apps/v1\n    kind: Deployment\n    name: api\n  updatePolicy:\n    updateMode: \"Off\"      # Recommendations\
+    \ only, no restarts\n  resourcePolicy:\n    containerPolicies:\n      - containerName: api\n        minAllowed:\n    \
+    \      cpu: \"100m\"\n          memory: \"128Mi\"\n        maxAllowed:\n          cpu: \"4\"\n          memory: \"8Gi\"\
+    \n        controlledResources: [\"cpu\", \"memory\"]\n"
+  example_bad: "apiVersion: autoscaling.k8s.io/v1\nkind: VerticalPodAutoscaler\nspec:\n  targetRef:\n    apiVersion: apps/v1\n\
+    \    kind: Deployment\n    name: api\n  updatePolicy:\n    updateMode: \"Auto\"     # Evicts pods to resize!\n  # No minAllowed/maxAllowed\
+    \ — can recommend 0.001 CPU or 100GB RAM\n  # Combined with HPA on CPU → scaling conflict\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments or VPA
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Kubernetes or VPA
+  sources: ["https://github.com/kubernetes/autoscaler/tree/master/vertical-pod-autoscaler#quick-start"]
+- id: CR-K8S-SCALE-004
+  text: Use KEDA for event-driven autoscaling — scale to zero for intermittent workloads.
+  why: HPA cannot scale to zero — minReplicas must be >= 1, wasting resources for workloads that are idle 90% of the time
+    (batch processors, event handlers, dev environments). KEDA extends HPA with 60+ event sources (Kafka, RabbitMQ, Prometheus,
+    cron, AWS SQS, Azure Service Bus) and supports scale-to-zero. A Kafka consumer that processes 100 messages/hour doesn't
+    need a pod running 24/7.
+  how_to_do_right: Install KEDA operator. Create ScaledObject pointing to your Deployment. Configure triggers based on your
+    event source. Set minReplicaCount=0 for scale-to-zero (KEDA manages activation). Set cooldownPeriod (time before scaling
+    to zero after last trigger). Use pollingInterval to control how often KEDA checks the trigger source. Combine multiple
+    triggers for complex scaling logic.
+  severity: medium
+  technologies:
+    library: [keda]
+    platform: [kubernetes]
+  domains:
+    domain: [performance, architecture]
+  example_good: "apiVersion: keda.sh/v1alpha1\nkind: ScaledObject\nmetadata:\n  name: order-processor\nspec:\n  scaleTargetRef:\n\
+    \    name: order-processor\n  minReplicaCount: 0        # Scale to zero when idle\n  maxReplicaCount: 20\n  cooldownPeriod:\
+    \ 300       # Wait 5 min before scaling to zero\n  pollingInterval: 15       # Check every 15 seconds\n  triggers:\n \
+    \   - type: kafka\n      metadata:\n        bootstrapServers: kafka:9092\n        consumerGroup: orders\n        topic:\
+    \ order-events\n        lagThreshold: \"50\"  # Scale up at 50 messages lag\n    - type: cron\n      metadata:\n     \
+    \   timezone: America/New_York\n        start: \"0 9 * * 1-5\"   # Business hours\n        end: \"0 18 * * 1-5\"\n   \
+    \     desiredReplicas: \"2\"    # Warm during business hours\n"
+  example_bad: "# HPA for a batch processor that runs 2x per day\napiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\n\
+    spec:\n  minReplicas: 1    # Pod running 24/7 for 2 daily batch jobs\n  maxReplicas: 10   # Cannot scale to zero\n  #\
+    \ Wastes resources 22 hours per day\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments or KEDA
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Kubernetes or KEDA
+  sources: ["https://keda.sh/docs/latest/concepts/"]
+- id: CR-K8S-SCALE-005
+  text: Configure Cluster Autoscaler with proper scale-down rules and pod disruption budgets.
+  why: 'Cluster Autoscaler adds/removes nodes based on pending pods and node utilization. Without proper configuration: scale-down
+    is too aggressive (removes nodes with running pods), too slow (nodes sit idle for hours), or never happens (pods prevent
+    scale-down). PodDisruptionBudgets prevent scale-down from violating availability, but misconfigured PDBs can block scale-down
+    entirely.'
+  how_to_do_right: 'Set scale-down-utilization-threshold to 0.5 (scale down nodes <50% utilized). Set scale-down-delay-after-add
+    to 10m (don''t scale down right after scaling up). Set scale-down-unneeded-time to 10m. Use priority expander to choose
+    which node group to scale up. Set max-graceful-termination-sec to match your longest-running pod''s terminationGracePeriodSeconds.
+    Annotate pods that should prevent scale-down with cluster-autoscaler.kubernetes.io/safe-to-evict: ''false''.'
+  severity: high
+  technologies:
+    library: [cluster autoscaler]
+    platform: [kubernetes]
+  domains:
+    domain: [performance, operations, devops]
+  example_good: "# Cluster Autoscaler configuration\n# --scale-down-utilization-threshold=0.5\n# --scale-down-delay-after-add=10m\n\
+    # --scale-down-unneeded-time=10m\n# --max-graceful-termination-sec=600\n# --balance-similar-node-groups=true\n# --expander=priority\n\
+    \n# Priority expander config\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cluster-autoscaler-priority-expander\n\
+    \  namespace: kube-system\ndata:\n  priorities: |\n    50:\n      - spot-workers\n    30:\n      - on-demand-workers\n\
+    \    10:\n      - gpu-workers\n"
+  example_bad: '# Default Cluster Autoscaler — no tuning
+
+    # Scale-down too aggressive: removes node with in-progress batch job
+
+    # Scale-down too slow: idle nodes run for hours costing money
+
+    # No priority: scales up expensive GPU nodes for simple web pods
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments or Cluster Autoscaler
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Kubernetes or Cluster Autoscaler
+  sources: ["https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/FAQ.md"]
+- id: CR-K8S-SCALE-006
+  text: Use taints and tolerations to dedicate nodes to specific workloads and prevent noisy-neighbor issues.
+  why: Without taints, the scheduler places any pod on any node — a CPU-intensive batch job lands on the same node as a latency-sensitive
+    API, causing tail latency spikes. GPU nodes run regular web pods that waste expensive GPU resources. Spot/preemptible
+    nodes run stateful workloads that can't handle interruption. Taints block scheduling unless pods explicitly tolerate them.
+  how_to_do_right: 'Taint GPU nodes: nvidia.com/gpu=true:NoSchedule. Taint spot nodes: cloud.google.com/gke-spot=true:NoSchedule.
+    Taint dedicated nodes: workload=batch:NoSchedule. Add matching tolerations to pods that should run on those nodes. Use
+    NoExecute taint to evict existing pods (for maintenance). Combine with nodeAffinity for positive selection (tolerations
+    only remove the block).'
+  severity: medium
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [performance, operations, devops]
+  example_good: "# Taint GPU nodes\n# kubectl taint nodes gpu-node-1 nvidia.com/gpu=true:NoSchedule\n\n# GPU workload with\
+    \ toleration + affinity\napiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      tolerations:\n  \
+    \      - key: nvidia.com/gpu\n          operator: Equal\n          value: \"true\"\n          effect: NoSchedule\n   \
+    \   affinity:\n        nodeAffinity:\n          requiredDuringSchedulingIgnoredDuringExecution:\n            nodeSelectorTerms:\n\
+    \              - matchExpressions:\n                  - key: nvidia.com/gpu\n                    operator: Exists\n  \
+    \    containers:\n        - name: ml-inference\n          resources:\n            limits:\n              nvidia.com/gpu:\
+    \ 1\n"
+  example_bad: '# No taints — web pods scheduled on GPU nodes
+
+    # $3/hour GPU node runs a pod that uses 0 GPUs
+
+    # Or: batch job on latency-sensitive API node
+
+    # causes P99 latency spikes for API traffic
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/"]
+- id: CR-K8S-SCALE-007
+  text: Use requiredDuringScheduling for hard constraints and preferredDuringScheduling for optimization hints.
+  why: Hard affinity (required) blocks scheduling if no matching node exists — pods stay Pending forever instead of degraded
+    performance. Soft affinity (preferred) is advisory — the scheduler tries to match but schedules anywhere if it can't.
+    Using required for optimization preferences (e.g., same-zone as cache) causes unnecessary outages during zone failures.
+    Using preferred for hard constraints (e.g., GPU workload) wastes resources.
+  how_to_do_right: 'Use requiredDuringSchedulingIgnoredDuringExecution for: GPU workloads on GPU nodes, compliance (data residency),
+    and dedicated node pools. Use preferredDuringSchedulingIgnoredDuringExecution with weights for: co-locating with dependencies,
+    zone affinity, cost optimization (spot nodes). Set weight 1-100 to express relative preference strength.'
+  severity: medium
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [performance]
+  example_good: "spec:\n  affinity:\n    # Hard: MUST be on x86 nodes (not ARM)\n    nodeAffinity:\n      requiredDuringSchedulingIgnoredDuringExecution:\n\
+    \        nodeSelectorTerms:\n          - matchExpressions:\n              - key: kubernetes.io/arch\n                operator:\
+    \ In\n                values: [\"amd64\"]\n    # Soft: PREFER same zone as cache, but schedule anywhere\n    podAffinity:\n\
+    \      preferredDuringSchedulingIgnoredDuringExecution:\n        - weight: 80\n          podAffinityTerm:\n          \
+    \  topologyKey: topology.kubernetes.io/zone\n            labelSelector:\n              matchLabels:\n                app:\
+    \ redis-cache\n"
+  example_bad: "spec:\n  affinity:\n    # Hard affinity for optimization — causes outage if zone down\n    podAffinity:\n\
+    \      requiredDuringSchedulingIgnoredDuringExecution:\n        - topologyKey: topology.kubernetes.io/zone\n         \
+    \ labelSelector:\n            matchLabels:\n              app: redis-cache\n    # Cache zone goes down → API pods can't\
+    \ be rescheduled\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity"]
+- id: CR-K8S-SCALE-008
+  text: Use pod anti-affinity to spread replicas across failure domains — prefer topologySpreadConstraints for new clusters.
+  why: Without anti-affinity, the scheduler may place all replicas of a service on the same node — a node failure takes down
+    the entire service. Anti-affinity ensures replicas are distributed across nodes/zones. However, pod anti-affinity has
+    quadratic complexity in scheduling decisions (O(N*P) where N=nodes, P=pods), making it slow in large clusters. TopologySpreadConstraints
+    are more efficient and flexible.
+  how_to_do_right: 'For new clusters (K8s 1.19+): use topologySpreadConstraints (see CR-K8S-CORE-018). For existing clusters
+    with anti-affinity: use preferredDuringSchedulingIgnoredDuringExecution with hostname topology key. Avoid requiredDuringScheduling
+    anti-affinity on hostname — if you have more replicas than nodes, pods are stuck Pending. Combine zone anti-affinity (required)
+    with node anti-affinity (preferred).'
+  severity: medium
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [performance, reliability]
+  example_good: "# Preferred approach: topologySpreadConstraints\nspec:\n  topologySpreadConstraints:\n    - maxSkew: 1\n\
+    \      topologyKey: topology.kubernetes.io/zone\n      whenUnsatisfiable: DoNotSchedule\n      labelSelector:\n      \
+    \  matchLabels:\n          app: api\n---\n# Legacy approach: anti-affinity\nspec:\n  affinity:\n    podAntiAffinity:\n\
+    \      preferredDuringSchedulingIgnoredDuringExecution:\n        - weight: 100\n          podAffinityTerm:\n         \
+    \   topologyKey: kubernetes.io/hostname\n            labelSelector:\n              matchLabels:\n                app:\
+    \ api\n"
+  example_bad: "spec:\n  affinity:\n    podAntiAffinity:\n      requiredDuringSchedulingIgnoredDuringExecution:\n        -\
+    \ topologyKey: kubernetes.io/hostname\n          labelSelector:\n            matchLabels:\n              app: api\n  \
+    \  # 10 replicas + 8 nodes = 2 pods stuck in Pending forever\n    # Blocks cluster autoscaler from consolidating nodes\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/"]
+- id: CR-K8S-SCALE-009
+  text: Define PriorityClasses to ensure critical workloads survive resource pressure — use preemption carefully.
+  why: 'During resource pressure, Kubernetes evicts pods in order: BestEffort first, then Burstable, then Guaranteed. But
+    within the same QoS class, there''s no way to differentiate between your payment processing pod and a dev test pod. PriorityClasses
+    add a numeric priority — higher priority pods preempt (evict) lower priority pods when nodes are full. Without them, a
+    burst of low-value batch jobs can starve critical production services.'
+  how_to_do_right: 'Create 3-4 PriorityClasses: system-critical (1000000, system pods), production-high (100000, production
+    workloads), production-low (10000, non-critical production), development (1000, dev/test). Set preemptionPolicy to PreemptLowerPriority
+    for production, Never for development (don''t let dev preempt anything). Never set globalDefault on high-priority classes.
+    Reserve system-cluster-critical and system-node-critical for infrastructure.'
+  severity: high
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [performance, reliability]
+  example_good: "apiVersion: scheduling.k8s.io/v1\nkind: PriorityClass\nmetadata:\n  name: production-high\nvalue: 100000\n\
+    preemptionPolicy: PreemptLowerPriority\nglobalDefault: false\ndescription: \"Critical production workloads\"\n---\napiVersion:\
+    \ scheduling.k8s.io/v1\nkind: PriorityClass\nmetadata:\n  name: development\nvalue: 1000\npreemptionPolicy: Never    \
+    \   # Dev pods never preempt others\nglobalDefault: false\ndescription: \"Development and testing workloads\"\n---\napiVersion:\
+    \ apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      priorityClassName: production-high\n"
+  example_bad: '# No PriorityClasses — all pods are equal priority
+
+    # Batch job burst fills the cluster
+
+    # Payment API pods get evicted alongside batch pods
+
+    # Critical production service goes down
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Kubernetes
+  sources: ["https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/"]
+- id: CR-K8S-SCALE-010
+  text: Right-size pod resources based on actual usage data — over-provisioning wastes money, under-provisioning causes incidents.
+  why: 'Developers typically set resource requests based on guesswork: too high means paying for unused capacity (30-60% waste
+    is common), too low means pods get OOMKilled or CPU-throttled under load. Without data-driven right-sizing, you''re either
+    wasting money or causing outages. VPA recommendations, Prometheus metrics, and cost tools give you the data to make informed
+    decisions.'
+  how_to_do_right: 'Deploy VPA in Off mode for all workloads. After 7 days, review recommendations. Use Prometheus queries:
+    container_memory_working_set_bytes (actual memory), container_cpu_usage_seconds_total (actual CPU). Set requests to P50
+    usage, limits to P99. Use Kubecost, OpenCost, or CloudPilot for cost visibility. Review quarterly. Never set CPU limits
+    equal to requests (causes unnecessary throttling) — set limits 2-4x requests or omit CPU limits entirely.'
+  severity: medium
+  technologies:
+    library: [vpa]
+    platform: [kubernetes, prometheus]
+  domains:
+    domain: [performance]
+  example_good: "# Step 1: Observe actual usage (Prometheus)\n# avg(container_memory_working_set_bytes{container=\"api\"})\
+    \ -> 180Mi\n# quantile(0.99, rate(container_cpu_usage_seconds_total{container=\"api\"}[5m])) -> 0.3\n\n# Step 2: Set resources\
+    \ based on data\nresources:\n  requests:\n    cpu: \"250m\"      # P50 CPU = 150m, add 60% buffer\n    memory: \"256Mi\"\
+    \  # P50 memory = 180Mi, add 40% buffer\n  limits:\n    cpu: \"1000m\"     # P99 CPU = 300m, 3x headroom\n    memory:\
+    \ \"512Mi\"  # P99 memory = 400Mi, 25% headroom\n"
+  example_bad: "resources:\n  requests:\n    cpu: \"2\"           # Actual usage: 150m — 13x over-provisioned\n    memory:\
+    \ \"4Gi\"      # Actual usage: 180Mi — 22x over-provisioned\n  limits:\n    cpu: \"2\"           # CPU limit = request\
+    \ — unnecessary throttling\n    memory: \"4Gi\"      # Wastes 3.7Gi per pod\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments, Prometheus metrics collection, or VPA
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant
+  sources: ["https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"]
+- id: CR-K8S-SCALE-011
+  text: Never use HPA and VPA on the same metric for the same workload — they conflict.
+  why: 'HPA scales horizontally (adds pods) when CPU is high. VPA scales vertically (increases pod resources) when CPU is
+    high. If both target CPU on the same Deployment: HPA adds a pod, reducing per-pod CPU → VPA recommends lower resources
+    → pods get smaller → HPA needs more pods → VPA recommends even lower → pods shrink to minimum. This feedback loop causes
+    instability.'
+  how_to_do_right: 'Option A: HPA on CPU/memory, VPA on Off mode for recommendations only (apply manually). Option B: HPA
+    on custom metrics (request rate, queue depth), VPA Auto on CPU/memory (they don''t overlap). Option C: Use KEDA with ScaledObject
+    + VPA (KEDA targets external metrics, VPA targets resources). Multidimensional Pod Autoscaler (MPA) is an experimental
+    alternative that combines both.'
+  severity: high
+  technologies:
+    library: [vpa]
+    platform: [kubernetes, hpa]
+  domains:
+    domain: [performance]
+  example_good: "# HPA on custom metrics, VPA on resources — no conflict\napiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\n\
+    spec:\n  metrics:\n    - type: Pods\n      pods:\n        metric:\n          name: http_requests_per_second\n        target:\n\
+    \          type: AverageValue\n          averageValue: 100\n---\napiVersion: autoscaling.k8s.io/v1\nkind: VerticalPodAutoscaler\n\
+    spec:\n  targetRef:\n    apiVersion: apps/v1\n    kind: Deployment\n    name: api\n  updatePolicy:\n    updateMode: \"\
+    Auto\"    # OK because HPA is not on CPU/memory\n"
+  example_bad: "# Both HPA and VPA targeting CPU — CONFLICT\napiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nspec:\n\
+    \  metrics:\n    - type: Resource\n      resource:\n        name: cpu\n        target:\n          type: Utilization\n\
+    \          averageUtilization: 70\n---\napiVersion: autoscaling.k8s.io/v1\nkind: VerticalPodAutoscaler\nspec:\n  updatePolicy:\n\
+    \    updateMode: \"Auto\"    # Also reacts to CPU — conflict!\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments, HPA, or VPA
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant
+  sources: ["https://github.com/kubernetes/autoscaler/tree/master/vertical-pod-autoscaler#known-limitations"]
+- id: CR-K8S-SCALE-012
+  text: Use spot/preemptible nodes for fault-tolerant workloads with proper termination handling.
+  why: Spot instances cost 60-90% less than on-demand but can be terminated with 2 minutes notice. Running all workloads on
+    spot is dangerous — stateful services lose data, long-running batch jobs restart from zero. But for stateless web services
+    (with multiple replicas), batch jobs (with checkpointing), and CI/CD runners, spot instances dramatically reduce costs.
+  how_to_do_right: Create separate node groups for spot and on-demand. Taint spot nodes. Run stateless services on spot with
+    pod anti-affinity across nodes. Run stateful services on on-demand. Use node termination handler (NTH) to gracefully drain
+    nodes on spot termination notice. Set terminationGracePeriodSeconds appropriately. Diversify across multiple instance
+    types to reduce interruption frequency.
+  severity: medium
+  technologies:
+    platform: [kubernetes, aws, gcp]
+  domains:
+    domain: [performance, operations, devops]
+  example_good: "# Spot-tolerant workload\napiVersion: apps/v1\nkind: Deployment\nspec:\n  replicas: 5     # Enough replicas\
+    \ to survive spot termination\n  template:\n    spec:\n      tolerations:\n        - key: cloud.google.com/gke-spot\n\
+    \          operator: Equal\n          value: \"true\"\n          effect: NoSchedule\n      affinity:\n        nodeAffinity:\n\
+    \          preferredDuringSchedulingIgnoredDuringExecution:\n            - weight: 90\n              preference:\n   \
+    \             matchExpressions:\n                  - key: cloud.google.com/gke-spot\n                    operator: In\n\
+    \                    values: [\"true\"]\n      topologySpreadConstraints:\n        - maxSkew: 1\n          topologyKey:\
+    \ kubernetes.io/hostname\n          whenUnsatisfiable: ScheduleAnyway\n      terminationGracePeriodSeconds: 25\n"
+  example_bad: "# Database on spot instances — data loss on termination\napiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n\
+    \  name: postgres\nspec:\n  template:\n    spec:\n      tolerations:\n        - key: spot\n          operator: Exists\n\
+    \      # Spot node terminated with 2min notice\n      # Database corruption, lost transactions\n"
+  when_applies: Projects using Kubernetes-orchestrated deployments, AWS cloud infrastructure, or Google Cloud Platform services
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant
+  sources: ["https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/"]
+- id: CR-K8S-SCALE-013
+  text: Implement namespace-level cost allocation and resource budgets to track and control Kubernetes spending.
+  why: Without cost allocation, Kubernetes becomes a shared cost center where no team is accountable — the monthly bill grows
+    30% but nobody knows why. Teams over-provision 'just in case' because there's no visibility into actual costs. Cost allocation
+    assigns spending to teams/projects, enabling chargeback/showback, budget alerts, and data-driven right-sizing decisions.
+  how_to_do_right: 'Deploy OpenCost or Kubecost for cost allocation. Label all workloads with team, project, and environment.
+    Create ResourceQuotas per namespace to enforce budgets. Set up alerts for: namespace cost exceeding budget, idle resources
+    (requested but unused), unallocated costs >10%. Review cost reports weekly. Target <20% waste (requested minus used resources).'
+  severity: medium
+  technologies:
+    library: [opencost, kubecost]
+    platform: [kubernetes]
+  domains:
+    domain: [performance, operations, devops]
+  example_good: "# Namespace with cost allocation labels\napiVersion: v1\nkind: Namespace\nmetadata:\n  name: team-alpha-prod\n\
+    \  labels:\n    team: alpha\n    project: ecommerce\n    environment: production\n    cost-center: cc-1234\n---\n# ResourceQuota\
+    \ as budget enforcement\napiVersion: v1\nkind: ResourceQuota\nmetadata:\n  name: budget\n  namespace: team-alpha-prod\n\
+    spec:\n  hard:\n    requests.cpu: \"20\"\n    requests.memory: \"40Gi\"\n    # Team Alpha's production budget: 20 CPU\
+    \ cores, 40Gi RAM\n"
+  example_bad: '# No cost labels, no quotas, no visibility
+
+    # Monthly K8s bill: $50,000
+
+    # "Who''s spending this?" -> "Nobody knows"
+
+    # "Can we reduce it?" -> "We''re afraid to change anything"
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments, OpenCost, or Kubecost
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant
+  sources: ["https://kubernetes.io/docs/concepts/policy/resource-quotas/"]
+- id: CR-K8S-SCALE-014
+  text: Use MostAllocated scoring strategy for bin packing to reduce node count and cost.
+  why: Default scheduling uses LeastAllocated strategy — it spreads pods across nodes for better availability. But this means
+    every node is partially utilized (40-60%), preventing Cluster Autoscaler from scaling down unused nodes. MostAllocated
+    packs pods tightly onto fewer nodes, leaving other nodes empty enough to be reclaimed by the autoscaler. This can reduce
+    node count by 20-40%.
+  how_to_do_right: Configure kube-scheduler with MostAllocated scoring for non-critical workloads. Keep LeastAllocated for
+    production (better availability). Use scheduler profiles to apply different strategies per namespace. Combine with Cluster
+    Autoscaler scale-down and spot instances for maximum savings. Monitor node utilization — target 60-80% average.
+  severity: medium
+  technologies:
+    platform: [kubernetes]
+  domains:
+    domain: [performance]
+  example_good: "# Scheduler profile for cost optimization\napiVersion: kubescheduler.config.k8s.io/v1\nkind: KubeSchedulerConfiguration\n\
+    profiles:\n  - schedulerName: cost-optimized\n    plugins:\n      score:\n        enabled:\n          - name: NodeResourcesFit\n\
+    \        disabled:\n          - name: NodeResourcesBalancedAllocation\n    pluginConfig:\n      - name: NodeResourcesFit\n\
+    \        args:\n          scoringStrategy:\n            type: MostAllocated    # Pack pods tightly\n            resources:\n\
+    \              - name: cpu\n                weight: 1\n              - name: memory\n                weight: 1\n"
+  example_bad: '# Default LeastAllocated: every node at 40% utilization
+
+    # 10 nodes at 40% = 4 nodes worth of unused capacity
+
+    # Cluster Autoscaler can''t scale down because each node has pods
+
+    # Monthly waste: ~$1,500 for idle compute
+
+    '
+  when_applies: Projects using Kubernetes-orchestrated deployments
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not
+    using Kubernetes
+  sources: ["https://kubernetes.io/docs/reference/scheduling/config/#scoring-strategy"]

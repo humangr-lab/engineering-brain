@@ -1,0 +1,1034 @@
+layer: rules
+domain: databases
+knowledge:
+- id: ALM-001
+  text: >
+    Configure Alembic env.py for async SQLAlchemy using asyncio.run() and
+    async_engine_from_config(). The async env.py must define both run_migrations_offline()
+    (synchronous, for generating SQL scripts) and run_migrations_online() (async, for
+    direct execution). Never run async migrations inside an existing event loop —
+    always create a fresh event loop via asyncio.run().
+  why: >
+    Alembic was designed synchronously; async support is bolted on. The most common failure
+    is calling asyncio.run(run_migrations_online()) inside a FastAPI lifespan that already
+    has a running event loop — this raises "asyncio.run() cannot be called when another event
+    loop is running." In CI, this error appears only on Python 3.10+ where nested event loops
+    are forbidden. The fix is to use loop.run_until_complete() via a sync wrapper or to run
+    Alembic migrations as a separate process, not from within the application's async context.
+  how_to_do_right: |
+    1. Generate async template: alembic init --template async migrations/
+    2. In env.py, implement async online mode:
+       async def run_migrations_online() -> None:
+           connectable = async_engine_from_config(
+               config.get_section(config.config_ini_section, {}),
+               prefix="sqlalchemy.",
+               poolclass=pool.NullPool,
+           )
+           async with connectable.connect() as connection:
+               await connection.run_sync(do_run_migrations)
+           await connectable.dispose()
+       def run_migrations_online_sync():
+           asyncio.run(run_migrations_online())
+    3. Call run_migrations_online_sync() (not the async version) at the end of env.py
+    4. Always use NullPool for migration connections — never pool migration connections
+    5. Run Alembic CLI from a separate process, not from within FastAPI startup
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [alembic, sqlalchemy, asyncio]
+  domains:
+    domain: [databases, backend]
+    concern: [async, configuration]
+  example_good: |
+    # migrations/env.py — correct async configuration
+    import asyncio
+    from alembic import context
+    from sqlalchemy.ext.asyncio import async_engine_from_config
+    from sqlalchemy import pool
+    from myapp.models import Base
+
+    target_metadata = Base.metadata
+
+    def do_run_migrations(connection):
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
+
+    async def run_migrations_online() -> None:
+        connectable = async_engine_from_config(
+            context.config.get_section(context.config.config_ini_section, {}),
+            prefix="sqlalchemy.",
+            poolclass=pool.NullPool,  # CRITICAL: NullPool for migrations
+        )
+        async with connectable.connect() as connection:
+            await connection.run_sync(do_run_migrations)
+        await connectable.dispose()
+
+    if context.is_offline_mode():
+        run_migrations_offline()
+    else:
+        asyncio.run(run_migrations_online())  # Fresh event loop, not inside existing one
+  example_bad: |
+    # WRONG: Calling from within FastAPI lifespan — nested event loop error
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # This FAILS: "asyncio.run() cannot be called when another event loop is running"
+        asyncio.run(run_migrations_online())
+        yield
+    # Also wrong: using regular engine in async env.py
+    # connectable = engine_from_config(...)  # Blocking sync calls in async context
+  when_applies: >
+    Any project using SQLAlchemy 2.0 async engine with FastAPI or any other async web framework,
+    and any project running migrations as part of application startup.
+  sources:
+    - "Alembic Asyncio Template — https://github.com/sqlalchemy/alembic/blob/main/alembic/templates/async/env.py"
+    - "Alembic Tutorial — https://alembic.sqlalchemy.org/en/latest/tutorial.html"
+    - "Alembic with Async SQLAlchemy — https://dev.to/matib/alembic-with-async-sqlalchemy-1ga"
+
+- id: ALM-002
+  text: >
+    Always review auto-generated migrations before applying them. Alembic autogenerate
+    has critical blind spots: it cannot detect table or column renames (generates a drop+add
+    pair instead, losing data), ignores server-side defaults unless compare_server_default=True
+    is set, and ignores PostgreSQL CHECK and EXCLUDE constraints entirely. Treat autogenerate
+    as a first draft, not a finished migration.
+  why: >
+    A developer renamed a column from user_id to author_id in the SQLAlchemy model and ran
+    alembic revision --autogenerate. The generated migration dropped user_id and created
+    author_id — losing all existing data in that column. No warning was issued. This pattern
+    silently drops data whenever a column is renamed. We now require every generated migration
+    to be code-reviewed by a second engineer and tested against a copy of production data
+    before deployment.
+  how_to_do_right: |
+    1. Enable type comparison (detects column type changes):
+       context.configure(
+           ...,
+           compare_type=True,
+           compare_server_default=True,
+       )
+    2. Review every generated migration for:
+       - op.drop_column() + op.add_column() pairs on same table = rename, not add/drop
+       - op.drop_table() for tables you still use (filter with include_name hook)
+    3. For renames, replace the generated drop+add with op.alter_column():
+       op.alter_column("users", "user_id", new_column_name="author_id")
+    4. Add filter to exclude tables not managed by Alembic:
+       def include_name(name, type_, parent_names):
+           if type_ == "table":
+               return name in target_metadata.tables
+           return True
+       context.configure(..., include_name=include_name)
+    5. Run alembic check in CI to detect model-migration drift
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [alembic, sqlalchemy, postgresql]
+  domains:
+    domain: [databases, data_integrity]
+    concern: [migration_safety, data_loss_prevention]
+  example_good: |
+    # env.py — configure autogenerate with type comparison
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        compare_type=True,         # Detect column type changes
+        compare_server_default=True,  # Detect server default changes
+        include_name=include_name,  # Filter unmanaged tables
+        include_schemas=True,       # Multi-schema support
+    )
+
+    # In migration review: rename, not drop+add
+    # WRONG autogenerate output:
+    # op.drop_column("posts", "user_id")
+    # op.add_column("posts", sa.Column("author_id", sa.Integer()))
+    #
+    # CORRECT manual replacement:
+    def upgrade():
+        op.alter_column("posts", "user_id", new_column_name="author_id")
+    def downgrade():
+        op.alter_column("posts", "author_id", new_column_name="user_id")
+  example_bad: |
+    # WRONG: Apply autogenerated migration without review
+    # $ alembic revision --autogenerate -m "rename user_id to author_id"
+    # $ alembic upgrade head  # IMMEDIATELY drops user_id column with all data!
+    def upgrade():
+        op.drop_column("posts", "user_id")  # DATA LOSS — all user_id values deleted
+        op.add_column("posts", sa.Column("author_id", sa.Integer(), nullable=True))
+  when_applies: >
+    Every time alembic revision --autogenerate is run, especially when SQLAlchemy models
+    have been modified with renames, type changes, or constraint additions.
+  sources:
+    - "Alembic Auto Generating Migrations — https://alembic.sqlalchemy.org/en/latest/autogenerate.html"
+    - "Alembic Operation Reference — https://alembic.sqlalchemy.org/en/latest/ops.html"
+
+- id: ALM-003
+  text: >
+    Implement zero-downtime migrations using the expand-contract (three-phase) pattern:
+    Phase 1 (Expand) — add new schema elements without removing old ones, deploy new code that
+    works with both old and new schema. Phase 2 (Migrate) — backfill data from old columns
+    to new columns. Phase 3 (Contract) — remove old schema elements, deploy code that uses
+    only the new schema. Never combine all three phases into a single migration file.
+  why: >
+    A single migration that renames a column, backfills data, and drops the old column requires
+    zero traffic during the entire operation. For a table with 100M rows, the backfill alone
+    takes 10-30 minutes. With the expand-contract pattern, Phase 1 deploys in <1 second (just
+    adds a nullable column), application code is updated to write to both columns, Phase 2
+    backfills in batches with no downtime, and Phase 3 removes the old column after all reads
+    are confirmed to use the new column. Total downtime: zero.
+  how_to_do_right: |
+    1. Phase 1 (Expand) migration — additive only, no column removal:
+       op.add_column("posts", sa.Column("author_id", sa.Integer(), nullable=True))
+       # Deploy app code that writes to BOTH old user_id and new author_id
+    2. Phase 2 (Migrate) migration — data only, no schema changes:
+       op.execute("""
+           UPDATE posts
+           SET author_id = user_id
+           WHERE author_id IS NULL AND user_id IS NOT NULL
+       """)
+       # For large tables: batch update (see ALM-009 for batch pattern)
+    3. Phase 3 (Contract) migration — remove old schema:
+       op.alter_column("posts", "author_id", nullable=False)
+       op.drop_column("posts", "user_id")
+       # Deploy app code that reads/writes ONLY author_id
+    4. Use depends_on to enforce ordering between phases
+    5. Keep phases in separate migration files for rollback granularity
+  severity: critical
+  technologies:
+    lang: [python, sql]
+    framework: [alembic, postgresql]
+  domains:
+    domain: [databases, deployment]
+    concern: [zero_downtime, deployment_strategy]
+  example_good: |
+    # Migration 001: expand — adds new column (safe, no downtime)
+    def upgrade():
+        op.add_column(
+            "posts",
+            sa.Column("author_id", sa.Integer(), nullable=True)
+        )
+        op.create_index("ix_posts_author_id", "posts", ["author_id"])
+
+    def downgrade():
+        op.drop_index("ix_posts_author_id")
+        op.drop_column("posts", "author_id")
+
+    # Migration 002: migrate — backfill data (batched for large tables)
+    def upgrade():
+        op.execute("""
+            UPDATE posts
+            SET author_id = user_id
+            WHERE author_id IS NULL
+        """)
+
+    # Migration 003: contract — remove old column (after code fully migrated)
+    def upgrade():
+        op.alter_column("posts", "author_id", nullable=False)
+        op.drop_index("ix_posts_user_id")
+        op.drop_column("posts", "user_id")
+  example_bad: |
+    # WRONG: Single migration that does everything — requires maintenance window
+    def upgrade():
+        op.add_column("posts", sa.Column("author_id", sa.Integer()))
+        op.execute("UPDATE posts SET author_id = user_id")  # Locks table for 30min on 100M rows
+        op.alter_column("posts", "author_id", nullable=False)
+        op.drop_column("posts", "user_id")
+        # Everything in one transaction = table locked for entire duration
+  when_applies: >
+    Any production migration that renames columns, changes column types, or modifies
+    not-null constraints on tables with significant data or live traffic.
+  sources:
+    - "Zero-downtime Upgrades With Alembic — https://that.guru/blog/zero-downtime-upgrades-with-alembic-and-sqlalchemy/"
+    - "Alembic Migrations Without Downtime (Exness) — https://medium.com/exness-blog/alembic-migrations-without-downtime-a3507d5da24d"
+    - "OpenStack Zero-Downtime Migrations — https://docs.openstack.org/glance/latest/contributor/database_migrations.html"
+
+- id: ALM-004
+  text: >
+    Create PostgreSQL indexes using CREATE INDEX CONCURRENTLY via Alembic's autocommit_block.
+    Regular CREATE INDEX acquires an ACCESS EXCLUSIVE lock that blocks all reads and writes
+    until the index is built. On a 100M row table, this can take 10-20 minutes of full downtime.
+    CONCURRENTLY requires no table lock (only incremental row locks) but cannot run inside
+    a transaction block, which is why autocommit_block is mandatory.
+  why: >
+    PostgreSQL ACCESS EXCLUSIVE lock from CREATE INDEX blocks every SELECT, INSERT, UPDATE,
+    and DELETE on the table. A 100M row production table with a 15-minute index build time
+    means 15 minutes of complete table unavailability. We ran a CREATE INDEX without CONCURRENTLY
+    on a orders table at 2 AM during "low traffic" — traffic was lower but not zero, and the
+    15-minute exclusive lock caused a cascade: connection queue filled up, application threw
+    500 errors, the on-call engineer was woken up. CONCURRENTLY takes longer (2-3x) but has
+    zero impact on concurrent queries.
+  how_to_do_right: |
+    1. Use autocommit_block + postgresql_concurrently=True:
+       with op.get_context().autocommit_block():
+           op.create_index(
+               "ix_orders_customer_id",
+               "orders",
+               ["customer_id"],
+               postgresql_concurrently=True,
+           )
+    2. Add IF NOT EXISTS to make it idempotent:
+       op.create_index(..., if_not_exists=True)
+    3. Drop index concurrently:
+       with op.get_context().autocommit_block():
+           op.drop_index("ix_orders_customer_id", postgresql_concurrently=True)
+    4. Always put CONCURRENTLY index creation LAST in a migration to keep transaction isolation
+    5. Use Squawk linter in CI to flag non-concurrent index creation:
+       pip install squawk-cli && squawk migration.sql
+  severity: critical
+  technologies:
+    lang: [python, sql]
+    framework: [alembic, postgresql]
+  domains:
+    domain: [databases, performance]
+    concern: [zero_downtime, index_management]
+  example_good: |
+    from alembic import op
+    import sqlalchemy as sa
+
+    def upgrade():
+        # First: other migration steps inside transaction
+        op.add_column("orders", sa.Column("customer_segment", sa.String(50)))
+
+        # Last: concurrent index creation OUTSIDE transaction block
+        with op.get_context().autocommit_block():
+            op.create_index(
+                "ix_orders_customer_id",
+                "orders",
+                ["customer_id"],
+                postgresql_concurrently=True,  # No exclusive lock!
+                if_not_exists=True,             # Idempotent
+            )
+
+    def downgrade():
+        with op.get_context().autocommit_block():
+            op.drop_index(
+                "ix_orders_customer_id",
+                table_name="orders",
+                postgresql_concurrently=True,
+            )
+        op.drop_column("orders", "customer_segment")
+  example_bad: |
+    # WRONG: Regular CREATE INDEX — 15+ minute exclusive table lock in production
+    def upgrade():
+        op.create_index(
+            "ix_orders_customer_id",
+            "orders",
+            ["customer_id"],
+            # No postgresql_concurrently=True — acquires ACCESS EXCLUSIVE lock
+        )
+    # 100M row table = 10-20 minutes of full table unavailability
+  when_applies: >
+    Any Alembic migration that creates a new index on a table with more than ~1 million
+    rows in production or any table that receives active concurrent traffic.
+  sources:
+    - "Alembic Postgres CREATE INDEX CONCURRENTLY — https://github.com/sqlalchemy/alembic/issues/277"
+    - "Squawk: require-concurrent-index-creation — https://squawkhq.com/docs/require-concurrent-index-creation"
+    - "Alembic Operations Reference — https://alembic.sqlalchemy.org/en/latest/ops.html"
+
+- id: ALM-005
+  text: >
+    Set lock_timeout in migration scripts that acquire table locks (ALTER TABLE, DROP COLUMN,
+    ADD CONSTRAINT). Without a lock_timeout, a migration that cannot acquire a lock waits
+    indefinitely, holding database connections and blocking all subsequent migrations in a
+    deployment pipeline. Set lock_timeout to 3-5 seconds: a failed migration is recoverable;
+    an indefinitely blocked migration causes cascading outages.
+  why: >
+    ALTER TABLE acquires an ACCESS EXCLUSIVE lock. If a long-running transaction is holding
+    a conflicting lock, the ALTER TABLE waits. While it waits, every new query on that table
+    also queues behind the ALTER TABLE request (PostgreSQL FIFO lock queue). After 30 seconds,
+    a web application shows a cascade of timeouts: the long transaction is still running, the
+    ALTER TABLE is queued, and 50 new SELECT queries are also queued behind it. Total impact:
+    full table availability failure. With lock_timeout=3s, the ALTER TABLE fails fast,
+    the deployment pipeline is notified, and normal traffic is unaffected.
+  how_to_do_right: |
+    1. Set lock_timeout at migration script level:
+       def upgrade():
+           op.execute("SET lock_timeout = '3s'")
+           op.execute("SET statement_timeout = '30s'")
+           op.alter_column("users", "email", nullable=False)
+    2. Set lock_timeout in connection string (affects all statements in session):
+       DATABASE_URL = "postgresql+asyncpg://...?options=-c lock_timeout=3000"
+    3. Retry the migration deployment after setting lock_timeout — it will succeed when
+       conflicting transactions complete
+    4. Monitor: pg_stat_activity WHERE wait_event_type = 'Lock' to identify blocking queries
+    5. For CI test environments: skip lock_timeout (tests run without concurrent traffic)
+  severity: high
+  technologies:
+    lang: [python, sql]
+    framework: [alembic, postgresql]
+  domains:
+    domain: [databases, reliability]
+    concern: [lock_management, zero_downtime]
+  example_good: |
+    def upgrade():
+        # Set lock timeout BEFORE any DDL that acquires table locks
+        op.execute("SET lock_timeout = '3s'")
+        op.execute("SET statement_timeout = '60s'")  # Migration itself should not run forever
+
+        # If lock cannot be acquired in 3s, migration fails fast (not hangs)
+        op.alter_column(
+            "users",
+            "email",
+            existing_type=sa.String(255),
+            nullable=False,
+            existing_nullable=True,
+        )
+
+    def downgrade():
+        op.execute("SET lock_timeout = '3s'")
+        op.alter_column("users", "email", existing_type=sa.String(255), nullable=True)
+  example_bad: |
+    # WRONG: No lock_timeout — migration waits indefinitely if conflicting transaction exists
+    def upgrade():
+        op.alter_column("users", "email", nullable=False)
+        # If a long-running transaction holds a RowExclusiveLock:
+        # - This ALTER TABLE waits forever for the lock
+        # - All new SELECT queries on users table queue behind it
+        # - Application shows cascading 500 errors after connection pool exhausts
+  when_applies: >
+    Every migration that uses ALTER TABLE, DROP COLUMN, ADD CONSTRAINT, or any DDL that
+    acquires ACCESS EXCLUSIVE lock on PostgreSQL tables with live traffic.
+  sources:
+    - "Alembic Migrations Without Downtime (Exness) — https://medium.com/exness-blog/alembic-migrations-without-downtime-a3507d5da24d"
+    - "PostgreSQL Lock Types Documentation — https://www.postgresql.org/docs/current/explicit-locking.html"
+    - "Best Practices for Alembic Schema Migration (PingCAP) — https://www.pingcap.com/article/best-practices-alembic-schema-migration/"
+
+- id: ALM-006
+  text: >
+    Migrate PostgreSQL enum types using the alembic-postgresql-enum package for safe
+    enum value addition, removal, or renaming. Direct PostgreSQL ALTER TYPE ... ADD VALUE
+    is irreversible and commits outside the transaction block. PostgreSQL does not support
+    removing enum values without recreating the type. Always use a migration pattern that
+    supports both upgrade and downgrade.
+  why: >
+    PostgreSQL enum mutations are uniquely treacherous: ADD VALUE cannot be rolled back
+    within a transaction (it auto-commits), and removing an enum value requires dropping
+    and recreating the type (plus all columns using it). We had a production incident
+    where alembic downgrade tried to remove an enum value that was already in use by 3,000
+    rows — the migration failed, leaving the schema in an inconsistent state that required
+    manual repair. alembic-postgresql-enum generates safe migrations that recreate the
+    full type with proper dependencies.
+  how_to_do_right: |
+    1. pip install alembic-postgresql-enum
+    2. Register the plugin in env.py:
+       import alembic_postgresql_enum  # noqa: F401 — side effect import registers hooks
+    3. autogenerate now detects enum changes: alembic revision --autogenerate
+    4. Generated migration is a safe drop-and-recreate pattern:
+       - Creates new enum type with new values
+       - Alters all dependent columns to use new type
+       - Drops old type
+    5. For manual migration (without the plugin):
+       # Add value (irreversible — use only if you never need to downgrade):
+       op.execute("ALTER TYPE my_enum ADD VALUE IF NOT EXISTS 'new_value'")
+       # Full recreate (reversible):
+       op.execute("ALTER TYPE my_enum RENAME TO my_enum_old")
+       op.execute("CREATE TYPE my_enum AS ENUM ('val1', 'val2', 'val3')")
+       op.execute("ALTER TABLE t ALTER COLUMN col TYPE my_enum USING col::text::my_enum")
+       op.execute("DROP TYPE my_enum_old")
+  severity: high
+  technologies:
+    lang: [python, sql]
+    framework: [alembic, postgresql]
+  domains:
+    domain: [databases, data_migration]
+    concern: [enum_migration, schema_evolution]
+  example_good: |
+    # env.py — register the plugin before Alembic uses autogenerate
+    import alembic_postgresql_enum  # noqa: F401 — registers autogenerate hooks
+
+    from alembic import context
+    from myapp.models import Base
+
+    target_metadata = Base.metadata
+    # ... rest of env.py
+
+    # Generated migration by alembic-postgresql-enum (reversible):
+    def upgrade():
+        op.sync_enum_values(
+            "public",
+            "order_status",
+            ["pending", "processing", "shipped", "delivered", "cancelled"],
+            # Adds "cancelled" to existing ["pending", "processing", "shipped", "delivered"]
+            affected_columns=[TableReference("orders", "status")]
+        )
+
+    def downgrade():
+        op.sync_enum_values(
+            "public",
+            "order_status",
+            ["pending", "processing", "shipped", "delivered"],
+            # Removes "cancelled" — safe because plugin handles the recreate
+            affected_columns=[TableReference("orders", "status")]
+        )
+  example_bad: |
+    # WRONG: Manual ALTER TYPE ADD VALUE — irreversible, cannot be rolled back
+    def upgrade():
+        op.execute("ALTER TYPE order_status ADD VALUE 'cancelled'")
+        # Cannot be undone — if migration fails after this line, downgrade breaks
+
+    def downgrade():
+        # IMPOSSIBLE: PostgreSQL does not support removing enum values
+        pass  # Application left in undefined state if downgrade is needed
+  when_applies: >
+    Any Alembic migration that modifies PostgreSQL ENUM types — adding values, removing
+    values, or renaming values.
+  sources:
+    - "alembic-postgresql-enum on PyPI — https://pypi.org/project/alembic-postgresql-enum/"
+    - "GitHub: alembic-postgresql-enum — https://github.com/Pogchamp-company/alembic-postgresql-enum"
+    - "Simplifying PostgreSQL enum migrations — https://roman.pt/posts/alembic-enums/"
+
+- id: ALM-007
+  text: >
+    Run migration roundtrip tests (upgrade → downgrade → upgrade) in CI using pytest-alembic.
+    Every migration must have a functioning downgrade() function — a migration with pass in
+    downgrade() is a one-way deployment that eliminates your rollback option. Run tests against
+    a real PostgreSQL instance, not SQLite, because PostgreSQL-specific operations (CONCURRENTLY,
+    enum types, partial indexes) fail silently on SQLite.
+  why: >
+    50% of migration downgrade functions are broken when first tested because developers write
+    upgrade() carefully and dash off a downgrade() that they never test. A broken downgrade
+    discovered during an incident response adds 20-40 minutes to the recovery time. During one
+    production incident, a broken downgrade caused us to manually repair the schema and restore
+    from backup — 3 hours of downtime that a 30-second CI test would have prevented.
+    pytest-alembic runs the full upgrade→downgrade→upgrade cycle automatically.
+  how_to_do_right: |
+    1. pip install pytest-alembic
+    2. conftest.py:
+       import pytest
+       from sqlalchemy import create_engine
+       @pytest.fixture
+       def alembic_engine():
+           return create_engine("postgresql://test:test@localhost/test_migrations")
+    3. Test file (just having pytest-alembic installed enables this):
+       def test_migrations_stairway(alembic_runner):
+           alembic_runner.migrate_up_to("head")
+       def test_downgrade_leaves_no_trace(alembic_runner):
+           alembic_runner.migrate_up_before("head")
+           alembic_runner.migrate_down_one()
+           alembic_runner.migrate_up_one()
+    4. Add to CI: pytest tests/test_migrations.py --tb=short
+    5. Use a disposable PostgreSQL container in CI (not a shared instance)
+    6. Never use SQLite for migration testing — PostgreSQL-specific syntax is not validated
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [alembic, pytest, postgresql]
+  domains:
+    domain: [databases, testing]
+    concern: [migration_testing, rollback_safety]
+  example_good: |
+    # tests/conftest.py
+    import pytest
+    from sqlalchemy import create_engine
+
+    @pytest.fixture
+    def alembic_engine(postgresql):
+        """Use pytest-postgresql for disposable test DB."""
+        return create_engine(postgresql.url())
+
+    # tests/test_migrations.py
+    def test_migrations_upgrade_to_head(alembic_runner):
+        """All migrations apply cleanly from scratch."""
+        alembic_runner.migrate_up_to("head")
+
+    def test_migrations_stairway(alembic_runner):
+        """Every migration can be applied and rolled back step by step."""
+        alembic_runner.run_migrations()  # Runs up/down/up for every revision
+
+    def test_downgrade_leaves_no_trace(alembic_runner):
+        """Downgrade removes exactly what upgrade added."""
+        alembic_runner.migrate_up_before("head")
+        alembic_runner.migrate_down_one()
+        alembic_runner.migrate_up_one()
+  example_bad: |
+    # WRONG: pass in downgrade — no rollback capability
+    def upgrade():
+        op.add_column("users", sa.Column("profile_json", sa.JSON()))
+        op.create_index("ix_users_created_at", "users", ["created_at"])
+
+    def downgrade():
+        pass  # "We'll never need to roll back" — famous last words
+    # If this migration causes a production issue, rollback does nothing
+  when_applies: >
+    Every Alembic migration in every project that deploys to production. Non-negotiable
+    for any team that has ever needed to roll back a database change under pressure.
+  sources:
+    - "pytest-alembic Documentation — https://pytest-alembic.readthedocs.io/en/latest/"
+    - "pytest-alembic Asyncio — https://pytest-alembic.readthedocs.io/en/latest/asyncio.html"
+    - "Alembic Tutorial — https://alembic.sqlalchemy.org/en/latest/tutorial.html"
+
+- id: ALM-008
+  text: >
+    Manage divergent migration branches (multiple developers creating migrations concurrently)
+    by using alembic merge to create a merge revision when multiple heads exist. Never allow
+    multiple head revisions to persist in production — alembic upgrade head will fail if there
+    are multiple heads. Detect multiple heads in CI: alembic heads | wc -l > 1 exits non-zero.
+  severity: medium
+  text: >
+    Manage migration branch conflicts using alembic merge heads to create a merge revision
+    when multiple developers create migrations simultaneously. Multiple head revisions block
+    alembic upgrade head with "Multiple head revisions are present" error. Detect multiple
+    heads in CI as a pre-merge check; never let multiple heads reach the main branch.
+  why: >
+    Two developers create migration files on the same day for different features — both are
+    based on the same parent revision. When merged to main, alembic history shows two heads.
+    alembic upgrade head fails: it cannot determine which head is "the" current state.
+    This blocks all deployments. The fix is alembic merge heads, which takes 1 minute, but
+    discovering it during a deployment with users waiting is costly. We automated the check
+    in CI (the pre-merge hook fails if heads > 1), reducing the average resolution time
+    from "during deployment" to "during PR review."
+  how_to_do_right: |
+    1. Detect multiple heads: alembic heads  (shows all current heads)
+    2. Merge: alembic merge heads -m "merge_feature_a_and_feature_b"
+    3. The merge revision has two down_revision values (tuple):
+       down_revision = ('abc123', 'def456')
+    4. CI check (add to PR pipeline):
+       head_count=$(alembic heads | wc -l)
+       if [ "$head_count" -gt 1 ]; then echo "Multiple Alembic heads detected!"; exit 1; fi
+    5. Conventional ordering: if migrations don't conflict logically, one developer rebases
+       their migration's down_revision to point to the other's revision (creating a linear chain)
+    6. Use depends_on in migration files to express explicit cross-branch dependencies
+  severity: medium
+  technologies:
+    lang: [python, bash]
+    framework: [alembic]
+  domains:
+    domain: [databases, team_workflow]
+    concern: [branch_management, ci_cd]
+  example_good: |
+    # CI pipeline check (GitHub Actions or similar)
+    # .github/workflows/migration-check.yml:
+    # - name: Check for multiple Alembic heads
+    #   run: |
+    #     source .venv/bin/activate
+    #     HEAD_COUNT=$(PYTHONPATH=src alembic heads | grep -c "(head)")
+    #     if [ "$HEAD_COUNT" -gt 1 ]; then
+    #       echo "ERROR: Multiple Alembic heads detected. Run 'alembic merge heads' to fix."
+    #       alembic heads
+    #       exit 1
+    #     fi
+
+    # When merge is needed:
+    # $ alembic merge heads -m "merge_user_feature_and_payment_feature"
+    # Generated merge revision:
+    # down_revision = ('a1b2c3d4', 'e5f6g7h8')  # Both parents
+    # revision = 'zz9900aabb'
+    # depends_on = None
+  example_bad: |
+    # WRONG: Two developers create migrations without checking for existing heads
+    # Developer A: creates migration based on rev abc123 (down_revision = 'abc123')
+    # Developer B: creates migration based on rev abc123 (down_revision = 'abc123')
+    # Both merge to main: now two heads exist
+    # $ alembic upgrade head
+    # FAILED alembic.util.exc.CommandError: Multiple head revisions are present for
+    # given argument 'head': abc123_feature_a, abc123_feature_b
+  when_applies: >
+    Any team with more than one developer working on database migrations, especially in
+    continuous deployment environments where multiple feature branches are active simultaneously.
+  sources:
+    - "Alembic Branch Management — https://alembic.sqlalchemy.org/en/latest/branches.html"
+    - "Alembic Tutorial — https://alembic.sqlalchemy.org/en/latest/tutorial.html"
+
+- id: ALM-009
+  text: >
+    Batch large data migrations in Alembic using offset+limit loops with commit between
+    batches. A single UPDATE on a 100M row table holds a single enormous transaction,
+    consuming write-ahead log (WAL) space and bloating the table. Process data migrations
+    in batches of 5,000-10,000 rows, committing between batches to release WAL space and
+    allow autovacuum to reclaim dead tuples.
+  why: >
+    A single UPDATE posts SET author_id = user_id on 100M rows creates a transaction that:
+    (1) generates ~20GB of WAL entries (2) holds row-level locks for the duration (30+ minutes)
+    (3) can crash if PostgreSQL runs out of WAL space or the connection drops mid-migration.
+    Batching into 10K-row chunks with commits between batches reduces max WAL accumulation
+    to ~200MB per batch, allows autovacuum to compact dead tuples after each batch, and makes
+    the migration restartable (WHERE author_id IS NULL picks up where it left off).
+  how_to_do_right: |
+    1. Use WHERE condition that identifies remaining rows (idempotent restart):
+       UPDATE posts SET author_id = user_id
+       WHERE author_id IS NULL AND id BETWEEN :start AND :end
+    2. Loop with commits:
+       batch_size = 10_000
+       offset = 0
+       while True:
+           rows = conn.execute(
+               text("UPDATE posts SET author_id = user_id WHERE author_id IS NULL "
+                    "ORDER BY id LIMIT :n RETURNING id"),
+               {"n": batch_size}
+           ).rowcount
+           if rows == 0:
+               break
+           conn.commit()  # Commit each batch separately
+    3. Add progress logging: log every 100K rows processed
+    4. Set statement_timeout per batch to prevent runaway queries
+    5. Monitor replication lag during migration — large batches can cause replication delay
+  severity: high
+  technologies:
+    lang: [python, sql]
+    framework: [alembic, postgresql]
+  domains:
+    domain: [databases, data_migration]
+    concern: [performance, reliability]
+  example_good: |
+    from alembic import op
+    from sqlalchemy import text
+
+    def upgrade():
+        conn = op.get_bind()
+        batch_size = 10_000
+        total_migrated = 0
+
+        while True:
+            # Idempotent: only processes rows where author_id IS NULL
+            result = conn.execute(text("""
+                UPDATE posts
+                SET author_id = user_id
+                WHERE id IN (
+                    SELECT id FROM posts
+                    WHERE author_id IS NULL
+                    ORDER BY id
+                    LIMIT :batch_size
+                )
+                RETURNING id
+            """), {"batch_size": batch_size})
+
+            rows_updated = result.rowcount
+            if rows_updated == 0:
+                break
+
+            total_migrated += rows_updated
+            conn.commit()  # Release WAL space after each batch
+
+            if total_migrated % 100_000 == 0:
+                print(f"Progress: {total_migrated:,} rows migrated")
+
+        print(f"Migration complete: {total_migrated:,} total rows")
+
+    def downgrade():
+        conn = op.get_bind()
+        batch_size = 10_000
+        while True:
+            result = conn.execute(text("""
+                UPDATE posts SET author_id = NULL
+                WHERE id IN (SELECT id FROM posts WHERE author_id IS NOT NULL LIMIT :bs)
+            """), {"bs": batch_size})
+            if result.rowcount == 0:
+                break
+            conn.commit()
+  example_bad: |
+    # WRONG: Single UPDATE on massive table — 100M rows in one transaction
+    def upgrade():
+        op.execute("""
+            UPDATE posts
+            SET author_id = user_id
+            WHERE author_id IS NULL
+        """)
+        # Single transaction holds locks for 30+ minutes
+        # WAL bloat: 20-30GB for 100M rows
+        # Not restartable: if connection drops at row 90M, re-run restarts at row 0
+  when_applies: >
+    Any migration that updates, inserts, or deletes more than 100,000 rows in a data migration
+    phase. Essential for Phase 2 (Migrate) in the expand-contract pattern.
+  sources:
+    - "Alembic Database Migrations Developer Guide (Medium/Tejpal) — https://medium.com/@tejpal.abhyuday/alembic-database-migrations-the-complete-developers-guide-d3fc852a6a9e"
+    - "PostgreSQL WAL Documentation — https://www.postgresql.org/docs/current/wal-intro.html"
+    - "How to Manage PostgreSQL Schema Migrations (OneUptime) — https://oneuptime.com/blog/post/2026-01-21-postgresql-schema-migrations/view"
+
+- id: ALM-010
+  text: >
+    Integrate alembic check into CI pipelines to automatically detect when SQLAlchemy model
+    changes have not been captured in a migration file. alembic check fails with exit code 1
+    if autogenerate would produce a non-empty migration — meaning the database schema and
+    the ORM models have diverged. This prevents the "model says X, database says Y" bug that
+    causes runtime crashes.
+  why: >
+    The model-migration drift problem: a developer adds a new column to a SQLAlchemy model,
+    runs tests (which pass because tests use the ORM layer), merges to main, deploys —
+    and the application crashes at runtime because the actual PostgreSQL table does not have
+    the column yet. The migration was never created. alembic check in CI catches this at
+    PR time, not after deployment. We reduced model-migration drift incidents from 3/month
+    to 0 after adding this check.
+  how_to_do_right: |
+    1. Add to CI pipeline (GitHub Actions, GitLab CI, etc.):
+       - name: Check for missing migrations
+         run: |
+           source .venv/bin/activate
+           PYTHONPATH=src alembic check
+         # Exits 1 if models have changed without a corresponding migration
+    2. alembic check requires a live database connection — use a test DB in CI
+    3. Configure env.py with compare_type=True so type changes are also detected
+    4. Add to pre-commit hook for immediate developer feedback:
+       # .pre-commit-config.yaml:
+       # - repo: local
+       #   hooks:
+       #     - id: alembic-check
+       #       name: Check Alembic migrations
+       #       entry: alembic check
+       #       language: system
+       #       pass_filenames: false
+  severity: high
+  technologies:
+    lang: [python, bash]
+    framework: [alembic, sqlalchemy]
+  domains:
+    domain: [databases, ci_cd]
+    concern: [schema_drift_detection, deployment_safety]
+  example_good: |
+    # .github/workflows/database-checks.yml
+    # jobs:
+    #   check-migrations:
+    #     runs-on: ubuntu-latest
+    #     services:
+    #       postgres:
+    #         image: postgres:16
+    #         env:
+    #           POSTGRES_PASSWORD: test
+    #           POSTGRES_DB: test_db
+    #         options: >-
+    #           --health-cmd pg_isready
+    #           --health-interval 10s
+    #     steps:
+    #       - uses: actions/checkout@v4
+    #       - name: Apply existing migrations
+    #         run: |
+    #           source .venv/bin/activate
+    #           PYTHONPATH=src alembic upgrade head
+    #       - name: Check no new migrations needed
+    #         run: |
+    #           source .venv/bin/activate
+    #           PYTHONPATH=src alembic check
+    #           # Fails with exit 1 if any SQLAlchemy model changes lack a migration
+
+    # In Makefile or scripts:
+    # check-migrations:
+    #     alembic upgrade head && alembic check
+  example_bad: |
+    # WRONG: No alembic check in CI — drift discovered at runtime
+    # Developer adds column to model:
+    # class Post(Base):
+    #     __tablename__ = "posts"
+    #     id = Column(Integer, primary_key=True)
+    #     title = Column(String)
+    #     featured_image_url = Column(String)  # New column — no migration created
+    #
+    # Tests pass (SQLAlchemy generates schema in test DB)
+    # Deployment succeeds (migration step skipped because no new migration file)
+    # Runtime crash: ProgrammingError: column "featured_image_url" does not exist
+  when_applies: >
+    Every CI pipeline in every project using Alembic + SQLAlchemy, triggered on every PR
+    that modifies any SQLAlchemy model file.
+  sources:
+    - "Alembic Auto Generating Migrations — https://alembic.sqlalchemy.org/en/latest/autogenerate.html"
+    - "Auto Generating Migrations alembic check — https://alembic.sqlalchemy.org/en/latest/autogenerate.html#running-alembic-check"
+    - "Alembic Tutorial — https://alembic.sqlalchemy.org/en/latest/tutorial.html"
+
+- id: ALM-011
+  text: >
+    Never use Alembic migrations to seed data that belongs in application code or fixtures.
+    Alembic migrations are for schema changes (structure) and schema-coupled data migrations
+    (e.g., backfilling a new column). Application reference data (countries, categories,
+    default settings) should be seeded via a separate idempotent seed script that uses
+    SQLAlchemy's ORM, not raw SQL in a migration file. Schema and seed data have different
+    change frequencies and rollback semantics.
+  why: >
+    Seed data in migrations causes three problems: (1) The data is bound to the migration
+    timestamp — if you need to update seed data, you must create a new migration (schema
+    migrations don't get updated). (2) Rolling back a migration that seeded data deletes
+    the seed data, often incorrectly in production where live data has been added on top
+    of the seeded records. (3) Seed data migrations run in every environment (dev, staging,
+    prod) — a migration that seeds 195 country records in production is fine; the same
+    migration running in a unit test database pollutes test isolation.
+  how_to_do_right: |
+    1. Create a separate seed script: scripts/seed_data.py
+    2. Use UPSERT pattern (idempotent):
+       from sqlalchemy.dialects.postgresql import insert
+       stmt = insert(Country).values(countries).on_conflict_do_nothing(index_elements=["code"])
+       session.execute(stmt)
+    3. Run seed script separately from migrations:
+       alembic upgrade head && python scripts/seed_data.py
+    4. EXCEPTION: reference data that the migration itself depends on IS allowed in the migration
+       (e.g., inserting a default enum value before making the column NOT NULL)
+    5. For test fixtures: use factory_boy or pytest-factoryboy, not migration seed data
+  severity: medium
+  technologies:
+    lang: [python, sql]
+    framework: [alembic, sqlalchemy, postgresql]
+  domains:
+    domain: [databases, data_management]
+    concern: [separation_of_concerns, test_isolation]
+  example_good: |
+    # scripts/seed_data.py — separate idempotent seed script
+    from sqlalchemy.dialects.postgresql import insert
+    from myapp.database import SessionLocal
+    from myapp.models import Country
+
+    COUNTRIES = [
+        {"code": "BR", "name": "Brazil"},
+        {"code": "US", "name": "United States"},
+        # ... 193 more
+    ]
+
+    def seed_countries(session):
+        stmt = insert(Country).values(COUNTRIES)
+        stmt = stmt.on_conflict_do_nothing(index_elements=["code"])
+        session.execute(stmt)
+        session.commit()
+        print(f"Seeded {len(COUNTRIES)} countries (idempotent)")
+
+    if __name__ == "__main__":
+        with SessionLocal() as session:
+            seed_countries(session)
+  example_bad: |
+    # WRONG: Seed data in a migration — bound forever, breaks test isolation
+    def upgrade():
+        op.create_table("countries",
+            sa.Column("code", sa.String(2), primary_key=True),
+            sa.Column("name", sa.String(100), nullable=False),
+        )
+        # Seed data in migration — runs in prod, staging, dev, AND tests
+        op.bulk_insert(countries_table, [
+            {"code": "BR", "name": "Brazil"},
+            # ... 194 more rows
+        ])
+
+    def downgrade():
+        op.drop_table("countries")  # Deletes live data in production if rolled back!
+  when_applies: >
+    Any migration that would insert static reference data such as country codes, currency
+    codes, default settings, or role definitions. Separate schema migrations from data seeding.
+  sources:
+    - "Alembic Tutorial — https://alembic.sqlalchemy.org/en/latest/tutorial.html"
+    - "Best Practices Alembic Schema Migration (PingCAP) — https://www.pingcap.com/article/best-practices-alembic-schema-migration/"
+
+- id: ALM-012
+  text: >
+    Use alembic's batch operations for SQLite migrations (via op.batch_alter_table) when
+    the application must support both PostgreSQL and SQLite (e.g., production vs. development/
+    testing). SQLite does not support ALTER TABLE ADD CONSTRAINT, DROP COLUMN (pre-3.35.0),
+    or many other DDL operations. The batch operations work by creating a new table, copying
+    data, and renaming — a process that works on both databases but is significantly slower
+    than native ALTER TABLE on PostgreSQL.
+  why: >
+    Teams that use SQLite for local development and PostgreSQL in production regularly
+    encounter migration failures in their development environment: DROP COLUMN fails on SQLite
+    < 3.35.0, ADD CONSTRAINT fails on all SQLite versions, and RENAME COLUMN fails on SQLite
+    < 3.25.0. The typical workaround (writing two versions of every migration) doubles
+    maintenance burden. op.batch_alter_table works on both databases transparently.
+    The performance penalty (table copy vs. in-place ALTER) is acceptable for development
+    but should not be used in production PostgreSQL migrations where ALTER TABLE is native.
+  how_to_do_right: |
+    1. Use batch mode for cross-database compatibility:
+       with op.batch_alter_table("users") as batch_op:
+           batch_op.add_column(sa.Column("profile_bio", sa.Text()))
+           batch_op.alter_column("email", nullable=False)
+           batch_op.drop_column("deprecated_field")
+    2. For PostgreSQL-only deployments: use native op.add_column, op.alter_column (faster)
+    3. The batch wrapper is transparent: on PostgreSQL it uses native ALTER; on SQLite it
+       creates a temporary table (as of Alembic 1.x with render_as_batch=True in env.py)
+    4. Configure env.py: context.configure(..., render_as_batch=True)
+    5. Batch operations cannot add CHECK constraints on SQLite — use the skip_if_exists flag
+  severity: low
+  technologies:
+    lang: [python, sql]
+    framework: [alembic, sqlalchemy, sqlite, postgresql]
+  domains:
+    domain: [databases, cross_platform]
+    concern: [compatibility, development_workflow]
+  example_good: |
+    from alembic import op
+    import sqlalchemy as sa
+
+    def upgrade():
+        # Works on both PostgreSQL and SQLite
+        with op.batch_alter_table("users") as batch_op:
+            batch_op.add_column(sa.Column("profile_bio", sa.Text(), nullable=True))
+            batch_op.alter_column(
+                "email",
+                existing_type=sa.String(255),
+                nullable=False,
+            )
+            batch_op.drop_column("legacy_field")
+
+    def downgrade():
+        with op.batch_alter_table("users") as batch_op:
+            batch_op.add_column(sa.Column("legacy_field", sa.String(50), nullable=True))
+            batch_op.alter_column("email", existing_type=sa.String(255), nullable=True)
+            batch_op.drop_column("profile_bio")
+  example_bad: |
+    # WRONG: Native ALTER TABLE — fails on SQLite < 3.35.0
+    def upgrade():
+        op.drop_column("users", "legacy_field")
+        # SQLite < 3.35.0: OperationalError: Cannot drop column "legacy_field"
+        # Developer wastes 30 minutes debugging "works in production, fails locally"
+  when_applies: >
+    Projects where SQLite is used for local development or testing and PostgreSQL for production,
+    or any project that must support multiple SQL database backends.
+  sources:
+    - "Alembic Batch Migrations — https://alembic.sqlalchemy.org/en/latest/batch.html"
+    - "Alembic Operations Reference — https://alembic.sqlalchemy.org/en/latest/ops.html"
+
+- id: ALM-013
+  text: >
+    Configure multi-database Alembic setup when your application uses more than one
+    PostgreSQL database (e.g., separate operational and analytics databases). Use named
+    migration branches (version_locations = alembic/versions/app1:alembic/versions/app2)
+    and separate configuration files per database. Never mix migrations for different
+    databases in the same migration version tree — cross-database foreign keys do not
+    exist, and mixing versions causes alembic heads to show false conflicts.
+  why: >
+    A SaaS application with a main operational database and a separate analytics database
+    started with a single Alembic configuration. After 6 months, the version tree had
+    migrations for both databases interleaved by timestamp. Running alembic upgrade head
+    attempted to apply analytics migrations to the operational database and vice versa,
+    causing errors. Separating into two migration trees (two alembic.ini files, two env.py
+    files) eliminated the confusion and enabled independent deployment of analytics schema
+    changes without touching the operational database deployment pipeline.
+  how_to_do_right: |
+    1. Create separate alembic directories: alembic_app/ and alembic_analytics/
+    2. Each has its own alembic.ini and env.py pointing to the correct DATABASE_URL
+    3. Run per-database: alembic -c alembic_app/alembic.ini upgrade head
+    4. Use Makefile or CI script to run all databases in sequence:
+       alembic -c alembic_app/alembic.ini upgrade head
+       alembic -c alembic_analytics/alembic.ini upgrade head
+    5. For shared models across databases: ensure env.py imports only the relevant metadata
+    6. Alternative: named branches in a single alembic setup (advanced — see Alembic docs)
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [alembic, sqlalchemy, postgresql]
+  domains:
+    domain: [databases, architecture]
+    concern: [multi_database, configuration]
+  example_good: |
+    # Project structure:
+    # migrations/
+    #   app/                 <- Operational DB migrations
+    #     alembic.ini
+    #     env.py             (DATABASE_URL from APP_DATABASE_URL env var)
+    #     versions/
+    #   analytics/           <- Analytics DB migrations
+    #     alembic.ini
+    #     env.py             (DATABASE_URL from ANALYTICS_DATABASE_URL env var)
+    #     versions/
+
+    # Makefile:
+    # migrate:
+    #     PYTHONPATH=src alembic -c migrations/app/alembic.ini upgrade head
+    #     PYTHONPATH=src alembic -c migrations/analytics/alembic.ini upgrade head
+
+    # CI deployment script:
+    import subprocess
+    for config in ["migrations/app/alembic.ini", "migrations/analytics/alembic.ini"]:
+        subprocess.run(["alembic", "-c", config, "upgrade", "head"], check=True)
+  example_bad: |
+    # WRONG: Single alembic version tree for multiple databases
+    # migrations/versions/
+    #   001_create_users.py        (operational DB)
+    #   002_create_events.py       (analytics DB)
+    #   003_add_user_index.py      (operational DB)
+    # alembic upgrade head tries to apply ALL migrations to BOTH databases
+    # Result: OperationalError: table "events" does not exist (in operational DB)
+  when_applies: >
+    Applications with more than one database backend, including read replica setups,
+    analytics databases, or multi-tenant databases with separate schemas per tenant.
+  sources:
+    - "Alembic Tutorial: Multi-database Support — https://alembic.sqlalchemy.org/en/latest/tutorial.html"
+    - "Alembic Branches — https://alembic.sqlalchemy.org/en/latest/branches.html"

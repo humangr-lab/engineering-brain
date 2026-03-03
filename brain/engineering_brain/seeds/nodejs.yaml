@@ -1,0 +1,509 @@
+layer: rules
+technology: Node.js
+domain: backend
+knowledge:
+- id: CR-NODE-001
+  text: Never block the event loop — no synchronous I/O in request handlers.
+  why: Node.js is single-threaded. A 100ms synchronous file read blocks ALL concurrent requests for 100ms. At 1000 req/s,
+    that means 100 requests waiting on one fs.readFileSync call. This turns a fast server into a queue.
+  how_to_do_right: 'Use async/await for all I/O: fs.promises.readFile, fetch, database queries. For CPU-intensive work (crypto,
+    image processing), offload to worker_threads. Use --prof or clinic.js to detect event loop blocking.'
+  severity: critical
+  technologies:
+    framework: [backend, express]
+    library: [node, js, fastify]
+  domains:
+    domain: [architecture, performance]
+    concern: [backend]
+  example_good: "import { readFile } from 'fs/promises';\n\napp.get('/config', async (req, res) => {\n  const data = await\
+    \ readFile('./config.json', 'utf8');  // Non-blocking\n  res.json(JSON.parse(data));\n});\n\n// CPU-intensive: offload\
+    \ to worker\nimport { Worker } from 'worker_threads';\n\napp.post('/hash', async (req, res) => {\n  const result = await\
+    \ runInWorker('./hash-worker.js', req.body);\n  res.json({ hash: result });\n});\n"
+  example_bad: "const fs = require('fs');\n\napp.get('/config', (req, res) => {\n  const data = fs.readFileSync('./config.json',\
+    \ 'utf8');  // BLOCKS ALL REQUESTS\n  res.json(JSON.parse(data));\n});\n\napp.post('/hash', (req, res) => {\n  const hash\
+    \ = crypto.pbkdf2Sync(req.body.password, salt, 100000, 64, 'sha512');\n  res.json({ hash });  // 200ms blocking = 200ms\
+    \ for ALL users\n});\n"
+  when_applies: Any project using Node.js, Express.js/Node.js servers, or Fastify
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant
+  sources: ["https://nodejs.org/en/learn/asynchronous-work/dont-block-the-event-loop"]
+- id: CR-NODE-002
+  text: Understand microtask priority — process.nextTick and Promise.then run between every event loop phase, not at the end.
+  why: Microtasks (nextTick, Promise callbacks) run to exhaustion between event loop phases. A recursive process.nextTick
+    creates an infinite microtask loop that starves timers, I/O, and everything else. The event loop never advances past the
+    microtask queue.
+  how_to_do_right: Use setImmediate() for deferring work to the next event loop iteration (check phase). Use process.nextTick()
+    only for error-handling in callback APIs. Use queueMicrotask() for Promise-like scheduling. Never recurse with nextTick.
+  severity: high
+  technologies:
+    library: [node, js]
+  domains:
+    domain: [architecture, performance]
+    concern: [backend]
+  example_good: "// Process items without starving the event loop\nfunction processItems(items, callback) {\n  let index =\
+    \ 0;\n\n  function next() {\n    if (index >= items.length) return callback();\n    processOne(items[index++]);\n    setImmediate(next);\
+    \  // Yields to event loop between items\n  }\n\n  next();\n}\n\n// Promise-based equivalent\nasync function processAll(items)\
+    \ {\n  for (const item of items) {\n    await processOne(item);  // Yields at each await\n  }\n}\n"
+  example_bad: "// Starves the event loop — timers, I/O never fire\nfunction processItems(items, i = 0) {\n  if (i >= items.length)\
+    \ return;\n  processOne(items[i]);\n  process.nextTick(() => processItems(items, i + 1));  // Microtask loop\n  // Timers,\
+    \ I/O callbacks, and other work NEVER execute\n}\n"
+  when_applies: Projects using Node.js
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not using Node.js
+  sources: ["https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick"]
+- id: CR-NODE-003
+  text: Always handle backpressure in streams — check write() return value and wait for 'drain' event.
+  why: When a writable stream's internal buffer fills up, write() returns false. Ignoring this causes unbounded memory growth
+    — writing a 10GB file to a slow destination without backpressure handling will buffer 10GB in memory.
+  how_to_do_right: 'Use pipeline() from stream/promises — it handles backpressure, errors, and cleanup automatically. If manual:
+    check if write() returns false, pause reading, resume on ''drain''. Never use .pipe() for production — use pipeline().'
+  severity: high
+  technologies:
+    library: [node, js]
+  domains:
+    domain: [architecture, performance]
+    concern: [backend]
+  example_good: "import { pipeline } from 'stream/promises';\nimport { createReadStream, createWriteStream } from 'fs';\n\
+    import { createGzip } from 'zlib';\n\n// pipeline() handles backpressure + errors + cleanup\nawait pipeline(\n  createReadStream('input.log'),\n\
+    \  createGzip(),\n  createWriteStream('input.log.gz')\n);\n\n// Streaming HTTP response — no buffering\napp.get('/export',\
+    \ async (req, res) => {\n  const stream = db.queryStream('SELECT * FROM large_table');\n  await pipeline(stream, JSONTransform(),\
+    \ res);\n});\n"
+  example_bad: "// .pipe() — no error handling, no cleanup\nreadStream.pipe(gzip).pipe(writeStream);\n// If gzip errors, streams\
+    \ leak. No backpressure awareness.\n\n// Buffering entire file in memory\napp.get('/export', async (req, res) => {\n \
+    \ const rows = await db.query('SELECT * FROM large_table');  // 10GB in memory\n  res.json(rows);  // Serializes 10GB\
+    \ to JSON in memory\n});\n"
+  when_applies: Projects using Node.js
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not using Node.js
+  sources: ["https://nodejs.org/api/stream.html#stream_api_for_stream_consumers"]
+- id: CR-NODE-004
+  text: Always handle unhandledRejection — unhandled Promise rejections terminate the process in Node 15+.
+  why: Since Node.js 15, an unhandled Promise rejection crashes the process with a non-zero exit code. Before that, it was
+    a warning that silently swallowed errors. Either way, an unhandled rejection means an error path you did not cover — a
+    bug.
+  how_to_do_right: 'Set process.on(''unhandledRejection'', handler) as a safety net that logs and exits. But the real fix:
+    always catch Promise rejections with try/catch or .catch(). Express: use express-async-errors or wrap handlers.'
+  severity: critical
+  technologies:
+    framework: [backend, express]
+    library: [node, js]
+  domains:
+    domain: [architecture, reliability]
+    concern: [backend]
+  example_good: "// Safety net — log and exit\nprocess.on('unhandledRejection', (reason, promise) => {\n  console.error('Unhandled\
+    \ Rejection at:', promise, 'reason:', reason);\n  process.exit(1);  // Exit — let process manager restart\n});\n\n// Express:\
+    \ async error handling\nimport 'express-async-errors';  // Patches Express to catch async errors\n\napp.get('/users/:id',\
+    \ async (req, res) => {\n  const user = await db.getUser(req.params.id);  // If this throws,\n  if (!user) throw new NotFoundError('User\
+    \ not found');  // express catches it\n  res.json(user);\n});\n\n// Error handler middleware (must have 4 params)\napp.use((err,\
+    \ req, res, next) => {\n  console.error(err.stack);\n  res.status(err.statusCode || 500).json({ error: err.message });\n\
+    });\n"
+  example_bad: "app.get('/users/:id', async (req, res) => {\n  // If getUser() rejects, Express does NOT catch it by default\n\
+    \  const user = await db.getUser(req.params.id);\n  res.json(user);\n  // Result: UnhandledPromiseRejection → process\
+    \ crash\n});\n\n// No unhandledRejection handler — silent death\n"
+  when_applies: Any project using Node.js or Express.js/Node.js servers
+  when_not_applies: projects not using Node.js or Express
+  sources: ["https://nodejs.org/api/process.html#event-unhandledrejection"]
+- id: CR-NODE-005
+  text: Implement graceful shutdown — handle SIGTERM to close connections and drain requests before exiting.
+  why: SIGTERM is sent by Kubernetes, Docker, PM2, and systemd before killing a process. Without handling it, in-flight requests
+    are dropped, database transactions are left half-committed, and WebSocket clients disconnect without cleanup.
+  how_to_do_right: Listen for SIGTERM and SIGINT. Stop accepting new connections (server.close()). Wait for in-flight requests
+    to complete (with timeout). Close database pools, Redis connections, message consumers. Then process.exit(0).
+  severity: high
+  technologies:
+    framework: [backend, express]
+    library: [node, js, fastify]
+  domains:
+    domain: [architecture, reliability, operations, devops]
+    concern: [backend]
+  example_good: "const server = app.listen(3000);\nlet isShuttingDown = false;\n\nasync function shutdown(signal) {\n  if\
+    \ (isShuttingDown) return;\n  isShuttingDown = true;\n  console.log(`${signal} received — graceful shutdown starting`);\n\
+    \n  // Stop accepting new connections\n  server.close();\n\n  // Close dependent services\n  await Promise.allSettled([\n\
+    \    db.end(),              // Close database pool\n    redis.quit(),          // Close Redis\n    consumer.disconnect(),\
+    \ // Close message consumer\n  ]);\n\n  console.log('Shutdown complete');\n  process.exit(0);\n}\n\nprocess.on('SIGTERM',\
+    \ () => shutdown('SIGTERM'));\nprocess.on('SIGINT', () => shutdown('SIGINT'));\n\n// Health check returns 503 during shutdown\n\
+    app.get('/health', (req, res) => {\n  res.status(isShuttingDown ? 503 : 200).json({ status: isShuttingDown ? 'draining'\
+    \ : 'ok' });\n});\n"
+  example_bad: 'app.listen(3000);
+
+    // No shutdown handling — SIGTERM kills process immediately
+
+    // In-flight requests get connection reset
+
+    // Database transactions left uncommitted
+
+    // WebSocket clients get no close frame
+
+    '
+  when_applies: Projects using Node.js, Express.js/Node.js servers, or Fastify
+  sources: ["https://nodejs.org/api/net.html#serverclose"]
+- id: CR-NODE-006
+  text: Use the cluster module or a process manager (PM2) to utilize all CPU cores — a single Node process uses one core.
+  why: Node.js runs JavaScript on a single thread. On an 8-core machine, a single Node process uses 12.5% of available CPU.
+    Under load, you hit 100% on one core while 7 sit idle. Clustering spawns one worker per core with shared port binding.
+  how_to_do_right: 'Production: use PM2 (pm2 start app.js -i max) for clustering with automatic restart, log management, and
+    zero-downtime reload. Development: cluster module directly. Workers share the server port via OS-level round-robin.'
+  severity: high
+  technologies:
+    library: [node, js, pm2]
+  domains:
+    domain: [architecture, performance, operations, devops]
+    concern: [backend]
+  example_good: "import cluster from 'cluster';\nimport os from 'os';\n\nif (cluster.isPrimary) {\n  const numCPUs = os.cpus().length;\n\
+    \  console.log(`Primary ${process.pid} forking ${numCPUs} workers`);\n\n  for (let i = 0; i < numCPUs; i++) {\n    cluster.fork();\n\
+    \  }\n\n  cluster.on('exit', (worker) => {\n    console.log(`Worker ${worker.process.pid} died — restarting`);\n    cluster.fork();\
+    \  // Restart crashed workers\n  });\n} else {\n  app.listen(3000);\n  console.log(`Worker ${process.pid} started`);\n\
+    }\n\n// Or simply: pm2 start app.js -i max\n"
+  example_bad: "// Single process — wastes 7/8 cores on 8-core machine\napp.listen(3000, () => {\n  console.log('Server started\
+    \ on port 3000');\n  // Under load: 1 core at 100%, 7 cores idle\n});\n"
+  when_applies: Projects using Node.js or PM2
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not using Node.js or PM2
+  sources: ["https://nodejs.org/api/cluster.html"]
+- id: CR-NODE-007
+  text: Always validate and sanitize all input — use zod or express-validator for request validation.
+  why: 'User input is the #1 attack vector. Without validation, you get SQL injection, XSS, command injection, prototype pollution,
+    and type confusion. Validation at the boundary ensures only expected data enters your system.'
+  how_to_do_right: Define schemas with zod at the route level. Validate body, params, query, and headers. Return 422 with
+    specific field errors. Never trust Content-Type — validate the actual data. Sanitize HTML output.
+  severity: critical
+  technologies:
+    framework: [backend, express]
+    library: [node, js, fastify]
+  domains:
+    domain: [architecture, security]
+    concern: [backend]
+  example_good: "import { z } from 'zod';\n\nconst CreateUserSchema = z.object({\n  email: z.string().email().max(255),\n\
+    \  name: z.string().min(1).max(100),\n  age: z.number().int().min(13).max(150),\n  role: z.enum(['user', 'admin']).default('user'),\n\
+    });\n\napp.post('/users', async (req, res) => {\n  const result = CreateUserSchema.safeParse(req.body);\n  if (!result.success)\
+    \ {\n    return res.status(422).json({\n      errors: result.error.issues.map(i => ({\n        field: i.path.join('.'),\n\
+    \        message: i.message,\n      })),\n    });\n  }\n  const user = await db.createUser(result.data);  // Validated\
+    \ data\n  res.status(201).json(user);\n});\n"
+  example_bad: "app.post('/users', async (req, res) => {\n  // Trusting raw input — SQL injection, type confusion\n  const\
+    \ user = await db.query(\n    `INSERT INTO users (email, name) VALUES ('${req.body.email}', '${req.body.name}')`\n  );\n\
+    \  res.json(user);\n  // req.body.email = \"'; DROP TABLE users; --\"\n});\n"
+  when_applies: Any project using Node.js, Express.js/Node.js servers, or Fastify
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities
+  sources: ["https://cheatsheetseries.owasp.org/cheatsheets/Input_Validation_Cheat_Sheet.html"]
+- id: CR-NODE-008
+  text: Use helmet for HTTP security headers and configure CORS with explicit allowed origins — never wildcard in production.
+  why: Missing security headers expose users to XSS (no CSP), clickjacking (no X-Frame-Options), and MIME sniffing attacks.
+    CORS wildcard (*) allows any website to make authenticated requests to your API, leaking user data.
+  how_to_do_right: Install helmet() as the first middleware — it sets 15+ security headers. Configure CORS with explicit origin
+    list. Set httpOnly + secure + sameSite on cookies. Enable rate limiting on auth endpoints.
+  severity: critical
+  technologies:
+    framework: [backend, express]
+    library: [node, js]
+  domains:
+    domain: [architecture, security]
+    concern: [backend]
+  example_good: "import helmet from 'helmet';\nimport cors from 'cors';\nimport rateLimit from 'express-rate-limit';\n\n//\
+    \ Security headers — FIRST middleware\napp.use(helmet());\n\n// CORS — explicit origins\napp.use(cors({\n  origin: ['https://app.example.com',\
+    \ 'https://admin.example.com'],\n  methods: ['GET', 'POST', 'PUT', 'DELETE'],\n  credentials: true,\n  maxAge: 86400,\n\
+    }));\n\n// Rate limiting on auth\nconst authLimiter = rateLimit({\n  windowMs: 15 * 60 * 1000,  // 15 minutes\n  max:\
+    \ 10,                     // 10 attempts\n  message: { error: 'Too many attempts' },\n});\napp.use('/auth', authLimiter);\n"
+  example_bad: '// No security headers at all
+
+    app.use(cors());  // Allows * — any site can make requests
+
+    // No rate limiting — brute force login at 10,000 req/s
+
+
+    app.use(cors({ origin: ''*'', credentials: true }));
+
+    // Contradictory: credentials with wildcard is ignored by browsers
+
+    // but indicates a fundamental security misunderstanding
+
+    '
+  when_applies: Any project using Node.js or Express.js/Node.js servers
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects not using Node.js or Express
+  sources: ["https://cheatsheetseries.owasp.org/cheatsheets/HTTP_Headers_Cheat_Sheet.html", "https://helmetjs.github.io/"]
+- id: CR-NODE-009
+  text: Use bcrypt or argon2 for password hashing — never MD5, SHA-1, or SHA-256.
+  why: Cryptographic hash functions (MD5, SHA) are designed to be FAST — billions of hashes per second on a GPU. Password
+    hashing must be SLOW to resist brute force. bcrypt/argon2 include salt and configurable work factor. A stolen database
+    with SHA-256 passwords is cracked in hours.
+  how_to_do_right: Use bcrypt with cost factor >= 12 or argon2id (preferred). Never implement your own hashing. Store the
+    full hash output (includes salt + algorithm + params). Verify with timing-safe comparison.
+  severity: critical
+  technologies:
+    library: [node, js]
+  domains:
+    domain: [architecture, security]
+    concern: [backend]
+  example_good: "import bcrypt from 'bcrypt';\n\nconst SALT_ROUNDS = 12;  // ~250ms per hash — good balance\n\nasync function\
+    \ hashPassword(password) {\n  return bcrypt.hash(password, SALT_ROUNDS);\n}\n\nasync function verifyPassword(password,\
+    \ hash) {\n  return bcrypt.compare(password, hash);  // Timing-safe\n}\n\n// Registration\nconst hash = await hashPassword(req.body.password);\n\
+    await db.createUser({ email, passwordHash: hash });\n\n// Login\nconst user = await db.getUserByEmail(email);\nif (!user\
+    \ || !await verifyPassword(password, user.passwordHash)) {\n  return res.status(401).json({ error: 'Invalid credentials'\
+    \ });\n}\n"
+  example_bad: "import crypto from 'crypto';\n\nfunction hashPassword(password) {\n  return crypto.createHash('sha256').update(password).digest('hex');\n\
+    \  // No salt — identical passwords produce identical hashes\n  // SHA-256 is FAST — 10 billion hashes/second on GPU\n\
+    \  // Rainbow table attack: instant lookup\n}\n"
+  when_applies: Any project using Node.js
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects not using Node.js
+  sources: ["https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html"]
+- id: CR-NODE-010
+  text: Prevent memory leaks — remove event listeners, clear timers, and set TTL on caches.
+  why: 'Node.js runs long-lived processes (unlike PHP/CGI). A small leak of 1KB per request means 86MB/day at 1 req/s. Common
+    leak sources: event listeners accumulating on long-lived objects, forgotten setInterval handles, unbounded in-memory caches.'
+  how_to_do_right: Use AbortController for cancellable listeners. Clear all timers in shutdown. Use LRU caches with maxSize/TTL
+    (e.g., lru-cache). Use WeakRef for optional caches. Monitor with --inspect + heap snapshots.
+  severity: high
+  technologies:
+    library: [node, js]
+  domains:
+    domain: [architecture, performance, reliability]
+    concern: [backend]
+  example_good: "import { LRUCache } from 'lru-cache';\n\n// Bounded cache with TTL\nconst cache = new LRUCache({\n  max:\
+    \ 1000,                    // Max 1000 entries\n  ttl: 1000 * 60 * 5,          // 5 minute TTL\n  maxSize: 50 * 1024 *\
+    \ 1024,   // 50MB max\n  sizeCalculation: (v) => JSON.stringify(v).length,\n});\n\n// AbortController for cancellable\
+    \ listeners\nconst controller = new AbortController();\nemitter.on('data', handler, { signal: controller.signal });\n\
+    // Later: controller.abort() removes the listener\n\n// Cleanup interval on shutdown\nconst interval = setInterval(cleanup,\
+    \ 60000);\nprocess.on('SIGTERM', () => {\n  clearInterval(interval);\n});\n"
+  example_bad: "// Unbounded cache — grows until OOM\nconst cache = {};\napp.get('/users/:id', async (req, res) => {\n  if\
+    \ (!cache[req.params.id]) {\n    cache[req.params.id] = await db.getUser(req.params.id);\n    // Never evicted — 1M users\
+    \ = 1M cached objects forever\n  }\n  res.json(cache[req.params.id]);\n});\n\n// Event listener leak\nfunction handleRequest(req,\
+    \ res) {\n  db.on('error', (err) => console.error(err));  // New listener EVERY request\n  // After 10,000 requests: 10,000\
+    \ listeners on db object\n}\n"
+  when_applies: Projects using Node.js
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not using Node.js
+  sources: ["https://nodejs.org/en/learn/diagnostics/memory/using-heap-snapshot"]
+- id: CR-NODE-011
+  text: Always commit package-lock.json and use npm ci in CI — never npm install in production builds.
+  why: npm install resolves version ranges (^1.2.3 can install 1.9.0) and modifies package-lock.json. This means your CI build
+    might install different versions than your local build. npm ci installs EXACTLY what's in package-lock.json — reproducible,
+    fast, deterministic.
+  how_to_do_right: Commit package-lock.json. Use npm ci in CI/CD (fails if lock file is out of sync). Use npm audit in CI
+    to check for vulnerabilities. Pin critical dependencies to exact versions.
+  severity: high
+  technologies:
+    library: [node, js, npm]
+  domains:
+    domain: [architecture, operations, devops, security]
+    concern: [backend]
+  example_good: '# CI pipeline
+
+    - run: npm ci                  # Deterministic install from lock file
+
+    - run: npm audit --audit-level=high  # Fail on high+ vulnerabilities
+
+    - run: npm test
+
+    - run: npm run build
+
+
+    # .gitignore — lock file is NOT ignored
+
+    node_modules/
+
+    dist/
+
+    .env
+
+    # package-lock.json is committed
+
+    '
+  example_bad: '# CI pipeline
+
+    - run: npm install  # Resolves ranges — may install newer versions
+
+    # package-lock.json not committed — every build resolves differently
+
+    # No audit — vulnerable dependencies ship to production
+
+
+    # .gitignore
+
+    package-lock.json  # WRONG — breaks reproducibility
+
+    '
+  when_applies: Projects using Node.js or npm
+  when_not_applies: local development only, throwaway experiments. projects not using Node.js or npm
+  sources: ["https://docs.npmjs.com/cli/commands/npm-ci"]
+- id: CR-NODE-012
+  text: Use connection pooling for databases — never create a connection per request.
+  why: TCP handshake + TLS + authentication takes 5-50ms per connection. At 1000 req/s, that is 50 seconds of connection setup
+    per second — impossible. Connection pools maintain warm connections, amortizing setup cost across all requests.
+  how_to_do_right: 'Create the pool once at startup (max 10-20 connections per process). Release connections after each query
+    (use pool.query, not pool.connect). Size the pool to: num_cores * 2 + effective_spindle_count. Monitor pool exhaustion.'
+  severity: high
+  technologies:
+    library: [node, js]
+    platform: [postgresql, mysql]
+  domains:
+    domain: [architecture, performance]
+    concern: [backend]
+  example_good: "import pg from 'pg';\n\n// Single pool for the application — created once at startup\nconst pool = new pg.Pool({\n\
+    \  connectionString: process.env.DATABASE_URL,\n  max: 20,                  // Max connections in pool\n  idleTimeoutMillis:\
+    \ 30000, // Close idle connections after 30s\n  connectionTimeoutMillis: 5000, // Fail if can't connect in 5s\n});\n\n\
+    // Use pool.query — automatically checks out and releases connection\napp.get('/users/:id', async (req, res) => {\n  const\
+    \ { rows } = await pool.query(\n    'SELECT * FROM users WHERE id = $1',\n    [req.params.id]\n  );\n  res.json(rows[0]);\n\
+    });\n\n// Shutdown: drain pool\nprocess.on('SIGTERM', () => pool.end());\n"
+  example_bad: "import pg from 'pg';\n\napp.get('/users/:id', async (req, res) => {\n  // New connection per request — 5-50ms\
+    \ overhead each time\n  const client = new pg.Client(process.env.DATABASE_URL);\n  await client.connect();\n  const {\
+    \ rows } = await client.query('SELECT * FROM users WHERE id = $1', [req.params.id]);\n  await client.end();  // If handler\
+    \ throws before this line, connection leaks\n  res.json(rows[0]);\n});\n"
+  when_applies: Projects using Node.js, PostgreSQL databases, or MySQL/MariaDB databases
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant
+  sources: ["https://node-postgres.com/features/pooling"]
+- id: CR-NODE-013
+  text: Stream large responses — never buffer entire files or query results in memory.
+  why: Buffering a 1GB file upload or a 10M-row query result in memory crashes the process. Even with enough memory, it creates
+    GC pressure and latency spikes. Streaming processes data in chunks — constant memory regardless of data size.
+  how_to_do_right: 'Use createReadStream for file serving. Use cursor/stream APIs for large queries. Use pipeline() for piping
+    data through transforms. Set Content-Length or use Transfer-Encoding: chunked.'
+  severity: high
+  technologies:
+    framework: [backend, express]
+    library: [node, js]
+  domains:
+    domain: [architecture, performance]
+    concern: [backend]
+  example_good: "import { createReadStream } from 'fs';\nimport { stat } from 'fs/promises';\nimport { pipeline } from 'stream/promises';\n\
+    \napp.get('/files/:name', async (req, res) => {\n  const filePath = path.join(UPLOAD_DIR, req.params.name);\n  const stats\
+    \ = await stat(filePath);\n\n  res.setHeader('Content-Length', stats.size);\n  res.setHeader('Content-Type', 'application/octet-stream');\n\
+    \n  await pipeline(createReadStream(filePath), res);\n  // Constant memory — file streamed in 64KB chunks\n});\n\n// Large\
+    \ CSV export — stream from DB\napp.get('/export', async (req, res) => {\n  res.setHeader('Content-Type', 'text/csv');\n\
+    \  const cursor = db.query('SELECT * FROM events').stream();\n  await pipeline(cursor, csvTransform, res);\n});\n"
+  example_bad: "app.get('/files/:name', async (req, res) => {\n  // Reads ENTIRE file into memory — 1GB file = 1GB RAM\n \
+    \ const data = await readFile(path.join(UPLOAD_DIR, req.params.name));\n  res.send(data);\n});\n\napp.get('/export', async\
+    \ (req, res) => {\n  // Loads ALL rows into memory — 10M rows = OOM\n  const rows = await db.query('SELECT * FROM events');\n\
+    \  const csv = rows.map(r => `${r.id},${r.name}`).join('\\n');\n  res.send(csv);\n});\n"
+  when_applies: Projects using Node.js or Express.js/Node.js servers
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not using Node.js or Express
+  sources: ["https://nodejs.org/api/stream.html#streampipelinesource-transforms-destination-options"]
+- id: CR-NODE-014
+  text: Use strict TypeScript configuration for Node.js backends — enable strict, noUncheckedIndexedAccess, and exactOptionalPropertyTypes.
+  why: Default TypeScript config allows implicit any, unchecked array access, and undefined-as-missing confusion. These create
+    the same class of bugs TypeScript is supposed to prevent. Strict mode catches null pointer exceptions, type mismatches,
+    and forgotten checks at compile time.
+  how_to_do_right: 'Set strict: true in tsconfig.json. Enable noUncheckedIndexedAccess (array[0] is T | undefined). Enable
+    exactOptionalPropertyTypes (undefined vs missing). Use unknown instead of any for external data.'
+  severity: high
+  technologies:
+    lang: [typescript]
+    library: [node, js]
+  domains:
+    domain: [architecture, quality]
+    concern: [backend]
+  example_good: "// tsconfig.json\n{\n  \"compilerOptions\": {\n    \"strict\": true,\n    \"noUncheckedIndexedAccess\": true,\n\
+    \    \"exactOptionalPropertyTypes\": true,\n    \"noImplicitReturns\": true,\n    \"noFallthroughCasesInSwitch\": true,\n\
+    \    \"forceConsistentCasingInFileNames\": true\n  }\n}\n\n// Code with strict mode\nfunction getFirst(items: string[]):\
+    \ string | undefined {\n  return items[0];  // Type is string | undefined — must check\n}\n\nconst first = getFirst(names);\n\
+    if (first !== undefined) {\n  console.log(first.toUpperCase());  // Safe — narrowed to string\n}\n"
+  example_bad: "// tsconfig.json — default loose settings\n{ \"compilerOptions\": { \"target\": \"ES2020\" } }\n// strict:\
+    \ false, no index checks, implicit any everywhere\n\nfunction getFirst(items: string[]): string {\n  return items[0];\
+    \  // TypeScript says this is string — it's actually undefined if empty\n}\ngetFirst([]).toUpperCase();  // Runtime: Cannot\
+    \ read property 'toUpperCase' of undefined\n"
+  when_applies: Projects using Node.js or TypeScript projects with static typing
+  when_not_applies: projects not using Node.js or TypeScript
+  sources: ["https://www.typescriptlang.org/tsconfig#strict"]
+- id: CR-NODE-015
+  text: Use worker threads with a thread pool (piscina) for CPU-intensive operations — never spawn unlimited workers.
+  why: Each worker thread consumes ~4-12MB of memory for its V8 isolate. Spawning a worker per request at 1000 req/s means
+    1000 V8 instances — OOM in seconds. A fixed-size thread pool bounds resource usage and queues excess work.
+  how_to_do_right: Use piscina for managed worker pools. Set pool size to CPU count. Workers share ArrayBuffer/SharedArrayBuffer
+    for large data (zero-copy). Use transferList for ownership transfer. Terminate idle workers.
+  severity: medium
+  technologies:
+    library: [node, js]
+  domains:
+    domain: [architecture, performance]
+    concern: [backend, concurrency]
+  example_good: "import Piscina from 'piscina';\nimport { cpus } from 'os';\n\nconst pool = new Piscina({\n  filename: './workers/hash-worker.js',\n\
+    \  maxThreads: cpus().length,     // Bounded pool\n  idleTimeout: 30000,            // Reclaim idle workers\n});\n\napp.post('/hash',\
+    \ async (req, res) => {\n  const hash = await pool.run(req.body.data);  // Queued if all busy\n  res.json({ hash });\n\
+    });\n\n// workers/hash-worker.js\nexport default function(data) {\n  return crypto.createHash('sha256').update(data).digest('hex');\n\
+    }\n"
+  example_bad: "import { Worker } from 'worker_threads';\n\napp.post('/hash', async (req, res) => {\n  // New worker per request\
+    \ — unbounded resource consumption\n  const worker = new Worker('./workers/hash-worker.js', {\n    workerData: req.body.data,\n\
+    \  });\n  worker.on('message', (hash) => res.json({ hash }));\n  // 1000 req/s = 1000 V8 isolates = 12GB RAM = OOM\n});\n"
+  when_applies: Projects using Node.js
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant. projects not using Node.js
+  sources: ["https://nodejs.org/api/worker_threads.html"]
+- id: CR-NODE-016
+  text: Use structured JSON logging (pino/winston) — never console.log in production.
+  why: console.log outputs unstructured text that cannot be parsed, filtered, or aggregated by log management systems (Datadog,
+    ELK, CloudWatch). Structured JSON logs with level, timestamp, requestId, and context enable filtering, alerting, and debugging
+    at scale.
+  how_to_do_right: Use pino (fastest) or winston. Add request context (requestId, userId) via async local storage. Set log
+    level via environment variable. Never log sensitive data (passwords, tokens, PII).
+  severity: medium
+  technologies:
+    framework: [backend, express]
+    library: [node, js]
+  domains:
+    domain: [architecture, observability]
+    concern: [backend]
+  example_good: "import pino from 'pino';\nimport { randomUUID } from 'crypto';\n\nconst logger = pino({\n  level: process.env.LOG_LEVEL\
+    \ || 'info',\n  serializers: pino.stdSerializers,\n});\n\n// Request context middleware\napp.use((req, res, next) => {\n\
+    \  req.log = logger.child({ requestId: randomUUID(), method: req.method, url: req.url });\n  next();\n});\n\napp.get('/users/:id',\
+    \ async (req, res) => {\n  req.log.info({ userId: req.params.id }, 'fetching user');\n  const user = await db.getUser(req.params.id);\n\
+    \  req.log.info({ found: !!user }, 'user fetch complete');\n  res.json(user);\n});\n// Output: {\"level\":30,\"time\"\
+    :1707000000,\"requestId\":\"abc-123\",\"userId\":\"42\",\"msg\":\"fetching user\"}\n"
+  example_bad: "app.get('/users/:id', async (req, res) => {\n  console.log('Getting user ' + req.params.id);  // Unstructured,\
+    \ no timestamp, no context\n  const user = await db.getUser(req.params.id);\n  console.log('Got user:', JSON.stringify(user));\
+    \  // May log PII\n  res.json(user);\n});\n// Output: \"Getting user 42\" — which request? when? what level?\n"
+  when_applies: Projects using Node.js or Express.js/Node.js servers
+  when_not_applies: throwaway prototypes, local dev scripts. projects not using Node.js or Express
+  sources: ["https://getpino.io/#/"]
+- id: CR-NODE-017
+  text: Validate all environment variables at startup — fail fast if required config is missing.
+  why: A missing DATABASE_URL that only crashes at the first query means the server accepted traffic for minutes and returned
+    500 errors to real users. Validating at startup means the process never starts if misconfigured — caught in deployment,
+    not in production.
+  how_to_do_right: Use envalid or zod to validate env vars at application startup (before listen()). Define required vs optional
+    with defaults. Type-coerce (PORT string to number). Exit with clear error message if validation fails.
+  severity: high
+  technologies:
+    library: [node, js]
+  domains:
+    domain: [architecture, reliability, operations, devops]
+    concern: [backend]
+  example_good: "import { cleanEnv, str, port, url, bool } from 'envalid';\n\nconst env = cleanEnv(process.env, {\n  NODE_ENV:\
+    \ str({ choices: ['development', 'production', 'test'] }),\n  PORT: port({ default: 3000 }),\n  DATABASE_URL: url(),\n\
+    \  REDIS_URL: url(),\n  JWT_SECRET: str({ desc: 'Secret for JWT signing' }),\n  ENABLE_CACHE: bool({ default: true }),\n\
+    });\n\n// Fails at startup with clear message:\n// \"Missing environment variables: DATABASE_URL, JWT_SECRET\"\n\nexport\
+    \ default env;\n"
+  example_bad: '// Scattered process.env reads — missing vars crash at first use
+
+    const port = process.env.PORT || 3000;
+
+    // ...later in a route handler...
+
+    const dbUrl = process.env.DATABASE_URL;  // undefined — crashes on first query
+
+    // 5 minutes of 500 errors before anyone notices
+
+    '
+  when_applies: Projects using Node.js
+  when_not_applies: projects not using Node.js
+  sources: ["https://12factor.net/config"]
+- id: CR-NODE-018
+  text: 'Use ESM (import/export) for new projects — configure package.json type: module and exports field.'
+  why: CommonJS (require) is synchronous, cannot be statically analyzed for tree-shaking, and has confusing module resolution.
+    ESM is the standard, supports top-level await, enables tree-shaking, and is the future of the Node.js ecosystem.
+  how_to_do_right: 'Set type: module in package.json. Use .js extension with import/export. Define exports field for public
+    API. Use .cjs for any CommonJS files you must keep. Set engines to Node >= 18.'
+  severity: medium
+  technologies:
+    library: [node, js]
+  domains:
+    domain: [architecture]
+    concern: [backend]
+  example_good: "// package.json\n{\n  \"type\": \"module\",\n  \"engines\": { \"node\": \">=18\" },\n  \"exports\": {\n \
+    \   \".\": {\n      \"import\": \"./dist/index.js\",\n      \"types\": \"./dist/index.d.ts\"\n    },\n    \"./utils\"\
+    : {\n      \"import\": \"./dist/utils.js\",\n      \"types\": \"./dist/utils.d.ts\"\n    }\n  }\n}\n\n// src/index.js\n\
+    import { readFile } from 'fs/promises';\nimport { createServer } from 'http';\n\nexport function startServer(port) {\n\
+    \  return createServer(handler).listen(port);\n}\n"
+  example_bad: '// Mixing CJS and ESM — confusing resolution rules
+
+    const fs = require(''fs'');           // CJS
+
+    import { something } from ''./lib'';  // ESM — ERROR: cannot mix
+
+    module.exports = { handler };       // CJS — incompatible with ESM imports
+
+    '
+  when_applies: Projects using Node.js
+  when_not_applies: projects not using Node.js
+  sources: ["https://nodejs.org/api/esm.html"]

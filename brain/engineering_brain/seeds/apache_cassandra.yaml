@@ -1,0 +1,590 @@
+layer: rules
+technology: Cassandra
+domain: database
+knowledge:
+- id: CR-CASS-001
+  text: Design Cassandra tables query-first — create one table per query pattern, not one table per entity.
+  why: Cassandra has no JOIN operations and secondary indexes are severely limited. If you model data like a relational database
+    (one table per entity, normalize, query with JOINs), every query becomes either impossible or requires full table scans
+    across the entire cluster. Cassandra's performance guarantee (single-digit millisecond reads) only holds when you read
+    from a single partition, which requires the table to be shaped exactly for the query.
+  how_to_do_right: Start by listing every query your application needs. For each query, design a dedicated table where the
+    partition key matches the query's WHERE clause equality predicates and the clustering columns match the ORDER BY clause.
+    Accept data duplication across tables — this is the intended design pattern. Use materialized views or application-level
+    denormalization to keep tables in sync.
+  severity: critical
+  technologies:
+    lang: [cql]
+    platform: [cassandra]
+  domains:
+    domain: [architecture]
+    concern: [data, database, data_modeling, distributed_systems]
+  example_good: "-- Query 1: Get all orders for a user, most recent first\nCREATE TABLE orders_by_user (\n    user_id UUID,\n\
+    \    created_at TIMESTAMP,\n    order_id UUID,\n    total DECIMAL,\n    status TEXT,\n    PRIMARY KEY (user_id, created_at,\
+    \ order_id)\n) WITH CLUSTERING ORDER BY (created_at DESC, order_id ASC);\n\n-- Query 2: Get order details by order_id\n\
+    CREATE TABLE orders_by_id (\n    order_id UUID,\n    user_id UUID,\n    created_at TIMESTAMP,\n    total DECIMAL,\n  \
+    \  status TEXT,\n    items LIST<FROZEN<order_item>>,\n    PRIMARY KEY (order_id)\n);\n\n-- Same data, two tables, each\
+    \ optimized for its query\n"
+  example_bad: "-- Relational-style: one table per entity, no query optimization\nCREATE TABLE orders (\n    order_id UUID\
+    \ PRIMARY KEY,\n    user_id UUID,\n    created_at TIMESTAMP,\n    total DECIMAL,\n    status TEXT,\n);\n-- \"Get all orders\
+    \ for user_id\" requires ALLOW FILTERING = full cluster scan\n-- Or secondary index on user_id = scattered reads across\
+    \ all nodes\n"
+  when_applies: Any project using Apache Cassandra distributed storage or CQL
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Cassandra
+    or CQL
+  sources: ["https://cassandra.apache.org/doc/latest/cassandra/data_modeling/data_modeling_queries.html"]
+- id: CR-CASS-002
+  text: Choose partition keys that bound partition size to under 100MB — unbounded partitions cause node instability.
+  why: 'A partition is the unit of storage and replication in Cassandra. All rows in a partition are stored contiguously on
+    the same node. An unbounded partition (e.g., all events for a high-traffic sensor_id with no time bucketing) grows until
+    it causes: compaction stalls (cannot compact a 10GB partition in memory), GC pressure (entire partition loaded for reads),
+    read timeouts (scanning millions of rows), and repair failures. This is the most common cause of Cassandra node crashes
+    in production.'
+  how_to_do_right: 'Estimate partition size: (average_row_size * expected_rows_per_partition). Keep under 100MB and 100,000
+    rows. For time-series data, use time bucketing: partition key = (entity_id, date_bucket). Choose bucket granularity based
+    on write rate: hourly for high-frequency, daily for moderate, monthly for low. Monitor partition size with nodetool tablehistograms.'
+  severity: critical
+  technologies:
+    lang: [cql]
+    platform: [cassandra]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, data_modeling]
+  example_good: "-- Time-bucketed partition key for IoT sensor data\n-- ~1000 readings/day/sensor * 200 bytes = 200KB per\
+    \ partition (well under 100MB)\nCREATE TABLE sensor_readings (\n    sensor_id UUID,\n    date_bucket DATE,          --\
+    \ Time bucket to bound partition size\n    reading_time TIMESTAMP,\n    temperature DOUBLE,\n    humidity DOUBLE,\n  \
+    \  PRIMARY KEY ((sensor_id, date_bucket), reading_time)\n) WITH CLUSTERING ORDER BY (reading_time DESC);\n\n-- Query:\
+    \ SELECT * FROM sensor_readings\n--        WHERE sensor_id = ? AND date_bucket = '2026-02-17';\n"
+  example_bad: "-- Unbounded partition — all readings for a sensor in one partition\nCREATE TABLE sensor_readings (\n    sensor_id\
+    \ UUID,\n    reading_time TIMESTAMP,\n    temperature DOUBLE,\n    humidity DOUBLE,\n    PRIMARY KEY (sensor_id, reading_time)\n\
+    );\n-- High-frequency sensor: 1M readings/day * 200 bytes = 200MB/day\n-- After 30 days: 6GB partition — compaction stalls,\
+    \ GC pauses, node crashes\n"
+  when_applies: Any project using Apache Cassandra distributed storage or CQL
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Cassandra
+    or CQL
+  sources: ["https://cassandra.apache.org/doc/latest/cassandra/data_modeling/data_modeling_physical.html"]
+- id: CR-CASS-003
+  text: Use clustering columns to define sort order within a partition — never rely on insertion order.
+  why: Cassandra stores rows within a partition sorted by clustering columns in a deterministic order defined at table creation.
+    Unlike a relational database, there is no implicit row ordering by insertion time. If you need to retrieve the most recent
+    N items or a range of items, the clustering column sort order determines whether this is a single efficient disk seek
+    or a full partition scan with application-side sorting.
+  how_to_do_right: 'Define clustering columns that match your query''s ORDER BY clause. Use DESC for most-recent-first patterns
+    (common in timelines, feeds, logs). Use FROZEN collections as clustering columns only when you need to query by the full
+    collection value. Remember: clustering order is immutable after table creation — changing it requires creating a new table
+    and migrating data.'
+  severity: high
+  technologies:
+    lang: [cql]
+    platform: [cassandra]
+  domains:
+    domain: [architecture]
+    concern: [data, database, data_modeling]
+  example_good: "-- Timeline: most recent posts first\nCREATE TABLE user_timeline (\n    user_id UUID,\n    posted_at TIMESTAMP,\n\
+    \    post_id UUID,\n    content TEXT,\n    PRIMARY KEY (user_id, posted_at, post_id)\n) WITH CLUSTERING ORDER BY (posted_at\
+    \ DESC, post_id ASC);\n\n-- Efficient: returns rows already sorted, no additional processing\nSELECT * FROM user_timeline\
+    \ WHERE user_id = ? LIMIT 20;\n"
+  example_bad: "-- No clustering order specified — defaults to ASC\nCREATE TABLE user_timeline (\n    user_id UUID,\n    post_id\
+    \ UUID,\n    posted_at TIMESTAMP,\n    content TEXT,\n    PRIMARY KEY (user_id, post_id)\n);\n-- \"Get latest 20 posts\"\
+    \ requires reading ALL posts for user\n-- and sorting in application code — O(n) instead of O(1) seek\n"
+  when_applies: Projects using Apache Cassandra distributed storage or CQL
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Cassandra
+    or CQL
+  sources: ["https://cassandra.apache.org/doc/latest/cassandra/cql/ddl.html#clustering-columns"]
+- id: CR-CASS-004
+  text: Never use ALLOW FILTERING in production queries — it triggers a full cluster scan.
+  why: ALLOW FILTERING tells Cassandra to read every partition in the table and filter results in memory on the coordinator
+    node. For a table with millions of partitions distributed across 20 nodes, this means a single query scans the entire
+    dataset, consuming CPU, memory, and network on every node. It times out on large tables, causes coordinator OOMs, and
+    generates massive cross-DC network traffic. It exists only as a development convenience.
+  how_to_do_right: If your query needs ALLOW FILTERING, your data model is wrong for that query. Create a new table with a
+    partition key that matches your WHERE clause. Use materialized views for simple denormalization. For ad-hoc analytics
+    queries, export to Spark or use Cassandra's Spark connector instead of querying Cassandra directly.
+  severity: critical
+  technologies:
+    lang: [cql]
+    platform: [cassandra]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, anti_patterns]
+  example_good: "-- Need: \"Find all orders with status = 'PENDING'\"\n-- Solution: dedicated table partitioned by status\n\
+    CREATE TABLE orders_by_status (\n    status TEXT,\n    created_at TIMESTAMP,\n    order_id UUID,\n    user_id UUID,\n\
+    \    PRIMARY KEY (status, created_at, order_id)\n) WITH CLUSTERING ORDER BY (created_at DESC);\n\n-- Efficient single-partition\
+    \ read\nSELECT * FROM orders_by_status WHERE status = 'PENDING' LIMIT 100;\n"
+  example_bad: '-- Full cluster scan — reads every order on every node
+
+    SELECT * FROM orders WHERE status = ''PENDING'' ALLOW FILTERING;
+
+    -- On 100M orders across 20 nodes:
+
+    -- Coordinator requests data from all 20 nodes
+
+    -- Each node scans all local partitions
+
+    -- Coordinator OOMs trying to merge results
+
+    -- Query times out after 10 seconds
+
+    '
+  when_applies: Any project using Apache Cassandra distributed storage or CQL
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Cassandra
+    or CQL
+  sources: ["https://cassandra.apache.org/doc/latest/cassandra/cql/dml.html#allow-filtering"]
+- id: CR-CASS-005
+  text: Avoid secondary indexes on high-cardinality columns — they create a hidden distributed scatter-gather.
+  why: Cassandra secondary indexes create a local index on each node containing only that node's data. A query using a secondary
+    index must contact every node in the cluster to collect partial results (scatter-gather), then merge them on the coordinator.
+    For high-cardinality columns (e.g., user_id, email), almost every node returns 0-1 results, making N network round-trips
+    for a single row. Performance degrades linearly with cluster size.
+  how_to_do_right: Use secondary indexes only on low-cardinality columns (status, country, category) combined with a partition
+    key restriction. For high-cardinality lookups, create a dedicated lookup table. Consider SAI (Storage-Attached Indexes)
+    in Cassandra 4.0+ for slightly better performance. For full-text search, use the Cassandra-Elasticsearch integration instead.
+  severity: high
+  technologies:
+    lang: [cql]
+    platform: [cassandra]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, anti_patterns]
+  example_good: "-- Dedicated lookup table for email → user_id\nCREATE TABLE users_by_email (\n    email TEXT,\n    user_id\
+    \ UUID,\n    name TEXT,\n    PRIMARY KEY (email)\n);\n\n-- O(1) lookup: partition key = email, single node read\nSELECT\
+    \ * FROM users_by_email WHERE email = 'user@example.com';\n"
+  example_bad: '-- Secondary index on high-cardinality column
+
+    CREATE INDEX ON users (email);
+
+    SELECT * FROM users WHERE email = ''user@example.com'';
+
+    -- Contacts ALL nodes in cluster, each scans local index
+
+    -- 20-node cluster = 20 network round-trips for 1 row
+
+    -- Gets slower as cluster grows — opposite of scaling
+
+    '
+  when_applies: Projects using Apache Cassandra distributed storage or CQL
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Cassandra
+    or CQL
+  sources: ["https://cassandra.apache.org/doc/latest/cassandra/cql/indexes.html"]
+- id: CR-CASS-006
+  text: Manage tombstones actively — excessive tombstones cause read amplification and heap pressure.
+  why: Cassandra does not delete data immediately. DELETE and TTL expiration create tombstones (markers that a value was deleted).
+    Tombstones are kept for gc_grace_seconds (default 10 days) to ensure deletes propagate to all replicas. During reads,
+    Cassandra must scan through all tombstones to find live data. A partition with 100,000 tombstones and 10 live rows reads
+    like a 100,000-row partition, causing slow queries, GC pressure, and the dreaded 'Read X live rows and Y tombstones' warning.
+  how_to_do_right: 'Set appropriate TTL values and gc_grace_seconds. Avoid patterns that generate many tombstones: do not
+    use DELETE to clear old data (use TTL instead), do not insert-then-delete in tight loops, avoid writing NULL values (each
+    NULL is a tombstone). Monitor tombstone counts with nodetool tablestats. Set tombstone_warn_threshold and tombstone_failure_threshold
+    in cassandra.yaml.'
+  severity: high
+  technologies:
+    platform: [cassandra]
+  domains:
+    domain: [architecture, performance, operations]
+    concern: [data, database]
+  example_good: "-- Use TTL instead of explicit DELETE for time-bounded data\nCREATE TABLE session_data (\n    session_id\
+    \ UUID,\n    key TEXT,\n    value TEXT,\n    PRIMARY KEY (session_id, key)\n) WITH default_time_to_live = 86400  -- Auto-expire\
+    \ after 24 hours\n  AND gc_grace_seconds = 86400;       -- GC tombstones after 24 hours\n\n-- Insert with TTL — no manual\
+    \ DELETE needed\nINSERT INTO session_data (session_id, key, value)\nVALUES (?, 'cart', '{\"items\": [...]}')\nUSING TTL\
+    \ 3600;  -- Expire after 1 hour\n\n-- Monitor tombstones\n-- nodetool tablestats keyspace.session_data | grep \"Tombstones\"\
+    \n"
+  example_bad: '-- Pattern that creates massive tombstones:
+
+    -- Write 1000 rows, delete 990, write 1000 more, delete 990...
+
+    DELETE FROM events WHERE sensor_id = ? AND event_time < ''2026-01-01'';
+
+    -- Creates one tombstone per deleted row
+
+    -- 10M deletes = 10M tombstones scanned on every read
+
+    -- nodetool tablestats shows "Average tombstones per slice: 50000"
+
+    '
+  when_applies: Projects using Apache Cassandra distributed storage
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Cassandra
+  sources: ["https://cassandra.apache.org/doc/latest/cassandra/operating/compaction/index.html"]
+- id: CR-CASS-007
+  text: Use LOCAL_QUORUM for multi-datacenter deployments — never QUORUM across DCs.
+  why: QUORUM requires acknowledgment from (replication_factor / 2 + 1) replicas across ALL datacenters. With RF=3 in 2 DCs
+    (6 total replicas), QUORUM needs 4 acknowledgments, which must span both DCs. This means every read and write crosses
+    the WAN link between datacenters, adding 50-200ms latency and creating a hard dependency on inter-DC connectivity. If
+    the WAN link fails, QUORUM operations fail in both DCs — you lose the multi-DC availability benefit entirely.
+  how_to_do_right: Use LOCAL_QUORUM for both reads and writes. This requires (local_RF / 2 + 1) replicas in the local DC only.
+    With RF=3 per DC, LOCAL_QUORUM needs 2 local replicas. Reads and writes complete in single-digit milliseconds. Inter-DC
+    replication happens asynchronously. Accept that a cross-DC failover may serve slightly stale data (typically < 1 second
+    behind). For strong consistency across DCs, use EACH_QUORUM on writes + LOCAL_QUORUM on reads.
+  severity: high
+  technologies:
+    lang: [cql]
+    platform: [cassandra]
+  domains:
+    domain: [architecture]
+    concern: [data, database, distributed_systems, multi_dc]
+  example_good: "-- Multi-DC keyspace with RF=3 in each DC\nCREATE KEYSPACE production WITH replication = {\n    'class':\
+    \ 'NetworkTopologyStrategy',\n    'dc_east': 3,\n    'dc_west': 3\n};\n\n-- Python driver: LOCAL_QUORUM for reads and\
+    \ writes\nfrom cassandra.cluster import Cluster\nfrom cassandra.policies import DCAwareRoundRobinPolicy\nfrom cassandra\
+    \ import ConsistencyLevel\n\ncluster = Cluster(\n    contact_points=['node1', 'node2'],\n    load_balancing_policy=DCAwareRoundRobinPolicy(local_dc='dc_east'),\n\
+    )\nsession = cluster.connect('production')\n\n# Write with LOCAL_QUORUM — 2 of 3 local replicas confirm\nstmt = session.prepare(\"\
+    INSERT INTO orders (id, data) VALUES (?, ?)\")\nstmt.consistency_level = ConsistencyLevel.LOCAL_QUORUM\n"
+  example_bad: '-- QUORUM across DCs — every operation crosses WAN
+
+    stmt.consistency_level = ConsistencyLevel.QUORUM
+
+    # 50-200ms added to every read/write
+
+    # WAN failure = both DCs unavailable (defeats multi-DC purpose)
+
+
+    -- ALL — even worse, requires every replica in every DC
+
+    stmt.consistency_level = ConsistencyLevel.ALL
+
+    # Single node failure anywhere = operation fails
+
+    '
+  when_applies: Projects using Apache Cassandra distributed storage or CQL
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Cassandra
+    or CQL
+  sources: ["https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html#tunable-consistency"]
+- id: CR-CASS-008
+  text: 'Understand the consistency formula: R + W > RF guarantees strong consistency per operation.'
+  why: 'Cassandra provides tunable consistency. The guarantee ''every read sees the latest write'' only holds when the number
+    of replicas read (R) plus the number of replicas written (W) exceeds the replication factor (RF). With RF=3: QUORUM reads
+    (2) + QUORUM writes (2) = 4 > 3 = strong consistency. ONE read (1) + ONE write (1) = 2 < 3 = eventual consistency. Choosing
+    consistency levels without understanding this formula leads to stale reads or unnecessary latency.'
+  how_to_do_right: 'For strong consistency: use LOCAL_QUORUM reads + LOCAL_QUORUM writes (R=2, W=2, R+W=4 > RF=3). For read-heavy
+    workloads tolerating staleness: use ONE reads + LOCAL_QUORUM writes. For write-heavy workloads: use LOCAL_QUORUM reads
+    + ONE writes. Document the consistency choice per table/query with the R+W>RF reasoning.'
+  severity: high
+  technologies:
+    lang: [cql]
+    platform: [cassandra]
+  domains:
+    domain: [architecture]
+    concern: [data, database, distributed_systems, consistency]
+  example_good: '# RF=3, need strong consistency for financial data
+
+    # R=LOCAL_QUORUM(2) + W=LOCAL_QUORUM(2) = 4 > 3 ✓
+
+
+    write_stmt = session.prepare("INSERT INTO balances (account_id, balance) VALUES (?, ?)")
+
+    write_stmt.consistency_level = ConsistencyLevel.LOCAL_QUORUM  # W=2
+
+
+    read_stmt = session.prepare("SELECT balance FROM balances WHERE account_id = ?")
+
+    read_stmt.consistency_level = ConsistencyLevel.LOCAL_QUORUM   # R=2
+
+
+    # R(2) + W(2) = 4 > RF(3) → guaranteed to read latest write
+
+    '
+  example_bad: '# RF=3, but using ONE for both reads and writes
+
+    write_stmt.consistency_level = ConsistencyLevel.ONE   # W=1
+
+    read_stmt.consistency_level = ConsistencyLevel.ONE    # R=1
+
+
+    # R(1) + W(1) = 2 < RF(3) → stale reads possible
+
+    # Account balance shows $1000 after $500 withdrawal was acknowledged
+
+    '
+  when_applies: Projects using Apache Cassandra distributed storage or CQL
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Cassandra
+    or CQL
+  sources: ["https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html#tunable-consistency"]
+- id: CR-CASS-009
+  text: 'Choose compaction strategy based on workload pattern: STCS for write-heavy, LCS for read-heavy, TWCS for time-series.'
+  why: Compaction merges SSTables to reclaim space and remove tombstones. The wrong strategy causes either write amplification
+    (LCS on write-heavy) or read amplification (STCS on read-heavy). Size-Tiered (STCS) groups SSTables by size — good for
+    writes but causes space amplification (needs 2x disk space during compaction). Leveled (LCS) guarantees 90% of reads touch
+    1 SSTable — good for reads but rewrites data 10x. Time-Window (TWCS) groups by time window — optimal for time-series where
+    old data is never updated.
+  how_to_do_right: 'STCS (default): Use for write-heavy workloads with infrequent reads. Ensure 50% free disk space for compaction.
+    LCS: Use for read-heavy workloads, point lookups, and tables with frequent updates. Accept 10x write amplification. TWCS:
+    Use for time-series data with TTL. Set compaction_window_size to match your TTL granularity. Never use TWCS if you update
+    old rows.'
+  severity: high
+  technologies:
+    platform: [cassandra]
+  domains:
+    domain: [architecture, performance, operations]
+    concern: [data, database]
+  example_good: "-- Time-series IoT data: TWCS with 1-day windows matching 30-day TTL\nCREATE TABLE sensor_readings (\n  \
+    \  sensor_id UUID,\n    day DATE,\n    reading_time TIMESTAMP,\n    value DOUBLE,\n    PRIMARY KEY ((sensor_id, day),\
+    \ reading_time)\n) WITH compaction = {\n    'class': 'TimeWindowCompactionStrategy',\n    'compaction_window_unit': 'DAYS',\n\
+    \    'compaction_window_size': 1\n} AND default_time_to_live = 2592000;  -- 30 days\n\n-- Read-heavy user profiles: LCS\
+    \ for efficient point lookups\nCREATE TABLE user_profiles (\n    user_id UUID PRIMARY KEY,\n    name TEXT,\n    email\
+    \ TEXT,\n    preferences MAP<TEXT, TEXT>\n) WITH compaction = {'class': 'LeveledCompactionStrategy'};\n"
+  example_bad: "-- STCS on read-heavy table — reads touch many SSTables\nCREATE TABLE user_profiles (\n    user_id UUID PRIMARY\
+    \ KEY,\n    name TEXT, email TEXT\n) WITH compaction = {'class': 'SizeTieredCompactionStrategy'};\n-- Point lookup may\
+    \ read 10+ SSTables instead of 1\n\n-- LCS on write-heavy log table — 10x write amplification\nCREATE TABLE event_log\
+    \ (...) WITH compaction = {\n    'class': 'LeveledCompactionStrategy'\n};\n-- Each write eventually rewritten 10 times\
+    \ by compaction\n"
+  when_applies: Projects using Apache Cassandra distributed storage
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Cassandra
+  sources: ["https://cassandra.apache.org/doc/latest/cassandra/operating/compaction/index.html"]
+- id: CR-CASS-010
+  text: Use Lightweight Transactions (IF NOT EXISTS / IF conditions) sparingly — they use Paxos and are 4-10x slower than
+    normal writes.
+  why: Lightweight transactions (LWTs) implement linearizable consistency using the Paxos consensus protocol. Each LWT requires
+    4 round-trips between replicas (prepare, promise, propose, commit) compared to 1 round-trip for a normal write. This makes
+    LWTs 4-10x slower and serializes all LWTs on the same partition through a single Paxos leader, creating a throughput bottleneck.
+    High LWT rates cause contention, timeouts, and the paxos_state table growing large.
+  how_to_do_right: 'Use LWTs only for operations that truly require compare-and-swap semantics: unique constraints (IF NOT
+    EXISTS), optimistic locking (IF version = ?), account balance checks (IF balance >= ?). Never use LWTs for bulk operations.
+    Keep the LWT rate below 5% of total writes. For high-frequency uniqueness checks, consider an application-level lock or
+    idempotency key approach instead.'
+  severity: medium
+  technologies:
+    lang: [cql]
+    platform: [cassandra]
+  domains:
+    domain: [architecture]
+    concern: [data, database, distributed_systems, consistency]
+  example_good: '-- Good use: ensure email uniqueness (low frequency, critical correctness)
+
+    INSERT INTO users_by_email (email, user_id, name)
+
+    VALUES (''user@example.com'', uuid(), ''Jane Doe'')
+
+    IF NOT EXISTS;  -- Returns [applied]=true or [applied]=false
+
+
+    -- Good use: optimistic locking with version counter
+
+    UPDATE account_balances
+
+    SET balance = 450.00, version = 6
+
+    WHERE account_id = ?
+
+    IF version = 5;  -- Only succeeds if no concurrent update
+
+    '
+  example_bad: '-- LWT on every write in a high-throughput pipeline
+
+    INSERT INTO events (event_id, data, processed)
+
+    VALUES (?, ?, false)
+
+    IF NOT EXISTS;
+
+    -- 100K events/sec * 4 Paxos round-trips each = Paxos contention storm
+
+    -- Timeouts, cascading failures, paxos_state table bloat
+
+    '
+  when_applies: Projects using Apache Cassandra distributed storage or CQL
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Cassandra
+    or CQL
+  sources: ["https://cassandra.apache.org/doc/latest/cassandra/cql/dml.html#lightweight-transactions"]
+- id: CR-CASS-011
+  text: Run nodetool repair regularly on every node — missed repairs cause data inconsistency and resurrection of deleted
+    data.
+  why: Cassandra relies on anti-entropy repair to synchronize replicas that missed writes (due to node downtime, network partitions,
+    or hinted handoff expiration). Without regular repair, replicas diverge silently. Worse, if repair does not run within
+    gc_grace_seconds (default 10 days), deleted data (tombstones) may be garbage collected on some replicas while still present
+    on others. When the out-of-sync replica serves a read, the deleted data resurrects — zombie data that was supposed to
+    be gone.
+  how_to_do_right: 'Schedule incremental repair (nodetool repair -pr) on every node within gc_grace_seconds interval (e.g.,
+    weekly for 10-day gc_grace). Use Cassandra Reaper for automated, throttled repairs across the cluster. Run repair during
+    low-traffic windows. Monitor repair status: nodetool repairstatus. Never let repair fall behind gc_grace_seconds or you
+    risk data resurrection.'
+  severity: critical
+  technologies:
+    library: [reaper]
+    platform: [cassandra]
+  domains:
+    domain: [architecture, operations, reliability]
+    concern: [data, database]
+  example_good: "# Automated repair with Cassandra Reaper\n# Schedule: weekly, within gc_grace_seconds (10 days)\ncurl -X\
+    \ POST http://reaper:8080/repair_schedule \\\n  -d '{\n    \"clusterName\": \"production\",\n    \"keyspace\": \"app_data\"\
+    ,\n    \"scheduleDaysBetween\": 7,\n    \"intensity\": 0.5,\n    \"repairParallelism\": \"DATACENTER_AWARE\",\n    \"\
+    incrementalRepair\": true\n  }'\n\n# Verify repair status\nnodetool repairstatus\nnodetool tablestats app_data.orders\
+    \ | grep \"repair\"\n"
+  example_bad: '# No repair schedule — replicas diverge silently
+
+    # Day 1: DELETE FROM users WHERE user_id = ''bad_actor''
+
+    # Day 11: gc_grace_seconds passes, tombstone garbage collected on node1
+
+    # Day 12: node2 (was down on Day 1) syncs, re-introduces deleted user
+
+    # Result: banned user "bad_actor" resurrects from the dead
+
+    '
+  when_applies: Any project using Apache Cassandra distributed storage or Reaper
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Cassandra
+    or Reaper
+  sources: ["https://cassandra.apache.org/doc/latest/cassandra/operating/repair.html"]
+- id: CR-CASS-012
+  text: Use NetworkTopologyStrategy for production keyspaces — SimpleStrategy does not account for rack awareness.
+  why: SimpleStrategy places replicas on the next N nodes in the token ring regardless of datacenter or rack. In a multi-rack
+    or multi-DC deployment, all 3 replicas can end up on the same rack — a single rack failure (power, network switch) loses
+    all copies. NetworkTopologyStrategy ensures replicas are distributed across racks and DCs, providing true fault isolation.
+    Even in a single-DC deployment, NTS with rack awareness is the correct choice.
+  how_to_do_right: 'Always use NetworkTopologyStrategy. Specify replication factor per datacenter. Configure rack-aware snitch
+    (GossipingPropertyFileSnitch) so Cassandra knows rack topology. Minimum RF=3 for production. For single DC: {''dc1'':
+    3}. For multi-DC: {''dc_east'': 3, ''dc_west'': 3}. Assign nodes to racks matching physical infrastructure.'
+  severity: high
+  technologies:
+    lang: [cql]
+    platform: [cassandra]
+  domains:
+    domain: [architecture, reliability]
+    concern: [data, database, distributed_systems]
+  example_good: "-- Multi-DC with rack awareness\nCREATE KEYSPACE production WITH replication = {\n    'class': 'NetworkTopologyStrategy',\n\
+    \    'dc_east': 3,\n    'dc_west': 3\n};\n\n-- Single DC — still use NTS for rack awareness\nCREATE KEYSPACE production\
+    \ WITH replication = {\n    'class': 'NetworkTopologyStrategy',\n    'dc1': 3\n};\n\n-- cassandra-rackdc.properties on\
+    \ each node\n-- dc=dc_east\n-- rack=rack1\n"
+  example_bad: "-- SimpleStrategy ignores racks — all replicas on same rack possible\nCREATE KEYSPACE production WITH replication\
+    \ = {\n    'class': 'SimpleStrategy',\n    'replication_factor': 3\n};\n-- Rack A power failure = all 3 replicas down\
+    \ = data unavailable\n"
+  when_applies: Projects using Apache Cassandra distributed storage or CQL
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Cassandra
+    or CQL
+  sources: ["https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html#network-topology-strategy"]
+- id: CR-CASS-013
+  text: Avoid reading before writing (read-modify-write) — use Cassandra's native upsert and collection operations instead.
+  why: 'Cassandra writes are append-only and do not read existing data. A write (INSERT/UPDATE) always succeeds regardless
+    of whether the row exists — it is an upsert. Reading before writing to check current state introduces a race condition:
+    between the read and the write, another client may have changed the data. It also doubles the latency (read + write) and
+    negates Cassandra''s write-optimized architecture. The only exception is lightweight transactions (IF conditions), which
+    use Paxos for atomic read-modify-write.'
+  how_to_do_right: 'Use upserts: INSERT and UPDATE are identical in Cassandra. Use counter columns for atomic increments.
+    Use collection append operations (UPDATE SET list = list + [item]) for adding to lists/sets. For true conditional updates,
+    use LWTs sparingly. Design your data model to avoid the need for read-modify-write entirely.'
+  severity: medium
+  technologies:
+    lang: [cql]
+    platform: [cassandra]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, data_modeling]
+  example_good: '-- Atomic counter increment — no read needed
+
+    UPDATE page_views SET view_count = view_count + 1
+
+    WHERE page_id = ? AND date = ?;
+
+
+    -- Atomic set append — no read needed
+
+    UPDATE user_tags SET tags = tags + {''premium''}
+
+    WHERE user_id = ?;
+
+
+    -- Upsert — works whether row exists or not
+
+    INSERT INTO user_preferences (user_id, theme, language)
+
+    VALUES (?, ''dark'', ''en'');
+
+    -- Overwrites if exists, creates if not — no read needed
+
+    '
+  example_bad: '# Anti-pattern: read-modify-write in application code
+
+    row = session.execute("SELECT tags FROM users WHERE user_id = ?", [uid]).one()
+
+    current_tags = row.tags or set()
+
+    current_tags.add(''premium'')
+
+    session.execute("UPDATE users SET tags = ? WHERE user_id = ?", [current_tags, uid])
+
+    # Race condition: concurrent update between read and write is lost
+
+    # Double latency: read + write instead of just write
+
+    '
+  when_applies: Projects using Apache Cassandra distributed storage or CQL
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Cassandra
+    or CQL
+  sources: ["https://cassandra.apache.org/doc/latest/cassandra/data_modeling/data_modeling_refining.html"]
+- id: CR-CASS-014
+  text: Understand that Cassandra deletes are writes — design your schema to minimize explicit DELETEs.
+  why: In Cassandra, DELETE does not remove data immediately. It writes a tombstone — a marker that says 'this data was deleted
+    at time T'. Tombstones consume disk space, memory, and read I/O until gc_grace_seconds passes and compaction removes them.
+    A workload that heavily uses DELETE (e.g., queue-like table where you delete after processing) generates enormous tombstone
+    overhead, degrading read performance and causing compaction pressure.
+  how_to_do_right: Use TTL for data that has a natural expiration (sessions, caches, time-series). Use time-bucketed tables
+    and drop entire tables instead of deleting rows. For queue-like patterns, use Kafka instead of Cassandra. If you must
+    delete, batch deletes by partition key to minimize tombstone scatter. Monitor tombstone counts with nodetool tablestats.
+  severity: medium
+  technologies:
+    lang: [cql]
+    platform: [cassandra]
+  domains:
+    domain: [architecture, performance]
+    concern: [data, database, data_modeling]
+  example_good: '-- Use TTL instead of DELETE for session data
+
+    INSERT INTO sessions (session_id, user_id, data)
+
+    VALUES (?, ?, ?)
+
+    USING TTL 3600;  -- Auto-expires in 1 hour, no manual DELETE needed
+
+
+    -- Time-bucketed table — drop old months instead of deleting rows
+
+    CREATE TABLE events_2026_02 (...);
+
+    -- When February ends:
+
+    DROP TABLE events_2026_02;  -- Instant, no tombstones
+
+    '
+  example_bad: '-- Queue pattern: insert, process, delete — tombstone generator
+
+    INSERT INTO task_queue (queue_id, task_id, payload) VALUES (?, ?, ?);
+
+    -- ... process task ...
+
+    DELETE FROM task_queue WHERE queue_id = ? AND task_id = ?;
+
+    -- 1M tasks/day = 1M tombstones/day
+
+    -- Read performance degrades, compaction cannot keep up
+
+    '
+  when_applies: Projects using Apache Cassandra distributed storage or CQL
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Cassandra
+    or CQL
+  sources: ["https://cassandra.apache.org/doc/latest/cassandra/operating/compaction/index.html"]
+- id: CR-CASS-015
+  text: Use prepared statements for all application queries — never build CQL strings with string concatenation.
+  why: Prepared statements are parsed and optimized once by Cassandra, then executed multiple times with different parameters.
+    Without prepared statements, every query execution re-parses the CQL, re-computes the query plan, and cannot reuse the
+    coordinator's prepared statement cache. This wastes CPU on every node and increases p99 latency by 2-5x. String concatenation
+    also opens CQL injection vulnerabilities (Cassandra's equivalent of SQL injection).
+  how_to_do_right: Prepare statements once at application startup or first use, cache the PreparedStatement object, and bind
+    parameters at execution time. Use the driver's built-in parameter binding (?) — never use Python f-strings or .format()
+    to build CQL. For batch operations, use BatchStatement with prepared statements.
+  severity: high
+  technologies:
+    lang: [cql, python]
+    platform: [cassandra]
+  domains:
+    domain: [architecture, performance, security]
+    concern: [data, database]
+  example_good: "from cassandra.cluster import Cluster\nfrom cassandra.query import BatchStatement, ConsistencyLevel\n\ncluster\
+    \ = Cluster(['node1', 'node2', 'node3'])\nsession = cluster.connect('app_data')\n\n# Prepare once, reuse many times\n\
+    insert_order = session.prepare(\n    \"INSERT INTO orders (order_id, user_id, total, status) VALUES (?, ?, ?, ?)\"\n)\n\
+    insert_order.consistency_level = ConsistencyLevel.LOCAL_QUORUM\n\n# Bind parameters safely at execution time\nsession.execute(insert_order,\
+    \ [order_id, user_id, total, 'PENDING'])\n\n# Batch with prepared statements\nbatch = BatchStatement(consistency_level=ConsistencyLevel.LOCAL_QUORUM)\n\
+    batch.add(insert_order, [order1_id, user1_id, 99.99, 'PENDING'])\nbatch.add(insert_order, [order2_id, user2_id, 49.99,\
+    \ 'PENDING'])\nsession.execute(batch)\n"
+  example_bad: "# String concatenation — CQL injection + no prepared statement cache\nsession.execute(\n    f\"INSERT INTO\
+    \ orders (order_id, user_id, total) \"\n    f\"VALUES ('{order_id}', '{user_id}', {total})\"\n)\n# CQL injection: user_id\
+    \ = \"'; DROP TABLE orders; --\"\n# Also: re-parses query on every call, wasting coordinator CPU\n"
+  when_applies: Projects using Apache Cassandra distributed storage, CQL, or Python codebases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules
+  sources: ["https://cassandra.apache.org/doc/latest/cassandra/cql/dml.html#prepared-statements"]

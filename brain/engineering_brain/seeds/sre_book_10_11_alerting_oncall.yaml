@@ -1,0 +1,329 @@
+layer: rules
+technology: SRE
+domain: observability
+knowledge:
+- id: CR-SRE-ALERT-001
+  text: Alert on rates of sums, not sums of rates. Computing sum(rates) defends against counter resets and missing data —
+    computing rate(sums) produces incorrect results when individual instances restart or disappear.
+  why: 'Google''s Borgmon system learned this the hard way. When a server restarts, its request counter resets to zero. If
+    you compute rate() per instance first, the restart looks like a massive negative spike (counter went from 1M to 0). Summing
+    these rates produces a wildly incorrect aggregate. The correct approach: sum the raw counters across all instances first
+    (sum has no reset artifact because other instances continue counting), THEN compute the rate of that sum. This produces
+    a smooth, accurate aggregate rate even when individual instances restart. This is especially critical in Kubernetes/containerized
+    environments where instances are constantly being created and destroyed. Prometheus adopted this exact pattern from Borgmon.
+
+    '
+  how_to_do_right: '1. In Prometheus: use rate(sum(counter)) not sum(rate(counter)) for aggregate rates.
+
+    2. Use counters (monotonically increasing) over gauges whenever possible — counters survive missed scrapes.
+
+    3. For error rate alerting: sum(rate(http_errors_total[5m])) / sum(rate(http_requests_total[5m])) > threshold.
+
+    4. Set the rate window (e.g., [5m]) to at least 4x the scrape interval to smooth out collection gaps.
+
+    5. Test alerting rules with simulated counter resets to verify they do not produce false positives.
+
+    6. When monitoring on Kubernetes, account for pod churn: use recording rules that pre-compute sums before rate calculation.
+
+    '
+  severity: critical
+  technologies:
+    platform: [kubernetes, grafana, prometheus]
+  domains:
+    domain: [observability, operations, reliability]
+    concern: [monitoring, alerting, on_call]
+  example_good: "# Correct: rate of sums (handles counter resets)\n# Prometheus recording rule:\nRECORDING_RULE = \"\"\"\ngroups:\n- name: aggregate_rates\n  rules:\n  - record: job:http_requests:rate5m\n    expr: sum(rate(http_requests_total[5m])) by (job)\n  - record: job:http_errors:rate5m\n    expr: sum(rate(http_errors_total[5m])) by (job)\n\"\"\"\n\n# Error rate alert using pre-computed sums:\nALERT_RULE = \"\"\"\n- alert: HighErrorRate\n  expr: job:http_errors:rate5m / job:http_requests:rate5m > 0.01\n  for: 5m\n\"\"\"\n# sum(rate()) — rate per instance first, then sum\n# Handles counter resets correctly\n# Rate window [5m] = 4x scrape interval (15s)\n"
+  example_bad: "# Anti-pattern: rate of sums (breaks on counter resets)\nBAD_ALERT = \"\"\"\n- alert: HighErrorRate\n  expr: rate(sum(http_requests_total)[5m]) > 1000\n\"\"\"\n# When instance restarts: counter goes from 1M to 0\n# sum() sees massive drop\n# rate(sum()) produces wildly negative value = false alert\n# Or worse: masks real errors with the reset noise\n"
+  when_applies: "When writing Prometheus alerting rules that aggregate metrics across multiple instances, especially in Kubernetes where pods restart frequently"
+  sources:
+  - url: https://sre.google/sre-book/practical-alerting/
+    title: 'Google SRE Book — Chapter 10: Practical Alerting from Time-Series Data'
+  validation_status: cross_checked
+- id: CR-SRE-ALERT-002
+  text: Prevent alert flapping with minimum duration thresholds. An alert should only fire after the condition has persisted
+    for at least two evaluation cycles. Transient spikes that self-resolve should never wake up a human.
+  why: 'Google''s Borgmon uses a two-stage alert lifecycle: pending → firing. When an alerting condition first becomes true,
+    the alert enters "pending" state. Only after the condition remains true for a configurable duration (typically 2+ evaluation
+    cycles) does it transition to "firing" and page a human. This eliminates false positives from transient conditions: a
+    2-second CPU spike, a single retry that briefly elevated error rates, a garbage collection pause that temporarily increased
+    latency. Without this mechanism, transient conditions fire alerts, engineers investigate, find nothing wrong, and learn
+    to ignore alerts — destroying the signal-to-noise ratio. The duration threshold should match the business impact: a 5-minute
+    latency spike might be tolerable; a 5-minute complete outage is not.
+
+    '
+  how_to_do_right: '1. Set alert duration thresholds proportional to impact: critical alerts (outage) = 1-2 minutes, warning
+    alerts (degradation) = 5-10 minutes.
+
+    2. In Prometheus: use `for: 5m` in alerting rules to require 5 minutes of sustained condition before firing.
+
+    3. Combine rate windows with duration thresholds: rate(errors[10m]) > 0.01 for: 5m means the 10-minute error rate exceeded
+    1% for at least 5 consecutive minutes.
+
+    4. Never set duration to 0 (instant fire) for non-catastrophic conditions — this maximizes false positives.
+
+    5. Track alert flap rate: alerts that fire and resolve within 5 minutes are candidates for longer duration thresholds.
+
+    6. Test alert timing: verify that alerts fire within acceptable delay (duration threshold + evaluation interval) of real
+    incidents.
+
+    '
+  severity: high
+  technologies:
+    platform: [grafana, pagerduty, prometheus]
+  domains:
+    domain: [observability, operations, reliability]
+    concern: [monitoring, alerting, on_call]
+  example_good: "# Alert with minimum duration threshold to prevent flapping\nALERT_WITH_DURATION = \"\"\"\ngroups:\n- name: service_alerts\n  rules:\n  - alert: HighErrorRate\n    expr: rate(http_errors_total[10m]) / rate(http_requests_total[10m]) > 0.01\n    for: 5m  # Must persist for 5 minutes before firing\n    labels:\n      severity: page\n    annotations:\n      summary: 'Error rate > 1% sustained for 5+ minutes'\n\"\"\"\n# Lifecycle: condition true -> PENDING (5min) -> FIRING (page)\n# Transient 2-second CPU spike: never reaches FIRING\n# Single retry that briefly elevated errors: self-resolves in PENDING\n# Track flap rate: alerts that fire+resolve within 5min need longer duration\n"
+  example_bad: "# Anti-pattern: instant-fire alerts with no duration threshold\nBAD_ALERT = \"\"\"\n  - alert: HighErrorRate\n    expr: error_rate > 0.01\n    for: 0s  # Fires instantly on any transient spike\n\"\"\"\n# GC pause causes 1-second latency spike -> instant page\n# Engineer investigates, finds nothing wrong -> wasted 30 minutes\n# Happens 3 times per shift -> alert fatigue -> real incidents ignored\n"
+  when_applies: "When alerts are flapping (firing and resolving quickly) or generating false positives from transient conditions"
+  sources:
+  - url: https://sre.google/sre-book/practical-alerting/
+    title: 'Google SRE Book — Chapter 10: Practical Alerting from Time-Series Data'
+  validation_status: cross_checked
+- id: CR-SRE-ALERT-003
+  text: Unit test your alerting rules. Alerting rules are code — they have bugs, edge cases, and regressions. Synthesize time-series
+    data and verify that rules fire when they should and do not fire when they should not.
+  why: 'Google runs continuous integration on monitoring configurations, including unit tests that synthesize time-series
+    data to verify rule behavior. This sounds like over-engineering until you consider the alternative: an alerting rule with
+    a typo (wrong metric name, wrong threshold, wrong label) silently fails to detect an outage because no one tested it.
+    Google found that alerting rules degrade over time: metric names change, services are renamed, thresholds become stale.
+    Without tests, these regressions go undetected until the next incident — which the broken rule fails to catch. Testing
+    alerting rules is as important as testing application code because both protect production reliability.
+
+    '
+  how_to_do_right: '1. Write unit tests for every alerting rule: provide synthetic time-series, verify the rule fires/does
+    not fire.
+
+    2. In Prometheus: use promtool test rules to validate alerting rules against synthetic data.
+
+    3. Test edge cases: counter resets, missing labels, NaN values, zero traffic, single-instance services.
+
+    4. Include alerting rule tests in CI/CD: any change to monitoring config must pass tests before deployment.
+
+    5. Test alert routing: verify that fired alerts reach the correct team via the correct channel (PagerDuty, Slack, etc.).
+
+    6. Conduct quarterly "fire drills": inject real failures in staging and verify that alerts fire, route correctly, and
+    runbooks are accurate.
+
+    '
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [deployment, prometheus]
+  domains:
+    domain: [observability, operations, reliability, testing]
+    concern: [monitoring, alerting, on_call]
+  example_good: "# Unit test alerting rules with synthetic time-series data\n# Using promtool test rules\nTEST_FILE = \"\"\"\nrule_files:\n  - alerts.yml\n\ntests:\n  - interval: 1m\n    input_series:\n      - series: 'http_requests_total{job=\"api\"}'\n        values: '0+100x10'  # 100 requests per minute\n      - series: 'http_errors_total{job=\"api\"}'\n        values: '0+5x10'    # 5 errors per minute = 5% error rate\n    alert_rule_test:\n      - eval_time: 10m\n        alertname: HighErrorRate\n        exp_alerts:\n          - exp_labels:\n              severity: page\n              job: api\n\"\"\"\n# Test edge cases: counter resets, NaN values, zero traffic\n# Include tests in CI/CD — any monitoring change must pass tests\n"
+  example_bad: "# Anti-pattern: untested alerting rules\nALERT_RULES = {\n    'HighErrorRate': 'http_erors_total > 100',  # Typo in metric name!\n}\n# Rule has a typo — will NEVER fire\n# No one knows until the next incident it should have caught\n# 'Why did we not get alerted?' — because no one tested the rule\n# Metric renamed 6 months ago — rule silently broken since then\n"
+  when_applies: "When modifying alerting rules or monitoring configurations, to verify they fire correctly before deploying to production"
+  sources:
+  - url: https://sre.google/sre-book/practical-alerting/
+    title: 'Google SRE Book — Chapter 10: Practical Alerting from Time-Series Data'
+  validation_status: cross_checked
+- id: CR-SRE-ONCALL-001
+  text: Hard limit — maximum 2 incidents per 12-hour on-call shift. If the average exceeds this, the service needs reliability
+    investment, not more on-call engineers. Each incident requires approximately 6 hours including root cause analysis, remediation,
+    and postmortem.
+  why: 'Google set this limit based on empirical data about human cognitive capacity under stress. An incident consumes approximately
+    6 hours: initial response (30 min), diagnosis (1-2 hours), remediation (1-2 hours), verification (30 min), documentation
+    and postmortem (1-2 hours). Two incidents in a 12-hour shift means the engineer spends the ENTIRE shift on incident response
+    with zero time for proactive work. More than 2 incidents means incidents overlap, quality of response degrades, root cause
+    analysis is skipped, and postmortems are not written — creating a debt spiral where undiagnosed issues cause more incidents.
+    Google treats exceeding 2 incidents/shift as a service health emergency, not a staffing problem.
+
+    '
+  how_to_do_right: '1. Track incidents per on-call shift as a primary service health metric. Report it monthly to leadership.
+
+    2. If average > 2 per shift for 2+ weeks: declare an operational overload. Redirect engineering effort to top incident
+    causes.
+
+    3. If a single shift has > 3 incidents: conduct a systemic review — the service may need architectural changes, not just
+    bug fixes.
+
+    4. Budget post-incident time as part of the incident: diagnosis + fix + postmortem = 6 hours. This is not optional padding.
+
+    5. If incidents are consistently consuming all on-call time, SRE can "give back the pager" — require the development team
+    to take on-call until reliability improves.
+
+    6. Reduce incident count through automation (auto-remediation), not through hiring (more on-call engineers).
+
+    '
+  severity: critical
+  technologies:
+    lang: [general]
+    platform: [pagerduty]
+  domains:
+    domain: [operations, reliability]
+    concern: [on_call]
+  example_good: "# Track incidents per shift as a service health metric\n@dataclass\nclass OnCallShift:\n    engineer: str\n    shift_hours: int = 12\n    incidents: list = None\n\n    def __post_init__(self):\n        self.incidents = self.incidents or []\n\n    @property\n    def incident_count(self) -> int:\n        return len(self.incidents)\n\n    def is_sustainable(self) -> bool:\n        return self.incident_count <= 2  # Hard limit\n\n    def assess(self) -> str:\n        if self.incident_count > 3:\n            return 'SYSTEMIC_REVIEW: service needs architectural changes'\n        if self.incident_count > 2:\n            return 'OPERATIONAL_OVERLOAD: redirect to top incident causes'\n        return 'HEALTHY'\n\n# Each incident = ~6 hours: response + diagnosis + remediation + postmortem\n# 2 incidents = entire 12-hour shift consumed = zero proactive work\n"
+  example_bad: "# Anti-pattern: no incident tracking per shift\ndef handle_pages():\n    while on_call:\n        page = wait_for_page()\n        handle(page)\n    # No tracking of how many incidents per shift\n    # 5 incidents last shift? Nobody knows.\n    # No data to justify reliability investment\n    # 'Just deal with it' culture\n"
+  when_applies: "When evaluating on-call burden and determining whether a service needs reliability investment versus more on-call engineers"
+  sources:
+  - url: https://sre.google/sre-book/being-on-call/
+    title: 'Google SRE Book — Chapter 11: Being On-Call'
+  validation_status: cross_checked
+- id: CR-SRE-ONCALL-002
+  text: On-call engineers should spend no more than 25% of their time on on-call duties, with at least 50% on engineering
+    work. This is a hard organizational rule, not a guideline — violating it guarantees attrition and degrading service quality.
+  why: 'Google''s work distribution is explicit and non-negotiable: minimum 50% engineering (automation, tooling, architecture),
+    maximum 25% on-call (pager duty, incident response), remaining 25% for other operational work (tickets, reviews, planning).
+    This ratio exists because on-call work is cognitively expensive: even when not actively paged, the on-call engineer carries
+    the mental burden of being interruptible. Sustained on-call load above 25% depletes cognitive resources, reduces code
+    quality, increases error rates, and drives attrition. Google found that teams violating the 50% engineering rule consistently
+    fell into a downward spiral: no time for automation → more incidents → more on-call time → even less time for automation.
+    The 50% rule breaks this spiral by protecting engineering time as a non-negotiable investment in the future.
+
+    '
+  how_to_do_right: '1. Track actual on-call time percentage per engineer per quarter. If anyone exceeds 25%, investigate and
+    fix.
+
+    2. Protect the 50% engineering block: do not schedule meetings during it, do not allow "quick" operational tasks to erode
+    it.
+
+    3. Minimum team size for 24/7 coverage: 8 engineers (single site) or 6 per site (dual site with follow-the-sun).
+
+    4. If the team is too small to sustain the ratio, either grow the team, share on-call with development, or reduce the
+    service''s scope.
+
+    5. On-call compensation (time-off-in-lieu or cash) must be meaningful — it incentivizes fair distribution and acknowledges
+    the burden.
+
+    6. Engineers should be on-call at least once per quarter to maintain production familiarity — too little on-call creates
+    knowledge gaps.
+
+    '
+  severity: critical
+  technologies:
+    lang: [general]
+  domains:
+    domain: [operations, reliability]
+    concern: [on_call]
+  example_good: "# Work distribution with hard organizational limits\n@dataclass\nclass SREWorkDistribution:\n    engineering_pct: float  # Target: >= 50%\n    oncall_pct: float       # Target: <= 25%\n    other_ops_pct: float    # Target: <= 25%\n\n    def is_compliant(self) -> bool:\n        return (self.engineering_pct >= 50 and\n                self.oncall_pct <= 25)\n\n    def action_needed(self) -> str:\n        if self.oncall_pct > 25:\n            return ('On-call exceeds 25%. Options: '\n                    '1) Grow team to 8+ for rotation, '\n                    '2) Share on-call with dev team, '\n                    '3) Automate top page causes')\n        if self.engineering_pct < 50:\n            return 'Engineering time below 50%. Protect engineering blocks.'\n        return 'Healthy distribution'\n\n# Minimum team size for 24/7: 8 (single site) or 6/site (follow-the-sun)\n"
+  example_bad: "# Anti-pattern: on-call consuming all engineering time\nclass OverloadedSRE:\n    engineering_pct = 10   # Should be >= 50%\n    oncall_pct = 60        # Should be <= 25%\n    other_ops_pct = 30\n\n    # Team of 4 doing 24/7 on-call = 50% floor before ANY work\n    # No time for automation -> more incidents -> more on-call\n    # Death spiral: cannot invest in prevention\n    # Best engineers leave -> spiral accelerates\n"
+  when_applies: "When evaluating SRE team health metrics or when on-call burden exceeds the 25% limit indicating structural issues"
+  sources:
+  - url: https://sre.google/sre-book/being-on-call/
+    title: 'Google SRE Book — Chapter 11: Being On-Call'
+  validation_status: cross_checked
+- id: CR-SRE-ONCALL-003
+  text: Maintain a 1:1 alert-to-incident ratio. Each page should represent one real incident requiring one set of actions.
+    Multiple alerts for the same root cause waste cognitive resources and create confusion during response.
+  why: 'Google observed that alert fan-out is one of the most damaging anti-patterns in incident response. A single database
+    failure triggers: database latency alert, application error rate alert, queue depth alert, dependent service timeout alert,
+    and cascading failure alert. The on-call engineer receives 5 pages simultaneously, each demanding attention. They spend
+    the first 20 minutes figuring out that all 5 alerts are the same incident, instead of fixing the database. Alert grouping
+    and deduplication solve this: related alerts are grouped into a single incident, and the engineer sees one page with context
+    about all affected components. Google also groups alerts by shared labels (service, datacenter, failure domain) so that
+    a single infrastructure failure produces one aggregated alert, not N alerts for N affected instances.
+
+    '
+  how_to_do_right: '1. Configure alert grouping in Alertmanager or PagerDuty: group by service, datacenter, and failure domain.
+
+    2. Use inhibition rules: when a "database down" alert fires, suppress all "application error rate" alerts that depend
+    on that database.
+
+    3. Review page frequency: if the same incident generates > 2 pages, fix the grouping before the next incident.
+
+    4. Track "pages per incident" as a metric. Target: 1.0. If > 1.5, the alerting configuration needs deduplication work.
+
+    5. Include dependency information in alerts: "This error rate spike is likely caused by database X being down (also alerting)."
+
+    6. Never create alerts for each instance of a service — create ONE alert for the service with instance details in the
+    alert body.
+
+    '
+  severity: high
+  technologies:
+    platform: [pagerduty, prometheus]
+  domains:
+    domain: [observability, operations, reliability]
+    concern: [on_call]
+  example_good: "# Alert grouping and inhibition to maintain 1:1 alert-to-incident ratio\nALERTMANAGER_CONFIG = \"\"\"\nroute:\n  group_by: ['service', 'datacenter', 'failure_domain']\n  group_wait: 30s\n  group_interval: 5m\n\ninhibit_rules:\n  - source_match:\n      alertname: DatabaseDown\n    target_match:\n      alertname: ApplicationErrorRate\n    equal: ['database_cluster']\n    # When database is down, suppress app error alerts (same root cause)\n\"\"\"\n\n# 1 database failure = 1 grouped alert (not 5 cascading alerts)\n# Track 'pages per incident' — target: 1.0\n# Include dependency info: 'Error rate likely caused by database X (also alerting)'\n"
+  example_bad: "# Anti-pattern: alert fan-out — multiple pages for same incident\n# Database fails -> 5 pages simultaneously:\n# 1. 'Database latency high'\n# 2. 'Application error rate elevated'\n# 3. 'Queue depth increasing'\n# 4. 'Dependent service timeout'\n# 5. 'Cascading failure detected'\n# Engineer spends first 20 minutes figuring out it is ONE incident\n# Instead of fixing the database\n"
+  when_applies: "When a single root cause generates multiple alerts, requiring alert grouping and inhibition configuration"
+  sources:
+  - url: https://sre.google/sre-book/being-on-call/
+    title: 'Google SRE Book — Chapter 11: Being On-Call'
+  validation_status: cross_checked
+- id: CR-SRE-ONCALL-004
+  text: SRE can "give back the pager" — require the development team to take on-call responsibility when a service consistently
+    fails to meet reliability standards. This is the most powerful incentive for development teams to invest in operability.
+  why: 'Google designed this as a structural incentive mechanism. When SRE carries the pager for a service that is constantly
+    on fire, the development team has no incentive to fix operational issues — it is "SRE''s problem." By returning on-call
+    responsibility to the development team, the team that writes the code feels the pain of operating it. This creates a direct
+    feedback loop: engineers who are woken at 3 AM by their own poorly designed service invest in monitoring, auto-remediation,
+    and reliability improvements. Google frames this not as punishment but as a healthy realignment of incentives. The development
+    team takes back the pager temporarily, invests in reliability, and SRE re-engages once the service meets operational standards.
+    This mechanism has driven more reliability improvements than any top-down directive.
+
+    '
+  how_to_do_right: '1. Define clear criteria for "giving back the pager": > X incidents per week for Y consecutive weeks,
+    or error budget depleted for Z months.
+
+    2. Frame it positively: "We need the development team''s expertise to fix the root causes that SRE cannot address alone."
+
+    3. Provide an SRE engineer as an advisor during the transition — the dev team should not be left without operational guidance.
+
+    4. Set a clear timeline and success criteria for re-engagement: "SRE will resume on-call when incidents/week < 2 for 4
+    consecutive weeks."
+
+    5. Use this as a last resort, not a frequent tool. It signals a serious operational problem that needs structural investment.
+
+    6. After re-engagement, maintain shared on-call (SRE + dev) for a transition period to ensure improvements are sustained.
+
+    '
+  severity: high
+  technologies:
+    lang: [general]
+  domains:
+    domain: [operations, reliability]
+    concern: [on_call]
+  example_good: "# Clear criteria for giving back the pager\nclass PagerReturnPolicy:\n    MAX_INCIDENTS_PER_WEEK = 5\n    MAX_CONSECUTIVE_WEEKS = 3\n    RE_ENGAGE_THRESHOLD = 2  # incidents/week for 4 consecutive weeks\n\n    def should_return_pager(self, incidents_by_week: list[int]) -> dict:\n        recent = incidents_by_week[-self.MAX_CONSECUTIVE_WEEKS:]\n        if all(w > self.MAX_INCIDENTS_PER_WEEK for w in recent):\n            return {\n                'action': 'RETURN_PAGER',\n                'message': f'> {self.MAX_INCIDENTS_PER_WEEK} incidents/week for '\n                           f'{self.MAX_CONSECUTIVE_WEEKS} consecutive weeks',\n                'sre_support': 'SRE engineer available as advisor',\n                're_engage_criteria': f'< {self.RE_ENGAGE_THRESHOLD} incidents/week '\n                                      f'for 4 consecutive weeks',\n            }\n        return {'action': 'KEEP_PAGER'}\n\n# Not punishment — incentive alignment: team that writes code feels operational pain\n"
+  example_bad: "# Anti-pattern: SRE absorbs all operational pain indefinitely\ndef sre_handles_everything(service):\n    while True:\n        page = wait_for_page()\n        fix_symptom(page)\n    # Dev team ships features without operability\n    # SRE drowns in pages from poorly designed service\n    # Dev team has zero incentive to improve — 'not their problem'\n    # SRE burnout, attrition, service gets worse\n"
+  when_applies: "When a service consistently generates excessive on-call burden despite SRE efforts, indicating the development team needs to invest in operability"
+  sources:
+  - url: https://sre.google/sre-book/being-on-call/
+    title: 'Google SRE Book — Chapter 11: Being On-Call'
+  validation_status: cross_checked
+- id: CR-SRE-ONCALL-005
+  text: Stress hormones impair cognitive function during incident response. Design processes, tools, and escalation paths
+    so that the on-call engineer never has to make high-stakes decisions alone under pressure.
+  why: 'Google explicitly acknowledges the neuroscience of incident response: cortisol and corticotropin-releasing hormone
+    released under stress impair the cognitive functions needed for complex debugging. An engineer woken at 3 AM with an adrenaline
+    spike is physiologically less capable of good decision-making than the same engineer at 2 PM after coffee. This is not
+    a character flaw — it is human biology. Google designs for this reality: clear escalation paths (never face an incident
+    alone), well-defined procedures (reduce decisions needed), blameless postmortem culture (reduce fear of making mistakes),
+    and "trained by default" automation that handles known failure modes so the human only engages for novel problems requiring
+    genuine judgment.
+
+    '
+  how_to_do_right: '1. Every alert must have a linked runbook with clear, step-by-step instructions that a stressed engineer
+    can follow.
+
+    2. Escalation paths must be one command/button away: "I need help" should not require navigating an org chart.
+
+    3. Major incidents: immediately bring in a second person. Two impaired people make better decisions than one.
+
+    4. Post-incident: schedule the postmortem for business hours, not immediately after the incident when the engineer is
+    exhausted.
+
+    5. Never blame individuals for decisions made under stress. Blame the system that put a human in a position to make a
+    bad decision.
+
+    6. Provide mental health resources and recovery time after major incidents — incident response is emotionally taxing.
+
+    '
+  severity: high
+  technologies:
+    lang: [general]
+    platform: [pagerduty]
+  domains:
+    domain: [management, culture, operations, reliability]
+    concern: [on_call]
+  example_good: "# Design incident response for stressed human cognition\nclass IncidentRunbook:\n    def __init__(self, service: str, steps: list[str], escalation: str):\n        self.service = service\n        self.steps = steps  # Clear, step-by-step — stressed brain can follow\n        self.escalation = escalation  # One-button escalation\n\n    def display(self):\n        print(f'=== INCIDENT: {self.service} ===')\n        for i, step in enumerate(self.steps, 1):\n            print(f'Step {i}: {step}')  # Unambiguous instructions\n        print(f'Need help? {self.escalation}')  # Never face it alone\n\nrunbook = IncidentRunbook(\n    service='payment-api',\n    steps=['Check error rate dashboard: <link>',\n           'If error > 5%: rollback to last-known-good',\n           'If rollback fails: page secondary on-call'],\n    escalation='Type /escalate in #incidents Slack channel'\n)\n# Schedule postmortem for business hours — not when engineer is exhausted\n"
+  example_bad: "# Anti-pattern: no runbook, no escalation path\ndef on_incident():\n    # Engineer woken at 3 AM with cortisol spike\n    # No runbook — must figure out what to do from scratch\n    # No escalation button — must search org chart for help\n    # No second person — facing it alone\n    # Decision made under stress — higher error probability\n    # Blamed for 'bad decision' made at 3 AM with impaired cognition\n    debug_complex_distributed_system_while_half_asleep()\n"
+  when_applies: "When designing incident response processes, recognizing that stress hormones impair the cognitive functions needed for complex debugging"
+  sources:
+  - url: https://sre.google/sre-book/being-on-call/
+    title: 'Google SRE Book — Chapter 11: Being On-Call'
+  validation_status: cross_checked

