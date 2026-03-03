@@ -10,9 +10,6 @@
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://python.org)
 [![MCP](https://img.shields.io/badge/MCP-20_tools-purple.svg)](#mcp-integration)
 
-<!-- Replace with actual screenshot when available -->
-<!-- ![Engineering Brain 3D Cockpit](docs/assets/hero.png) -->
-
 **3,700+ curated nodes** · **285 seed files** · **66 technologies** · **20 MCP tools** · **6 cortical layers** · **Zero LLM calls for reasoning**
 
 </div>
@@ -215,7 +212,7 @@ pip install -e cockpit/
 ### Option 2: From source
 
 ```bash
-git clone https://github.com/<username>/engineering-brain.git
+git clone https://github.com/gustavoschneiter/engineering-brain.git
 cd engineering-brain
 make install
 make test
