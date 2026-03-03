@@ -11,7 +11,7 @@ This guide gets you from zero to running in under 5 minutes.
 ## Installation
 
 ```bash
-git clone https://github.com/gustavoschneiter/engineering-brain.git
+git clone https://github.com/humangr-lab/engineering-brain.git
 cd engineering-brain
 make install
 ```
