@@ -15,7 +15,7 @@ The Engineering Brain organizes knowledge in 6 hierarchical layers:
 
 ### Edge Types
 
-31 edge types organized in 7 categories:
+32 edge types organized in 7 categories:
 
 - **Hierarchical**: GROUNDS, INFORMS, INSTANTIATES, EVIDENCED_BY, DEMONSTRATED_BY
 - **Cross-layer**: APPLIES_TO, IN_DOMAIN, USED_IN, CAUGHT_BY, VIOLATED, IN_SPRINT

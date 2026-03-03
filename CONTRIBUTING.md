@@ -6,7 +6,7 @@ Thanks for your interest in contributing! This guide will help you get started.
 
 ```bash
 # 1. Fork and clone
-git clone https://github.com/<your-username>/engineering-brain.git
+git clone https://github.com/<your-fork>/engineering-brain.git
 cd engineering-brain
 
 # 2. Install everything
