@@ -212,7 +212,7 @@ pip install -e cockpit/
 ### Option 2: From source
 
 ```bash
-git clone https://github.com/gustavoschneiter/engineering-brain.git
+git clone https://github.com/humangr-lab/engineering-brain.git
 cd engineering-brain
 make install
 make test
@@ -262,5 +262,5 @@ make lint     # Check code quality
 ---
 
 <div align="center">
-  <sub>Built with care by <a href="https://github.com/gustavoschneiter">Gustavo Schneiter</a></sub>
+  <sub>Built with care by <a href="https://github.com/humangr-lab">Human Guardrail</a></sub>
 </div>
