@@ -13,7 +13,7 @@
 import * as T from 'three';
 import { scene, cam } from '../scene/engine.js';
 import { state, batch } from '../state.js';
-import { LEVELS } from './zoom-manager.js';
+import { LEVELS } from './constants.js';
 
 /* ── Module state ── */
 

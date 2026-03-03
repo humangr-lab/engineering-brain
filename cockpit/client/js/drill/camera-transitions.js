@@ -18,7 +18,7 @@
 import * as T from 'three';
 import { cam, ctrl } from '../scene/engine.js';
 import { state } from '../state.js';
-import { LEVELS } from './zoom-manager.js';
+import { LEVELS } from './constants.js';
 
 /* ── Constants ── */
 

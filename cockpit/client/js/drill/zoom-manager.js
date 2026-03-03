@@ -25,17 +25,9 @@ import { renderLevel, exitLevel } from './level-renderers.js';
 import { updateFocus } from './lod-manager.js';
 import { getCache } from './data-cache.js';
 
-/* ── Constants ── */
-
-export const LEVELS = Object.freeze({
-  SYSTEM:   0,
-  MODULE:   1,
-  FILE:     2,
-  FUNCTION: 3,
-  CODE:     4,
-});
-
-const LEVEL_NAMES = ['System', 'Module', 'File', 'Function', 'Code'];
+/* ── Constants (from shared module to avoid circular deps) ── */
+import { LEVELS, LEVEL_NAMES } from './constants.js';
+export { LEVELS };
 
 /**
  * Distance thresholds for automatic drill transitions (ExplorViz pattern).
