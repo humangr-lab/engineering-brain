@@ -52,7 +52,6 @@ export const state = _createReactiveStore({
   klibOpen: false,
   klibSelectedNode: null,
   klibGroupBy: 'layer',
-  klibViewMode: 'list',
   klibFilters: { layers: [], severities: [], tags: [], confidence: 0, search: '' },
   layout: 'default',
   searchOpen: false,
