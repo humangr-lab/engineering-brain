@@ -1,12 +1,13 @@
 """Multi-signal relevance scorer for the Engineering Knowledge Brain.
 
-Ranks knowledge nodes using 6 weighted signals:
+Ranks knowledge nodes using 6 base weighted signals + 1 optional vector signal:
 1. Technology match (0.28) — does the knowledge apply to the same tech?
 2. Domain match (0.18) — is the knowledge in the same domain?
 3. Severity (0.18) — how critical is this knowledge?
 4. Reinforcement count (0.13) — how many times has this been confirmed?
 5. Recency (0.13) — how recently was this knowledge relevant?
 6. Confidence (0.10) — is this knowledge validated against authoritative sources?
+7. Vector similarity (optional) — cosine similarity when vector adapter available.
 """
 
 from __future__ import annotations
