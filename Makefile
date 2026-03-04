@@ -1,4 +1,4 @@
-.PHONY: install test test-brain test-cockpit lint serve mcp clean help
+.PHONY: install test test-brain test-cockpit lint serve mcp clean help benchmark benchmark-report benchmark-ablation
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -32,6 +32,15 @@ serve: ## Start cockpit dev server (http://localhost:8420)
 
 mcp: ## Start MCP server
 	python -m engineering_brain.mcp_server
+
+benchmark: ## Run full benchmark suite with PDF report
+	cd brain && python -m benchmarks run
+
+benchmark-report: ## Generate PDF from latest benchmark results
+	cd brain && python -m benchmarks report
+
+benchmark-ablation: ## Run ablation study with PDF report
+	cd brain && python -m benchmarks ablation
 
 clean: ## Remove build artifacts
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
