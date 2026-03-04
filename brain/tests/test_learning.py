@@ -298,7 +298,6 @@ class TestKnowledgeCrystallizer:
         finding_id = crystallizer.learn_from_finding(
             description="CORS wildcard is insecure",
             severity="high",
-            sprint="S00",
             file_path="server.py",
             line=42,
         )
@@ -319,7 +318,6 @@ class TestKnowledgeCrystallizer:
             severity="high",
             resolution="Use explicit origin list instead of wildcard",
             lesson="Wildcard CORS bypasses same-origin policy",
-            sprint="S00",
             technologies=["flask"],
             domains=["security"],
         )

@@ -1,4 +1,4 @@
-"""Engineering Brain — Learning pipeline (auto-evolution)."""
+"""Engineering Brain — Learning subsystem (auto-evolution)."""
 
 __all__ = [
     "KnowledgeCrystallizer",

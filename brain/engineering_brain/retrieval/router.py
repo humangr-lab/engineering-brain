@@ -69,7 +69,6 @@ class QueryRouter:
             domain=ctx.domains[0] if ctx.domains else "general",
             technology=ctx.technologies[0] if ctx.technologies else "",
             file_type=ctx.file_types[0] if ctx.file_types else "",
-            phase=ctx.phase,
         )
         if self._cache:
             cached = self._cache.get(ck)
@@ -232,7 +231,6 @@ class QueryRouter:
             domain=ctx.domains[0] if ctx.domains else "general",
             technology=ctx.technologies[0] if ctx.technologies else "",
             file_type=ctx.file_types[0] if ctx.file_types else "",
-            phase=ctx.phase,
         )
         if self._cache:
             cached = self._cache.get(ck)

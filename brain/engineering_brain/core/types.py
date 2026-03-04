@@ -344,11 +344,7 @@ class Rule(BaseModel):
 
 
 class Finding(BaseModel):
-    """Concrete finding — specific bug, issue, or observation.
-
-    SBAR extension fields (expected, actual, requirement_id, root_cause,
-    category) align with pipeline Finding dataclass for seamless ingestion.
-    """
+    """Concrete finding — specific bug, issue, or observation."""
 
     id: str
     finding_type: str = Field(default="bug", description="bug|security|quality|performance")
@@ -356,15 +352,9 @@ class Finding(BaseModel):
     severity: str = Field(default="medium")
     file_path: str = Field(default="")
     line: int | None = Field(default=None)
-    sprint: str = Field(default="")
-    run_id: str = Field(default="")
     resolution: str = Field(default="")
     lesson_learned: str = Field(default="", description="What we learned from this finding")
     timestamp: datetime = Field(default_factory=_now)
-    # SBAR extension — structured finding fields
-    expected: str = Field(default="", description="SBAR: what was expected")
-    actual: str = Field(default="", description="SBAR: what actually happened")
-    requirement_id: str = Field(default="", description="RF/INV/EDGE ID this finding relates to")
     root_cause: str = Field(default="", description="Root cause analysis")
     category: str = Field(
         default="", description="Finding category (e.g., logic_error, missing_validation)"
@@ -412,7 +402,6 @@ class TestResult(BaseModel):
     id: str
     test_name: str
     status: str = Field(default="passed", description="passed|failed|skipped|error")
-    sprint: str = Field(default="")
     assertion_count: int = Field(default=0)
     failure_reason: str = Field(default="")
     timestamp: datetime = Field(default_factory=_now)
@@ -431,7 +420,7 @@ class TaskContext(BaseModel):
     description: str
     technologies: list[str] = Field(default_factory=list)
     file_types: list[str] = Field(default_factory=list)
-    phase: str = Field(default="exec", description="init|spec|exec|qa|vote")
+    phase: str = Field(default="exec", description="init|spec|exec|qa")
     ttl_minutes: int = Field(default=60)
 
 
@@ -475,17 +464,6 @@ class HumanLayer(BaseModel):
     name: str
     perspective: str = Field(default="", description="What perspective this layer provides")
     focus_areas: list[str] = Field(default_factory=list)
-
-
-class Sprint(BaseModel):
-    """Sprint node — execution context for findings and test results."""
-
-    id: str
-    name: str = Field(default="", description="Sprint name, e.g. 'S00 — Foundation Models'")
-    product: str = Field(default="", description="Product this sprint belongs to")
-    status: str = Field(default="pending", description="pending|in_progress|completed|failed")
-    started_at: datetime | None = Field(default=None)
-    completed_at: datetime | None = Field(default=None)
 
 
 # =============================================================================
@@ -601,7 +579,7 @@ class GuardrailMetadata(BaseModel):
 class AssemblyResult(BaseModel):
     """Output of the LLM knowledge pack assembler.
 
-    Replaces the static enforce_budget + format_for_llm pipeline with
+    Replaces the static enforce_budget + format_for_llm flow with
     an LLM-curated, query-specific knowledge pack.
     """
 

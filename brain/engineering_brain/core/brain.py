@@ -3,7 +3,7 @@
 The Brain class is the single entry point for all operations:
 - add_rule, add_principle, add_pattern: Insert knowledge
 - query: Retrieve relevant knowledge for a task
-- learn_from_finding: Auto-evolve from pipeline findings
+- learn_from_finding: Auto-evolve from code review findings
 - ingest, ingest_directory: Bulk load from YAML seed files
 - seed: Load all built-in seed data
 - stats: Get brain statistics
@@ -226,8 +226,8 @@ class Brain:
     def version(self) -> int:
         """Monotonic write counter. Increments on every knowledge mutation.
 
-        Used by epoch-based versioning: pipeline snapshots version before
-        batch execution, checks delta after to detect new knowledge.
+        Useful for detecting new knowledge: snapshot version before a batch,
+        check delta after to see if the graph was updated.
         """
         return self._write_counter
 
@@ -250,7 +250,7 @@ class Brain:
             task_description: What the agent is trying to do
             technologies: Explicit technology list (auto-detected if empty)
             file_type: File extension being worked on (.py, .js, etc.)
-            phase: Pipeline phase (spec, exec, qa)
+            phase: Workflow phase (spec, exec, qa)
             domains: Explicit domain list (auto-detected if empty)
             budget_chars: Override context budget (default from config)
 
@@ -287,7 +287,7 @@ class Brain:
             task_description: What the agent is trying to do
             technologies: Explicit technology list (auto-detected if empty)
             file_type: File extension being worked on (.py, .js, etc.)
-            phase: Pipeline phase (spec, exec, qa)
+            phase: Workflow phase (spec, exec, qa)
             domains: Explicit domain list (auto-detected if empty)
             budget_chars: Override enhanced context budget (default 4500)
 
@@ -351,7 +351,7 @@ class Brain:
             task_description: What you need to reason about
             technologies: Technologies involved
             file_type: File extension (.py, .js, etc.)
-            phase: Pipeline phase (spec, exec, qa)
+            phase: Workflow phase (spec, exec, qa)
             domains: Relevant domains
             profile: Reasoning profile (data_engineer, security_engineer, fullstack)
             max_chains: Max reasoning chains (default 3)
@@ -814,7 +814,7 @@ class Brain:
     # =========================================================================
 
     def learn_from_finding(self, description: str, **kwargs: Any) -> str | None:
-        """Learn from a pipeline finding — auto-evolve the knowledge graph."""
+        """Learn from a finding — auto-evolve the knowledge graph."""
         result = self._crystallizer.learn_from_finding(description, **kwargs)
         if result:
             self._write_counter += 1
@@ -2223,7 +2223,6 @@ _ID_PREFIX_TO_TYPE: list[tuple[str, str]] = [
     ("domain:", NodeType.DOMAIN.value),
     ("filetype:", NodeType.FILE_TYPE.value),
     ("hl:", NodeType.HUMAN_LAYER.value),
-    ("sprint:", NodeType.SPRINT.value),
     ("src:", NodeType.SOURCE.value),
     ("vr:", NodeType.VALIDATION_RUN.value),
     ("TASK-", NodeType.TASK.value),

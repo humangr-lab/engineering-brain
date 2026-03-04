@@ -46,7 +46,6 @@ TYPE_CONSTRAINTS: dict[tuple[str, str], list[EdgeType]] = {
     (NodeType.PATTERN.value, NodeType.DOMAIN.value): [EdgeType.IN_DOMAIN],
     (NodeType.FINDING.value, NodeType.HUMAN_LAYER.value): [EdgeType.CAUGHT_BY],
     (NodeType.FINDING.value, NodeType.RULE.value): [EdgeType.VIOLATED],
-    (NodeType.FINDING.value, NodeType.SPRINT.value): [EdgeType.IN_SPRINT],
     # Evolution
     (NodeType.RULE.value, NodeType.RULE.value): [EdgeType.SUPERSEDES, EdgeType.CONFLICTS_WITH],
     (NodeType.PATTERN.value, NodeType.PATTERN.value): [EdgeType.VARIANT_OF],

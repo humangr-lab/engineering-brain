@@ -54,9 +54,9 @@ _DOMAIN_ADJACENCY: dict[str, list[str]] = {
 def _get_brain() -> Any:
     """Get brain instance (lazy import to avoid circular deps)."""
     try:
-        from engineering_brain.retrieval.task_knowledge import _get_brain as _gb
+        from engineering_brain.core.brain_factory import get_brain
 
-        return _gb()
+        return get_brain(background_embed=False)
     except Exception as exc:
         logger.debug("Failed to get brain instance for proactive push: %s", exc)
         return None
@@ -228,51 +228,35 @@ class ProactivePush:
         task: dict[str, Any],
         state: dict[str, Any],
     ) -> list[PushRecommendation]:
-        """Push knowledge based on historical failure patterns."""
-        deliverable = task.get("deliverable", "")
-        tags = task.get("knowledge_tags", [])
+        """Push knowledge based on historical failure patterns from the brain's findings."""
         recs: list[PushRecommendation] = []
 
-        # Check feed_forward from previous sprint (postmortem learnings)
-        feed_forward = state.get("_prev_sprint_feedback", {})
-        spec_quality_issues = feed_forward.get("spec_quality_issues", [])
-        for issue in spec_quality_issues[:3]:
-            desc = issue.get("description", str(issue)) if isinstance(issue, dict) else str(issue)
-            if desc:
-                recs.append(
-                    PushRecommendation(
-                        node_id=f"postmortem:{hash(desc) % 10000}",
-                        title="Previous Sprint Issue",
-                        content=desc[:300],
-                        push_reason="Similar issue in previous sprint postmortem",
-                        signal="failure_pattern",
-                        confidence=0.6,
-                    )
+        # Query the brain for relevant findings based on task technologies/domains
+        tags = task.get("knowledge_tags", [])
+        if tags and self.brain:
+            try:
+                result = self.brain.query(
+                    task_description=f"common failures and pitfalls for {' '.join(tags[:3])}",
+                    domains=task.get("knowledge_domains", []),
+                    budget_chars=5000,
                 )
-
-        # Check A-MEM corrective actions
-        try:
-            from pipeline_autonomo.amem_integration import get_amem_integration
-
-            amem = get_amem_integration()
-            _query = f"failures in {deliverable} {' '.join(tags[:3])}"
-            _context = amem.get_relevant_context(
-                query=_query,
-                max_notes=3,
-            )
-            if _context and len(_context) > 50:
-                recs.append(
-                    PushRecommendation(
-                        node_id="amem:corrective_actions",
-                        title="Historical Corrective Actions",
-                        content=_context[:500],
-                        push_reason="A-MEM: similar tasks had failures requiring these fixes",
-                        signal="failure_pattern",
-                        confidence=0.65,
-                    )
-                )
-        except Exception as exc:
-            logger.debug("A-MEM failure pattern lookup failed: %s", exc)
+                for node in (result.evidence or [])[:2]:
+                    nid = node.get("id", "")
+                    title = node.get("title", node.get("description", "")[:80])
+                    content = node.get("description", node.get("content", ""))[:300]
+                    if nid and title:
+                        recs.append(
+                            PushRecommendation(
+                                node_id=nid,
+                                title=title,
+                                content=content,
+                                push_reason="Historical failure pattern from brain findings",
+                                signal="failure_pattern",
+                                confidence=0.6,
+                            )
+                        )
+            except Exception as exc:
+                logger.debug("Failure pattern lookup failed: %s", exc)
 
         return recs[:2]
 
@@ -288,18 +272,9 @@ class ProactivePush:
         if not deliverable:
             return []
 
-        # Check if other tasks in the sprint depend on this file
-        granular_tasks = state.get("granular_tasks", [])
-        dependent_files: list[str] = []
-        for other in granular_tasks:
-            deps = other.get("depends_on", [])
-            other_del = other.get("deliverable", "") or (
-                other.get("deliverables", [""])[0] if other.get("deliverables") else ""
-            )
-            if deliverable in str(deps) and other_del != deliverable:
-                dependent_files.append(other_del)
-
-        if not dependent_files:
+        # Check if task has explicit dependencies
+        deps = task.get("depends_on", [])
+        if not deps:
             return []
 
         return [
@@ -307,11 +282,11 @@ class ProactivePush:
                 node_id="dep:cross_file",
                 title="Cross-File Dependencies",
                 content=(
-                    f"This file ({deliverable}) is depended on by: {', '.join(dependent_files[:5])}. "
+                    f"This file ({deliverable}) has dependencies: {', '.join(str(d) for d in deps[:5])}. "
                     f"Changes to public API (function signatures, return types, imports) "
                     f"MUST maintain backward compatibility or update all dependents."
                 ),
-                push_reason=f"{len(dependent_files)} file(s) depend on this deliverable",
+                push_reason=f"{len(deps)} dependency(ies) declared for this deliverable",
                 signal="dependency",
                 confidence=0.8,
             )

@@ -1,11 +1,10 @@
 """FalkorDB graph adapter for the Engineering Knowledge Brain.
 
 Provides graph traversal, relationship queries, and batch operations
-for the knowledge graph.
+for the knowledge graph. Requires `falkordb` package.
 
-When used inside the pipeline, reuses the FalkorDB singleton from pipeline_autonomo.
-When used standalone (open-source install), falls back gracefully:
-- _get_client() returns None if pipeline_autonomo is not installed
+Graceful degradation:
+- _get_client() returns None if falkordb is not installed
 - All methods return empty results / False on unavailable client
 - Use BRAIN_ADAPTER=memory for fully standalone operation (no FalkorDB needed)
 """
@@ -41,9 +40,7 @@ def _sanitize_property_key(k: str) -> str:
     return k
 
 
-# Lazy imports to avoid hard dependency on pipeline code
 _falkordb_client = None
-_falkordb_enhanced = None
 
 
 def _get_client(config: BrainConfig | None = None) -> Any:
@@ -52,12 +49,14 @@ def _get_client(config: BrainConfig | None = None) -> Any:
     if _falkordb_client is not None:
         return _falkordb_client
     try:
-        from pipeline_autonomo.falkordb_client import get_falkordb_client
+        import falkordb
 
-        _falkordb_client = get_falkordb_client()
+        host = config.falkordb_host if config else "localhost"
+        port = config.falkordb_port if config else 6379
+        _falkordb_client = falkordb.FalkorDB(host=host, port=port)
         return _falkordb_client
     except ImportError:
-        logger.info("pipeline_autonomo not installed — FalkorDB adapter disabled (standalone mode)")
+        logger.info("falkordb package not installed — FalkorDB adapter disabled")
         return None
     except Exception as e:
         logger.warning("FalkorDB connection failed: %s", e)
@@ -96,7 +95,7 @@ def _deserialize_node(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 class FalkorDBGraphAdapter(GraphAdapter):
-    """FalkorDB adapter using the existing pipeline singleton client."""
+    """FalkorDB graph adapter with Cypher-based queries."""
 
     def __init__(self, config: BrainConfig | None = None) -> None:
         self._config = config
@@ -115,14 +114,10 @@ class FalkorDBGraphAdapter(GraphAdapter):
         if client is None:
             return None
         try:
-            self._graph_instance = client._client.select_graph(self._graph_name)
-        except Exception as exc:
-            logger.debug("FalkorDB select_graph via _client failed, trying _graph attr: %s", exc)
-            try:
-                self._graph_instance = client._graph
-            except Exception as e:
-                logger.warning("Cannot get FalkorDB graph: %s", e)
-                return None
+            self._graph_instance = client.select_graph(self._graph_name)
+        except Exception as e:
+            logger.warning("Cannot get FalkorDB graph: %s", e)
+            return None
         if self._graph_instance and not self._indexes_ensured:
             self._ensure_indexes()
         return self._graph_instance
@@ -143,7 +138,6 @@ class FalkorDBGraphAdapter(GraphAdapter):
             "CodeExample",
             "TestResult",
             "Task",
-            "Sprint",
             "Source",
             "ValidationRun",
         ):
@@ -526,7 +520,6 @@ class FalkorDBGraphAdapter(GraphAdapter):
                 "CodeExample",
                 "TestResult",
                 "Task",
-                "Sprint",
                 "Source",
                 "ValidationRun",
             ):
@@ -617,7 +610,7 @@ class FalkorDBGraphAdapter(GraphAdapter):
     def is_available(self) -> bool:
         try:
             client = self._client()
-            return client is not None and client.is_available()
+            return client is not None
         except Exception as exc:
             logger.debug("FalkorDB availability check failed: %s", exc)
             return False

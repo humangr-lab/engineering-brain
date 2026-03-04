@@ -1,6 +1,5 @@
 """Runtime card loader for agent YAML definitions.
 
-Same pattern as the brains pipeline runtime_card_loader.py:
 YAML safe_load, cache, sanitize (prompt injection detection).
 3-tier fallback: card -> default template -> error.
 """

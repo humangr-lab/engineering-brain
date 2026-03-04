@@ -1,10 +1,10 @@
 """Qdrant vector adapter for the Engineering Knowledge Brain.
 
 Provides semantic search across knowledge layers using vector embeddings.
+Requires the `qdrant-client` package.
 
-When used inside the pipeline, reuses the Qdrant singleton from pipeline_autonomo.
-When used standalone (open-source install), falls back gracefully:
-- _get_client() returns None if pipeline_autonomo is not installed
+Graceful degradation:
+- _get_client() returns None if qdrant-client is not installed
 - All methods return empty results / False on unavailable client
 - Use BRAIN_ADAPTER=memory for fully standalone operation (no Qdrant needed)
 """
@@ -12,24 +12,13 @@ When used standalone (open-source install), falls back gracefully:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+import uuid
 from typing import Any
 
 from engineering_brain.adapters.base import VectorAdapter
 from engineering_brain.core.config import BrainConfig
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class _VectorDocument:
-    """Lightweight vector document for standalone use (no pipeline dependency)."""
-
-    id: str
-    text: str
-    vector: list[float]
-    metadata: dict[str, Any] = field(default_factory=dict)
-
 
 _qdrant_client = None
 
@@ -40,20 +29,27 @@ def _get_client(config: BrainConfig | None = None) -> Any:
     if _qdrant_client is not None:
         return _qdrant_client
     try:
-        from pipeline_autonomo.qdrant_client import get_qdrant_client
+        from qdrant_client import QdrantClient
 
-        _qdrant_client = get_qdrant_client()
+        host = config.qdrant_host if config else "localhost"
+        port = config.qdrant_port if config else 6333
+        _qdrant_client = QdrantClient(host=host, port=port)
         return _qdrant_client
     except ImportError:
-        logger.info("pipeline_autonomo not installed — Qdrant adapter disabled (standalone mode)")
+        logger.info("qdrant-client package not installed — Qdrant adapter disabled")
         return None
     except Exception as e:
         logger.warning("Qdrant connection failed: %s", e)
         return None
 
 
+def _stable_uuid(doc_id: str) -> str:
+    """Convert a string doc_id to a deterministic UUID string for Qdrant point IDs."""
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, doc_id))
+
+
 class QdrantVectorAdapter(VectorAdapter):
-    """Qdrant adapter using the existing pipeline singleton client."""
+    """Qdrant vector adapter for semantic search."""
 
     def __init__(self, config: BrainConfig | None = None) -> None:
         self._config = config
@@ -64,7 +60,7 @@ class QdrantVectorAdapter(VectorAdapter):
         return _get_client(self._config)
 
     def _full_collection_name(self, collection: str) -> str:
-        """Prefix collection name to avoid collisions with pipeline collections."""
+        """Prefix collection name for namespacing."""
         if collection.startswith(self._prefix):
             return collection
         return f"{self._prefix}{collection}"
@@ -81,19 +77,17 @@ class QdrantVectorAdapter(VectorAdapter):
         if client is None:
             return False
         try:
+            from qdrant_client.models import PointStruct
+
             full_name = self._full_collection_name(collection)
             self.ensure_collection(collection, len(vector))
-            try:
-                from pipeline_autonomo.qdrant_client import VectorDocument
-            except ImportError:
-                VectorDocument = _VectorDocument
-            doc = VectorDocument(
-                id=doc_id,
-                text=text,
+            payload = {"text": text, **(metadata or {})}
+            point = PointStruct(
+                id=_stable_uuid(doc_id),
                 vector=vector,
-                metadata=metadata or {},
+                payload={"doc_id": doc_id, **payload},
             )
-            client.insert_document(full_name, doc)
+            client.upsert(collection_name=full_name, points=[point])
             return True
         except Exception as e:
             logger.error("Qdrant upsert failed: %s", e)
@@ -104,24 +98,29 @@ class QdrantVectorAdapter(VectorAdapter):
         if client is None:
             return 0
         try:
+            from qdrant_client.models import PointStruct
+
             full_name = self._full_collection_name(collection)
             if documents:
                 self.ensure_collection(collection, len(documents[0].get("vector", [])))
-            try:
-                from pipeline_autonomo.qdrant_client import VectorDocument
-            except ImportError:
-                VectorDocument = _VectorDocument
-            docs = []
+            points = []
             for doc in documents:
-                docs.append(
-                    VectorDocument(
-                        id=doc["id"],
-                        text=doc.get("text", ""),
+                doc_id = doc["id"]
+                payload = {
+                    "doc_id": doc_id,
+                    "text": doc.get("text", ""),
+                    **(doc.get("metadata", {})),
+                }
+                points.append(
+                    PointStruct(
+                        id=_stable_uuid(doc_id),
                         vector=doc["vector"],
-                        metadata=doc.get("metadata", {}),
+                        payload=payload,
                     )
                 )
-            return client.upsert_batch(full_name, docs)
+            if points:
+                client.upsert(collection_name=full_name, points=points)
+            return len(points)
         except Exception as e:
             logger.error("Qdrant batch_upsert failed: %s", e)
             return 0
@@ -141,19 +140,18 @@ class QdrantVectorAdapter(VectorAdapter):
             full_name = self._full_collection_name(collection)
             if not client.collection_exists(full_name):
                 return []
-            results = client.search_similar(
-                collection=full_name,
+            results = client.search(
+                collection_name=full_name,
                 query_vector=query_vector,
-                top_k=top_k,
-                filters=filters,
-                score_threshold=score_threshold,
+                limit=top_k,
+                score_threshold=score_threshold if score_threshold > 0 else None,
             )
             return [
                 {
-                    "id": r.id,
+                    "id": r.payload.get("doc_id", str(r.id)),
                     "score": r.score,
-                    "text": r.text,
-                    "metadata": r.metadata,
+                    "text": r.payload.get("text", ""),
+                    "metadata": {k: v for k, v in r.payload.items() if k not in ("doc_id", "text")},
                 }
                 for r in results
             ]
@@ -166,8 +164,14 @@ class QdrantVectorAdapter(VectorAdapter):
         if client is None:
             return False
         try:
+            from qdrant_client.models import PointIdsList
+
             full_name = self._full_collection_name(collection)
-            return client.delete_by_id(full_name, doc_id)
+            client.delete(
+                collection_name=full_name,
+                points_selector=PointIdsList(points=[_stable_uuid(doc_id)]),
+            )
+            return True
         except Exception as e:
             logger.error("Qdrant delete failed: %s", e)
             return False
@@ -177,17 +181,21 @@ class QdrantVectorAdapter(VectorAdapter):
         if client is None:
             return False
         try:
+            from qdrant_client.models import Distance, VectorParams
+
             full_name = self._full_collection_name(collection)
             if not client.collection_exists(full_name):
-                created = client.create_collection(full_name, dimension=dimension)
-                if created:
-                    self._configure_collection(full_name)
-                return created
+                client.create_collection(
+                    collection_name=full_name,
+                    vectors_config=VectorParams(size=dimension, distance=Distance.COSINE),
+                )
+                self._configure_collection(full_name)
+                return True
             else:
-                # BUG-1 FIX: Validate dimension match on existing collection
+                # Validate dimension match on existing collection
                 try:
-                    info = client.get_collection_info(full_name)
-                    existing_dim = info.get("dimension", 0)
+                    info = client.get_collection(full_name)
+                    existing_dim = info.config.params.vectors.size
                     if existing_dim and existing_dim != dimension:
                         logger.warning(
                             "Brain dimension mismatch for '%s': existing=%d, required=%d. Recreating.",
@@ -196,10 +204,11 @@ class QdrantVectorAdapter(VectorAdapter):
                             dimension,
                         )
                         client.delete_collection(full_name)
-                        created = client.create_collection(full_name, dimension=dimension)
-                        if created:
-                            self._configure_collection(full_name)
-                        return created
+                        client.create_collection(
+                            collection_name=full_name,
+                            vectors_config=VectorParams(size=dimension, distance=Distance.COSINE),
+                        )
+                        self._configure_collection(full_name)
                 except Exception as dim_err:
                     logger.warning("Failed to validate brain dimensions: %s", dim_err)
                     return False
@@ -214,24 +223,21 @@ class QdrantVectorAdapter(VectorAdapter):
         if client is None:
             return
         try:
-            raw = getattr(client, "_client", None)
-            if raw is None:
-                return
             from qdrant_client.models import PayloadSchemaType
 
-            for field in ("layer", "domain", "technologies"):
+            for field_name in ("layer", "domain", "technologies"):
                 try:
-                    raw.create_payload_index(
+                    client.create_payload_index(
                         collection_name=full_name,
-                        field_name=field,
+                        field_name=field_name,
                         field_schema=PayloadSchemaType.KEYWORD,
                     )
                 except Exception as exc:
                     logger.debug(
-                        "Qdrant payload index creation skipped for field %s: %s", field, exc
+                        "Qdrant payload index creation skipped for field %s: %s", field_name, exc
                     )
         except ImportError:
-            pass  # qdrant_client not available
+            pass  # qdrant_client models not available
         except Exception as e:
             logger.debug("Qdrant configure_collection failed (non-blocking): %s", e)
 
@@ -243,7 +249,8 @@ class QdrantVectorAdapter(VectorAdapter):
             full_name = self._full_collection_name(collection)
             if not client.collection_exists(full_name):
                 return 0
-            return client.count(full_name)
+            info = client.get_collection(full_name)
+            return info.points_count or 0
         except Exception as e:
             logger.error("Qdrant count failed: %s", e)
             return 0
@@ -254,9 +261,7 @@ class QdrantVectorAdapter(VectorAdapter):
             client = self._client()
             if client is None:
                 return False
-            raw = getattr(client, "_client", None)
-            if raw:
-                raw.get_collections()
+            client.get_collections()
             return True
         except Exception as exc:
             logger.debug("Qdrant health check failed: %s", exc)

@@ -1,7 +1,7 @@
 """Dead letter queue for failed Engineering Brain operations (O-09).
 
 Failed embeddings, writes, validations are appended to a JSONL file
-for periodic retry or manual review. Never blocks the main pipeline.
+for periodic retry or manual review. Never blocks the main flow.
 """
 
 from __future__ import annotations

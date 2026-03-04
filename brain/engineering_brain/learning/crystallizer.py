@@ -36,19 +36,17 @@ class KnowledgeCrystallizer:
         resolution: str = "",
         lesson: str = "",
         hl_layer: str = "",
-        sprint: str = "",
-        run_id: str = "",
         file_path: str = "",
         line: int | None = None,
         technologies: list[str] | None = None,
         domains: list[str] | None = None,
     ) -> str | None:
-        """Learn from a pipeline finding — create evidence and optionally crystallize into a rule.
+        """Learn from a finding — create evidence and optionally crystallize into a rule.
 
         Returns the finding ID if stored successfully, None otherwise.
         """
         # 1. Create L4 finding node
-        finding_id = _generate_finding_id(description, sprint, file_path, line)
+        finding_id = _generate_finding_id(description, "", file_path, line)
         finding = Finding(
             id=finding_id,
             finding_type="bug" if severity in ("critical", "high") else "quality",
@@ -56,8 +54,6 @@ class KnowledgeCrystallizer:
             severity=severity,
             file_path=file_path,
             line=line,
-            sprint=sprint,
-            run_id=run_id,
             resolution=resolution,
             lesson_learned=lesson,
         )
