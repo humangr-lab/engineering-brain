@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import math
+
 import pytest
 
 from engineering_brain.epistemic.opinion import OpinionTuple
-
 
 # --- Construction & Validation ---
 

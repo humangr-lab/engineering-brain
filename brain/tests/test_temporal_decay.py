@@ -6,8 +6,8 @@ import pytest
 
 from engineering_brain.epistemic.opinion import OpinionTuple
 from engineering_brain.epistemic.temporal import (
-    HawkesDecayEngine,
     LAYER_DECAY_PROFILES,
+    HawkesDecayEngine,
     get_decay_engine,
 )
 
@@ -61,7 +61,9 @@ class TestApplyDecay:
     def test_no_elapsed_time_no_change(self):
         engine = HawkesDecayEngine(mu=0.001, alpha=0.05, beta=0.01)
         op = OpinionTuple(b=0.8, d=0.1, u=0.1, a=0.5)
-        result = engine.apply_decay(op, now_unix=1000, last_decay_unix=1000, event_timestamps_unix=[])
+        result = engine.apply_decay(
+            op, now_unix=1000, last_decay_unix=1000, event_timestamps_unix=[]
+        )
         assert result.b == pytest.approx(op.b, abs=1e-9)
 
     def test_belief_decays_to_uncertainty(self):
@@ -77,7 +79,9 @@ class TestApplyDecay:
     def test_mass_conservation_after_decay(self):
         engine = HawkesDecayEngine(mu=0.005, alpha=0.05, beta=0.01)
         op = OpinionTuple(b=0.6, d=0.2, u=0.2, a=0.5)
-        result = engine.apply_decay(op, now_unix=10000000, last_decay_unix=0, event_timestamps_unix=[])
+        result = engine.apply_decay(
+            op, now_unix=10000000, last_decay_unix=0, event_timestamps_unix=[]
+        )
         total = result.b + result.d + result.u
         assert total == pytest.approx(1.0, abs=1e-6)
 
@@ -85,7 +89,9 @@ class TestApplyDecay:
         """Disbelief decays to uncertainty too — forgotten contradiction != proven truth."""
         engine = HawkesDecayEngine(mu=0.005, alpha=0.05, beta=0.01)
         op = OpinionTuple(b=0.1, d=0.7, u=0.2, a=0.5)
-        result = engine.apply_decay(op, now_unix=10000000, last_decay_unix=0, event_timestamps_unix=[])
+        result = engine.apply_decay(
+            op, now_unix=10000000, last_decay_unix=0, event_timestamps_unix=[]
+        )
         assert result.d < op.d
         assert result.u > op.u
 
@@ -96,10 +102,14 @@ class TestApplyDecay:
         now = 100 * 86400
 
         # Without events
-        no_events = engine.apply_decay(op, now_unix=now, last_decay_unix=0, event_timestamps_unix=[])
+        no_events = engine.apply_decay(
+            op, now_unix=now, last_decay_unix=0, event_timestamps_unix=[]
+        )
         # With recent events
         events = [now - 86400 * i for i in range(1, 10)]
-        with_events = engine.apply_decay(op, now_unix=now, last_decay_unix=0, event_timestamps_unix=events)
+        with_events = engine.apply_decay(
+            op, now_unix=now, last_decay_unix=0, event_timestamps_unix=events
+        )
 
         assert with_events.b > no_events.b  # more belief preserved
 
@@ -114,21 +124,27 @@ class TestLayerDecayProfiles:
     def test_l0_never_decays(self):
         engine = LAYER_DECAY_PROFILES["L0"]
         op = OpinionTuple(b=0.95, d=0.0, u=0.05, a=0.9)
-        result = engine.apply_decay(op, now_unix=100000000, last_decay_unix=0, event_timestamps_unix=[])
+        result = engine.apply_decay(
+            op, now_unix=100000000, last_decay_unix=0, event_timestamps_unix=[]
+        )
         assert result.b == pytest.approx(op.b, abs=1e-9)
 
     def test_l5_decays_fast(self):
         engine = LAYER_DECAY_PROFILES["L5"]
         op = OpinionTuple(b=0.8, d=0.0, u=0.2, a=0.5)
         # 30 days
-        result = engine.apply_decay(op, now_unix=30*86400, last_decay_unix=0, event_timestamps_unix=[])
+        result = engine.apply_decay(
+            op, now_unix=30 * 86400, last_decay_unix=0, event_timestamps_unix=[]
+        )
         assert result.b < op.b * 0.95  # significant decay
 
     def test_l3_moderate_decay(self):
         engine = LAYER_DECAY_PROFILES["L3"]
         op = OpinionTuple(b=0.8, d=0.0, u=0.2, a=0.5)
         # 180 days
-        result = engine.apply_decay(op, now_unix=180*86400, last_decay_unix=0, event_timestamps_unix=[])
+        result = engine.apply_decay(
+            op, now_unix=180 * 86400, last_decay_unix=0, event_timestamps_unix=[]
+        )
         assert result.b < op.b  # some decay
         assert result.b > 0.1  # but not completely gone
 

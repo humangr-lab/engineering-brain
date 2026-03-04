@@ -16,15 +16,11 @@ Uses MemoryGraphAdapter / MemoryCacheAdapter to avoid external dependencies.
 
 from __future__ import annotations
 
-import math
 import os
-import sys
 import tempfile
-import textwrap
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
-from typing import Any
-from unittest.mock import MagicMock, patch
+from datetime import UTC, datetime, timedelta
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -34,20 +30,18 @@ from engineering_brain.adapters.memory import (
     MemoryVectorAdapter,
 )
 from engineering_brain.core.config import BrainConfig
-from engineering_brain.core.schema import EdgeType, Layer, NodeType
+from engineering_brain.core.schema import EdgeType, Layer
 from engineering_brain.core.types import KnowledgeQuery, KnowledgeResult
 from engineering_brain.retrieval.context_extractor import (
     ExtractedContext,
     KnowledgeShoppingList,
     apply_technology_implications,
-    build_contextual_text,
     build_domain_hierarchy,
     build_embedding_preamble,
     build_tech_index_from_nodes,
     contextual_text_for_embedding,
     expand_domains,
     extract_ast_context,
-    extract_context,
 )
 from engineering_brain.retrieval.router import QueryRouter, _clean_node
 from engineering_brain.retrieval.scorer import (
@@ -58,7 +52,6 @@ from engineering_brain.retrieval.scorer import (
     rank_results,
     score_knowledge,
 )
-
 
 # =============================================================================
 # Fixtures
@@ -91,65 +84,89 @@ def cache() -> MemoryCacheAdapter:
 @pytest.fixture
 def populated_graph(graph: MemoryGraphAdapter) -> MemoryGraphAdapter:
     """Graph populated with nodes across all four queryable layers."""
-    graph.add_node("Principle", "P-001", {
-        "id": "P-001",
-        "name": "Defense in Depth",
-        "why": "No single layer is perfect",
-        "how_to_apply": "Layer multiple security controls",
-        "domains": ["security"],
-        "technologies": [],
-        "severity": "high",
-        "validation_status": "human_verified",
-    })
-    graph.add_node("Pattern", "PAT-001", {
-        "id": "PAT-001",
-        "name": "Circuit Breaker",
-        "intent": "Prevent cascading failures",
-        "technologies": ["Python"],
-        "domains": ["reliability"],
-        "severity": "high",
-        "languages": ["Python"],
-    })
-    graph.add_node("Rule", "CR-001", {
-        "id": "CR-001",
-        "text": "Always validate CORS origins explicitly",
-        "why": "Wildcard CORS allows any origin",
-        "how_to_do_right": "List allowed origins explicitly",
-        "technologies": ["Flask"],
-        "domains": ["security", "api"],
-        "severity": "critical",
-        "reinforcement_count": 15,
-        "confidence": 0.9,
-        "validation_status": "cross_checked",
-    })
-    graph.add_node("Rule", "CR-002", {
-        "id": "CR-002",
-        "text": "Use parameterized queries for SQL",
-        "why": "String concat enables injection",
-        "how_to_do_right": "Use ORM or parameterized placeholders",
-        "technologies": ["Python", "PostgreSQL"],
-        "domains": ["security", "database"],
-        "severity": "critical",
-        "reinforcement_count": 20,
-        "confidence": 0.95,
-        "validation_status": "human_verified",
-    })
-    graph.add_node("Finding", "F-001", {
-        "id": "F-001",
-        "description": "CORS wildcard in production server.py",
-        "severity": "critical",
-        "domains": ["security"],
-        "technologies": ["Flask"],
-    })
+    graph.add_node(
+        "Principle",
+        "P-001",
+        {
+            "id": "P-001",
+            "name": "Defense in Depth",
+            "why": "No single layer is perfect",
+            "how_to_apply": "Layer multiple security controls",
+            "domains": ["security"],
+            "technologies": [],
+            "severity": "high",
+            "validation_status": "human_verified",
+        },
+    )
+    graph.add_node(
+        "Pattern",
+        "PAT-001",
+        {
+            "id": "PAT-001",
+            "name": "Circuit Breaker",
+            "intent": "Prevent cascading failures",
+            "technologies": ["Python"],
+            "domains": ["reliability"],
+            "severity": "high",
+            "languages": ["Python"],
+        },
+    )
+    graph.add_node(
+        "Rule",
+        "CR-001",
+        {
+            "id": "CR-001",
+            "text": "Always validate CORS origins explicitly",
+            "why": "Wildcard CORS allows any origin",
+            "how_to_do_right": "List allowed origins explicitly",
+            "technologies": ["Flask"],
+            "domains": ["security", "api"],
+            "severity": "critical",
+            "reinforcement_count": 15,
+            "confidence": 0.9,
+            "validation_status": "cross_checked",
+        },
+    )
+    graph.add_node(
+        "Rule",
+        "CR-002",
+        {
+            "id": "CR-002",
+            "text": "Use parameterized queries for SQL",
+            "why": "String concat enables injection",
+            "how_to_do_right": "Use ORM or parameterized placeholders",
+            "technologies": ["Python", "PostgreSQL"],
+            "domains": ["security", "database"],
+            "severity": "critical",
+            "reinforcement_count": 20,
+            "confidence": 0.95,
+            "validation_status": "human_verified",
+        },
+    )
+    graph.add_node(
+        "Finding",
+        "F-001",
+        {
+            "id": "F-001",
+            "description": "CORS wildcard in production server.py",
+            "severity": "critical",
+            "domains": ["security"],
+            "technologies": ["Flask"],
+        },
+    )
     # A deprecated node that should be filtered
-    graph.add_node("Rule", "CR-DEP", {
-        "id": "CR-DEP",
-        "text": "Deprecated rule",
-        "technologies": ["Flask"],
-        "domains": ["security"],
-        "severity": "high",
-        "deprecated": True,
-    })
+    graph.add_node(
+        "Rule",
+        "CR-DEP",
+        {
+            "id": "CR-DEP",
+            "text": "Deprecated rule",
+            "technologies": ["Flask"],
+            "domains": ["security"],
+            "severity": "high",
+            "deprecated": True,
+        },
+    )
     # Edges
     graph.add_edge("CR-001", "P-001", EdgeType.INSTANTIATES.value)
     graph.add_edge("F-001", "CR-001", EdgeType.EVIDENCED_BY.value)
@@ -209,26 +226,34 @@ class TestQueryRouterQuery:
     """Tests for QueryRouter.query() end-to-end pipeline."""
 
     def test_returns_knowledge_result(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         result = router.query(_make_query("Flask security API CORS"))
         assert isinstance(result, KnowledgeResult)
 
     def test_finds_matching_rules_by_technology(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
-        result = router.query(_make_query(
-            "Implement Flask REST API with CORS",
-            techs=["Flask"],
-        ))
+        result = router.query(
+            _make_query(
+                "Implement Flask REST API with CORS",
+                techs=["Flask"],
+            )
+        )
         # CR-001 is Flask + CORS → should appear in rules
         rule_ids = [r.get("id") for r in result.rules]
         assert "CR-001" in rule_ids
 
     def test_deprecated_nodes_excluded(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         result = router.query(_make_query("Flask security", techs=["Flask"]))
@@ -241,7 +266,10 @@ class TestQueryRouterQuery:
         assert "CR-DEP" not in all_ids
 
     def test_cache_hit_returns_cached_result(
-        self, populated_graph: MemoryGraphAdapter, cache: MemoryCacheAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        cache: MemoryCacheAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, cache=cache, config=config)
         # First query populates the cache
@@ -252,7 +280,9 @@ class TestQueryRouterQuery:
         assert result2.cache_hit is True
 
     def test_formatted_text_not_empty(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         result = router.query(_make_query("Flask security", techs=["Flask"]))
@@ -262,14 +292,18 @@ class TestQueryRouterQuery:
             assert len(result.formatted_text) > 0
 
     def test_query_time_ms_is_positive(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         result = router.query(_make_query("Flask security"))
         assert result.query_time_ms >= 0.0
 
     def test_empty_graph_returns_empty_result(
-        self, graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=graph, config=config)
         result = router.query(_make_query("Flask security", techs=["Flask"]))
@@ -308,7 +342,9 @@ class TestQueryRouterSplitByLayer:
     """Tests for QueryRouter._split_by_layer."""
 
     def test_splits_by_layer_field(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         nodes = [
@@ -324,7 +360,9 @@ class TestQueryRouterSplitByLayer:
         assert len(by_layer["L4"]) == 1
 
     def test_falls_back_to_label_when_no_layer(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         nodes = [
@@ -340,7 +378,9 @@ class TestQueryRouterSplitByLayer:
         assert len(by_layer["L4"]) == 1
 
     def test_code_example_and_test_result_go_to_l4(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         nodes = [
@@ -351,7 +391,9 @@ class TestQueryRouterSplitByLayer:
         assert len(by_layer["L4"]) == 2
 
     def test_unknown_label_defaults_to_l3(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         nodes = [{"id": "X-001", "_label": "Unknown"}]
@@ -359,7 +401,9 @@ class TestQueryRouterSplitByLayer:
         assert len(by_layer["L3"]) == 1
 
     def test_empty_nodes(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         by_layer = router._split_by_layer([])
@@ -370,7 +414,9 @@ class TestQueryRouterWithScoredNodes:
     """Tests for QueryRouter.query_with_scored_nodes."""
 
     def test_returns_tuple_of_result_and_scored(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         result, scored = router.query_with_scored_nodes(
@@ -380,7 +426,9 @@ class TestQueryRouterWithScoredNodes:
         assert isinstance(scored, list)
 
     def test_scored_nodes_contain_relevance_scores(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         _, scored = router.query_with_scored_nodes(
@@ -390,7 +438,10 @@ class TestQueryRouterWithScoredNodes:
             assert "_relevance_score" in node
 
     def test_cache_hit_returns_empty_scored(
-        self, populated_graph: MemoryGraphAdapter, cache: MemoryCacheAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        cache: MemoryCacheAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, cache=cache, config=config)
         # Prime the cache
@@ -407,7 +458,9 @@ class TestQueryRouterQueryGraph:
     """Tests for QueryRouter._query_graph internal method."""
 
     def test_queries_by_technology(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         ctx = ExtractedContext(
@@ -420,7 +473,9 @@ class TestQueryRouterQueryGraph:
         assert "CR-001" in ids
 
     def test_queries_by_domain(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         ctx = ExtractedContext(
@@ -434,7 +489,9 @@ class TestQueryRouterQueryGraph:
         assert "CR-001" in ids or "CR-002" in ids
 
     def test_general_fallback_when_no_tech_or_domain(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         ctx = ExtractedContext(
@@ -447,7 +504,9 @@ class TestQueryRouterQueryGraph:
         assert isinstance(results, list)
 
     def test_deprecated_filtered_from_graph_results(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         ctx = ExtractedContext(
@@ -456,13 +515,16 @@ class TestQueryRouterQueryGraph:
             raw_text="Flask security",
         )
         results = router._query_graph(
-            ctx, [Layer.L1_PRINCIPLES, Layer.L2_PATTERNS, Layer.L3_RULES, Layer.L4_EVIDENCE],
+            ctx,
+            [Layer.L1_PRINCIPLES, Layer.L2_PATTERNS, Layer.L3_RULES, Layer.L4_EVIDENCE],
         )
         ids = [n.get("id") for n in results]
         assert "CR-DEP" not in ids
 
     def test_layer_annotation_set(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         ctx = ExtractedContext(
@@ -479,7 +541,9 @@ class TestQueryRouterProvenance:
     """Tests for QueryRouter._trace_provenance and query_with_provenance."""
 
     def test_trace_provenance_follows_edges(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         # F-001 -> EVIDENCED_BY -> CR-001
@@ -489,7 +553,9 @@ class TestQueryRouterProvenance:
         assert "CR-001" in chain_ids
 
     def test_trace_provenance_empty_for_leaf(
-        self, graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         graph.add_node("Rule", "CR-ALONE", {"id": "CR-ALONE", "text": "isolated"})
         router = QueryRouter(graph=graph, config=config)
@@ -497,14 +563,18 @@ class TestQueryRouterProvenance:
         assert chain == []
 
     def test_trace_provenance_respects_max_depth(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         chain = router._trace_provenance("F-001", max_depth=1)
         assert len(chain) <= 1
 
     def test_trace_provenance_nonexistent_node(
-        self, graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=graph, config=config)
         chain = router._trace_provenance("NONEXISTENT-123")
@@ -548,17 +618,23 @@ class TestApplyTechnologyImplicationsDeeper:
 
     def test_flask_database_conditional(self):
         domains = apply_technology_implications(
-            ["Flask"], "connect to the database using sqlalchemy model",
+            ["Flask"],
+            "connect to the database using sqlalchemy model",
         )
         assert "sql_injection" in domains or "orm_patterns" in domains
 
     def test_docker_always_domains(self):
         domains = apply_technology_implications(["Docker"], "build a container image")
-        assert "non_root_user" in domains or "secrets_management" in domains or "health_checks" in domains
+        assert (
+            "non_root_user" in domains
+            or "secrets_management" in domains
+            or "health_checks" in domains
+        )
 
     def test_multiple_technologies_combined(self):
         domains = apply_technology_implications(
-            ["Flask", "WebSocket"], "flask app with websocket routes",
+            ["Flask", "WebSocket"],
+            "flask app with websocket routes",
         )
         # Flask always: cors, error_handling, input_validation, http_status_codes
         # WebSocket always: auth, message_validation, ...
@@ -574,7 +650,8 @@ class TestApplyTechnologyImplicationsDeeper:
     def test_no_duplicate_domains_across_techs(self):
         # Both Flask and FastAPI have "cors" in their "always" list
         domains = apply_technology_implications(
-            ["Flask", "FastAPI"], "build an API",
+            ["Flask", "FastAPI"],
+            "build an API",
         )
         assert domains.count("cors") == 1
 
@@ -778,18 +855,21 @@ class TestBuildTechIndexHierarchical:
         nodes = [{"technologies": ["language.python.web.flask"]}]
         build_tech_index_from_nodes(nodes)
         from engineering_brain.retrieval.context_extractor import _dynamic_tech_index
+
         assert "flask" in _dynamic_tech_index
 
     def test_dotted_path_registers_suffixes(self):
         nodes = [{"technologies": ["language.python.web.flask"]}]
         build_tech_index_from_nodes(nodes)
         from engineering_brain.retrieval.context_extractor import _dynamic_tech_index
+
         assert "web.flask" in _dynamic_tech_index
 
     def test_domain_hierarchy_decomposition(self):
         nodes = [{"domains": ["engineering.software.testing"]}]
         build_tech_index_from_nodes(nodes)
         from engineering_brain.retrieval.context_extractor import _dynamic_domain_index
+
         assert "testing" in _dynamic_domain_index
         assert "software.testing" in _dynamic_domain_index
 
@@ -856,7 +936,9 @@ class TestComputeConfidence:
         assert result == 1.0
 
     def test_invalid_confidence_value_uses_base(self):
-        result = _compute_confidence({"confidence": "not_a_number", "validation_status": "cross_checked"})
+        result = _compute_confidence(
+            {"confidence": "not_a_number", "validation_status": "cross_checked"}
+        )
         assert result == 0.7
 
     def test_unknown_status_defaults(self):
@@ -868,13 +950,13 @@ class TestComputeRecency:
     """Tests for _compute_recency."""
 
     def test_recent_timestamp_high_score(self):
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         score = _compute_recency({"last_violation": now})
         # Within same day → close to 1.0
         assert score > 0.9
 
     def test_old_timestamp_low_score(self):
-        old = (datetime.now(timezone.utc) - timedelta(days=365)).isoformat()
+        old = (datetime.now(UTC) - timedelta(days=365)).isoformat()
         score = _compute_recency({"last_violation": old})
         assert score < 0.2
 
@@ -883,34 +965,35 @@ class TestComputeRecency:
         assert score == 0.3
 
     def test_floor_at_005(self):
-        very_old = (datetime.now(timezone.utc) - timedelta(days=10000)).isoformat()
+        very_old = (datetime.now(UTC) - timedelta(days=10000)).isoformat()
         score = _compute_recency({"last_violation": very_old})
         assert score >= 0.05
 
     def test_uses_timestamp_field(self):
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         score = _compute_recency({"timestamp": now})
         assert score > 0.9
 
     def test_uses_created_at_field(self):
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         score = _compute_recency({"created_at": now})
         assert score > 0.9
 
     def test_priority_last_violation_over_timestamp(self):
-        now = datetime.now(timezone.utc).isoformat()
-        old = (datetime.now(timezone.utc) - timedelta(days=365)).isoformat()
+        now = datetime.now(UTC).isoformat()
+        old = (datetime.now(UTC) - timedelta(days=365)).isoformat()
         # last_violation is recent, timestamp is old → should use last_violation
         score = _compute_recency({"last_violation": now, "timestamp": old})
         assert score > 0.9
 
     def test_numeric_timestamp(self):
         import time
+
         score = _compute_recency({"timestamp": time.time()})
         assert score > 0.9
 
     def test_datetime_object(self):
-        score = _compute_recency({"timestamp": datetime.now(timezone.utc)})
+        score = _compute_recency({"timestamp": datetime.now(UTC)})
         assert score > 0.9
 
     def test_invalid_timestamp_returns_default(self):
@@ -919,7 +1002,7 @@ class TestComputeRecency:
 
     def test_half_life_90_days(self):
         # At 90 days, score should be approximately 0.5 (half-life)
-        target = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+        target = (datetime.now(UTC) - timedelta(days=90)).isoformat()
         score = _compute_recency({"timestamp": target})
         assert 0.35 <= score <= 0.65
 
@@ -961,29 +1044,40 @@ class TestScoreKnowledgeDeeper:
 
     def test_eigentrust_score_contributes(self):
         base = {
-            "id": "CR-001", "text": "test",
-            "technologies": ["Flask"], "domains": ["security"],
+            "id": "CR-001",
+            "text": "test",
+            "technologies": ["Flask"],
+            "domains": ["security"],
             "severity": "medium",
         }
         score_high_et = score_knowledge(
-            {**base, "eigentrust_score": 1.0}, ["Flask"], ["security"],
+            {**base, "eigentrust_score": 1.0},
+            ["Flask"],
+            ["security"],
         )
         score_low_et = score_knowledge(
-            {**base, "eigentrust_score": 0.0}, ["Flask"], ["security"],
+            {**base, "eigentrust_score": 0.0},
+            ["Flask"],
+            ["security"],
         )
         assert score_high_et > score_low_et
 
     def test_epistemic_fields_override_confidence(self):
         base = {
-            "id": "CR-001", "text": "test",
-            "technologies": ["Flask"], "domains": ["security"],
+            "id": "CR-001",
+            "text": "test",
+            "technologies": ["Flask"],
+            "domains": ["security"],
             "severity": "medium",
             "validation_status": "unvalidated",
         }
         # With high ep_b, confidence should be higher than base unvalidated
         ep_node = {
             **base,
-            "ep_b": 0.9, "ep_d": 0.05, "ep_u": 0.05, "ep_a": 0.5,
+            "ep_b": 0.9,
+            "ep_d": 0.05,
+            "ep_u": 0.05,
+            "ep_a": 0.5,
         }
         score_ep = score_knowledge(ep_node, ["Flask"], ["security"])
         score_no_ep = score_knowledge(base, ["Flask"], ["security"])
@@ -991,8 +1085,10 @@ class TestScoreKnowledgeDeeper:
 
     def test_high_uncertainty_penalty(self):
         base = {
-            "id": "CR-001", "text": "test",
-            "technologies": ["Flask"], "domains": ["security"],
+            "id": "CR-001",
+            "text": "test",
+            "technologies": ["Flask"],
+            "domains": ["security"],
             "severity": "medium",
         }
         # The epistemic formula is: projected = ep_b + ep_a * ep_u
@@ -1006,9 +1102,12 @@ class TestScoreKnowledgeDeeper:
 
     def test_calibrator_applied(self):
         node = {
-            "id": "CR-001", "text": "test",
-            "technologies": ["Flask"], "domains": ["security"],
-            "severity": "medium", "confidence": 0.6,
+            "id": "CR-001",
+            "text": "test",
+            "technologies": ["Flask"],
+            "domains": ["security"],
+            "severity": "medium",
+            "confidence": 0.6,
         }
         # Mock calibrator that always returns 1.0
         calibrator = MagicMock()
@@ -1023,9 +1122,12 @@ class TestScoreKnowledgeDeeper:
 
     def test_calibrator_exception_non_blocking(self):
         node = {
-            "id": "CR-001", "text": "test",
-            "technologies": ["Flask"], "domains": ["security"],
-            "severity": "medium", "confidence": 0.6,
+            "id": "CR-001",
+            "text": "test",
+            "technologies": ["Flask"],
+            "domains": ["security"],
+            "severity": "medium",
+            "confidence": 0.6,
         }
         calibrator = MagicMock()
         calibrator.calibrated_confidence.side_effect = RuntimeError("boom")
@@ -1036,17 +1138,23 @@ class TestScoreKnowledgeDeeper:
     def test_prediction_accuracy_below_threshold_no_bonus(self):
         # prediction_tested_count < 3 → no modification
         node = {
-            "id": "CR-001", "text": "test",
-            "technologies": ["Flask"], "domains": ["security"],
-            "severity": "medium", "confidence": 0.7,
+            "id": "CR-001",
+            "text": "test",
+            "technologies": ["Flask"],
+            "domains": ["security"],
+            "severity": "medium",
+            "confidence": 0.7,
             "prediction_tested_count": 2,
             "prediction_success_count": 2,
         }
         score_with = score_knowledge(node, ["Flask"], ["security"])
         node_no_pred = {
-            "id": "CR-001", "text": "test",
-            "technologies": ["Flask"], "domains": ["security"],
-            "severity": "medium", "confidence": 0.7,
+            "id": "CR-001",
+            "text": "test",
+            "technologies": ["Flask"],
+            "domains": ["security"],
+            "severity": "medium",
+            "confidence": 0.7,
         }
         score_without = score_knowledge(node_no_pred, ["Flask"], ["security"])
         # With < 3 predictions, should be same as without
@@ -1055,15 +1163,17 @@ class TestScoreKnowledgeDeeper:
     def test_score_always_clamped_0_to_1(self):
         # Extreme node with all maximized fields
         extreme = {
-            "id": "CR-001", "text": "test",
-            "technologies": ["Flask"], "domains": ["security"],
+            "id": "CR-001",
+            "text": "test",
+            "technologies": ["Flask"],
+            "domains": ["security"],
             "severity": "critical",
             "reinforcement_count": 100,
             "validation_status": "human_verified",
             "confidence": 1.0,
             "eigentrust_score": 1.0,
             "_vector_score": 1.0,
-            "last_violation": datetime.now(timezone.utc).isoformat(),
+            "last_violation": datetime.now(UTC).isoformat(),
         }
         score = score_knowledge(extreme, ["Flask"], ["security"])
         assert 0.0 <= score <= 1.0
@@ -1083,10 +1193,14 @@ class TestRankResultsDeeper:
 
     def test_adaptive_weight_optimizer(self):
         nodes = [
-            {"id": "A", "text": "test", "technologies": ["Flask"],
-             "domains": ["security"], "severity": "critical"},
-            {"id": "B", "text": "test2", "technologies": [],
-             "domains": [], "severity": "low"},
+            {
+                "id": "A",
+                "text": "test",
+                "technologies": ["Flask"],
+                "domains": ["security"],
+                "severity": "critical",
+            },
+            {"id": "B", "text": "test2", "technologies": [], "domains": [], "severity": "low"},
         ]
         # Mock weight optimizer
         optimizer = MagicMock()
@@ -1099,8 +1213,11 @@ class TestRankResultsDeeper:
             "confidence": 0.01,
         }
         ranked = rank_results(
-            nodes, ["Flask"], ["security"],
-            top_k=10, weight_optimizer=optimizer,
+            nodes,
+            ["Flask"],
+            ["security"],
+            top_k=10,
+            weight_optimizer=optimizer,
         )
         optimizer.get_weights.assert_called_once()
         # With tech_match heavily boosted, node A (Flask match) should win
@@ -1108,23 +1225,36 @@ class TestRankResultsDeeper:
 
     def test_adaptive_optimizer_exception_non_blocking(self):
         nodes = [
-            {"id": "A", "text": "test", "technologies": ["Flask"],
-             "domains": ["security"], "severity": "medium"},
+            {
+                "id": "A",
+                "text": "test",
+                "technologies": ["Flask"],
+                "domains": ["security"],
+                "severity": "medium",
+            },
         ]
         optimizer = MagicMock()
         optimizer.get_weights.side_effect = RuntimeError("optimizer broken")
         # Should not crash, should fall back to default weights
         ranked = rank_results(
-            nodes, ["Flask"], ["security"],
-            top_k=10, weight_optimizer=optimizer,
+            nodes,
+            ["Flask"],
+            ["security"],
+            top_k=10,
+            weight_optimizer=optimizer,
         )
         assert len(ranked) == 1
         assert "_relevance_score" in ranked[0]
 
     def test_rank_preserves_original_node_fields(self):
         nodes = [
-            {"id": "A", "text": "rule text", "custom_field": "preserved",
-             "technologies": ["Flask"], "domains": ["security"]},
+            {
+                "id": "A",
+                "text": "rule text",
+                "custom_field": "preserved",
+                "technologies": ["Flask"],
+                "domains": ["security"],
+            },
         ]
         ranked = rank_results(nodes, ["Flask"], ["security"])
         assert ranked[0]["custom_field"] == "preserved"
@@ -1148,11 +1278,21 @@ class TestRankResultsDeeper:
     def test_rank_with_custom_config_weights(self):
         nodes = [
             # Node with high severity but no tech match
-            {"id": "A", "text": "test", "technologies": ["React"],
-             "domains": ["security"], "severity": "critical"},
+            {
+                "id": "A",
+                "text": "test",
+                "technologies": ["React"],
+                "domains": ["security"],
+                "severity": "critical",
+            },
             # Node with tech match but low severity
-            {"id": "B", "text": "test", "technologies": ["Flask"],
-             "domains": ["security"], "severity": "low"},
+            {
+                "id": "B",
+                "text": "test",
+                "technologies": ["Flask"],
+                "domains": ["security"],
+                "severity": "low",
+            },
         ]
         # Config that heavily weights severity
         cfg = replace(
@@ -1172,17 +1312,22 @@ class TestRankResultsDeeper:
 class TestScoreKnowledgeSeverityValues:
     """Test all severity level scores."""
 
-    @pytest.mark.parametrize("severity,expected_min", [
-        ("critical", 0.8),
-        ("high", 0.6),
-        ("medium", 0.3),
-        ("low", 0.1),
-    ])
+    @pytest.mark.parametrize(
+        "severity,expected_min",
+        [
+            ("critical", 0.8),
+            ("high", 0.6),
+            ("medium", 0.3),
+            ("low", 0.1),
+        ],
+    )
     def test_severity_score_ordering(self, severity: str, expected_min: float):
         # Severity is one signal among many, so we verify relative ordering
         node = {
-            "id": "CR-001", "text": "test",
-            "technologies": ["Flask"], "domains": ["security"],
+            "id": "CR-001",
+            "text": "test",
+            "technologies": ["Flask"],
+            "domains": ["security"],
             "severity": severity,
         }
         score = score_knowledge(node, ["Flask"], ["security"])
@@ -1190,8 +1335,10 @@ class TestScoreKnowledgeSeverityValues:
 
     def test_critical_beats_low(self):
         base = {
-            "id": "CR-001", "text": "test",
-            "technologies": ["Flask"], "domains": ["security"],
+            "id": "CR-001",
+            "text": "test",
+            "technologies": ["Flask"],
+            "domains": ["security"],
         }
         score_c = score_knowledge({**base, "severity": "critical"}, ["Flask"], ["security"])
         score_l = score_knowledge({**base, "severity": "low"}, ["Flask"], ["security"])
@@ -1199,8 +1346,10 @@ class TestScoreKnowledgeSeverityValues:
 
     def test_unknown_severity_gets_default(self):
         node = {
-            "id": "CR-001", "text": "test",
-            "technologies": ["Flask"], "domains": ["security"],
+            "id": "CR-001",
+            "text": "test",
+            "technologies": ["Flask"],
+            "domains": ["security"],
             "severity": "unknown_level",
         }
         score = score_knowledge(node, ["Flask"], ["security"])
@@ -1211,7 +1360,9 @@ class TestRetrievalMetricsTracking:
     """Tests for QueryRouter._track_retrieval_metrics."""
 
     def test_updates_retrieval_count(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         scored = [{"id": "CR-001", "_relevance_score": 0.8}]
@@ -1222,7 +1373,9 @@ class TestRetrievalMetricsTracking:
         assert node.get("retrieval_count", 0) >= 1
 
     def test_updates_last_retrieved_at(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         scored = [{"id": "CR-001", "_relevance_score": 0.8}]
@@ -1233,25 +1386,30 @@ class TestRetrievalMetricsTracking:
         assert "last_retrieved_at" in node
 
     def test_tracks_only_top_30(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         # Create 35 scored nodes (only first 30 should be tracked)
-        scored = [{"id": f"N-{i:03d}", "_relevance_score": 0.9 - i * 0.01}
-                  for i in range(35)]
+        scored = [{"id": f"N-{i:03d}", "_relevance_score": 0.9 - i * 0.01} for i in range(35)]
         # Only the ones that exist in graph get tracked; non-existing are silently skipped
         router._track_retrieval_metrics(scored)
         # Should not crash
 
     def test_skips_nodes_without_id(
-        self, populated_graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        populated_graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=populated_graph, config=config)
         scored = [{"_relevance_score": 0.8}]  # no id
         router._track_retrieval_metrics(scored)  # Should not crash
 
     def test_skips_nonexistent_nodes(
-        self, graph: MemoryGraphAdapter, config: BrainConfig,
+        self,
+        graph: MemoryGraphAdapter,
+        config: BrainConfig,
     ):
         router = QueryRouter(graph=graph, config=config)
         scored = [{"id": "NONEXISTENT", "_relevance_score": 0.8}]

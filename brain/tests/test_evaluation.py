@@ -19,7 +19,6 @@ from typing import Any
 import pytest
 import yaml
 
-
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
@@ -27,6 +26,7 @@ import yaml
 
 def ndcg_at_k(ranked_ids: list[str], relevant_ids: set[str], k: int = 10) -> float:
     """Normalized Discounted Cumulative Gain at rank k."""
+
     def dcg(ids: list[str], rel: set[str], n: int) -> float:
         total = 0.0
         for i, nid in enumerate(ids[:n]):
@@ -113,8 +113,12 @@ class EvaluationFramework:
                 node = self.brain._graph.get_node(nid)
                 if node is None:
                     continue
-                node_techs = set(t.lower() for t in (node.get("technologies") or node.get("languages") or []))
-                node_domains = set(d.lower() for d in (node.get("domains") or [node.get("domain", "")]))
+                node_techs = set(
+                    t.lower() for t in (node.get("technologies") or node.get("languages") or [])
+                )
+                node_domains = set(
+                    d.lower() for d in (node.get("domains") or [node.get("domain", "")])
+                )
                 query_techs = set(t.lower() for t in techs)
                 query_domains = set(d.lower() for d in domains)
                 if (query_techs & node_techs) or (query_domains & node_domains) or not query_techs:
@@ -182,6 +186,7 @@ class EvaluationFramework:
 def brain():
     """Create and seed a brain instance for evaluation."""
     from engineering_brain.core.brain import Brain
+
     b = Brain()
     b.seed()
     return b

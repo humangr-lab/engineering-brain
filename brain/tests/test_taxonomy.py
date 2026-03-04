@@ -36,16 +36,15 @@ from engineering_brain.core.taxonomy import (
 )
 from engineering_brain.core.taxonomy_bootstrap import (
     KNOWN_ALIASES,
-    POLYHIERARCHY_LINKS,
     bootstrap_registry,
     discover_tags_from_nodes,
     load_taxonomy_yaml,
 )
 
-
 # =====================================================================
 # Fixtures
 # =====================================================================
+
 
 @pytest.fixture
 def empty_registry() -> TagRegistry:
@@ -66,15 +65,17 @@ def simple_registry() -> TagRegistry:
     security (facet: domain)
     """
     r = TagRegistry()
-    r.register_batch([
-        Tag(id="python", facet="lang"),
-        Tag(id="microframework", facet="pattern"),
-        Tag(id="security", facet="domain"),
-        Tag(id="cors", facet="concern", parents=["security"]),
-        Tag(id="flask", facet="framework", parents=["python", "microframework"]),
-        Tag(id="django", facet="framework", parents=["python"]),
-        Tag(id="flask_cors", facet="concern", parents=["flask", "cors"]),
-    ])
+    r.register_batch(
+        [
+            Tag(id="python", facet="lang"),
+            Tag(id="microframework", facet="pattern"),
+            Tag(id="security", facet="domain"),
+            Tag(id="cors", facet="concern", parents=["security"]),
+            Tag(id="flask", facet="framework", parents=["python", "microframework"]),
+            Tag(id="django", facet="framework", parents=["python"]),
+            Tag(id="flask_cors", facet="concern", parents=["flask", "cors"]),
+        ]
+    )
     r.ensure_closure()
     return r
 
@@ -131,6 +132,7 @@ def taxonomy_dir() -> str:
 # Tag dataclass
 # =====================================================================
 
+
 class TestTag:
     def test_defaults(self):
         t = Tag(id="python", facet="lang")
@@ -156,6 +158,7 @@ class TestTag:
 # TagRegistry — Registration & Lookup
 # =====================================================================
 
+
 class TestRegistryRegistration:
     def test_register_single(self, empty_registry: TagRegistry):
         r = empty_registry
@@ -166,10 +169,12 @@ class TestRegistryRegistration:
 
     def test_register_batch(self, empty_registry: TagRegistry):
         r = empty_registry
-        r.register_batch([
-            Tag(id="python", facet="lang"),
-            Tag(id="flask", facet="framework"),
-        ])
+        r.register_batch(
+            [
+                Tag(id="python", facet="lang"),
+                Tag(id="flask", facet="framework"),
+            ]
+        )
         assert r.size == 2
 
     def test_register_merges_parents(self, empty_registry: TagRegistry):
@@ -229,6 +234,7 @@ class TestRegistryRegistration:
 # Precomputed Closure (ancestors, descendants)
 # =====================================================================
 
+
 class TestClosure:
     def test_ancestors_of_flask(self, simple_registry: TagRegistry):
         anc = simple_registry.ancestors("flask")
@@ -240,8 +246,8 @@ class TestClosure:
         anc = simple_registry.ancestors("flask_cors")
         assert "flask" in anc
         assert "cors" in anc
-        assert "python" in anc       # transitive
-        assert "security" in anc     # transitive (cors → security)
+        assert "python" in anc  # transitive
+        assert "security" in anc  # transitive (cors → security)
         assert "microframework" in anc  # transitive (flask → microframework)
 
     def test_descendants_of_python(self, simple_registry: TagRegistry):
@@ -292,6 +298,7 @@ class TestClosure:
 # =====================================================================
 # Matching
 # =====================================================================
+
 
 class TestMatching:
     def test_tag_matches_exact(self, simple_registry: TagRegistry):
@@ -362,6 +369,7 @@ class TestMatching:
 # Dotted path decomposition
 # =====================================================================
 
+
 class TestDecomposeDottedPath:
     def test_known_tag(self, simple_registry: TagRegistry):
         result = simple_registry.decompose_dotted_path("flask")
@@ -399,6 +407,7 @@ class TestDecomposeDottedPath:
 # Node tag normalization
 # =====================================================================
 
+
 class TestNormalizeNodeTags:
     def test_new_format_passthrough(self, simple_registry: TagRegistry):
         node = {"tags": {"lang": ["python"], "domain": ["security"]}}
@@ -426,6 +435,7 @@ class TestNormalizeNodeTags:
 # =====================================================================
 # Bootstrap
 # =====================================================================
+
 
 class TestBootstrap:
     def test_load_taxonomy_yaml(self, taxonomy_dir: str):
@@ -488,6 +498,7 @@ class TestBootstrap:
 # Discover tags from nodes
 # =====================================================================
 
+
 class TestDiscoverFromNodes:
     def test_discover_creates_new_tags(self, simple_registry: TagRegistry):
         nodes = [
@@ -521,6 +532,7 @@ class TestDiscoverFromNodes:
 # Module-level singleton
 # =====================================================================
 
+
 class TestSingleton:
     def test_get_creates_empty(self):
         set_registry(None)
@@ -539,6 +551,7 @@ class TestSingleton:
 # =====================================================================
 # Edge cases
 # =====================================================================
+
 
 class TestEdgeCases:
     def test_cycle_detection(self, empty_registry: TagRegistry):
@@ -579,11 +592,13 @@ class TestEdgeCases:
         r = empty_registry
         tags = [Tag(id="root", facet="lang")]
         for i in range(999):
-            tags.append(Tag(
-                id=f"tag_{i}",
-                facet="lang",
-                parents=["root" if i < 50 else f"tag_{i % 50}"],
-            ))
+            tags.append(
+                Tag(
+                    id=f"tag_{i}",
+                    facet="lang",
+                    parents=["root" if i < 50 else f"tag_{i % 50}"],
+                )
+            )
         r.register_batch(tags)
         r.ensure_closure()
         assert r.size == 1000
@@ -595,6 +610,7 @@ class TestEdgeCases:
 # =====================================================================
 # Constants
 # =====================================================================
+
 
 class TestConstants:
     def test_facet_weights_sum_to_one(self):
@@ -608,7 +624,7 @@ class TestConstants:
         assert len(FACET_PREFIXES) > 5
 
     def test_known_aliases_valid(self):
-        for tag_id, aliases in KNOWN_ALIASES.items():
+        for _tag_id, aliases in KNOWN_ALIASES.items():
             assert isinstance(aliases, list)
             assert len(aliases) > 0
 
@@ -616,6 +632,7 @@ class TestConstants:
 # =====================================================================
 # Tier 1 — Tag Embeddings
 # =====================================================================
+
 
 class _MockVectorAdapter:
     """Mock Qdrant vector adapter for testing."""
@@ -630,18 +647,26 @@ class _MockVectorAdapter:
         if collection not in self._collections:
             self._collections[collection] = {"dim": len(vec), "points": {}}
         self._collections[collection]["points"][id] = {
-            "text": text, "vec": vec, "metadata": metadata,
+            "text": text,
+            "vec": vec,
+            "metadata": metadata,
         }
 
-    def search(self, collection: str, vec: list[float], top_k: int = 5,
-               filters: dict | None = None, score_threshold: float = 0.0) -> list[dict]:
+    def search(
+        self,
+        collection: str,
+        vec: list[float],
+        top_k: int = 5,
+        filters: dict | None = None,
+        score_threshold: float = 0.0,
+    ) -> list[dict]:
         if collection not in self._collections:
             return []
         points = self._collections[collection]["points"]
         results = []
         for pid, pdata in points.items():
             # Simple dot product as mock similarity
-            score = sum(a * b for a, b in zip(vec[:4], pdata["vec"][:4]))
+            score = sum(a * b for a, b in zip(vec[:4], pdata["vec"][:4], strict=False))
             if filters:
                 if not all(pdata["metadata"].get(k) == v for k, v in filters.items()):
                     continue
@@ -684,16 +709,44 @@ class TestTagEmbeddingIndex:
         reg = TagRegistry()
         reg.register(Tag(id="python", facet="lang", display_name="Python"))
         reg.register(Tag(id="javascript", facet="lang", display_name="JavaScript"))
-        reg.register(Tag(id="flask", facet="framework", display_name="Flask",
-                         parents=["python"], description="Micro web framework"))
-        reg.register(Tag(id="django", facet="framework", display_name="Django",
-                         parents=["python"], description="Full-stack web framework"))
-        reg.register(Tag(id="react", facet="framework", display_name="React",
-                         parents=["javascript"], description="UI library"))
-        reg.register(Tag(id="xss", facet="concern", display_name="XSS",
-                         aliases=["cross-site scripting"]))
-        reg.register(Tag(id="csrf", facet="concern", display_name="CSRF",
-                         aliases=["cross-site request forgery"]))
+        reg.register(
+            Tag(
+                id="flask",
+                facet="framework",
+                display_name="Flask",
+                parents=["python"],
+                description="Micro web framework",
+            )
+        )
+        reg.register(
+            Tag(
+                id="django",
+                facet="framework",
+                display_name="Django",
+                parents=["python"],
+                description="Full-stack web framework",
+            )
+        )
+        reg.register(
+            Tag(
+                id="react",
+                facet="framework",
+                display_name="React",
+                parents=["javascript"],
+                description="UI library",
+            )
+        )
+        reg.register(
+            Tag(id="xss", facet="concern", display_name="XSS", aliases=["cross-site scripting"])
+        )
+        reg.register(
+            Tag(
+                id="csrf",
+                facet="concern",
+                display_name="CSRF",
+                aliases=["cross-site request forgery"],
+            )
+        )
         reg.register(Tag(id="cors", facet="concern", display_name="CORS"))
         reg.ensure_closure()
         return reg
@@ -823,7 +876,9 @@ class TestTagEmbeddingIndex:
 
     def test_singleton_get_set(self):
         from engineering_brain.retrieval.tag_embeddings import (
-            TagEmbeddingIndex, get_tag_index, set_tag_index,
+            TagEmbeddingIndex,
+            get_tag_index,
+            set_tag_index,
         )
 
         reg = self._make_registry()
@@ -875,6 +930,7 @@ class TestTagEmbeddingIndex:
 # Tier 2 — Taxonomy Auto-Expansion
 # =====================================================================
 
+
 class TestTaxonomyExpander:
     """Tests for TaxonomyExpander (Tier 2)."""
 
@@ -885,18 +941,45 @@ class TestTaxonomyExpander:
         reg = TagRegistry()
         reg.register(Tag(id="python", facet="lang", display_name="Python"))
         reg.register(Tag(id="javascript", facet="lang", display_name="JavaScript"))
-        reg.register(Tag(id="flask", facet="framework", display_name="Flask",
-                         parents=["python"], description="Micro web framework"))
-        reg.register(Tag(id="django", facet="framework", display_name="Django",
-                         parents=["python"], description="Full-stack web framework"))
-        reg.register(Tag(id="react", facet="framework", display_name="React",
-                         parents=["javascript"], description="UI library"))
-        reg.register(Tag(id="express", facet="framework", display_name="Express",
-                         parents=["javascript"], description="Node.js web framework",
-                         aliases=["expressjs"]))
+        reg.register(
+            Tag(
+                id="flask",
+                facet="framework",
+                display_name="Flask",
+                parents=["python"],
+                description="Micro web framework",
+            )
+        )
+        reg.register(
+            Tag(
+                id="django",
+                facet="framework",
+                display_name="Django",
+                parents=["python"],
+                description="Full-stack web framework",
+            )
+        )
+        reg.register(
+            Tag(
+                id="react",
+                facet="framework",
+                display_name="React",
+                parents=["javascript"],
+                description="UI library",
+            )
+        )
+        reg.register(
+            Tag(
+                id="express",
+                facet="framework",
+                display_name="Express",
+                parents=["javascript"],
+                description="Node.js web framework",
+                aliases=["expressjs"],
+            )
+        )
         reg.register(Tag(id="web_security", facet="domain", display_name="Web Security"))
-        reg.register(Tag(id="xss", facet="concern", display_name="XSS",
-                         parents=["web_security"]))
+        reg.register(Tag(id="xss", facet="concern", display_name="XSS", parents=["web_security"]))
         reg.ensure_closure()
 
         vector = _MockVectorAdapter()
@@ -1005,8 +1088,8 @@ class TestTaxonomyExpander:
 
         # Create suggestions with varying scores
         suggestions = [
-            ("react", "python", 0.9),   # High confidence
-            ("xss", "python", 0.5),     # Below threshold
+            ("react", "python", 0.9),  # High confidence
+            ("xss", "python", 0.5),  # Below threshold
         ]
 
         applied = expander.apply_suggestions(suggestions, min_confidence=0.8)
@@ -1057,7 +1140,9 @@ class TestTaxonomyExpander:
 
     def test_singleton_get_set(self):
         from engineering_brain.retrieval.taxonomy_expander import (
-            TaxonomyExpander, get_expander, set_expander,
+            TaxonomyExpander,
+            get_expander,
+            set_expander,
         )
 
         reg, idx = self._make_indexed_setup()
@@ -1074,18 +1159,18 @@ class TestTaxonomyExpander:
 # Tier 3a — HAKE Hierarchy-Aware Embeddings
 # =====================================================================
 
+
 class TestHAKEEncoder:
     """Tests for HAKEEncoder (Tier 3a)."""
 
     def _make_registry(self) -> TagRegistry:
         reg = TagRegistry()
         reg.register(Tag(id="python", facet="lang", display_name="Python"))
-        reg.register(Tag(id="flask", facet="framework", display_name="Flask",
-                         parents=["python"]))
-        reg.register(Tag(id="django", facet="framework", display_name="Django",
-                         parents=["python"]))
-        reg.register(Tag(id="flask_cors", facet="library", display_name="Flask-CORS",
-                         parents=["flask"]))
+        reg.register(Tag(id="flask", facet="framework", display_name="Flask", parents=["python"]))
+        reg.register(Tag(id="django", facet="framework", display_name="Django", parents=["python"]))
+        reg.register(
+            Tag(id="flask_cors", facet="library", display_name="Flask-CORS", parents=["flask"])
+        )
         reg.ensure_closure()
         return reg
 
@@ -1111,6 +1196,7 @@ class TestHAKEEncoder:
 
     def test_phase_siblings_close(self):
         import math
+
         from engineering_brain.retrieval.hake_embeddings import HAKEEncoder
 
         reg = self._make_registry()
@@ -1234,16 +1320,15 @@ class TestHAKEEncoder:
 # Tier 3b — Relationship Learner
 # =====================================================================
 
+
 class TestRelationshipLearner:
     """Tests for RelationshipLearner (Tier 3b)."""
 
     def _make_registry(self) -> TagRegistry:
         reg = TagRegistry()
         reg.register(Tag(id="python", facet="lang", display_name="Python"))
-        reg.register(Tag(id="flask", facet="framework", display_name="Flask",
-                         parents=["python"]))
-        reg.register(Tag(id="django", facet="framework", display_name="Django",
-                         parents=["python"]))
+        reg.register(Tag(id="flask", facet="framework", display_name="Flask", parents=["python"]))
+        reg.register(Tag(id="django", facet="framework", display_name="Django", parents=["python"]))
         reg.register(Tag(id="security", facet="domain", display_name="Security"))
         reg.register(Tag(id="testing", facet="concern", display_name="Testing"))
         reg.ensure_closure()
@@ -1272,10 +1357,12 @@ class TestRelationshipLearner:
 
         # Same pair appears in multiple nodes
         for _ in range(5):
-            learner.observe_node({
-                "technologies": ["python", "flask"],
-                "domains": ["security"],
-            })
+            learner.observe_node(
+                {
+                    "technologies": ["python", "flask"],
+                    "domains": ["security"],
+                }
+            )
 
         assert learner.stats["nodes_observed"] == 5
         # (flask, python), (flask, security), (python, security) = 3 pairs
@@ -1304,10 +1391,12 @@ class TestRelationshipLearner:
 
         # security+testing co-occur 5 times but aren't connected
         for _ in range(5):
-            learner.observe_node({
-                "technologies": ["python"],
-                "domains": ["security", "testing"],
-            })
+            learner.observe_node(
+                {
+                    "technologies": ["python"],
+                    "domains": ["security", "testing"],
+                }
+            )
 
         suggestions = learner.suggest_relationships(min_cooccurrence=3)
 
@@ -1324,10 +1413,12 @@ class TestRelationshipLearner:
 
         # flask-python already connected — should not be suggested
         for _ in range(10):
-            learner.observe_node({
-                "technologies": ["python", "flask"],
-                "domains": [],
-            })
+            learner.observe_node(
+                {
+                    "technologies": ["python", "flask"],
+                    "domains": [],
+                }
+            )
 
         suggestions = learner.suggest_relationships(min_cooccurrence=3)
 
@@ -1346,10 +1437,12 @@ class TestRelationshipLearner:
 
         # Make testing very frequent alongside other tags
         for _ in range(20):
-            learner.observe_node({
-                "technologies": ["python", "flask"],
-                "domains": ["security", "testing"],
-            })
+            learner.observe_node(
+                {
+                    "technologies": ["python", "flask"],
+                    "domains": ["security", "testing"],
+                }
+            )
 
         updated = learner.update_weights()
 

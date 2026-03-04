@@ -14,10 +14,17 @@ from engineering_brain.epistemic.opinion import OpinionTuple
 
 
 def _make_node(graph, node_id, b, d, u, a=0.5):
-    graph.add_node("Rule", node_id, {
-        "id": node_id,
-        "ep_b": b, "ep_d": d, "ep_u": u, "ep_a": a,
-    })
+    graph.add_node(
+        "Rule",
+        node_id,
+        {
+            "id": node_id,
+            "ep_b": b,
+            "ep_d": d,
+            "ep_u": u,
+            "ep_a": a,
+        },
+    )
 
 
 class TestDetectAll:
@@ -81,10 +88,12 @@ class TestResolve:
         g = MemoryGraphAdapter()
         detector = ContradictionDetector(g)
         report = ContradictionReport(
-            node_a_id="CR-001", node_b_id="CR-002",
+            node_a_id="CR-001",
+            node_b_id="CR-002",
             opinion_a=OpinionTuple(b=0.6, d=0.1, u=0.3, a=0.5),
             opinion_b=OpinionTuple(b=0.1, d=0.5, u=0.4, a=0.5),
-            conflict_k=0.35, severity=ConflictSeverity.LOW,
+            conflict_k=0.35,
+            severity=ConflictSeverity.LOW,
         )
         result = detector.resolve(report)
         assert report.resolution_method == "cbf"
@@ -95,10 +104,12 @@ class TestResolve:
         g = MemoryGraphAdapter()
         detector = ContradictionDetector(g)
         report = ContradictionReport(
-            node_a_id="CR-001", node_b_id="CR-002",
+            node_a_id="CR-001",
+            node_b_id="CR-002",
             opinion_a=OpinionTuple(b=0.9, d=0.0, u=0.1, a=0.5),
             opinion_b=OpinionTuple(b=0.0, d=0.9, u=0.1, a=0.5),
-            conflict_k=0.81, severity=ConflictSeverity.HIGH,
+            conflict_k=0.81,
+            severity=ConflictSeverity.HIGH,
         )
         result = detector.resolve(report)
         assert report.resolution_method == "murphy_trust_squared"
@@ -109,10 +120,12 @@ class TestResolve:
         g = MemoryGraphAdapter()
         detector = ContradictionDetector(g)
         report = ContradictionReport(
-            node_a_id="CR-001", node_b_id="CR-002",
+            node_a_id="CR-001",
+            node_b_id="CR-002",
             opinion_a=OpinionTuple(b=1.0, d=0.0, u=0.0, a=0.5),
             opinion_b=OpinionTuple(b=0.0, d=1.0, u=0.0, a=0.5),
-            conflict_k=1.0, severity=ConflictSeverity.EXTREME,
+            conflict_k=1.0,
+            severity=ConflictSeverity.EXTREME,
         )
         result = detector.resolve(report)
         assert result.u > 0.0  # uncertainty injected

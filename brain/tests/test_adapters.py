@@ -12,9 +12,8 @@ Covers:
 
 from __future__ import annotations
 
-import sys
 import os
-import math
+import sys
 import time
 from unittest.mock import MagicMock, patch
 
@@ -32,8 +31,7 @@ from engineering_brain.adapters.memory import (
     _cosine_similarity,
 )
 from engineering_brain.adapters.sharding import ShardRouter, ShardTarget
-from engineering_brain.core.schema import SHARD_DOMAINS, VECTOR_COLLECTIONS, Layer, shard_key
-
+from engineering_brain.core.schema import Layer, shard_key
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -940,12 +938,13 @@ class TestFalkorDBGraphAdapter:
     def test_import_succeeds(self):
         """The adapter module should be importable regardless of FalkorDB availability."""
         from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
+
         assert FalkorDBGraphAdapter is not None
 
     def test_is_available_returns_false_without_connection(self):
         """Without a running FalkorDB, is_available() should return False."""
-        from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
         import engineering_brain.adapters.falkordb as fdb_module
+        from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
 
         # Reset the singleton to force fresh connection attempt
         original_client = fdb_module._falkordb_client
@@ -961,11 +960,12 @@ class TestFalkorDBGraphAdapter:
 
     def test_implements_graph_adapter_interface(self):
         from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
+
         assert issubclass(FalkorDBGraphAdapter, GraphAdapter)
 
     def test_get_node_returns_none_without_connection(self):
-        from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
         import engineering_brain.adapters.falkordb as fdb_module
+        from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
 
         original_client = fdb_module._falkordb_client
         fdb_module._falkordb_client = None
@@ -973,7 +973,7 @@ class TestFalkorDBGraphAdapter:
             adapter = FalkorDBGraphAdapter()
             # Force _graph() to return None
             adapter._graph_instance = None
-            with patch.object(adapter, '_client', return_value=None):
+            with patch.object(adapter, "_client", return_value=None):
                 result = adapter.get_node("test_id")
                 assert result is None
         finally:
@@ -981,102 +981,116 @@ class TestFalkorDBGraphAdapter:
 
     def test_add_node_returns_false_without_connection(self):
         from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
+
         adapter = FalkorDBGraphAdapter()
         adapter._graph_instance = None
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             result = adapter.add_node("Rule", "R001", {"title": "test"})
             assert result is False
 
     def test_get_all_nodes_returns_empty_without_connection(self):
         from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
+
         adapter = FalkorDBGraphAdapter()
         adapter._graph_instance = None
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             result = adapter.get_all_nodes()
             assert result == []
 
     def test_delete_node_returns_false_without_connection(self):
         from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
+
         adapter = FalkorDBGraphAdapter()
         adapter._graph_instance = None
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             assert adapter.delete_node("R001") is False
 
     def test_add_edge_returns_false_without_connection(self):
         from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
+
         adapter = FalkorDBGraphAdapter()
         adapter._graph_instance = None
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             assert adapter.add_edge("R001", "F001", "EVIDENCED_BY") is False
 
     def test_query_returns_empty_without_connection(self):
         from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
+
         adapter = FalkorDBGraphAdapter()
         adapter._graph_instance = None
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             assert adapter.query(label="Rule") == []
 
     def test_traverse_returns_empty_without_connection(self):
         from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
+
         adapter = FalkorDBGraphAdapter()
         adapter._graph_instance = None
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             assert adapter.traverse("R001") == []
 
     def test_count_returns_zero_without_connection(self):
         from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
+
         adapter = FalkorDBGraphAdapter()
         adapter._graph_instance = None
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             assert adapter.count() == 0
 
     def test_stats_returns_defaults_without_connection(self):
         from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
+
         adapter = FalkorDBGraphAdapter()
         adapter._graph_instance = None
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             st = adapter.stats()
             assert st["node_count"] == 0
             assert st["edge_count"] == 0
 
     def test_clear_returns_false_without_connection(self):
         from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
+
         adapter = FalkorDBGraphAdapter()
         adapter._graph_instance = None
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             assert adapter.clear() is False
 
     def test_health_check_false_without_connection(self):
         from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
+
         adapter = FalkorDBGraphAdapter()
         adapter._graph_instance = None
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             assert adapter.health_check() is False
 
     def test_batch_add_nodes_zero_without_connection(self):
         from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
+
         adapter = FalkorDBGraphAdapter()
         adapter._graph_instance = None
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             assert adapter.batch_add_nodes("Rule", [{"id": "R1"}]) == 0
 
     def test_get_nodes_paginated_empty_without_connection(self):
         from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
+
         adapter = FalkorDBGraphAdapter()
         adapter._graph_instance = None
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             pages = list(adapter.get_nodes_paginated())
             assert pages == []
 
     def test_graph_name_from_config(self):
         from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
         from engineering_brain.core.config import BrainConfig
+
         config = BrainConfig(falkordb_database="custom_brain_db")
         adapter = FalkorDBGraphAdapter(config=config)
         assert adapter._graph_name == "custom_brain_db"
 
     def test_graph_name_default(self):
         from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
+
         adapter = FalkorDBGraphAdapter(config=None)
         assert adapter._graph_name == "engineering_brain"
 
@@ -1104,40 +1118,48 @@ class TestFalkorDBSerialization:
 
     def test_serialize_value_list(self):
         from engineering_brain.adapters.falkordb import _serialize_value
-        assert _serialize_value([1, 2, 3]) == '[1, 2, 3]'
+
+        assert _serialize_value([1, 2, 3]) == "[1, 2, 3]"
 
     def test_serialize_value_dict(self):
         from engineering_brain.adapters.falkordb import _serialize_value
+
         result = _serialize_value({"a": 1})
         assert '"a"' in result
 
     def test_serialize_value_none(self):
         from engineering_brain.adapters.falkordb import _serialize_value
+
         assert _serialize_value(None) == ""
 
     def test_serialize_value_passthrough(self):
         from engineering_brain.adapters.falkordb import _serialize_value
+
         assert _serialize_value("hello") == "hello"
         assert _serialize_value(42) == 42
 
     def test_deserialize_node_json_list(self):
         from engineering_brain.adapters.falkordb import _deserialize_node
+
         result = _deserialize_node({"tags": '["a", "b"]', "name": "test"})
         assert result["tags"] == ["a", "b"]
         assert result["name"] == "test"
 
     def test_deserialize_node_json_dict(self):
         from engineering_brain.adapters.falkordb import _deserialize_node
+
         result = _deserialize_node({"meta": '{"x": 1}'})
         assert result["meta"] == {"x": 1}
 
     def test_deserialize_node_invalid_json(self):
         from engineering_brain.adapters.falkordb import _deserialize_node
+
         result = _deserialize_node({"val": "[not valid json"})
         assert result["val"] == "[not valid json"
 
     def test_deserialize_node_passthrough(self):
         from engineering_brain.adapters.falkordb import _deserialize_node
+
         result = _deserialize_node({"num": 42, "str": "hello"})
         assert result["num"] == 42
         assert result["str"] == "hello"
@@ -1153,15 +1175,17 @@ class TestQdrantVectorAdapter:
 
     def test_import_succeeds(self):
         from engineering_brain.adapters.qdrant import QdrantVectorAdapter
+
         assert QdrantVectorAdapter is not None
 
     def test_implements_vector_adapter_interface(self):
         from engineering_brain.adapters.qdrant import QdrantVectorAdapter
+
         assert issubclass(QdrantVectorAdapter, VectorAdapter)
 
     def test_is_available_returns_bool(self):
-        from engineering_brain.adapters.qdrant import QdrantVectorAdapter
         import engineering_brain.adapters.qdrant as qdr_module
+        from engineering_brain.adapters.qdrant import QdrantVectorAdapter
 
         original_client = qdr_module._qdrant_client
         qdr_module._qdrant_client = None
@@ -1174,80 +1198,93 @@ class TestQdrantVectorAdapter:
 
     def test_upsert_returns_false_without_connection(self):
         from engineering_brain.adapters.qdrant import QdrantVectorAdapter
+
         adapter = QdrantVectorAdapter()
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             result = adapter.upsert("coll", "D001", "text", [1.0, 0.0])
             assert result is False
 
     def test_search_returns_empty_without_connection(self):
         from engineering_brain.adapters.qdrant import QdrantVectorAdapter
+
         adapter = QdrantVectorAdapter()
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             results = adapter.search("coll", [1.0, 0.0])
             assert results == []
 
     def test_delete_returns_false_without_connection(self):
         from engineering_brain.adapters.qdrant import QdrantVectorAdapter
+
         adapter = QdrantVectorAdapter()
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             assert adapter.delete("coll", "D001") is False
 
     def test_ensure_collection_returns_false_without_connection(self):
         from engineering_brain.adapters.qdrant import QdrantVectorAdapter
+
         adapter = QdrantVectorAdapter()
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             assert adapter.ensure_collection("coll", 128) is False
 
     def test_count_returns_zero_without_connection(self):
         from engineering_brain.adapters.qdrant import QdrantVectorAdapter
+
         adapter = QdrantVectorAdapter()
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             assert adapter.count("coll") == 0
 
     def test_batch_upsert_returns_zero_without_connection(self):
         from engineering_brain.adapters.qdrant import QdrantVectorAdapter
+
         adapter = QdrantVectorAdapter()
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             result = adapter.batch_upsert("coll", [{"id": "D1", "vector": [1.0]}])
             assert result == 0
 
     def test_health_check_false_without_connection(self):
         from engineering_brain.adapters.qdrant import QdrantVectorAdapter
+
         adapter = QdrantVectorAdapter()
-        with patch.object(adapter, '_client', return_value=None):
+        with patch.object(adapter, "_client", return_value=None):
             assert adapter.health_check() is False
 
     def test_collection_prefix_from_config(self):
         from engineering_brain.adapters.qdrant import QdrantVectorAdapter
         from engineering_brain.core.config import BrainConfig
+
         config = BrainConfig(qdrant_collection_prefix="custom_")
         adapter = QdrantVectorAdapter(config=config)
         assert adapter._prefix == "custom_"
 
     def test_collection_prefix_default(self):
         from engineering_brain.adapters.qdrant import QdrantVectorAdapter
+
         adapter = QdrantVectorAdapter(config=None)
         assert adapter._prefix == "brain_"
 
     def test_full_collection_name_adds_prefix(self):
         from engineering_brain.adapters.qdrant import QdrantVectorAdapter
+
         adapter = QdrantVectorAdapter(config=None)
         assert adapter._full_collection_name("rules") == "brain_rules"
 
     def test_full_collection_name_no_double_prefix(self):
         from engineering_brain.adapters.qdrant import QdrantVectorAdapter
+
         adapter = QdrantVectorAdapter(config=None)
         assert adapter._full_collection_name("brain_rules") == "brain_rules"
 
     def test_embedding_dimension_from_config(self):
         from engineering_brain.adapters.qdrant import QdrantVectorAdapter
         from engineering_brain.core.config import BrainConfig
+
         config = BrainConfig(embedding_dimension=768)
         adapter = QdrantVectorAdapter(config=config)
         assert adapter._dimension == 768
 
     def test_embedding_dimension_default(self):
         from engineering_brain.adapters.qdrant import QdrantVectorAdapter
+
         adapter = QdrantVectorAdapter(config=None)
         assert adapter._dimension == 1024
 

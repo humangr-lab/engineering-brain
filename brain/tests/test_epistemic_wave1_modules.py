@@ -17,32 +17,30 @@ This file focuses on:
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from engineering_brain.epistemic.bayesian_edges import (
-    BayesianEdgeManager,
     DEFAULT_HALF_LIFE,
     EDGE_DECAY_PROFILES,
+    BayesianEdgeManager,
 )
 from engineering_brain.epistemic.contradiction_tensor import (
     ContradictionManager,
     ContradictionTensor,
 )
+from engineering_brain.epistemic.opinion import OpinionTuple
 from engineering_brain.epistemic.predictive_decay import (
     DECAY_PROFILES,
     STALE_THRESHOLD,
-    DecayPrediction,
     PredictiveDecayEngine,
 )
 from engineering_brain.epistemic.temporal import (
-    HawkesDecayEngine,
     LAYER_DECAY_PROFILES,
+    HawkesDecayEngine,
     get_decay_engine,
 )
-from engineering_brain.epistemic.opinion import OpinionTuple
-
 
 # ===========================================================================
 # Section 1: BayesianEdgeManager — Beta Distribution Math & Edge Cases
@@ -231,7 +229,7 @@ class TestBayesianEdgePropagation:
         base = {"edge_confidence": 0.9}
         for length in range(1, 6):
             conf = mgr.propagate_through([base] * length)
-            assert conf == pytest.approx(0.9 ** length, abs=1e-9)
+            assert conf == pytest.approx(0.9**length, abs=1e-9)
 
     def test_propagation_with_zero_confidence_edge(self, mgr):
         """A zero-confidence edge should make the whole path zero."""
@@ -253,17 +251,21 @@ class TestBayesianEdgeBatchUpdate:
 
     def test_batch_update_without_graph_returns_zero(self):
         mgr = BayesianEdgeManager(graph_adapter=None)
-        result = mgr.batch_update_from_feedback([
-            {"from_id": "A", "to_id": "B", "positive": True},
-        ])
+        result = mgr.batch_update_from_feedback(
+            [
+                {"from_id": "A", "to_id": "B", "positive": True},
+            ]
+        )
         assert result == 0
 
     def test_batch_update_skips_empty_ids(self):
         mgr = BayesianEdgeManager(graph_adapter=None)
-        result = mgr.batch_update_from_feedback([
-            {"from_id": "", "to_id": "B", "positive": True},
-            {"from_id": "A", "to_id": "", "positive": True},
-        ])
+        result = mgr.batch_update_from_feedback(
+            [
+                {"from_id": "", "to_id": "B", "positive": True},
+                {"from_id": "A", "to_id": "", "positive": True},
+            ]
+        )
         assert result == 0
 
 
@@ -313,7 +315,7 @@ class TestContradictionTensorDataclass:
         assert len(d["evidence_for_b"]) == 2
 
     def test_to_dict_with_resolution(self):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         ct = ContradictionTensor(
             id="CT-resolved123",
             node_a_id="A",
@@ -443,8 +445,9 @@ class TestContradictionManagerResolve:
     def cm(self):
         return ContradictionManager()
 
-    def _make_tensor(self, k: float, b_a: float = 0.7, d_a: float = 0.1,
-                     b_b: float = 0.1, d_b: float = 0.7) -> ContradictionTensor:
+    def _make_tensor(
+        self, k: float, b_a: float = 0.7, d_a: float = 0.1, b_b: float = 0.1, d_b: float = 0.7
+    ) -> ContradictionTensor:
         u_a = 1.0 - b_a - d_a
         u_b = 1.0 - b_b - d_b
         return ContradictionTensor(
@@ -613,13 +616,13 @@ class TestPredictiveDecayFreshnessmath:
         return PredictiveDecayEngine()
 
     def test_freshness_at_zero_age_is_one(self, engine):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         node = {"id": "CR-001", "created_at": now.isoformat()}
         assert engine.compute_freshness(node, now) == pytest.approx(1.0, abs=1e-6)
 
     def test_freshness_at_half_life_is_half(self, engine):
         """At exactly one half-life, freshness should be 0.5."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         profile = DECAY_PROFILES["best_practice"]
         half_life = profile["half_life_days"]
         created = now - timedelta(days=half_life)
@@ -629,14 +632,14 @@ class TestPredictiveDecayFreshnessmath:
 
     def test_axiom_freshness_always_one(self, engine):
         """Axioms (infinite half-life) never decay."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         very_old = now - timedelta(days=36500)  # 100 years
         node = {"id": "AX-001", "created_at": very_old.isoformat()}
         assert engine.compute_freshness(node, now) == 1.0
 
     def test_freshness_bounded_0_1(self, engine):
         """Freshness must always be in [0, 1]."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for days in [0, 1, 30, 180, 365, 730, 3650, 36500]:
             created = now - timedelta(days=days)
             node = {"id": "CR-001", "created_at": created.isoformat()}
@@ -650,7 +653,7 @@ class TestPredictiveDecayFreshnessmath:
 
     def test_reinforcement_increases_freshness(self, engine):
         """Reinforced nodes should have higher freshness."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         created = now - timedelta(days=200)
         base = {"id": "CR-001", "created_at": created.isoformat(), "reinforcement_count": 0}
         reinforced = {"id": "CR-001", "created_at": created.isoformat(), "reinforcement_count": 5}
@@ -660,7 +663,7 @@ class TestPredictiveDecayFreshnessmath:
 
     def test_reinforcement_capped_at_30_percent(self, engine):
         """Reinforcement bonus capped at 30% -> freshness should not exceed 1.0."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         node = {
             "id": "CR-001",
             "created_at": now.isoformat(),
@@ -670,7 +673,7 @@ class TestPredictiveDecayFreshnessmath:
 
     def test_task_context_decays_very_fast(self, engine):
         """task_context (half_life=1 day) should be nearly stale after 3 days."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         created = now - timedelta(days=3)
         node = {"id": "TC-001", "created_at": created.isoformat()}
         freshness = engine.compute_freshness(node, now)
@@ -686,7 +689,7 @@ class TestPredictiveDecayStaleness:
 
     def test_predict_staleness_already_stale(self, engine):
         """Very old node should have days_until_stale == 0."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         very_old = now - timedelta(days=3650)
         node = {"id": "CR-001", "created_at": very_old.isoformat()}
         pred = engine.predict_staleness(node, now)
@@ -700,7 +703,7 @@ class TestPredictiveDecayStaleness:
         assert pred.confidence == 1.0
 
     def test_predict_staleness_fresh_node_future(self, engine):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         node = {"id": "CR-001", "created_at": now.isoformat()}
         pred = engine.predict_staleness(node, now)
         assert pred.days_until_stale > 0
@@ -709,7 +712,7 @@ class TestPredictiveDecayStaleness:
 
     def test_confidence_lower_for_volatile_types(self, engine):
         """High-volatility types should have lower prediction confidence."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         # security_vuln: volatility=0.5
         vuln_node = {
             "id": "CR-V",
@@ -728,7 +731,7 @@ class TestPredictiveDecayStaleness:
         """Unknown creation date should reduce confidence by 50%."""
         node_with_ts = {
             "id": "CR-001",
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": datetime.now(UTC).isoformat(),
         }
         node_without_ts = {"id": "CR-002"}
 
@@ -737,7 +740,7 @@ class TestPredictiveDecayStaleness:
         assert p_without.confidence < p_with.confidence
 
     def test_at_risk_excludes_axioms(self, engine):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         nodes = [
             {"id": "AX-001"},
             {"id": "CR-001", "created_at": (now - timedelta(days=500)).isoformat()},
@@ -748,7 +751,7 @@ class TestPredictiveDecayStaleness:
 
     def test_at_risk_sorted_by_urgency(self, engine):
         """Results should be sorted soonest-stale first."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         nodes = [
             {"id": "CR-001", "created_at": (now - timedelta(days=480)).isoformat()},
             {"id": "CR-002", "created_at": (now - timedelta(days=500)).isoformat()},
@@ -760,7 +763,7 @@ class TestPredictiveDecayStaleness:
                 assert at_risk[i].days_until_stale <= at_risk[i + 1].days_until_stale
 
     def test_prediction_to_dict(self, engine):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         node = {"id": "CR-001", "created_at": now.isoformat()}
         pred = engine.predict_staleness(node, now)
         d = pred.to_dict()
@@ -787,7 +790,7 @@ class TestPredictiveDecayTimestamp:
 
     def test_datetime_object_with_tz(self):
         engine = PredictiveDecayEngine()
-        dt = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        dt = datetime(2025, 1, 1, tzinfo=UTC)
         node = {"id": "CR-001", "created_at": dt}
         result = engine._get_timestamp(node)
         assert result is not None
@@ -799,7 +802,7 @@ class TestPredictiveDecayTimestamp:
         node = {"id": "CR-001", "created_at": dt}
         result = engine._get_timestamp(node)
         assert result is not None
-        assert result.tzinfo == timezone.utc  # should add UTC
+        assert result.tzinfo == UTC  # should add UTC
 
     def test_iso_string_with_z(self):
         engine = PredictiveDecayEngine()
@@ -922,7 +925,9 @@ class TestHawkesApplyDecayInvariants:
             OpinionTuple(b=0.33, d=0.33, u=0.34, a=0.5),
         ]
         for op in opinions:
-            result = engine.apply_decay(op, now_unix=10000000, last_decay_unix=0, event_timestamps_unix=[])
+            result = engine.apply_decay(
+                op, now_unix=10000000, last_decay_unix=0, event_timestamps_unix=[]
+            )
             total = result.b + result.d + result.u
             assert total == pytest.approx(1.0, abs=1e-6), (
                 f"Mass not conserved for {op}: b+d+u={total}"
@@ -932,14 +937,18 @@ class TestHawkesApplyDecayInvariants:
         """Decay should not change the base rate 'a'."""
         engine = HawkesDecayEngine(mu=0.005, alpha=0.05, beta=0.01)
         op = OpinionTuple(b=0.7, d=0.1, u=0.2, a=0.75)
-        result = engine.apply_decay(op, now_unix=10000000, last_decay_unix=0, event_timestamps_unix=[])
+        result = engine.apply_decay(
+            op, now_unix=10000000, last_decay_unix=0, event_timestamps_unix=[]
+        )
         assert result.a == op.a
 
     def test_belief_and_disbelief_non_negative_after_decay(self):
         """b and d must never go negative."""
         engine = HawkesDecayEngine(mu=0.01, alpha=0.05, beta=0.01)
         op = OpinionTuple(b=0.001, d=0.001, u=0.998, a=0.5)
-        result = engine.apply_decay(op, now_unix=100000000, last_decay_unix=0, event_timestamps_unix=[])
+        result = engine.apply_decay(
+            op, now_unix=100000000, last_decay_unix=0, event_timestamps_unix=[]
+        )
         assert result.b >= 0.0
         assert result.d >= 0.0
 
@@ -947,7 +956,9 @@ class TestHawkesApplyDecayInvariants:
         """Vacuous opinion (b=0,d=0,u=1) should remain vacuous after decay."""
         engine = HawkesDecayEngine(mu=0.01, alpha=0.05, beta=0.01)
         op = OpinionTuple(b=0.0, d=0.0, u=1.0, a=0.5)
-        result = engine.apply_decay(op, now_unix=10000000, last_decay_unix=0, event_timestamps_unix=[])
+        result = engine.apply_decay(
+            op, now_unix=10000000, last_decay_unix=0, event_timestamps_unix=[]
+        )
         assert result.b == pytest.approx(0.0, abs=1e-9)
         assert result.d == pytest.approx(0.0, abs=1e-9)
         assert result.u == pytest.approx(1.0, abs=1e-6)
@@ -956,7 +967,9 @@ class TestHawkesApplyDecayInvariants:
         """L0 engine (mu=0) should produce zero decay regardless of time."""
         engine = LAYER_DECAY_PROFILES["L0"]
         op = OpinionTuple(b=0.95, d=0.01, u=0.04, a=0.9)
-        result = engine.apply_decay(op, now_unix=999999999, last_decay_unix=0, event_timestamps_unix=[])
+        result = engine.apply_decay(
+            op, now_unix=999999999, last_decay_unix=0, event_timestamps_unix=[]
+        )
         assert result.b == pytest.approx(op.b, abs=1e-9)
         assert result.d == pytest.approx(op.d, abs=1e-9)
         assert result.u == pytest.approx(op.u, abs=1e-9)
@@ -1090,4 +1103,4 @@ class TestDecayProfileConsistency:
         """Higher layers should have higher mu (faster natural decay)."""
         mus = [LAYER_DECAY_PROFILES[f"L{i}"].mu for i in range(6)]
         for i in range(len(mus) - 1):
-            assert mus[i] <= mus[i + 1], f"L{i}.mu={mus[i]} > L{i+1}.mu={mus[i+1]}"
+            assert mus[i] <= mus[i + 1], f"L{i}.mu={mus[i]} > L{i + 1}.mu={mus[i + 1]}"

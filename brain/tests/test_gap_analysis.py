@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from engineering_brain.adapters.memory import MemoryGraphAdapter
-from engineering_brain.epistemic.gap_analysis import GapAnalyzer, KnowledgeGap
+from engineering_brain.epistemic.gap_analysis import GapAnalyzer
 
 
 class TestHighUncertaintyNodes:

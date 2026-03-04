@@ -17,16 +17,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from engineering_brain.core.config import BrainConfig
 from engineering_brain.learning.adaptive_weights import (
-    AdaptiveWeightOptimizer,
     DEFAULT_WEIGHTS,
     SIGNAL_NAMES,
+    AdaptiveWeightOptimizer,
     SignalDistribution,
 )
-
 
 # =============================================================================
 # Mock observation log
 # =============================================================================
+
 
 class MockObservationLog:
     """Minimal mock for the observation log used by the optimizer."""
@@ -41,6 +41,7 @@ class MockObservationLog:
 # =============================================================================
 # Helpers
 # =============================================================================
+
 
 def _make_optimizer(
     observation_log=None,
@@ -90,7 +91,7 @@ class TestAdaptiveWeightOptimizer:
         """Initial mean weights should approximate DEFAULT_WEIGHTS."""
         opt = _make_optimizer()
         mean_weights = opt.get_mean_weights()
-        for name, default_w in zip(SIGNAL_NAMES, DEFAULT_WEIGHTS):
+        for name, default_w in zip(SIGNAL_NAMES, DEFAULT_WEIGHTS, strict=False):
             assert mean_weights[name] == pytest.approx(default_w, abs=0.02)
 
     def test_weights_sum_to_one(self):

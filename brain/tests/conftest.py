@@ -43,3 +43,11 @@ def _reset_global_state() -> None:  # noqa: PT004
         reset_brain()
     except (ImportError, AttributeError):
         pass
+
+    # Reset agent card cache
+    try:
+        from engineering_brain.agent.runtime_cards import clear_card_cache
+
+        clear_card_cache()
+    except (ImportError, AttributeError):
+        pass

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from engineering_brain.epistemic.opinion import OpinionTuple
 from engineering_brain.epistemic.fusion import cbf
+from engineering_brain.epistemic.opinion import OpinionTuple
 from engineering_brain.epistemic.source_trust import source_to_opinion
 
 

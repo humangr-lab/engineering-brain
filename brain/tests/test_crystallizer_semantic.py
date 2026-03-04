@@ -20,10 +20,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from engineering_brain.adapters.memory import MemoryGraphAdapter
-from engineering_brain.core.config import BrainConfig
 from engineering_brain.core.schema import NodeType
 from engineering_brain.learning.crystallizer import KnowledgeCrystallizer, _cosine_similarity
-
 
 # =============================================================================
 # Mock embedder
@@ -233,9 +231,7 @@ def test_fallback_to_keyterm_when_no_embedder() -> None:
     # Since rule text is "cors" (only 1 term), key-term overlap won't reach 2.
     # This verifies the fallback path runs without errors and returns None
     # when there is insufficient term overlap.
-    result = crystallizer._find_similar_rule(
-        "cors wildcard origins insecure setup detected"
-    )
+    result = crystallizer._find_similar_rule("cors wildcard origins insecure setup detected")
     # Key-term fallback runs but overlap < 2 so no match is returned.
     assert result is None
 
@@ -289,3 +285,86 @@ def test_crystallizer_init_without_embedder() -> None:
     crystallizer = KnowledgeCrystallizer(graph)
 
     assert crystallizer._embedder is None
+
+
+# =============================================================================
+# LLM Crystallization
+# =============================================================================
+
+from unittest import mock
+
+
+class TestLLMCrystallization:
+    """Tests for _llm_derive_why and _llm_derive_rule_text."""
+
+    def test_why_flag_off_returns_none(self) -> None:
+        """LLM WHY derivation skipped when flag is off."""
+        from engineering_brain.learning.crystallizer import _llm_derive_why
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            assert _llm_derive_why("desc", "resolution", "lesson") is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_why_llm_success(self, mock_flag, mock_llm) -> None:
+        """Returns WHY text when LLM succeeds."""
+        from engineering_brain.learning.crystallizer import _llm_derive_why
+
+        mock_llm.return_value = "CORS misconfiguration exposes APIs to cross-origin attacks."
+        result = _llm_derive_why("CORS wildcard", "Restrict origins", "Always validate")
+        assert result is not None
+        assert "CORS" in result
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_why_llm_failure(self, mock_flag, mock_llm) -> None:
+        """Returns None when LLM call fails."""
+        from engineering_brain.learning.crystallizer import _llm_derive_why
+
+        mock_llm.return_value = None
+        assert _llm_derive_why("desc", "res", "lesson") is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_why_too_long_returns_none(self, mock_flag, mock_llm) -> None:
+        """Returns None when LLM response exceeds 300 chars."""
+        from engineering_brain.learning.crystallizer import _llm_derive_why
+
+        mock_llm.return_value = "x" * 400
+        assert _llm_derive_why("desc", "res", "lesson") is None
+
+    def test_rule_text_flag_off_returns_none(self) -> None:
+        """LLM rule text skipped when flag is off."""
+        from engineering_brain.learning.crystallizer import _llm_derive_rule_text
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            assert _llm_derive_rule_text("some finding") is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_rule_text_llm_success(self, mock_flag, mock_llm) -> None:
+        """Returns prescriptive rule text when LLM succeeds."""
+        from engineering_brain.learning.crystallizer import _llm_derive_rule_text
+
+        mock_llm.return_value = "Always validate CORS origins against an allowlist."
+        result = _llm_derive_rule_text("CORS wildcard finding")
+        assert result is not None
+        assert result.startswith("Always")
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_rule_text_too_short_returns_none(self, mock_flag, mock_llm) -> None:
+        """Returns None when LLM response is under 10 chars."""
+        from engineering_brain.learning.crystallizer import _llm_derive_rule_text
+
+        mock_llm.return_value = "Short"
+        assert _llm_derive_rule_text("finding") is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_rule_text_llm_failure(self, mock_flag, mock_llm) -> None:
+        """Returns None when LLM call fails."""
+        from engineering_brain.learning.crystallizer import _llm_derive_rule_text
+
+        mock_llm.return_value = None
+        assert _llm_derive_rule_text("finding") is None

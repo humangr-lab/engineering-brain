@@ -259,7 +259,7 @@ class TestProductionTemplates:
 
         registry = PackTemplateRegistry(templates_dir=templates_dir)
         for t in registry.list_templates():
-            assert t.id, f"Template missing id"
+            assert t.id, "Template missing id"
             assert t.name, f"Template {t.id} missing name"
 
     def test_security_review_template(self):

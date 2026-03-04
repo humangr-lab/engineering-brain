@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from engineering_brain.retrieval.scorer import score_knowledge
 
 

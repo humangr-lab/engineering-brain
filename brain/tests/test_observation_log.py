@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -77,11 +75,13 @@ class TestObservationLog:
 
     def test_append_only(self, tmp_log: ObservationLog):
         for i in range(3):
-            tmp_log.record(Observation(
-                timestamp=f"2026-02-18T12:0{i}:00+00:00",
-                event_type=EVENT_QUERY_SERVED,
-                rule_ids=(f"CR-{i:03d}",),
-            ))
+            tmp_log.record(
+                Observation(
+                    timestamp=f"2026-02-18T12:0{i}:00+00:00",
+                    event_type=EVENT_QUERY_SERVED,
+                    rule_ids=(f"CR-{i:03d}",),
+                )
+            )
         assert len(tmp_log.read_all()) == 3
         assert tmp_log.count() == 3
 
@@ -159,18 +159,22 @@ class TestObservationLog:
         assert tmp_log.count() == 0
 
     def test_read_since(self, tmp_log: ObservationLog):
-        tmp_log.record(Observation(
-            timestamp="2026-02-17T12:00:00+00:00",
-            event_type=EVENT_QUERY_SERVED,
-            rule_ids=("CR-old",),
-        ))
-        tmp_log.record(Observation(
-            timestamp="2026-02-19T12:00:00+00:00",
-            event_type=EVENT_QUERY_SERVED,
-            rule_ids=("CR-new",),
-        ))
+        tmp_log.record(
+            Observation(
+                timestamp="2026-02-17T12:00:00+00:00",
+                event_type=EVENT_QUERY_SERVED,
+                rule_ids=("CR-old",),
+            )
+        )
+        tmp_log.record(
+            Observation(
+                timestamp="2026-02-19T12:00:00+00:00",
+                event_type=EVENT_QUERY_SERVED,
+                rule_ids=("CR-new",),
+            )
+        )
 
-        since = datetime(2026, 2, 18, tzinfo=timezone.utc)
+        since = datetime(2026, 2, 18, tzinfo=UTC)
         recent = tmp_log.read_since(since)
         assert len(recent) == 1
         assert recent[0].rule_ids == ("CR-new",)

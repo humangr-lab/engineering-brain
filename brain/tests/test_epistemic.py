@@ -10,8 +10,8 @@ Covers four pillars:
 from __future__ import annotations
 
 import math
-import sys
 import os
+import sys
 
 # Ensure src/ is importable regardless of how pytest is invoked
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
@@ -19,42 +19,54 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 import pytest
 
 from engineering_brain.adapters.memory import MemoryGraphAdapter
-from engineering_brain.epistemic.trust_propagation import (
-    EigenTrustEngine,
-    IncrementalEigenTrust,
-    TRUST_WEIGHTS,
+from engineering_brain.epistemic.conflict_resolution import (
+    ConflictSeverity,
+    classify_conflict,
+    dempster_conflict,
+    murphy_weighted_average,
 )
 from engineering_brain.epistemic.contradiction import (
     ContradictionDetector,
     ContradictionReport,
 )
-from engineering_brain.epistemic.conflict_resolution import (
-    ConflictSeverity,
-    dempster_conflict,
-    classify_conflict,
-    murphy_weighted_average,
-)
+from engineering_brain.epistemic.fusion import cbf, multi_source_cbf
+from engineering_brain.epistemic.opinion import OpinionTuple
 from engineering_brain.epistemic.temporal import (
-    HawkesDecayEngine,
     LAYER_DECAY_PROFILES,
+    HawkesDecayEngine,
     get_decay_engine,
 )
-from engineering_brain.epistemic.opinion import OpinionTuple
-from engineering_brain.epistemic.fusion import cbf, multi_source_cbf
-
+from engineering_brain.epistemic.trust_propagation import (
+    EigenTrustEngine,
+    IncrementalEigenTrust,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_graph_node(graph: MemoryGraphAdapter, node_id: str, label: str = "Rule",
-                     b: float = 0.5, d: float = 0.0, u: float = 0.5,
-                     a: float = 0.5) -> None:
+
+def _make_graph_node(
+    graph: MemoryGraphAdapter,
+    node_id: str,
+    label: str = "Rule",
+    b: float = 0.5,
+    d: float = 0.0,
+    u: float = 0.5,
+    a: float = 0.5,
+) -> None:
     """Helper: add a node with epistemic opinion properties."""
-    graph.add_node(label, node_id, {
-        "id": node_id,
-        "ep_b": b, "ep_d": d, "ep_u": u, "ep_a": a,
-    })
+    graph.add_node(
+        label,
+        node_id,
+        {
+            "id": node_id,
+            "ep_b": b,
+            "ep_d": d,
+            "ep_u": u,
+            "ep_a": a,
+        },
+    )
 
 
 def _build_linear_chain(n: int = 5) -> MemoryGraphAdapter:
@@ -146,8 +158,8 @@ class TestEigenTrustCompute:
         g.add_node("Axiom", "AX", {"id": "AX"})
         g.add_node("Rule", "STRONG", {"id": "STRONG"})
         g.add_node("Rule", "WEAK", {"id": "WEAK"})
-        g.add_edge("AX", "STRONG", "GROUNDS")      # weight=1.0
-        g.add_edge("AX", "WEAK", "APPLIES_TO")      # weight=0.3
+        g.add_edge("AX", "STRONG", "GROUNDS")  # weight=1.0
+        g.add_edge("AX", "WEAK", "APPLIES_TO")  # weight=0.3
         scores = EigenTrustEngine().compute(g)
         assert scores["STRONG"] > scores["WEAK"]
 
@@ -260,7 +272,7 @@ class TestEigenTrustIncrementalUpdate:
         g.add_edge("AX", "CR-001", "GROUNDS")
 
         engine = EigenTrustEngine()
-        scores_before = engine.compute(g)
+        engine.compute(g)
 
         # Add a new edge and do incremental update
         g.add_edge("AX", "CR-002", "GROUNDS")
@@ -293,7 +305,7 @@ class TestEigenTrustIncrementalUpdate:
         engine.compute(g)
         engine.invalidate_cache()
         # Now incremental should fall back to full compute
-        result = engine.incremental_update(g, "C")
+        engine.incremental_update(g, "C")
         # Full compute returns all 4 nodes
         assert len(engine._cached_scores) == 4
 
@@ -449,16 +461,20 @@ class TestContradictionDetectAll:
 
     def test_is_contradicted_property(self):
         report_high = ContradictionReport(
-            node_a_id="A", node_b_id="B",
+            node_a_id="A",
+            node_b_id="B",
             opinion_a=OpinionTuple(b=0.9, d=0.0, u=0.1),
             opinion_b=OpinionTuple(b=0.0, d=0.9, u=0.1),
-            conflict_k=0.81, severity=ConflictSeverity.HIGH,
+            conflict_k=0.81,
+            severity=ConflictSeverity.HIGH,
         )
         report_low = ContradictionReport(
-            node_a_id="A", node_b_id="B",
+            node_a_id="A",
+            node_b_id="B",
             opinion_a=OpinionTuple(b=0.5, d=0.1, u=0.4),
             opinion_b=OpinionTuple(b=0.1, d=0.4, u=0.5),
-            conflict_k=0.21, severity=ConflictSeverity.NONE,
+            conflict_k=0.21,
+            severity=ConflictSeverity.NONE,
         )
         assert report_high.is_contradicted is True
         assert report_low.is_contradicted is False
@@ -492,10 +508,12 @@ class TestContradictionResolve:
         g = MemoryGraphAdapter()
         detector = ContradictionDetector(g)
         report = ContradictionReport(
-            node_a_id="A", node_b_id="B",
+            node_a_id="A",
+            node_b_id="B",
             opinion_a=OpinionTuple(b=0.6, d=0.1, u=0.3),
             opinion_b=OpinionTuple(b=0.1, d=0.5, u=0.4),
-            conflict_k=0.35, severity=ConflictSeverity.LOW,
+            conflict_k=0.35,
+            severity=ConflictSeverity.LOW,
         )
         result = detector.resolve(report)
         assert report.resolution_method == "cbf"
@@ -505,10 +523,12 @@ class TestContradictionResolve:
         g = MemoryGraphAdapter()
         detector = ContradictionDetector(g)
         report = ContradictionReport(
-            node_a_id="A", node_b_id="B",
+            node_a_id="A",
+            node_b_id="B",
             opinion_a=OpinionTuple(b=0.7, d=0.1, u=0.2),
             opinion_b=OpinionTuple(b=0.1, d=0.7, u=0.2),
-            conflict_k=0.56, severity=ConflictSeverity.MODERATE,
+            conflict_k=0.56,
+            severity=ConflictSeverity.MODERATE,
         )
         result = detector.resolve(report)
         assert report.resolution_method == "murphy_wbf"
@@ -518,10 +538,12 @@ class TestContradictionResolve:
         g = MemoryGraphAdapter()
         detector = ContradictionDetector(g)
         report = ContradictionReport(
-            node_a_id="A", node_b_id="B",
+            node_a_id="A",
+            node_b_id="B",
             opinion_a=OpinionTuple(b=0.9, d=0.0, u=0.1),
             opinion_b=OpinionTuple(b=0.0, d=0.9, u=0.1),
-            conflict_k=0.81, severity=ConflictSeverity.HIGH,
+            conflict_k=0.81,
+            severity=ConflictSeverity.HIGH,
         )
         result = detector.resolve(report)
         assert report.resolution_method == "murphy_trust_squared"
@@ -531,10 +553,12 @@ class TestContradictionResolve:
         g = MemoryGraphAdapter()
         detector = ContradictionDetector(g)
         report = ContradictionReport(
-            node_a_id="A", node_b_id="B",
+            node_a_id="A",
+            node_b_id="B",
             opinion_a=OpinionTuple(b=1.0, d=0.0, u=0.0),
             opinion_b=OpinionTuple(b=0.0, d=1.0, u=0.0),
-            conflict_k=1.0, severity=ConflictSeverity.EXTREME,
+            conflict_k=1.0,
+            severity=ConflictSeverity.EXTREME,
         )
         result = detector.resolve(report)
         assert result.u > 0.0  # penalty injects uncertainty
@@ -544,10 +568,12 @@ class TestContradictionResolve:
         g = MemoryGraphAdapter()
         detector = ContradictionDetector(g)
         report = ContradictionReport(
-            node_a_id="A", node_b_id="B",
+            node_a_id="A",
+            node_b_id="B",
             opinion_a=OpinionTuple(b=0.8, d=0.0, u=0.2),
             opinion_b=OpinionTuple(b=0.0, d=0.8, u=0.2),
-            conflict_k=0.64, severity=ConflictSeverity.MODERATE,
+            conflict_k=0.64,
+            severity=ConflictSeverity.MODERATE,
         )
         # A is highly trusted, B is not
         result_biased = detector.resolve(report, source_trusts={"A": 0.9, "B": 0.1})
@@ -595,12 +621,16 @@ class TestContradictionInjectDisbelief:
         detector = ContradictionDetector(g)
 
         # Create a high-K report manually
-        reports = [ContradictionReport(
-            node_a_id="A", node_b_id="B",
-            opinion_a=OpinionTuple(b=0.8, d=0.0, u=0.2),
-            opinion_b=OpinionTuple(b=0.9, d=0.0, u=0.1),
-            conflict_k=0.95, severity=ConflictSeverity.EXTREME,
-        )]
+        reports = [
+            ContradictionReport(
+                node_a_id="A",
+                node_b_id="B",
+                opinion_a=OpinionTuple(b=0.8, d=0.0, u=0.2),
+                opinion_b=OpinionTuple(b=0.9, d=0.0, u=0.1),
+                conflict_k=0.95,
+                severity=ConflictSeverity.EXTREME,
+            )
+        ]
         result = detector.inject_disbelief("A", reports)
         assert result is not None
         # Disbelief should not exceed half of original belief
@@ -693,39 +723,42 @@ class TestHawkesApplyDecay:
     def test_no_elapsed_no_change(self):
         engine = HawkesDecayEngine(mu=0.005, alpha=0.05, beta=0.01)
         op = OpinionTuple(b=0.8, d=0.1, u=0.1)
-        result = engine.apply_decay(op, now_unix=1000, last_decay_unix=1000,
-                                    event_timestamps_unix=[])
+        result = engine.apply_decay(
+            op, now_unix=1000, last_decay_unix=1000, event_timestamps_unix=[]
+        )
         assert result.b == pytest.approx(op.b, abs=1e-9)
         assert result.d == pytest.approx(op.d, abs=1e-9)
 
     def test_backward_time_no_change(self):
         engine = HawkesDecayEngine(mu=0.01, alpha=0.05, beta=0.01)
         op = OpinionTuple(b=0.7, d=0.0, u=0.3)
-        result = engine.apply_decay(op, now_unix=100, last_decay_unix=200,
-                                    event_timestamps_unix=[])
+        result = engine.apply_decay(op, now_unix=100, last_decay_unix=200, event_timestamps_unix=[])
         assert result.b == pytest.approx(op.b, abs=1e-9)
 
     def test_belief_decays_over_time(self):
         engine = HawkesDecayEngine(mu=0.01, alpha=0.05, beta=0.01)
         op = OpinionTuple(b=0.8, d=0.1, u=0.1)
-        result = engine.apply_decay(op, now_unix=365 * 86400, last_decay_unix=0,
-                                    event_timestamps_unix=[])
+        result = engine.apply_decay(
+            op, now_unix=365 * 86400, last_decay_unix=0, event_timestamps_unix=[]
+        )
         assert result.b < op.b
         assert result.u > op.u
 
     def test_disbelief_also_decays(self):
         engine = HawkesDecayEngine(mu=0.005, alpha=0.05, beta=0.01)
         op = OpinionTuple(b=0.1, d=0.7, u=0.2)
-        result = engine.apply_decay(op, now_unix=10000000, last_decay_unix=0,
-                                    event_timestamps_unix=[])
+        result = engine.apply_decay(
+            op, now_unix=10000000, last_decay_unix=0, event_timestamps_unix=[]
+        )
         assert result.d < op.d
         assert result.u > op.u
 
     def test_mass_conservation(self):
         engine = HawkesDecayEngine(mu=0.005, alpha=0.05, beta=0.01)
         op = OpinionTuple(b=0.6, d=0.2, u=0.2)
-        result = engine.apply_decay(op, now_unix=5000000, last_decay_unix=0,
-                                    event_timestamps_unix=[])
+        result = engine.apply_decay(
+            op, now_unix=5000000, last_decay_unix=0, event_timestamps_unix=[]
+        )
         total = result.b + result.d + result.u
         assert total == pytest.approx(1.0, abs=1e-6)
 
@@ -741,15 +774,17 @@ class TestHawkesApplyDecay:
     def test_zero_mu_means_no_decay(self):
         engine = HawkesDecayEngine(mu=0.0, alpha=0.0, beta=0.0)
         op = OpinionTuple(b=0.9, d=0.0, u=0.1)
-        result = engine.apply_decay(op, now_unix=99999999, last_decay_unix=0,
-                                    event_timestamps_unix=[])
+        result = engine.apply_decay(
+            op, now_unix=99999999, last_decay_unix=0, event_timestamps_unix=[]
+        )
         assert result.b == pytest.approx(op.b, abs=1e-9)
 
     def test_base_rate_preserved(self):
         engine = HawkesDecayEngine(mu=0.005, alpha=0.05, beta=0.01)
         op = OpinionTuple(b=0.6, d=0.2, u=0.2, a=0.7)
-        result = engine.apply_decay(op, now_unix=5000000, last_decay_unix=0,
-                                    event_timestamps_unix=[])
+        result = engine.apply_decay(
+            op, now_unix=5000000, last_decay_unix=0, event_timestamps_unix=[]
+        )
         assert result.a == pytest.approx(0.7, abs=1e-9)
 
 
@@ -764,8 +799,9 @@ class TestLayerDecayProfiles:
         engine = LAYER_DECAY_PROFILES["L0"]
         assert engine.mu == 0.0
         op = OpinionTuple(b=0.95, d=0.0, u=0.05, a=0.9)
-        result = engine.apply_decay(op, now_unix=100000000, last_decay_unix=0,
-                                    event_timestamps_unix=[])
+        result = engine.apply_decay(
+            op, now_unix=100000000, last_decay_unix=0, event_timestamps_unix=[]
+        )
         assert result.b == pytest.approx(op.b, abs=1e-9)
 
     def test_l5_context_decays_fastest(self):
@@ -854,8 +890,8 @@ class TestOpinionTupleProperties:
 
     def test_shannon_entropy_max_disorder(self):
         """Equal distribution b=d=u=1/3 gives max entropy."""
-        op = OpinionTuple(b=1/3, d=1/3, u=1/3)
-        expected = -3 * (1/3 * math.log2(1/3))
+        op = OpinionTuple(b=1 / 3, d=1 / 3, u=1 / 3)
+        expected = -3 * (1 / 3 * math.log2(1 / 3))
         assert op.shannon_entropy == pytest.approx(expected, abs=1e-6)
 
     def test_to_confidence_equals_projected(self):
@@ -1049,8 +1085,9 @@ class TestEpistemicIntegration:
         """Decayed opinion can still be fused via CBF."""
         engine = HawkesDecayEngine(mu=0.005, alpha=0.05, beta=0.01)
         op = OpinionTuple(b=0.7, d=0.0, u=0.3)
-        decayed = engine.apply_decay(op, now_unix=180 * 86400, last_decay_unix=0,
-                                     event_timestamps_unix=[])
+        decayed = engine.apply_decay(
+            op, now_unix=180 * 86400, last_decay_unix=0, event_timestamps_unix=[]
+        )
         other = OpinionTuple(b=0.6, d=0.0, u=0.4)
         fused = cbf(decayed, other)
         assert fused.b + fused.d + fused.u == pytest.approx(1.0, abs=1e-6)

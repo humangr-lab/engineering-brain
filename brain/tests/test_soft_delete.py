@@ -10,9 +10,7 @@ Verifies:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-
-import pytest
+from datetime import UTC, datetime, timedelta
 
 from engineering_brain.adapters.memory import MemoryGraphAdapter
 from engineering_brain.core.config import BrainConfig
@@ -29,20 +27,24 @@ def _make_stale_rule(
     confidence: float = 0.5,
     **extra,
 ) -> None:
-    created_at = (datetime.now(timezone.utc) - timedelta(days=age_days)).isoformat()
-    graph.add_node(NodeType.RULE.value, rule_id, {
-        "id": rule_id,
-        "text": f"Stale rule {rule_id}",
-        "why": "Testing",
-        "how_to_do_right": "Do it",
-        "severity": "medium",
-        "technologies": ["python"],
-        "domains": ["testing"],
-        "reinforcement_count": reinforcement_count,
-        "confidence": confidence,
-        "created_at": created_at,
-        **extra,
-    })
+    created_at = (datetime.now(UTC) - timedelta(days=age_days)).isoformat()
+    graph.add_node(
+        NodeType.RULE.value,
+        rule_id,
+        {
+            "id": rule_id,
+            "text": f"Stale rule {rule_id}",
+            "why": "Testing",
+            "how_to_do_right": "Do it",
+            "severity": "medium",
+            "technologies": ["python"],
+            "domains": ["testing"],
+            "reinforcement_count": reinforcement_count,
+            "confidence": confidence,
+            "created_at": created_at,
+            **extra,
+        },
+    )
 
 
 class TestSoftDelete:
@@ -99,8 +101,11 @@ class TestSoftDelete:
         config.prune_min_reinforcements = 0
 
         _make_stale_rule(
-            graph, "CR-ALREADY-001", age_days=90,
-            deprecated=True, deprecated_at="2026-01-01T00:00:00+00:00",
+            graph,
+            "CR-ALREADY-001",
+            age_days=90,
+            deprecated=True,
+            deprecated_at="2026-01-01T00:00:00+00:00",
             deprecation_reason="previous_prune",
         )
 
@@ -117,12 +122,16 @@ class TestSoftDelete:
         graph = MemoryGraphAdapter()
         config = BrainConfig()
 
-        created = (datetime.now(timezone.utc) - timedelta(minutes=120)).isoformat()
-        graph.add_node(NodeType.TASK.value, "TASK-001", {
-            "id": "TASK-001",
-            "ttl_minutes": 60,
-            "created_at": created,
-        })
+        created = (datetime.now(UTC) - timedelta(minutes=120)).isoformat()
+        graph.add_node(
+            NodeType.TASK.value,
+            "TASK-001",
+            {
+                "id": "TASK-001",
+                "ttl_minutes": 60,
+                "created_at": created,
+            },
+        )
 
         pruner = KnowledgePruner(graph, config)
         results = pruner.prune()

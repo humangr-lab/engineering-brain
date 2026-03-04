@@ -14,65 +14,87 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
-from engineering_brain.adapters.memory import MemoryGraphAdapter, MemoryVectorAdapter
+from engineering_brain.adapters.memory import MemoryGraphAdapter
 from engineering_brain.core.config import BrainConfig
 from engineering_brain.core.schema import NodeType
 from engineering_brain.retrieval.context_extractor import ExtractedContext
 from engineering_brain.retrieval.pack_manager_v2 import ScalablePackManager
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _build_graph() -> MemoryGraphAdapter:
     """Build a small test graph with nodes across layers."""
     graph = MemoryGraphAdapter()
 
-    graph.add_node(NodeType.PRINCIPLE.value, "P-SEC-001", {
-        "id": "P-SEC-001",
-        "name": "Defense in Depth",
-        "why": "Multiple layers prevent single point of failure",
-        "domains": ["security"],
-    })
-    graph.add_node(NodeType.PATTERN.value, "PAT-SEC-001", {
-        "id": "PAT-SEC-001",
-        "name": "Auth Decorator",
-        "intent": "Protect endpoints with decorators",
-        "languages": ["Python"],
-        "domains": ["security"],
-    })
-    graph.add_node(NodeType.RULE.value, "CR-SEC-001", {
-        "id": "CR-SEC-001",
-        "text": "Always validate CORS origins",
-        "why": "Prevent XSS via CORS misconfiguration",
-        "severity": "critical",
-        "technologies": ["Python", "Flask"],
-        "domains": ["security"],
-    })
-    graph.add_node(NodeType.RULE.value, "CR-SEC-002", {
-        "id": "CR-SEC-002",
-        "text": "Use bcrypt for password hashing",
-        "why": "Prevent rainbow table attacks",
-        "severity": "high",
-        "technologies": ["Python"],
-        "domains": ["security"],
-    })
-    graph.add_node(NodeType.RULE.value, "CR-FLASK-001", {
-        "id": "CR-FLASK-001",
-        "text": "Use Flask app factory pattern",
-        "why": "Testability and modularity",
-        "severity": "medium",
-        "technologies": ["Flask", "Python"],
-        "domains": ["architecture"],
-    })
-    graph.add_node("Finding", "F-SEC-001", {
-        "id": "F-SEC-001",
-        "description": "CORS wildcard found in production",
-        "domains": ["security"],
-    })
+    graph.add_node(
+        NodeType.PRINCIPLE.value,
+        "P-SEC-001",
+        {
+            "id": "P-SEC-001",
+            "name": "Defense in Depth",
+            "why": "Multiple layers prevent single point of failure",
+            "domains": ["security"],
+        },
+    )
+    graph.add_node(
+        NodeType.PATTERN.value,
+        "PAT-SEC-001",
+        {
+            "id": "PAT-SEC-001",
+            "name": "Auth Decorator",
+            "intent": "Protect endpoints with decorators",
+            "languages": ["Python"],
+            "domains": ["security"],
+        },
+    )
+    graph.add_node(
+        NodeType.RULE.value,
+        "CR-SEC-001",
+        {
+            "id": "CR-SEC-001",
+            "text": "Always validate CORS origins",
+            "why": "Prevent XSS via CORS misconfiguration",
+            "severity": "critical",
+            "technologies": ["Python", "Flask"],
+            "domains": ["security"],
+        },
+    )
+    graph.add_node(
+        NodeType.RULE.value,
+        "CR-SEC-002",
+        {
+            "id": "CR-SEC-002",
+            "text": "Use bcrypt for password hashing",
+            "why": "Prevent rainbow table attacks",
+            "severity": "high",
+            "technologies": ["Python"],
+            "domains": ["security"],
+        },
+    )
+    graph.add_node(
+        NodeType.RULE.value,
+        "CR-FLASK-001",
+        {
+            "id": "CR-FLASK-001",
+            "text": "Use Flask app factory pattern",
+            "why": "Testability and modularity",
+            "severity": "medium",
+            "technologies": ["Flask", "Python"],
+            "domains": ["architecture"],
+        },
+    )
+    graph.add_node(
+        "Finding",
+        "F-SEC-001",
+        {
+            "id": "F-SEC-001",
+            "description": "CORS wildcard found in production",
+            "domains": ["security"],
+        },
+    )
 
     return graph
 
@@ -93,6 +115,7 @@ def _config(**overrides) -> BrainConfig:
 # ---------------------------------------------------------------------------
 # Multi-query decomposition
 # ---------------------------------------------------------------------------
+
 
 class TestDecomposeQueries:
     """Test _decompose_queries generates correct sub-queries."""
@@ -171,6 +194,7 @@ class TestDecomposeQueries:
 # Vector retrieval
 # ---------------------------------------------------------------------------
 
+
 class TestRetrieveCandidates:
     """Test _retrieve_candidates calls vector search per collection."""
 
@@ -246,6 +270,7 @@ class TestRetrieveCandidates:
 # Vertical completeness v2
 # ---------------------------------------------------------------------------
 
+
 class TestVerticalCompletenessV2:
     """Test _ensure_vertical_completeness_v2 uses filtered queries."""
 
@@ -256,15 +281,18 @@ class TestVerticalCompletenessV2:
 
         # Only L3 nodes — should fill L1 and L2
         candidates = [
-            {"id": "CR-SEC-001", "text": "CORS rule", "technologies": ["Python"],
-             "domains": ["security"], "severity": "critical"},
+            {
+                "id": "CR-SEC-001",
+                "text": "CORS rule",
+                "technologies": ["Python"],
+                "domains": ["security"],
+                "severity": "critical",
+            },
         ]
 
         result = mgr._ensure_vertical_completeness_v2(candidates, ctx)
 
-        layers_present = {
-            _infer_layer(str(n.get("id", ""))) for n in result
-        }
+        layers_present = {_infer_layer(str(n.get("id", ""))) for n in result}
         # Should now have L1 and L2 from filtered queries
         assert "L3" in layers_present
         # L1/L2 depend on graph.query() finding matching nodes
@@ -289,16 +317,21 @@ class TestVerticalCompletenessV2:
     def test_does_not_call_get_all_nodes(self):
         graph = _build_graph()
         original_get_all = graph.get_all_nodes
-        graph.get_all_nodes = MagicMock(side_effect=AssertionError(
-            "get_all_nodes should NOT be called in v2"
-        ))
+        graph.get_all_nodes = MagicMock(
+            side_effect=AssertionError("get_all_nodes should NOT be called in v2")
+        )
 
         mgr = ScalablePackManager(graph, None, _config())
         ctx = ExtractedContext(technologies=["Python"], domains=["security"])
 
         candidates = [
-            {"id": "CR-SEC-001", "text": "Rule", "technologies": ["Python"],
-             "domains": ["security"], "severity": "critical"},
+            {
+                "id": "CR-SEC-001",
+                "text": "Rule",
+                "technologies": ["Python"],
+                "domains": ["security"],
+                "severity": "critical",
+            },
         ]
 
         # Should NOT raise — v2 uses graph.query(), not get_all_nodes()
@@ -325,6 +358,7 @@ def _infer_layer(node_id: str) -> str:
 # Feature flag routing
 # ---------------------------------------------------------------------------
 
+
 class TestFeatureFlagRouting:
     """Test that Brain.create_pack routes through feature flag."""
 
@@ -332,17 +366,25 @@ class TestFeatureFlagRouting:
         """When pack_v2_enabled=True, ScalablePackManager is used."""
         with patch.dict("os.environ", {"BRAIN_PACK_V2_ENABLED": "true"}):
             from engineering_brain.core.brain import Brain
+
             brain = Brain(adapter="memory")
 
             # Add some nodes
             brain.add_principle(
-                name="Test Principle", why="Testing", how="Test",
-                domains=["testing"], id="P-TEST-001",
+                name="Test Principle",
+                why="Testing",
+                how="Test",
+                domains=["testing"],
+                id="P-TEST-001",
             )
             brain.add_rule(
-                text="Test rule", why="Testing", how="Test",
-                severity="medium", technologies=["Python"],
-                domains=["testing"], id="CR-TEST-001",
+                text="Test rule",
+                why="Testing",
+                how="Test",
+                severity="medium",
+                technologies=["Python"],
+                domains=["testing"],
+                id="CR-TEST-001",
             )
 
             # Force config
@@ -355,12 +397,17 @@ class TestFeatureFlagRouting:
     def test_v2_disabled_uses_v1(self):
         """When pack_v2_enabled=False, PackManager v1 is used."""
         from engineering_brain.core.brain import Brain
+
         brain = Brain(adapter="memory")
 
         brain.add_rule(
-            text="Test rule", why="Testing", how="Test",
-            severity="medium", technologies=["Python"],
-            domains=["testing"], id="CR-TEST-002",
+            text="Test rule",
+            why="Testing",
+            how="Test",
+            severity="medium",
+            technologies=["Python"],
+            domains=["testing"],
+            id="CR-TEST-002",
         )
 
         brain._config.pack_v2_enabled = False
@@ -372,6 +419,7 @@ class TestFeatureFlagRouting:
 # ---------------------------------------------------------------------------
 # Graceful fallback
 # ---------------------------------------------------------------------------
+
 
 class TestGracefulFallback:
     """Test graceful degradation when vector adapter is None."""
@@ -415,6 +463,7 @@ class TestGracefulFallback:
 # Delegated methods
 # ---------------------------------------------------------------------------
 
+
 class TestDelegatedMethods:
     """Test that batch/explicit methods delegate to v1."""
 
@@ -455,6 +504,7 @@ class TestDelegatedMethods:
 # ---------------------------------------------------------------------------
 # End-to-end create_pack
 # ---------------------------------------------------------------------------
+
 
 class TestCreatePackE2E:
     """End-to-end test for create_pack with real graph."""

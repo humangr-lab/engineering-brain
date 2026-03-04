@@ -54,7 +54,7 @@ class TestComputeEdgeOpinion:
         source = OpinionTuple(b=0.9, d=0.0, u=0.1, a=0.5)
         target = OpinionTuple(b=0.7, d=0.0, u=0.3, a=0.5)
         result = compute_edge_opinion("GROUNDS", source, target)
-        prior = edge_prior("GROUNDS")
+        edge_prior("GROUNDS")
         # With source strength = 0.9, edge should be close to prior * 0.9
         assert result.b > 0.8
 

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from engineering_brain.core.brain import Brain
 from engineering_brain.core.types import Rule
 from engineering_brain.retrieval.formatter import format_for_llm
@@ -56,18 +54,20 @@ class TestPredictionFields:
 class TestPredictionFormatting:
     def test_format_with_prediction_untested(self):
         results = {
-            "L3": [{
-                "text": "Don't use CORS *",
-                "why": "Security risk",
-                "how_to_do_right": "Use explicit origins",
-                "severity": "high",
-                "validation_status": "cross_checked",
-                "reinforcement_count": 3,
-                "prediction_if": "cors_allowed_origins == '*'",
-                "prediction_then": "XSS via cross-origin",
-                "prediction_tested_count": 0,
-                "prediction_success_count": 0,
-            }],
+            "L3": [
+                {
+                    "text": "Don't use CORS *",
+                    "why": "Security risk",
+                    "how_to_do_right": "Use explicit origins",
+                    "severity": "high",
+                    "validation_status": "cross_checked",
+                    "reinforcement_count": 3,
+                    "prediction_if": "cors_allowed_origins == '*'",
+                    "prediction_then": "XSS via cross-origin",
+                    "prediction_tested_count": 0,
+                    "prediction_success_count": 0,
+                }
+            ],
         }
         text = format_for_llm(results)
         assert "PREDICT:" in text
@@ -77,18 +77,20 @@ class TestPredictionFormatting:
 
     def test_format_with_prediction_tested(self):
         results = {
-            "L3": [{
-                "text": "Always validate paths",
-                "why": "Path traversal",
-                "how_to_do_right": "Use is_relative_to()",
-                "severity": "critical",
-                "validation_status": "unvalidated",
-                "reinforcement_count": 0,
-                "prediction_if": "Path() / user_input without validation",
-                "prediction_then": "path traversal attack possible",
-                "prediction_tested_count": 10,
-                "prediction_success_count": 8,
-            }],
+            "L3": [
+                {
+                    "text": "Always validate paths",
+                    "why": "Path traversal",
+                    "how_to_do_right": "Use is_relative_to()",
+                    "severity": "critical",
+                    "validation_status": "unvalidated",
+                    "reinforcement_count": 0,
+                    "prediction_if": "Path() / user_input without validation",
+                    "prediction_then": "path traversal attack possible",
+                    "prediction_tested_count": 10,
+                    "prediction_success_count": 8,
+                }
+            ],
         }
         text = format_for_llm(results)
         assert "PREDICT:" in text
@@ -96,14 +98,16 @@ class TestPredictionFormatting:
 
     def test_format_without_prediction(self):
         results = {
-            "L3": [{
-                "text": "Simple rule",
-                "why": "Because",
-                "how_to_do_right": "Do this",
-                "severity": "medium",
-                "validation_status": "unvalidated",
-                "reinforcement_count": 0,
-            }],
+            "L3": [
+                {
+                    "text": "Simple rule",
+                    "why": "Because",
+                    "how_to_do_right": "Do this",
+                    "severity": "medium",
+                    "validation_status": "unvalidated",
+                    "reinforcement_count": 0,
+                }
+            ],
         }
         text = format_for_llm(results)
         assert "PREDICT:" not in text
@@ -111,15 +115,17 @@ class TestPredictionFormatting:
     def test_format_partial_prediction_not_shown(self):
         """If only prediction_if is set but not prediction_then, don't show."""
         results = {
-            "L3": [{
-                "text": "Partial prediction",
-                "why": "Why",
-                "how_to_do_right": "How",
-                "severity": "medium",
-                "validation_status": "unvalidated",
-                "prediction_if": "some condition",
-                "prediction_then": "",
-            }],
+            "L3": [
+                {
+                    "text": "Partial prediction",
+                    "why": "Why",
+                    "how_to_do_right": "How",
+                    "severity": "medium",
+                    "validation_status": "unvalidated",
+                    "prediction_if": "some condition",
+                    "prediction_then": "",
+                }
+            ],
         }
         text = format_for_llm(results)
         assert "PREDICT:" not in text
@@ -288,19 +294,21 @@ class TestPredictionHumanFormat:
         from engineering_brain.retrieval.formatter import format_for_human
 
         results = {
-            "L3": [{
-                "id": "CR-001",
-                "text": "Test rule",
-                "why": "Why",
-                "how_to_do_right": "How",
-                "severity": "high",
-                "reinforcement_count": 5,
-                "validation_status": "cross_checked",
-                "prediction_if": "condition X",
-                "prediction_then": "outcome Y",
-                "prediction_tested_count": 5,
-                "prediction_success_count": 4,
-            }],
+            "L3": [
+                {
+                    "id": "CR-001",
+                    "text": "Test rule",
+                    "why": "Why",
+                    "how_to_do_right": "How",
+                    "severity": "high",
+                    "reinforcement_count": 5,
+                    "validation_status": "cross_checked",
+                    "prediction_if": "condition X",
+                    "prediction_then": "outcome Y",
+                    "prediction_tested_count": 5,
+                    "prediction_success_count": 4,
+                }
+            ],
         }
         text = format_for_human(results)
         assert "**Prediction**: IF condition X THEN outcome Y" in text
@@ -310,19 +318,21 @@ class TestPredictionHumanFormat:
         from engineering_brain.retrieval.formatter import format_for_human
 
         results = {
-            "L3": [{
-                "id": "CR-002",
-                "text": "Test rule",
-                "why": "Why",
-                "how_to_do_right": "How",
-                "severity": "medium",
-                "reinforcement_count": 0,
-                "validation_status": "unvalidated",
-                "prediction_if": "condition",
-                "prediction_then": "outcome",
-                "prediction_tested_count": 0,
-                "prediction_success_count": 0,
-            }],
+            "L3": [
+                {
+                    "id": "CR-002",
+                    "text": "Test rule",
+                    "why": "Why",
+                    "how_to_do_right": "How",
+                    "severity": "medium",
+                    "reinforcement_count": 0,
+                    "validation_status": "unvalidated",
+                    "prediction_if": "condition",
+                    "prediction_then": "outcome",
+                    "prediction_tested_count": 0,
+                    "prediction_success_count": 0,
+                }
+            ],
         }
         text = format_for_human(results)
         assert "**Prediction Accuracy**: untested" in text

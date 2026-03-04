@@ -3,26 +3,23 @@ ContradictionTensor, DSTEvidence, BM25, PPR."""
 
 from __future__ import annotations
 
-import math
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from engineering_brain.epistemic.bayesian_edges import BayesianEdgeManager, EDGE_DECAY_PROFILES
-from engineering_brain.epistemic.predictive_decay import (
-    PredictiveDecayEngine,
-    DECAY_PROFILES,
-    DecayPrediction,
-)
+from engineering_brain.epistemic.bayesian_edges import EDGE_DECAY_PROFILES, BayesianEdgeManager
 from engineering_brain.epistemic.contradiction_tensor import (
     ContradictionManager,
     ContradictionTensor,
 )
 from engineering_brain.epistemic.dst_evidence import DSTEvidenceCombiner
 from engineering_brain.epistemic.opinion import OpinionTuple
+from engineering_brain.epistemic.predictive_decay import (
+    DECAY_PROFILES,
+    PredictiveDecayEngine,
+)
 from engineering_brain.retrieval.bm25 import BM25Index
-from engineering_brain.retrieval.ppr import personalized_pagerank, build_adjacency_from_edges
-
+from engineering_brain.retrieval.ppr import build_adjacency_from_edges, personalized_pagerank
 
 # ===========================================================================
 # BayesianEdgeManager
@@ -112,7 +109,7 @@ class TestPredictiveDecayEngine:
         assert pred.days_until_stale == float("inf")
 
     def test_fresh_node_high_freshness(self, engine):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         node = {
             "id": "CR-001",
             "created_at": now.isoformat(),
@@ -123,13 +120,13 @@ class TestPredictiveDecayEngine:
         assert freshness > 0.95
 
     def test_old_node_low_freshness(self, engine):
-        old = datetime.now(timezone.utc) - timedelta(days=365 * 3)
+        old = datetime.now(UTC) - timedelta(days=365 * 3)
         node = {"id": "CR-002", "created_at": old.isoformat()}
         freshness = engine.compute_freshness(node)
         assert freshness < 0.5
 
     def test_predict_staleness_future_date(self, engine):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         node = {"id": "CR-003", "created_at": now.isoformat()}
         pred = engine.predict_staleness(node, now)
         assert pred.days_until_stale > 0
@@ -137,7 +134,7 @@ class TestPredictiveDecayEngine:
         assert pred.estimated_stale_date > now
 
     def test_at_risk_nodes(self, engine):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         old = now - timedelta(days=500)
         nodes = [
             {"id": "CR-010", "created_at": old.isoformat()},
@@ -150,7 +147,7 @@ class TestPredictiveDecayEngine:
         assert "AX-001" not in risk_ids
 
     def test_reinforce_boosts_freshness(self, engine):
-        old = datetime.now(timezone.utc) - timedelta(days=200)
+        old = datetime.now(UTC) - timedelta(days=200)
         node_base = {"id": "CR-020", "created_at": old.isoformat(), "reinforcement_count": 0}
         node_reinforced = {"id": "CR-020", "created_at": old.isoformat(), "reinforcement_count": 5}
         f_base = engine.compute_freshness(node_base)
@@ -379,7 +376,11 @@ class TestBM25Index:
         nodes = [
             {"id": "R1", "text": "Flask CORS security configuration", "technologies": ["flask"]},
             {"id": "R2", "text": "React component rendering patterns", "technologies": ["react"]},
-            {"id": "R3", "text": "Python exception handling best practices", "technologies": ["python"]},
+            {
+                "id": "R3",
+                "text": "Python exception handling best practices",
+                "technologies": ["python"],
+            },
             {"id": "R4", "text": "Flask API rate limiting security", "technologies": ["flask"]},
         ]
         idx.index(nodes)

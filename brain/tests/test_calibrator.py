@@ -11,9 +11,6 @@ Verifies:
 
 from __future__ import annotations
 
-import os
-import tempfile
-
 import pytest
 
 from engineering_brain.observation.calibrator import (
@@ -58,14 +55,17 @@ def _populate_reinforcements(log: ObservationLog, entries: list[tuple[float, boo
         Observation,
         _now_iso,
     )
+
     for confidence, positive in entries:
-        log.record(Observation(
-            timestamp=_now_iso(),
-            event_type=EVENT_REINFORCED if positive else EVENT_WEAKENED,
-            rule_ids=("R-TEST",),
-            outcome="positive" if positive else "negative",
-            metadata={"confidence_at_time": confidence},
-        ))
+        log.record(
+            Observation(
+                timestamp=_now_iso(),
+                event_type=EVENT_REINFORCED if positive else EVENT_WEAKENED,
+                rule_ids=("R-TEST",),
+                outcome="positive" if positive else "negative",
+                metadata={"confidence_at_time": confidence},
+            )
+        )
 
 
 # --- CalibrationBucket ---
@@ -185,7 +185,7 @@ class TestPerBucketThreshold:
         """Buckets with <5 observations return raw confidence."""
         # Put 30+ in one bucket, <5 in another
         _populate_log(tmp_log, [(0.9, True)] * 32)  # All in [0.8, 1.01)
-        _populate_log(tmp_log, [(0.3, True)] * 3)    # Only 3 in [0.2, 0.4)
+        _populate_log(tmp_log, [(0.3, True)] * 3)  # Only 3 in [0.2, 0.4)
         cal = ConfidenceCalibrator(observation_log=tmp_log)
         # Bucket [0.2, 0.4) has only 3 obs → raw
         result = cal.calibrated_confidence(0.35)
@@ -193,7 +193,7 @@ class TestPerBucketThreshold:
 
     def test_bucket_at_5_calibrates(self, tmp_log):
         """Buckets with exactly 5 observations should calibrate."""
-        _populate_log(tmp_log, [(0.9, True)] * 30)   # 30 in high bucket
+        _populate_log(tmp_log, [(0.9, True)] * 30)  # 30 in high bucket
         _populate_log(tmp_log, [(0.3, True)] * 3 + [(0.3, False)] * 2)  # 5 in [0.2,0.4)
         cal = ConfidenceCalibrator(observation_log=tmp_log)
         result = cal.calibrated_confidence(0.35)
@@ -306,11 +306,15 @@ class TestScorerIntegration:
 
         # Without calibrator
         score_no_cal = score_knowledge(
-            node, query_technologies=["flask"], query_domains=["security"],
+            node,
+            query_technologies=["flask"],
+            query_domains=["security"],
         )
         # With calibrator
         score_with_cal = score_knowledge(
-            node, query_technologies=["flask"], query_domains=["security"],
+            node,
+            query_technologies=["flask"],
+            query_domains=["security"],
             calibrator=cal,
         )
         # Both should be valid scores

@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from engineering_brain.epistemic.opinion import OpinionTuple
 from engineering_brain.epistemic.fusion import cbf, multi_source_cbf
-
+from engineering_brain.epistemic.opinion import OpinionTuple
 
 # --- CBF Pairwise ---
 

@@ -26,16 +26,14 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from engineering_brain.adapters.memory import MemoryGraphAdapter
-from engineering_brain.core.config import BrainConfig
 from engineering_brain.core.schema import EdgeType, NodeType
 from engineering_brain.learning.link_predictor import (
+    TYPE_CONSTRAINTS,
     LinkPredictor,
     PredictedLink,
-    TYPE_CONSTRAINTS,
     _cosine_similarity,
     _node_label,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -102,21 +100,46 @@ def _build_constrained_graph(embedder: MockEmbedder | None = None):
     """
     graph = _make_graph()
 
-    _add_node(graph, NodeType.AXIOM.value, "AX-001",
-              text="Defense in depth principle",
-              technologies=["python"], domains=["security"])
-    _add_node(graph, NodeType.PRINCIPLE.value, "P-001",
-              text="Layered security architecture",
-              technologies=["python"], domains=["security"])
-    _add_node(graph, NodeType.PATTERN.value, "PAT-001",
-              text="Input validation at every layer",
-              technologies=["python"], domains=["security"])
-    _add_node(graph, NodeType.RULE.value, "CR-001",
-              text="Validate all user input before processing",
-              technologies=["python"], domains=["security"])
-    _add_node(graph, NodeType.RULE.value, "CR-002",
-              text="Sanitize output encoding to prevent XSS",
-              technologies=["python"], domains=["security"])
+    _add_node(
+        graph,
+        NodeType.AXIOM.value,
+        "AX-001",
+        text="Defense in depth principle",
+        technologies=["python"],
+        domains=["security"],
+    )
+    _add_node(
+        graph,
+        NodeType.PRINCIPLE.value,
+        "P-001",
+        text="Layered security architecture",
+        technologies=["python"],
+        domains=["security"],
+    )
+    _add_node(
+        graph,
+        NodeType.PATTERN.value,
+        "PAT-001",
+        text="Input validation at every layer",
+        technologies=["python"],
+        domains=["security"],
+    )
+    _add_node(
+        graph,
+        NodeType.RULE.value,
+        "CR-001",
+        text="Validate all user input before processing",
+        technologies=["python"],
+        domains=["security"],
+    )
+    _add_node(
+        graph,
+        NodeType.RULE.value,
+        "CR-002",
+        text="Sanitize output encoding to prevent XSS",
+        technologies=["python"],
+        domains=["security"],
+    )
 
     if embedder is None:
         embedder = MockEmbedder()
@@ -248,15 +271,15 @@ def test_predict_respects_threshold():
     graph = _make_graph()
 
     # Use explicit vectors that are very different
-    embedder = MockEmbedder(vectors={
-        "Text for AX-001": [1.0, 0.0, 0.0],
-        "Text for P-001": [0.0, 1.0, 0.0],
-    })
+    embedder = MockEmbedder(
+        vectors={
+            "Text for AX-001": [1.0, 0.0, 0.0],
+            "Text for P-001": [0.0, 1.0, 0.0],
+        }
+    )
 
-    _add_node(graph, NodeType.AXIOM.value, "AX-001",
-              technologies=[], domains=[])
-    _add_node(graph, NodeType.PRINCIPLE.value, "P-001",
-              technologies=[], domains=[])
+    _add_node(graph, NodeType.AXIOM.value, "AX-001", technologies=[], domains=[])
+    _add_node(graph, NodeType.PRINCIPLE.value, "P-001", technologies=[], domains=[])
 
     predictor = LinkPredictor(graph, embedder)
     predictor._threshold = 0.99  # Very high threshold
@@ -275,13 +298,15 @@ def test_predict_respects_threshold():
 def test_predict_for_node():
     """predict_for_node returns predictions for a specific node."""
     # Use similar vectors for axiom -> principle pair
-    embedder = MockEmbedder(vectors={
-        "Defense in depth principle": [1.0, 0.1, 0.0],
-        "Layered security architecture": [0.99, 0.12, 0.0],
-        "Input validation at every layer": [0.5, 0.8, 0.1],
-        "Validate all user input before processing": [0.4, 0.9, 0.1],
-        "Sanitize output encoding to prevent XSS": [0.3, 0.7, 0.2],
-    })
+    embedder = MockEmbedder(
+        vectors={
+            "Defense in depth principle": [1.0, 0.1, 0.0],
+            "Layered security architecture": [0.99, 0.12, 0.0],
+            "Input validation at every layer": [0.5, 0.8, 0.1],
+            "Validate all user input before processing": [0.4, 0.9, 0.1],
+            "Sanitize output encoding to prevent XSS": [0.3, 0.7, 0.2],
+        }
+    )
 
     graph, _, predictor = _build_constrained_graph(embedder)
 
@@ -318,7 +343,12 @@ def test_score_pair_without_hake():
     target = {"id": "CR-B", "technologies": ["python", "flask"], "domains": ["security"]}
 
     link = predictor._score_pair(
-        "CR-A", "CR-B", src_vec, tgt_vec, source, target,
+        "CR-A",
+        "CR-B",
+        src_vec,
+        tgt_vec,
+        source,
+        target,
         [EdgeType.SUPERSEDES],
     )
 
@@ -346,7 +376,12 @@ def test_score_pair_without_hake_partial_overlap():
     target = {"id": "CR-B", "technologies": ["python", "react"], "domains": ["testing"]}
 
     link = predictor._score_pair(
-        "CR-A", "CR-B", src_vec, tgt_vec, source, target,
+        "CR-A",
+        "CR-B",
+        src_vec,
+        tgt_vec,
+        source,
+        target,
         [EdgeType.SUPERSEDES],
     )
 
@@ -374,7 +409,12 @@ def test_score_pair_with_hake():
     target = {"id": "CR-B", "technologies": ["python"], "domains": ["security"]}
 
     link = predictor._score_pair(
-        "CR-A", "CR-B", src_vec, tgt_vec, source, target,
+        "CR-A",
+        "CR-B",
+        src_vec,
+        tgt_vec,
+        source,
+        target,
         [EdgeType.SUPERSEDES],
     )
 
@@ -402,12 +442,14 @@ def test_apply_predictions_respects_threshold():
 
     predictions = [
         PredictedLink(
-            source_id="CR-A", target_id="CR-B",
+            source_id="CR-A",
+            target_id="CR-B",
             edge_type=EdgeType.SUPERSEDES,
             confidence=0.95,
         ),
         PredictedLink(
-            source_id="CR-A", target_id="CR-C",
+            source_id="CR-A",
+            target_id="CR-C",
             edge_type=EdgeType.SUPERSEDES,
             confidence=0.50,  # Below min_confidence
         ),
@@ -441,7 +483,8 @@ def test_apply_predictions_skips_existing_edges():
 
     predictions = [
         PredictedLink(
-            source_id="CR-A", target_id="CR-B",
+            source_id="CR-A",
+            target_id="CR-B",
             edge_type=EdgeType.SUPERSEDES,
             confidence=0.95,
         ),
@@ -461,13 +504,20 @@ def test_no_self_links():
     graph = _make_graph()
 
     # Create two Rule nodes (Rule->Rule is a valid constraint pair)
-    _add_node(graph, NodeType.RULE.value, "CR-SELF",
-              text="Self-link test rule",
-              technologies=["python"], domains=["testing"])
+    _add_node(
+        graph,
+        NodeType.RULE.value,
+        "CR-SELF",
+        text="Self-link test rule",
+        technologies=["python"],
+        domains=["testing"],
+    )
 
-    embedder = MockEmbedder(vectors={
-        "Self-link test rule": [1.0, 0.0, 0.0],
-    })
+    embedder = MockEmbedder(
+        vectors={
+            "Self-link test rule": [1.0, 0.0, 0.0],
+        }
+    )
 
     predictor = LinkPredictor(graph, embedder)
     predictor._threshold = 0.01
@@ -538,9 +588,14 @@ def test_top_k_limit():
 
     # Create many Rule nodes so many Rule->Rule pairs exist
     for i in range(20):
-        _add_node(graph, NodeType.RULE.value, f"CR-{i:03d}",
-                  text=f"Rule number {i} for top-k test",
-                  technologies=["python"], domains=["security"])
+        _add_node(
+            graph,
+            NodeType.RULE.value,
+            f"CR-{i:03d}",
+            text=f"Rule number {i} for top-k test",
+            technologies=["python"],
+            domains=["security"],
+        )
 
     embedder = MockEmbedder()
     predictor = LinkPredictor(graph, embedder)

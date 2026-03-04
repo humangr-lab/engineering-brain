@@ -33,10 +33,10 @@ from engineering_brain.retrieval.ontology_aligner import (
     OntologyAligner,
 )
 
-
 # =====================================================================
 # Fixtures
 # =====================================================================
+
 
 @pytest.fixture
 def simple_registry() -> TagRegistry:
@@ -56,6 +56,7 @@ def aligner(simple_registry: TagRegistry) -> OntologyAligner:
 # =====================================================================
 # URI expansion
 # =====================================================================
+
 
 class TestExpandUri:
     def test_expand_uri_wikidata(self):
@@ -89,8 +90,11 @@ class TestExpandUri:
 # apply_alignment
 # =====================================================================
 
+
 class TestApplyAlignment:
-    def test_apply_alignment_exact_match(self, aligner: OntologyAligner, simple_registry: TagRegistry):
+    def test_apply_alignment_exact_match(
+        self, aligner: OntologyAligner, simple_registry: TagRegistry
+    ):
         """Applying an exact_match alignment adds the expanded URI to the tag."""
         ok = aligner.apply_alignment("python", "exact_match", "wd:Q28865")
         assert ok is True
@@ -98,7 +102,9 @@ class TestApplyAlignment:
         tag = simple_registry.get("python")
         assert "https://www.wikidata.org/wiki/Q28865" in tag.exact_match
 
-    def test_apply_alignment_broad_match(self, aligner: OntologyAligner, simple_registry: TagRegistry):
+    def test_apply_alignment_broad_match(
+        self, aligner: OntologyAligner, simple_registry: TagRegistry
+    ):
         """Applying a broad_match alignment works correctly."""
         ok = aligner.apply_alignment("flask", "broad_match", "schema:WebApplication")
         assert ok is True
@@ -106,7 +112,9 @@ class TestApplyAlignment:
         tag = simple_registry.get("flask")
         assert "https://schema.org/WebApplication" in tag.broad_match
 
-    def test_apply_alignment_narrow_match(self, aligner: OntologyAligner, simple_registry: TagRegistry):
+    def test_apply_alignment_narrow_match(
+        self, aligner: OntologyAligner, simple_registry: TagRegistry
+    ):
         """Applying a narrow_match alignment works correctly."""
         ok = aligner.apply_alignment("security", "narrow_match", "dbr:Computer_security")
         assert ok is True
@@ -114,7 +122,9 @@ class TestApplyAlignment:
         tag = simple_registry.get("security")
         assert "https://dbpedia.org/resource/Computer_security" in tag.narrow_match
 
-    def test_apply_alignment_related_match(self, aligner: OntologyAligner, simple_registry: TagRegistry):
+    def test_apply_alignment_related_match(
+        self, aligner: OntologyAligner, simple_registry: TagRegistry
+    ):
         """Applying a related_match alignment works correctly."""
         ok = aligner.apply_alignment("python", "related_match", "dbr:Guido_van_Rossum")
         assert ok is True
@@ -132,7 +142,9 @@ class TestApplyAlignment:
         ok = aligner.apply_alignment("nonexistent_tag", "exact_match", "wd:Q28865")
         assert ok is False
 
-    def test_apply_alignment_no_duplicates(self, aligner: OntologyAligner, simple_registry: TagRegistry):
+    def test_apply_alignment_no_duplicates(
+        self, aligner: OntologyAligner, simple_registry: TagRegistry
+    ):
         """Applying the same alignment twice does not create a duplicate entry."""
         aligner.apply_alignment("python", "exact_match", "wd:Q28865")
         result_second = aligner.apply_alignment("python", "exact_match", "wd:Q28865")
@@ -145,6 +157,7 @@ class TestApplyAlignment:
 # =====================================================================
 # remove_alignment
 # =====================================================================
+
 
 class TestRemoveAlignment:
     def test_remove_alignment(self, aligner: OntologyAligner, simple_registry: TagRegistry):
@@ -176,6 +189,7 @@ class TestRemoveAlignment:
 # =====================================================================
 # export_skos
 # =====================================================================
+
 
 class TestExportSkos:
     def test_export_skos_format(self, aligner: OntologyAligner):
@@ -218,6 +232,7 @@ class TestExportSkos:
 # align_all (coverage report)
 # =====================================================================
 
+
 class TestAlignAll:
     def test_align_all_coverage(self, aligner: OntologyAligner):
         """align_all reports correct aligned/unaligned counts and coverage."""
@@ -251,6 +266,7 @@ class TestAlignAll:
 # import_skos_file
 # =====================================================================
 
+
 class TestImportSkosFile:
     def test_import_skos_file(self, aligner: OntologyAligner, simple_registry: TagRegistry):
         """Importing a JSON SKOS file applies all alignments and returns the count."""
@@ -262,7 +278,9 @@ class TestImportSkosFile:
         }
 
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False,
+            mode="w",
+            suffix=".json",
+            delete=False,
         ) as f:
             json.dump(data, f)
             tmp_path = f.name
@@ -279,7 +297,9 @@ class TestImportSkosFile:
         finally:
             os.unlink(tmp_path)
 
-    def test_import_skos_file_multiple_uris(self, aligner: OntologyAligner, simple_registry: TagRegistry):
+    def test_import_skos_file_multiple_uris(
+        self, aligner: OntologyAligner, simple_registry: TagRegistry
+    ):
         """Import with multiple URIs per match type applies each one."""
         data = {
             "alignments": [
@@ -291,7 +311,9 @@ class TestImportSkosFile:
         }
 
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False,
+            mode="w",
+            suffix=".json",
+            delete=False,
         ) as f:
             json.dump(data, f)
             tmp_path = f.name
@@ -320,7 +342,9 @@ class TestImportSkosFile:
         }
 
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False,
+            mode="w",
+            suffix=".json",
+            delete=False,
         ) as f:
             json.dump(data, f)
             tmp_path = f.name
@@ -335,6 +359,7 @@ class TestImportSkosFile:
 # =====================================================================
 # stats
 # =====================================================================
+
 
 class TestStats:
     def test_stats_structure(self, aligner: OntologyAligner):
@@ -384,6 +409,7 @@ class TestStats:
 # Cosine similarity
 # =====================================================================
 
+
 class TestCosine:
     def test_cosine_identical(self):
         """Cosine of identical vectors is 1.0."""
@@ -414,6 +440,7 @@ class TestCosine:
 # align_tag
 # =====================================================================
 
+
 class TestAlignTag:
     def test_align_tag_returns_current_mappings(self, aligner: OntologyAligner):
         """Without candidates, align_tag returns the tag's current SKOS mappings."""
@@ -442,6 +469,7 @@ class TestAlignTag:
 # Constants
 # =====================================================================
 
+
 class TestConstants:
     def test_ontology_prefixes_are_complete(self):
         """ONTOLOGY_PREFIXES has exactly the expected keys."""
@@ -449,4 +477,4 @@ class TestConstants:
 
     def test_match_types_are_complete(self):
         """MATCH_TYPES has exactly the expected values."""
-        assert MATCH_TYPES == {"exact_match", "broad_match", "narrow_match", "related_match"}
+        assert {"exact_match", "broad_match", "narrow_match", "related_match"} == MATCH_TYPES

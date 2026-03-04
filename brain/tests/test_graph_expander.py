@@ -11,16 +11,14 @@ Verifies:
 
 from __future__ import annotations
 
-import pytest
-
 from engineering_brain.adapters.memory import MemoryGraphAdapter
 from engineering_brain.core.schema import EdgeType, NodeType
 from engineering_brain.retrieval.graph_expander import _infer_layer, expand_top_results
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _build_graph_with_hierarchy() -> MemoryGraphAdapter:
     """Build a small knowledge graph with cross-layer edges.
@@ -32,21 +30,42 @@ def _build_graph_with_hierarchy() -> MemoryGraphAdapter:
     """
     graph = MemoryGraphAdapter()
 
-    graph.add_node(NodeType.PRINCIPLE.value, "P-001", {
-        "id": "P-001", "name": "Defense in Depth",
-        "why": "Multiple layers prevent single point of failure",
-    })
-    graph.add_node(NodeType.PATTERN.value, "PAT-001", {
-        "id": "PAT-001", "name": "Deny By Default",
-        "intent": "Block unless explicitly allowed",
-    })
-    graph.add_node(NodeType.RULE.value, "CR-001", {
-        "id": "CR-001", "text": "Validate CORS origins explicitly",
-        "why": "Prevent XSS", "technologies": ["flask"],
-    })
-    graph.add_node("Finding", "F-001", {
-        "id": "F-001", "description": "CORS wildcard in server.py",
-    })
+    graph.add_node(
+        NodeType.PRINCIPLE.value,
+        "P-001",
+        {
+            "id": "P-001",
+            "name": "Defense in Depth",
+            "why": "Multiple layers prevent single point of failure",
+        },
+    )
+    graph.add_node(
+        NodeType.PATTERN.value,
+        "PAT-001",
+        {
+            "id": "PAT-001",
+            "name": "Deny By Default",
+            "intent": "Block unless explicitly allowed",
+        },
+    )
+    graph.add_node(
+        NodeType.RULE.value,
+        "CR-001",
+        {
+            "id": "CR-001",
+            "text": "Validate CORS origins explicitly",
+            "why": "Prevent XSS",
+            "technologies": ["flask"],
+        },
+    )
+    graph.add_node(
+        "Finding",
+        "F-001",
+        {
+            "id": "F-001",
+            "description": "CORS wildcard in server.py",
+        },
+    )
 
     # Edges
     graph.add_edge("P-001", "PAT-001", EdgeType.INFORMS.value)
@@ -59,6 +78,7 @@ def _build_graph_with_hierarchy() -> MemoryGraphAdapter:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 class TestExpandTopResults:
     def test_follows_instantiates_backward(self):
@@ -137,12 +157,16 @@ class TestExpandTopResults:
         # Add extra rules
         for i in range(5):
             rid = f"CR-EXTRA-{i:03d}"
-            graph.add_node(NodeType.RULE.value, rid, {
-                "id": rid, "text": f"Extra rule {i}",
-            })
+            graph.add_node(
+                NodeType.RULE.value,
+                rid,
+                {
+                    "id": rid,
+                    "text": f"Extra rule {i}",
+                },
+            )
 
-        scored = [{"id": f"CR-EXTRA-{i:03d}", "_relevance_score": 0.9 - i * 0.1}
-                  for i in range(5)]
+        scored = [{"id": f"CR-EXTRA-{i:03d}", "_relevance_score": 0.9 - i * 0.1} for i in range(5)]
 
         # With max_expand=2, only first 2 nodes are expanded
         expanded = expand_top_results(graph, scored, max_expand=2)
@@ -156,9 +180,14 @@ class TestExpandTopResults:
     def test_no_edges_returns_empty(self):
         """Node with no edges → no expansion."""
         graph = MemoryGraphAdapter()
-        graph.add_node(NodeType.RULE.value, "CR-LONELY", {
-            "id": "CR-LONELY", "text": "No connections",
-        })
+        graph.add_node(
+            NodeType.RULE.value,
+            "CR-LONELY",
+            {
+                "id": "CR-LONELY",
+                "text": "No connections",
+            },
+        )
 
         scored = [{"id": "CR-LONELY", "_relevance_score": 0.8}]
         assert expand_top_results(graph, scored) == []

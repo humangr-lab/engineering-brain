@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import tempfile
 
 import pytest
@@ -23,55 +22,75 @@ def config():
 def graph():
     g = MemoryGraphAdapter()
     # Add L1 principles
-    g.add_node(NodeType.PRINCIPLE.value, "P-SEC-BOUNDARY", {
-        "id": "P-SEC-BOUNDARY",
-        "name": "Validate at Boundary",
-        "why": "All input is hostile until proven otherwise",
-        "how_to_apply": "Validate at every system boundary",
-        "mental_model": "Castle walls metaphor",
-        "domains": ["security"],
-    })
-    g.add_node(NodeType.PRINCIPLE.value, "P-ERR-FAIL-FAST", {
-        "id": "P-ERR-FAIL-FAST",
-        "name": "Fail Fast",
-        "why": "Catching errors early prevents cascading failures",
-        "how_to_apply": "Validate preconditions at function entry",
-        "mental_model": "Electrical fuse analogy",
-        "domains": ["error_handling"],
-    })
+    g.add_node(
+        NodeType.PRINCIPLE.value,
+        "P-SEC-BOUNDARY",
+        {
+            "id": "P-SEC-BOUNDARY",
+            "name": "Validate at Boundary",
+            "why": "All input is hostile until proven otherwise",
+            "how_to_apply": "Validate at every system boundary",
+            "mental_model": "Castle walls metaphor",
+            "domains": ["security"],
+        },
+    )
+    g.add_node(
+        NodeType.PRINCIPLE.value,
+        "P-ERR-FAIL-FAST",
+        {
+            "id": "P-ERR-FAIL-FAST",
+            "name": "Fail Fast",
+            "why": "Catching errors early prevents cascading failures",
+            "how_to_apply": "Validate preconditions at function entry",
+            "mental_model": "Electrical fuse analogy",
+            "domains": ["error_handling"],
+        },
+    )
     # Add L2 patterns
-    g.add_node(NodeType.PATTERN.value, "PAT-SEC-INPUT-VALID", {
-        "id": "PAT-SEC-INPUT-VALID",
-        "name": "Input Validation Pattern",
-        "intent": "Prevent injection attacks",
-        "when_to_use": "Any user-facing input",
-        "languages": ["python", "flask"],
-        "domains": ["security"],
-    })
-    g.add_node(NodeType.PATTERN.value, "PAT-ERR-RESULT", {
-        "id": "PAT-ERR-RESULT",
-        "name": "Result Type Pattern",
-        "intent": "Structured error handling",
-        "when_to_use": "Operations that can fail",
-        "languages": ["python"],
-        "domains": ["error_handling"],
-    })
+    g.add_node(
+        NodeType.PATTERN.value,
+        "PAT-SEC-INPUT-VALID",
+        {
+            "id": "PAT-SEC-INPUT-VALID",
+            "name": "Input Validation Pattern",
+            "intent": "Prevent injection attacks",
+            "when_to_use": "Any user-facing input",
+            "languages": ["python", "flask"],
+            "domains": ["security"],
+        },
+    )
+    g.add_node(
+        NodeType.PATTERN.value,
+        "PAT-ERR-RESULT",
+        {
+            "id": "PAT-ERR-RESULT",
+            "name": "Result Type Pattern",
+            "intent": "Structured error handling",
+            "when_to_use": "Operations that can fail",
+            "languages": ["python"],
+            "domains": ["error_handling"],
+        },
+    )
     # Add L3 rules
     for i in range(10):
         severity = "critical" if i < 2 else "high" if i < 5 else "medium"
         tech = "flask" if i < 7 else "django"
-        g.add_node(NodeType.RULE.value, f"CR-SEC-{i:03d}", {
-            "id": f"CR-SEC-{i:03d}",
-            "text": f"Security rule {i}",
-            "why": f"Because security matter #{i}",
-            "how_to_do_right": f"Do it right #{i}",
-            "severity": severity,
-            "confidence": 0.8 - (i * 0.05),
-            "technologies": [tech],
-            "domains": ["security"],
-            "example_good": f"good_code_{i}()",
-            "example_bad": f"bad_code_{i}()",
-        })
+        g.add_node(
+            NodeType.RULE.value,
+            f"CR-SEC-{i:03d}",
+            {
+                "id": f"CR-SEC-{i:03d}",
+                "text": f"Security rule {i}",
+                "why": f"Because security matter #{i}",
+                "how_to_do_right": f"Do it right #{i}",
+                "severity": severity,
+                "confidence": 0.8 - (i * 0.05),
+                "technologies": [tech],
+                "domains": ["security"],
+                "example_good": f"good_code_{i}()",
+                "example_bad": f"bad_code_{i}()",
+            },
+        )
     # Add edges
     g.add_edge("P-SEC-BOUNDARY", "PAT-SEC-INPUT-VALID", EdgeType.INFORMS.value)
     g.add_edge("PAT-SEC-INPUT-VALID", "CR-SEC-000", EdgeType.INSTANTIATES.value)
@@ -143,6 +162,7 @@ class TestPackMaterializer:
     def test_materialize_technology_filter_excludes_mismatch(self, materializer):
         """Bug fix: technology filter must actually exclude non-matching nodes."""
         from engineering_brain.core.types import PackTemplate
+
         template = PackTemplate(
             id="django-only",
             layers=["L3"],
@@ -268,12 +288,14 @@ class TestMaterializedPackLifecycle:
         """Bug fix: export() should use domain-specific tools, not defaults."""
         pack = materializer.materialize(security_template)
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-            path = f.name
+            pass
 
-        import tempfile as _tf
         import json as _json
+        import tempfile as _tf
+
         with _tf.TemporaryDirectory() as tmpdir:
             import os
+
             out = os.path.join(tmpdir, "test-export")
             pack.export(out)
             with open(os.path.join(out, "pack_data.json")) as f:
@@ -296,6 +318,7 @@ class TestBrainPackIntegration:
 
         config = brain._config
         import os
+
         if not os.path.isdir(config.pack_templates_directory):
             pytest.skip("Production templates not found")
 
@@ -314,6 +337,7 @@ class TestBrainPackIntegration:
 
         config = brain._config
         import os
+
         if not os.path.isdir(config.pack_templates_directory):
             pytest.skip("Production templates not found")
 
