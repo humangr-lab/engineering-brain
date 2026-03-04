@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 
 from ..results import BenchmarkResults
-from .theme import apply_hugr_theme, fig_to_base64, get_system_color, HUGR_BLUE
+from .theme import apply_hugr_theme, fig_to_base64, get_system_color
 
 
 def bar_comparison(results: BenchmarkResults, dark: bool = False) -> str:
@@ -33,7 +33,7 @@ def bar_comparison(results: BenchmarkResults, dark: bool = False) -> str:
     x = np.arange(n_metrics)
     width = 0.8 / n_systems
 
-    for i, (name, values) in enumerate(zip(systems, data)):
+    for i, (name, values) in enumerate(zip(systems, data, strict=False)):
         offset = (i - n_systems / 2 + 0.5) * width
         bars = ax.bar(
             x + offset,
@@ -46,7 +46,7 @@ def bar_comparison(results: BenchmarkResults, dark: bool = False) -> str:
             zorder=3,
         )
         # Value labels on bars
-        for bar, val in zip(bars, values):
+        for bar, val in zip(bars, values, strict=False):
             ax.text(
                 bar.get_x() + bar.get_width() / 2,
                 bar.get_height() + 0.01,

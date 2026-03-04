@@ -34,10 +34,7 @@ def _resolve_systems(names: str) -> list:
     """Dynamically import and instantiate baseline systems."""
     import importlib
 
-    if names == "all":
-        keys = list(SYSTEM_REGISTRY.keys())
-    else:
-        keys = [k.strip() for k in names.split(",")]
+    keys = list(SYSTEM_REGISTRY.keys()) if names == "all" else [k.strip() for k in names.split(",")]
 
     systems = []
     for key in keys:

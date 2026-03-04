@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 
 from ..results import AblationResult
-from .theme import apply_hugr_theme, fig_to_base64, HUGR_BLUE, HUGR_RED, HUGR_GREEN
+from .theme import HUGR_GREEN, HUGR_RED, apply_hugr_theme, fig_to_base64
 
 
 def waterfall_impact(ablation_results: list[AblationResult], dark: bool = False) -> str:
@@ -27,7 +27,7 @@ def waterfall_impact(ablation_results: list[AblationResult], dark: bool = False)
     bars = ax.barh(y_pos, deltas, color=colors, edgecolor="white", linewidth=0.5, height=0.7, zorder=3)
 
     # Value labels
-    for bar, delta in zip(bars, deltas):
+    for bar, delta in zip(bars, deltas, strict=False):
         x = bar.get_width()
         sign = "+" if delta >= 0 else ""
         ha = "left" if x >= 0 else "right"

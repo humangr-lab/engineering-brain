@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from ..baselines.brain_system import BrainSystem
 from ..datasets.loader import DatasetLoader

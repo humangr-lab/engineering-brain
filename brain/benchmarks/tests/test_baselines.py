@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
-
 from benchmarks.baselines.base import BaselineSystem, SystemResult
 from benchmarks.baselines.brain_system import BrainSystem
 from benchmarks.baselines.graph_rag import GraphRAGSystem

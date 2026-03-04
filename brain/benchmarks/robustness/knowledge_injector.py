@@ -60,4 +60,4 @@ class KnowledgeInjector:
 
     def get_scenarios(self) -> list[str]:
         """Return available adversarial scenarios."""
-        return [k for k in self._data.keys() if k != "version"]
+        return [k for k in self._data if k != "version"]

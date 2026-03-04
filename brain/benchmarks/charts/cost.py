@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 
 from ..results import BenchmarkResults, CostProfile
-from .theme import apply_hugr_theme, fig_to_base64, get_system_color, HUGR_BLUE
+from .theme import apply_hugr_theme, fig_to_base64, get_system_color
 
 
 def latency_comparison(cost_profiles: list[CostProfile], dark: bool = False) -> str:

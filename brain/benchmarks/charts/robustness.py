@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 
 from ..results import RobustnessScenarioResult
-from .theme import apply_hugr_theme, fig_to_base64, HUGR_BLUE, HUGR_RED, HUGR_GREEN, HUGR_AMBER
+from .theme import HUGR_AMBER, HUGR_GREEN, HUGR_RED, apply_hugr_theme, fig_to_base64
 
 
 def degradation_chart(robustness_results: list[RobustnessScenarioResult], dark: bool = False) -> str:
@@ -39,7 +39,7 @@ def degradation_chart(robustness_results: list[RobustnessScenarioResult], dark: 
     # Right: Resilience scores
     colors = [HUGR_GREEN if r >= 0.8 else HUGR_AMBER if r >= 0.6 else HUGR_RED for r in resilience]
     bars = ax2.bar(x, resilience, color=colors, edgecolor="white", linewidth=0.5, zorder=3)
-    for bar, val in zip(bars, resilience):
+    for bar, val in zip(bars, resilience, strict=False):
         ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02, f"{val:.3f}", ha="center", va="bottom", fontsize=11, fontweight="medium")
     ax2.set_xticks(x)
     ax2.set_xticklabels(scenarios, fontweight="medium")

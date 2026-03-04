@@ -70,8 +70,8 @@ class RawLLMSystem(BaselineSystem):
             import anthropic
 
             self._client = anthropic.Anthropic(api_key=api_key)
-        except ImportError:
-            raise RuntimeError("Raw LLM baseline requires 'anthropic' package: pip install anthropic")
+        except ImportError as exc:
+            raise RuntimeError("Raw LLM baseline requires 'anthropic' package: pip install anthropic") from exc
 
         # Also seed a Brain instance for node matching
         from engineering_brain.core.brain import Brain

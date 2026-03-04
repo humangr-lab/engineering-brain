@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import inspect
 import re
-from dataclasses import dataclass, fields as dc_fields
+from dataclasses import dataclass
+from dataclasses import fields as dc_fields
 from typing import Any
 
 from .flag_groups import get_flag_group
