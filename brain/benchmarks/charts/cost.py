@@ -22,9 +22,39 @@ def latency_comparison(cost_profiles: list[CostProfile], dark: bool = False) -> 
     x = np.arange(len(names))
     width = 0.25
 
-    ax.bar(x - width, p50, width, label="p50", color=[get_system_color(n) for n in names], edgecolor="white", linewidth=0.5, alpha=0.6, zorder=3)
-    ax.bar(x, p95, width, label="p95", color=[get_system_color(n) for n in names], edgecolor="white", linewidth=0.5, alpha=0.8, zorder=3)
-    ax.bar(x + width, p99, width, label="p99", color=[get_system_color(n) for n in names], edgecolor="white", linewidth=0.5, alpha=1.0, zorder=3)
+    ax.bar(
+        x - width,
+        p50,
+        width,
+        label="p50",
+        color=[get_system_color(n) for n in names],
+        edgecolor="white",
+        linewidth=0.5,
+        alpha=0.6,
+        zorder=3,
+    )
+    ax.bar(
+        x,
+        p95,
+        width,
+        label="p95",
+        color=[get_system_color(n) for n in names],
+        edgecolor="white",
+        linewidth=0.5,
+        alpha=0.8,
+        zorder=3,
+    )
+    ax.bar(
+        x + width,
+        p99,
+        width,
+        label="p99",
+        color=[get_system_color(n) for n in names],
+        edgecolor="white",
+        linewidth=0.5,
+        alpha=1.0,
+        zorder=3,
+    )
 
     ax.set_xticks(x)
     ax.set_xticklabels(names, fontweight="medium")
@@ -40,7 +70,9 @@ def latency_comparison(cost_profiles: list[CostProfile], dark: bool = False) -> 
     return fig_to_base64(fig)
 
 
-def quality_vs_cost(results: BenchmarkResults, cost_profiles: list[CostProfile], dark: bool = False) -> str:
+def quality_vs_cost(
+    results: BenchmarkResults, cost_profiles: list[CostProfile], dark: bool = False
+) -> str:
     """Scatter plot: quality (NDCG) vs cost (latency)."""
     apply_hugr_theme(dark)
 

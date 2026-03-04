@@ -24,7 +24,9 @@ def waterfall_impact(ablation_results: list[AblationResult], dark: bool = False)
     colors = [HUGR_RED if d < -0.001 else HUGR_GREEN if d > 0.001 else "#888888" for d in deltas]
     y_pos = np.arange(len(names))
 
-    bars = ax.barh(y_pos, deltas, color=colors, edgecolor="white", linewidth=0.5, height=0.7, zorder=3)
+    bars = ax.barh(
+        y_pos, deltas, color=colors, edgecolor="white", linewidth=0.5, height=0.7, zorder=3
+    )
 
     # Value labels
     for bar, delta in zip(bars, deltas, strict=False):
@@ -32,7 +34,14 @@ def waterfall_impact(ablation_results: list[AblationResult], dark: bool = False)
         sign = "+" if delta >= 0 else ""
         ha = "left" if x >= 0 else "right"
         offset = 0.001 if x >= 0 else -0.001
-        ax.text(x + offset, bar.get_y() + bar.get_height() / 2, f"{sign}{delta:.4f}", va="center", ha=ha, fontsize=9)
+        ax.text(
+            x + offset,
+            bar.get_y() + bar.get_height() / 2,
+            f"{sign}{delta:.4f}",
+            va="center",
+            ha=ha,
+            fontsize=9,
+        )
 
     ax.set_yticks(y_pos)
     ax.set_yticklabels(names, fontsize=10)
@@ -81,7 +90,9 @@ def heatmap_flags(ablation_results: list[AblationResult], dark: bool = False) ->
             val = arr[i, j]
             sign = "+" if val >= 0 else ""
             text_color = "white" if abs(val) > vmax * 0.6 else "black"
-            ax.text(j, i, f"{sign}{val:.4f}", ha="center", va="center", fontsize=8, color=text_color)
+            ax.text(
+                j, i, f"{sign}{val:.4f}", ha="center", va="center", fontsize=8, color=text_color
+            )
 
     ax.set_title("Ablation Impact Matrix (delta when toggled OFF)", fontweight="bold", pad=16)
     fig.colorbar(im, ax=ax, label="Delta", shrink=0.8)

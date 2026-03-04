@@ -113,7 +113,9 @@ def cmd_ablation(args: argparse.Namespace) -> None:
     print("-" * 75)
     for r in sorted(results, key=lambda x: abs(x.delta_ndcg), reverse=True):
         sign = "+" if r.delta_ndcg >= 0 else ""
-        print(f"  {r.flag_name:<38} {r.group:<12} {sign}{r.delta_ndcg:>10.4f} {sign}{r.delta_mrr:>9.4f}")
+        print(
+            f"  {r.flag_name:<38} {r.group:<12} {sign}{r.delta_ndcg:>10.4f} {sign}{r.delta_mrr:>9.4f}"
+        )
 
 
 def cmd_robustness(args: argparse.Namespace) -> None:
@@ -189,7 +191,9 @@ def cmd_compare(args: argparse.Namespace) -> None:
         print(f"\n  {name}:")
         print(f"    NDCG@10:  {a1.avg_ndcg_at_10:.4f} -> {a2.avg_ndcg_at_10:.4f}  ({d_ndcg:+.4f})")
         print(f"    MRR:      {a1.avg_mrr:.4f} -> {a2.avg_mrr:.4f}  ({d_mrr:+.4f})")
-        print(f"    Latency:  {a1.avg_latency_ms:.1f} -> {a2.avg_latency_ms:.1f}ms  ({d_lat:+.1f}ms)")
+        print(
+            f"    Latency:  {a1.avg_latency_ms:.1f} -> {a2.avg_latency_ms:.1f}ms  ({d_lat:+.1f}ms)"
+        )
         if d_ndcg < -0.01:
             print(f"    ** REGRESSION: NDCG dropped {abs(d_ndcg):.4f} **")
             regressions = True
@@ -217,7 +221,9 @@ def main() -> None:
 
     # run
     p_run = sub.add_parser("run", help="Run benchmark suite")
-    p_run.add_argument("--systems", default="all", help="Comma-separated: brain,naive_rag,raw_llm,graph_rag")
+    p_run.add_argument(
+        "--systems", default="all", help="Comma-separated: brain,naive_rag,raw_llm,graph_rag"
+    )
     p_run.add_argument("--category", nargs="*", default=None)
     p_run.add_argument("--difficulty", nargs="*", default=None)
     p_run.add_argument("--dataset", default=None, help="Dataset YAML path")
@@ -228,7 +234,9 @@ def main() -> None:
 
     # ablation
     p_abl = sub.add_parser("ablation", help="Run ablation study")
-    p_abl.add_argument("--group", default=None, help="scoring|retrieval|epistemic|llm|gaps|maintenance")
+    p_abl.add_argument(
+        "--group", default=None, help="scoring|retrieval|epistemic|llm|gaps|maintenance"
+    )
     p_abl.add_argument("--flags", nargs="*", default=None, help="Specific flag names")
     p_abl.add_argument("--dataset", default=None)
     p_abl.set_defaults(func=cmd_ablation)

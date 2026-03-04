@@ -117,12 +117,8 @@ class RobustnessRunner:
 
             degraded_agg = AggregateMetrics.from_suites(suites)
 
-            contamination_rate = (
-                total_contaminated / total_returned if total_returned > 0 else 0.0
-            )
-            detection_rate = (
-                total_detected / len(injected_ids) if injected_ids else 0.0
-            )
+            contamination_rate = total_contaminated / total_returned if total_returned > 0 else 0.0
+            detection_rate = total_detected / len(injected_ids) if injected_ids else 0.0
             degradation = (
                 (degraded_agg.avg_ndcg_at_10 - baseline_agg.avg_ndcg_at_10)
                 / baseline_agg.avg_ndcg_at_10

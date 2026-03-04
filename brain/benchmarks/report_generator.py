@@ -129,7 +129,13 @@ class ReportGenerator:
         winner = ""
         winner_metrics = 0
         if len(systems) > 1:
-            metric_keys = ["avg_ndcg_at_10", "avg_mrr", "avg_recall_at_10", "avg_map", "avg_f1_at_10"]
+            metric_keys = [
+                "avg_ndcg_at_10",
+                "avg_mrr",
+                "avg_recall_at_10",
+                "avg_map",
+                "avg_f1_at_10",
+            ]
             wins: dict[str, int] = {}
             for key in metric_keys:
                 best_name = max(systems.keys(), key=lambda n: getattr(systems[n].aggregate, key, 0))
@@ -142,9 +148,19 @@ class ReportGenerator:
         if primary:
             agg = primary.aggregate
             executive_cards = [
-                {"label": "NDCG@10", "value": f"{agg.avg_ndcg_at_10:.4f}", "delta": None, "delta_class": ""},
+                {
+                    "label": "NDCG@10",
+                    "value": f"{agg.avg_ndcg_at_10:.4f}",
+                    "delta": None,
+                    "delta_class": "",
+                },
                 {"label": "MRR", "value": f"{agg.avg_mrr:.4f}", "delta": None, "delta_class": ""},
-                {"label": "Recall@10", "value": f"{agg.avg_recall_at_10:.4f}", "delta": None, "delta_class": ""},
+                {
+                    "label": "Recall@10",
+                    "value": f"{agg.avg_recall_at_10:.4f}",
+                    "delta": None,
+                    "delta_class": "",
+                },
                 {"label": "MAP", "value": f"{agg.avg_map:.4f}", "delta": None, "delta_class": ""},
             ]
 
@@ -172,7 +188,8 @@ class ReportGenerator:
             "logo_base64": logo_base64,
             "date": time.strftime("%Y-%m-%d %H:%M UTC"),
             "dataset_version": self._results.dataset_version,
-            "total_queries": sum(sr.aggregate.count for sr in systems.values()) // max(len(systems), 1),
+            "total_queries": sum(sr.aggregate.count for sr in systems.values())
+            // max(len(systems), 1),
             "total_systems": len(systems),
             "charts": charts,
             # Cover
@@ -191,7 +208,9 @@ class ReportGenerator:
             "layer_count": 6,
             # Ablation
             "ablation_results": self._results.ablation,
-            "ablation_top10": sorted(self._results.ablation or [], key=lambda r: abs(r.delta_ndcg), reverse=True)[:10],
+            "ablation_top10": sorted(
+                self._results.ablation or [], key=lambda r: abs(r.delta_ndcg), reverse=True
+            )[:10],
             # Robustness
             "robustness_results": self._results.robustness,
             # Cost
@@ -230,7 +249,9 @@ class ReportGenerator:
         # Best category
         primary = systems[names[0]]
         if primary.per_category:
-            best_cat = max(primary.per_category.keys(), key=lambda c: primary.per_category[c].avg_ndcg_at_10)
+            best_cat = max(
+                primary.per_category.keys(), key=lambda c: primary.per_category[c].avg_ndcg_at_10
+            )
             findings.append(
                 f"Strongest category: <strong>{best_cat.replace('_', ' ').title()}</strong> "
                 f"(NDCG@10 = {primary.per_category[best_cat].avg_ndcg_at_10:.4f})."
@@ -255,7 +276,11 @@ class ReportGenerator:
 
         # Robustness summary
         if self._results.robustness:
-            avg_resilience = sum(r.resilience_score for r in self._results.robustness) / len(self._results.robustness)
-            findings.append(f"Average resilience score: <strong>{avg_resilience:.3f}</strong> across adversarial scenarios.")
+            avg_resilience = sum(r.resilience_score for r in self._results.robustness) / len(
+                self._results.robustness
+            )
+            findings.append(
+                f"Average resilience score: <strong>{avg_resilience:.3f}</strong> across adversarial scenarios."
+            )
 
         return findings

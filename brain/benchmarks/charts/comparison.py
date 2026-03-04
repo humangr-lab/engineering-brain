@@ -21,13 +21,15 @@ def bar_comparison(results: BenchmarkResults, dark: bool = False) -> str:
     data = []
     for name in systems:
         agg = results.systems[name].aggregate
-        data.append([
-            agg.avg_ndcg_at_10,
-            agg.avg_mrr,
-            agg.avg_recall_at_10,
-            agg.avg_map,
-            agg.avg_f1_at_10,
-        ])
+        data.append(
+            [
+                agg.avg_ndcg_at_10,
+                agg.avg_mrr,
+                agg.avg_recall_at_10,
+                agg.avg_map,
+                agg.avg_f1_at_10,
+            ]
+        )
 
     fig, ax = plt.subplots(figsize=(12, 6))
     x = np.arange(n_metrics)
@@ -142,7 +144,16 @@ def category_heatmap(results: BenchmarkResults, dark: bool = False) -> str:
         for j in range(len(categories)):
             val = arr[i, j]
             text_color = "white" if val < 0.75 else "black"
-            ax.text(j, i, f"{val:.3f}", ha="center", va="center", fontsize=10, color=text_color, fontweight="medium")
+            ax.text(
+                j,
+                i,
+                f"{val:.3f}",
+                ha="center",
+                va="center",
+                fontsize=10,
+                color=text_color,
+                fontweight="medium",
+            )
 
     ax.set_title("NDCG@10 by Category and System", fontweight="bold", pad=16)
     fig.colorbar(im, ax=ax, label="NDCG@10", shrink=0.8)

@@ -67,12 +67,9 @@ class BaselineSystem(ABC):
             if not nid:
                 continue
             node_techs = {
-                t.lower()
-                for t in (item.get("technologies") or item.get("languages") or [])
+                t.lower() for t in (item.get("technologies") or item.get("languages") or [])
             }
-            node_domains = {
-                d.lower() for d in (item.get("domains") or [item.get("domain", "")])
-            }
+            node_domains = {d.lower() for d in (item.get("domains") or [item.get("domain", "")])}
             if (query_techs & node_techs) or (query_domains & node_domains) or not query_techs:
                 relevant.add(nid)
         return relevant

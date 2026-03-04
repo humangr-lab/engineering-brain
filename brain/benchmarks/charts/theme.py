@@ -31,8 +31,26 @@ TEXT_PRIMARY = "#e0e4ed"
 TEXT_SECONDARY = "#8b92a8"
 
 # -- Palettes --
-PALETTE = [HUGR_BLUE, HUGR_PURPLE, HUGR_GREEN, HUGR_AMBER, HUGR_TEAL, HUGR_RED, HUGR_ORANGE, HUGR_INDIGO]
-PALETTE_LIGHT = ["#4a6fdf", "#7b5cdf", "#2e8b57", "#b8920e", "#1a8b8b", "#c9374e", "#b06820", "#5b5adf"]
+PALETTE = [
+    HUGR_BLUE,
+    HUGR_PURPLE,
+    HUGR_GREEN,
+    HUGR_AMBER,
+    HUGR_TEAL,
+    HUGR_RED,
+    HUGR_ORANGE,
+    HUGR_INDIGO,
+]
+PALETTE_LIGHT = [
+    "#4a6fdf",
+    "#7b5cdf",
+    "#2e8b57",
+    "#b8920e",
+    "#1a8b8b",
+    "#c9374e",
+    "#b06820",
+    "#5b5adf",
+]
 
 # -- System names to colors (consistent across all charts) --
 SYSTEM_COLORS = {

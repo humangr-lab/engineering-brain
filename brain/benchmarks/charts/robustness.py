@@ -9,7 +9,9 @@ from ..results import RobustnessScenarioResult
 from .theme import HUGR_AMBER, HUGR_GREEN, HUGR_RED, apply_hugr_theme, fig_to_base64
 
 
-def degradation_chart(robustness_results: list[RobustnessScenarioResult], dark: bool = False) -> str:
+def degradation_chart(
+    robustness_results: list[RobustnessScenarioResult], dark: bool = False
+) -> str:
     """Bar chart showing quality degradation per adversarial scenario."""
     apply_hugr_theme(dark)
 
@@ -23,8 +25,26 @@ def degradation_chart(robustness_results: list[RobustnessScenarioResult], dark: 
     # Left: NDCG before/after
     x = np.arange(len(scenarios))
     width = 0.35
-    ax1.bar(x - width / 2, baseline_ndcg, width, label="Clean Baseline", color=HUGR_GREEN, edgecolor="white", linewidth=0.5, zorder=3)
-    ax1.bar(x + width / 2, degraded_ndcg, width, label="After Injection", color=HUGR_RED, edgecolor="white", linewidth=0.5, zorder=3)
+    ax1.bar(
+        x - width / 2,
+        baseline_ndcg,
+        width,
+        label="Clean Baseline",
+        color=HUGR_GREEN,
+        edgecolor="white",
+        linewidth=0.5,
+        zorder=3,
+    )
+    ax1.bar(
+        x + width / 2,
+        degraded_ndcg,
+        width,
+        label="After Injection",
+        color=HUGR_RED,
+        edgecolor="white",
+        linewidth=0.5,
+        zorder=3,
+    )
     ax1.set_xticks(x)
     ax1.set_xticklabels(scenarios, fontweight="medium")
     ax1.set_ylabel("NDCG@10")
@@ -40,7 +60,15 @@ def degradation_chart(robustness_results: list[RobustnessScenarioResult], dark: 
     colors = [HUGR_GREEN if r >= 0.8 else HUGR_AMBER if r >= 0.6 else HUGR_RED for r in resilience]
     bars = ax2.bar(x, resilience, color=colors, edgecolor="white", linewidth=0.5, zorder=3)
     for bar, val in zip(bars, resilience, strict=False):
-        ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02, f"{val:.3f}", ha="center", va="bottom", fontsize=11, fontweight="medium")
+        ax2.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.02,
+            f"{val:.3f}",
+            ha="center",
+            va="bottom",
+            fontsize=11,
+            fontweight="medium",
+        )
     ax2.set_xticks(x)
     ax2.set_xticklabels(scenarios, fontweight="medium")
     ax2.set_ylabel("Resilience Score")

@@ -63,10 +63,14 @@ class CostAnalyzer:
                         system_name=system.name,
                         avg_latency_ms=sum(latencies) / n,
                         median_latency_ms=statistics.median(latencies) if latencies else 0.0,
-                        p95_latency_ms=latencies[min(int(0.95 * len(latencies)), len(latencies) - 1)]
+                        p95_latency_ms=latencies[
+                            min(int(0.95 * len(latencies)), len(latencies) - 1)
+                        ]
                         if latencies
                         else 0.0,
-                        p99_latency_ms=latencies[min(int(0.99 * len(latencies)), len(latencies) - 1)]
+                        p99_latency_ms=latencies[
+                            min(int(0.99 * len(latencies)), len(latencies) - 1)
+                        ]
                         if latencies
                         else 0.0,
                         total_tokens=total_tokens,
