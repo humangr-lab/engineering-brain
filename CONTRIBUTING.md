@@ -74,13 +74,18 @@ Seeds are YAML files in `brain/engineering_brain/seeds/`. Each seed becomes node
 
 ```yaml
 # brain/engineering_brain/seeds/my_domain.yaml
-nodes:
+layer: rules
+domain: security
+
+knowledge:
   - id: CR-MY-001
-    type: rule
-    severity: high
+    statement: "Always validate input at system boundaries"
     text: "Always validate input at system boundaries"
-    technologies: [python, flask]
-    domains: [security, api]
+    severity: high
+    technologies:
+      lang: [python, javascript]
+    domains:
+      domain: [security, api]
     why: "Unvalidated input is the root cause of injection attacks"
     how_to_do_right: "Use Pydantic models or marshmallow schemas"
 ```

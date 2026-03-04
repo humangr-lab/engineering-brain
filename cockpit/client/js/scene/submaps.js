@@ -215,7 +215,6 @@ export function enterSubmap(nodeId, submaps, nodeDetails, openModal) {
   const neonColor = getNeon(smColor);
   const dk = isDark();
 
-  _createDefaultPlatform(_subGroup, neonColor);
   _particles = _createAmbientParticles(_subGroup);
 
   // ── Build nodes ──

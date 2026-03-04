@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-The Engineering Brain exposes 20 tools and 5 resources via the [Model Context Protocol](https://modelcontextprotocol.io).
+The Engineering Brain exposes 22 tools and 5 resources via the [Model Context Protocol](https://modelcontextprotocol.io).
 
 ## Setup
 
@@ -64,6 +64,27 @@ Add to your Claude Desktop or Claude Code config:
 |------|-------------|
 | `brain_mine_code` | Mine patterns from Python source files via AST analysis. Discovers anti-patterns and creates L4 Findings. |
 
+### Agent (Deep Reasoning)
+
+Requires `BRAIN_AGENT_ENABLED=true` and `BRAIN_AGENT_API_KEY` set to an Anthropic API key (BYOK).
+
+| Tool | Description |
+|------|-------------|
+| `brain_agent` | Deep multi-domain reasoning via orchestrator + domain workers. Decomposes complex questions, dispatches specialist workers (security, architecture, performance, debugging, general) that reason over brain knowledge with an LLM, and synthesizes a composed answer with evidence citations and confidence scores. Simple queries use the fast path (zero LLM). |
+| `brain_agent_status` | Check agent availability. Returns whether the agent is configured, enabled, and which model is active. |
+
+**Parameters for `brain_agent`:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `question` | string | Yes | The engineering question to analyze |
+| `intent` | string | No | Query intent: `explanation`, `decision`, `analysis`, `investigation`, `synthesis` (default: `explanation`) |
+| `domain_hints` | list | No | Domain hints: `security`, `architecture`, `performance`, `debugging`, `general` |
+| `technology_hints` | list | No | Technology hints: `python`, `flask`, `react`, etc. |
+| `context` | string | No | Additional context for the query |
+| `constraints` | list | No | Constraints to apply during reasoning |
+| `max_depth` | int | No | Reasoning depth (1-5, default: 2) |
+
 ## Resources
 
 | Resource URI | Description |
@@ -74,6 +95,30 @@ Add to your Claude Desktop or Claude Code config:
 | `brain://gaps` | Knowledge gaps identified by the epistemic engine |
 | `brain://version` | Server version and capabilities |
 
+## Knowledge Assembly & Guardrails
+
+Query tools (`brain_query`, `brain_think`, `brain_reason`) return results that go through the Knowledge Assembly pipeline:
+
+1. **Complexity classification** — simple/moderate/complex based on query length and candidate count
+2. **Strategy selection** — DIRECT (zero LLM), CURATED (LLM-selected), or SYNTHESIZED (full LLM synthesis)
+3. **Guardrail annotation** — Each node is tagged with RFC 2119 obligations (MUST/MUST NOT/SHOULD/MAY)
+
+The `KnowledgeResult` includes a `guardrails` field:
+
+```json
+{
+  "guardrails": {
+    "must_do": [{"node_id": "CR-SEC-001", "obligation": "MUST", "text": "Set explicit CORS origins", "why": "Wildcard allows any domain"}],
+    "must_not_do": [{"node_id": "CR-SEC-042", "obligation": "MUST NOT", "text": "Never use eval() on user input"}],
+    "should_do": [...],
+    "may_do": [...],
+    "inapplicable_ids": ["CR-REACT-001"]
+  }
+}
+```
+
+Disable with `BRAIN_GUARDRAILS=false` or `BRAIN_LLM_KNOWLEDGE_ASSEMBLY=false`.
+
 ## Example Usage
 
 Ask your AI agent:
@@ -83,3 +128,7 @@ Ask your AI agent:
 - *"Create a security review pack for our Python backend"*
 - *"What contradictions exist in the knowledge about caching?"*
 - *"Mine patterns from src/api/ for anti-patterns"*
+
+---
+
+See also: [Architecture](architecture.md) · [Getting Started](getting-started.md) · [Extending the Knowledge Graph](extending.md)
