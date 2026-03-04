@@ -8,7 +8,6 @@ All tests use the memory adapter only — no Docker or external services require
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import tempfile
@@ -25,10 +24,10 @@ from engineering_brain.core.brain import Brain
 from engineering_brain.core.config import BrainConfig
 from engineering_brain.core.types import KnowledgeResult
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture()
 def brain() -> Brain:
@@ -75,6 +74,7 @@ def seeded_brain(brain: Brain, tmp_path: Path) -> Brain:
 # 1. Create Brain with memory adapter
 # ---------------------------------------------------------------------------
 
+
 class TestBrainCreation:
     def test_create_memory_brain(self, brain: Brain) -> None:
         assert brain.is_healthy()
@@ -89,6 +89,7 @@ class TestBrainCreation:
 # ---------------------------------------------------------------------------
 # 2. Add rules (add_rule, batch_add_rules)
 # ---------------------------------------------------------------------------
+
 
 class TestAddRules:
     def test_add_rule_returns_id(self, brain: Brain) -> None:
@@ -146,6 +147,7 @@ class TestAddRules:
 # 3. Query and verify results have formatted_text
 # ---------------------------------------------------------------------------
 
+
 class TestQuery:
     def test_query_empty_brain(self, brain: Brain) -> None:
         result = brain.query("flask security best practices")
@@ -175,6 +177,7 @@ class TestQuery:
 # ---------------------------------------------------------------------------
 # 4. Version tracking (version increments on add)
 # ---------------------------------------------------------------------------
+
 
 class TestVersionTracking:
     def test_version_increments_on_add_rule(self, brain: Brain) -> None:
@@ -207,11 +210,13 @@ class TestVersionTracking:
 
     def test_batch_add_increments_once(self, brain: Brain) -> None:
         v0 = brain.version
-        brain.batch_add_rules([
-            {"text": "R1", "why": "W1", "severity": "low", "id": "CR-V1"},
-            {"text": "R2", "why": "W2", "severity": "low", "id": "CR-V2"},
-            {"text": "R3", "why": "W3", "severity": "low", "id": "CR-V3"},
-        ])
+        brain.batch_add_rules(
+            [
+                {"text": "R1", "why": "W1", "severity": "low", "id": "CR-V1"},
+                {"text": "R2", "why": "W2", "severity": "low", "id": "CR-V2"},
+                {"text": "R3", "why": "W3", "severity": "low", "id": "CR-V3"},
+            ]
+        )
         # Batch add increments write counter exactly once
         assert brain.version == v0 + 1
 
@@ -219,6 +224,7 @@ class TestVersionTracking:
 # ---------------------------------------------------------------------------
 # 5. Validation (_validate_rule raises on empty why)
 # ---------------------------------------------------------------------------
+
 
 class TestValidation:
     def test_validate_rule_raises_on_empty_why(self) -> None:
@@ -261,6 +267,7 @@ class TestValidation:
 # ---------------------------------------------------------------------------
 # 6. Seed versioning (ingest, second ingest skips, force=True reloads)
 # ---------------------------------------------------------------------------
+
 
 class TestSeedVersioning:
     def test_ingest_loads_rules(self, brain: Brain, tmp_path: Path) -> None:
@@ -324,6 +331,7 @@ class TestSeedVersioning:
 # 7. Maintenance cycle
 # ---------------------------------------------------------------------------
 
+
 class TestMaintenance:
     def test_maintenance_returns_dict(self, brain: Brain) -> None:
         # Add some rules first so there is material for maintenance
@@ -355,6 +363,7 @@ class TestMaintenance:
 # ---------------------------------------------------------------------------
 # 8. Save to tempfile, load from file, verify node counts match
 # ---------------------------------------------------------------------------
+
 
 class TestSaveLoad:
     def test_save_and_load_roundtrip(self, brain: Brain) -> None:
@@ -426,6 +435,7 @@ class TestSaveLoad:
 # 9. detect_communities
 # ---------------------------------------------------------------------------
 
+
 class TestDetectCommunities:
     def test_communities_empty_brain(self, brain: Brain) -> None:
         communities = brain.detect_communities()
@@ -453,6 +463,7 @@ class TestDetectCommunities:
 # 10. query_with_provenance
 # ---------------------------------------------------------------------------
 
+
 class TestQueryWithProvenance:
     def test_query_with_provenance_returns_tuple(self, seeded_brain: Brain) -> None:
         result, provenance = seeded_brain.query_with_provenance(
@@ -470,6 +481,7 @@ class TestQueryWithProvenance:
 # ---------------------------------------------------------------------------
 # 11. observation_count via reinforce
 # ---------------------------------------------------------------------------
+
 
 class TestObservationCount:
     def test_reinforce_increments_observation_count(self, brain: Brain) -> None:
@@ -492,7 +504,9 @@ class TestObservationCount:
         assert int(node.get("observation_count", 0)) == 1
         assert int(node.get("reinforcement_count", 0)) == 1
 
-    def test_negative_reinforce_increments_observation_not_reinforcement(self, brain: Brain) -> None:
+    def test_negative_reinforce_increments_observation_not_reinforcement(
+        self, brain: Brain
+    ) -> None:
         rid = brain.add_rule(
             text="Weaken test rule",
             why="Testing weakening",
@@ -532,6 +546,7 @@ class TestObservationCount:
 # ---------------------------------------------------------------------------
 # Bonus: stats, add_axiom, add_principle, add_pattern round-trip
 # ---------------------------------------------------------------------------
+
 
 class TestMiscAPI:
     def test_stats_reflect_node_counts(self, brain: Brain) -> None:

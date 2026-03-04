@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import pytest
 
-from engineering_brain.epistemic.opinion import OpinionTuple
-from engineering_brain.epistemic.fusion import cbf as brain_cbf
 from engineering_brain.epistemic.conflict_resolution import (
     dempster_conflict as brain_dempster,
+)
+from engineering_brain.epistemic.conflict_resolution import (
     murphy_weighted_average as brain_murphy,
 )
-
+from engineering_brain.epistemic.fusion import cbf as brain_cbf
+from engineering_brain.epistemic.opinion import OpinionTuple
 
 # Common test pairs
 _PAIRS = [
@@ -35,8 +36,9 @@ class TestCrossConsistency:
     def _try_import_esl(self):
         """Try to import ESL Opinion. Skip test if not available."""
         try:
-            from pipeline_v2.knowledge.epistemic.opinion import Opinion
             from pipeline_v2.knowledge.epistemic.fusion import cumulative_belief_fusion
+            from pipeline_v2.knowledge.epistemic.opinion import Opinion
+
             return Opinion, cumulative_belief_fusion
         except ImportError:
             pytest.skip("pipeline_v2 ESL not available for cross-consistency test")
@@ -44,11 +46,12 @@ class TestCrossConsistency:
     def _try_import_esl_conflict(self):
         """Try to import ESL conflict resolution. Skip if not available."""
         try:
-            from pipeline_v2.knowledge.epistemic.opinion import Opinion
             from pipeline_v2.knowledge.epistemic.conflict_resolution import (
                 dempster_conflict,
                 murphy_weighted_average,
             )
+            from pipeline_v2.knowledge.epistemic.opinion import Opinion
+
             return Opinion, dempster_conflict, murphy_weighted_average
         except ImportError:
             pytest.skip("pipeline_v2 ESL conflict resolution not available")
@@ -152,12 +155,8 @@ class TestCrossConsistency:
 
         ops = [(0.7, 0.1, 0.2, 0.5), (0.3, 0.5, 0.2, 0.5)]
 
-        brain_result = brain_murphy([
-            OpinionTuple(b=o[0], d=o[1], u=o[2], a=o[3]) for o in ops
-        ])
-        esl_result = esl_murphy([
-            Opinion(b=o[0], d=o[1], u=o[2], a=o[3]) for o in ops
-        ])
+        brain_result = brain_murphy([OpinionTuple(b=o[0], d=o[1], u=o[2], a=o[3]) for o in ops])
+        esl_result = esl_murphy([Opinion(b=o[0], d=o[1], u=o[2], a=o[3]) for o in ops])
 
         assert brain_result.b == pytest.approx(esl_result.b, abs=1e-6)
         assert brain_result.d == pytest.approx(esl_result.d, abs=1e-6)
@@ -173,12 +172,8 @@ class TestCrossConsistency:
             (0.5, 0.2, 0.3, 0.5),
         ]
 
-        brain_result = brain_murphy([
-            OpinionTuple(b=o[0], d=o[1], u=o[2], a=o[3]) for o in ops
-        ])
-        esl_result = esl_murphy([
-            Opinion(b=o[0], d=o[1], u=o[2], a=o[3]) for o in ops
-        ])
+        brain_result = brain_murphy([OpinionTuple(b=o[0], d=o[1], u=o[2], a=o[3]) for o in ops])
+        esl_result = esl_murphy([Opinion(b=o[0], d=o[1], u=o[2], a=o[3]) for o in ops])
 
         assert brain_result.b == pytest.approx(esl_result.b, abs=1e-6)
         assert brain_result.d == pytest.approx(esl_result.d, abs=1e-6)
@@ -190,12 +185,8 @@ class TestCrossConsistency:
 
         ops = [(0.9, 0.0, 0.1, 0.5), (0.0, 0.9, 0.1, 0.5)]
 
-        brain_result = brain_murphy([
-            OpinionTuple(b=o[0], d=o[1], u=o[2], a=o[3]) for o in ops
-        ])
-        esl_result = esl_murphy([
-            Opinion(b=o[0], d=o[1], u=o[2], a=o[3]) for o in ops
-        ])
+        brain_result = brain_murphy([OpinionTuple(b=o[0], d=o[1], u=o[2], a=o[3]) for o in ops])
+        esl_result = esl_murphy([Opinion(b=o[0], d=o[1], u=o[2], a=o[3]) for o in ops])
 
         assert brain_result.b == pytest.approx(esl_result.b, abs=1e-6)
         assert brain_result.d == pytest.approx(esl_result.d, abs=1e-6)

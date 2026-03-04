@@ -8,10 +8,7 @@ import tempfile
 
 import pytest
 
-from engineering_brain.adapters.memory import MemoryGraphAdapter
-from engineering_brain.core.config import BrainConfig
-from engineering_brain.core.schema import EdgeType, NodeType
-from engineering_brain.core.types import MCPToolSpec, MaterializedPack, PackTemplate
+from engineering_brain.core.types import MaterializedPack, MCPToolSpec, PackTemplate
 from engineering_brain.export.pack_mcp_generator import PackMCPGenerator
 from engineering_brain.export.pack_mcp_runtime import (
     PackIndex,
@@ -291,7 +288,9 @@ class TestHandlers:
 
     def test_handle_aggregate(self, pack_data):
         index = PackIndex(pack_data)
-        result = handle_aggregate(index, {"topic": "input security"}, {"layers": ["L1", "L2", "L3"]})
+        result = handle_aggregate(
+            index, {"topic": "input security"}, {"layers": ["L1", "L2", "L3"]}
+        )
         assert "Multi-Layer" in result or "security" in result.lower()
 
     def test_handle_stats(self, pack_data):
@@ -308,14 +307,18 @@ class TestPackMCPServer:
         gen = PackMCPGenerator()
         server = gen.generate_server(
             MaterializedPack(
-                id="test", nodes=pack_data["nodes"], edges=pack_data["edges"],
+                id="test",
+                nodes=pack_data["nodes"],
+                edges=pack_data["edges"],
                 reasoning_edges=pack_data["reasoning_edges"],
                 node_count=len(pack_data["nodes"]),
                 template_id="security-review",
             ),
             template=sample_template,
         )
-        resp = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        resp = server.handle_request(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+        )
         assert resp["result"]["protocolVersion"] == "2024-11-05"
         assert resp["result"]["serverInfo"]["name"] == "security-review"
 
@@ -323,14 +326,18 @@ class TestPackMCPServer:
         gen = PackMCPGenerator()
         server = gen.generate_server(
             MaterializedPack(
-                id="test", nodes=pack_data["nodes"], edges=pack_data["edges"],
+                id="test",
+                nodes=pack_data["nodes"],
+                edges=pack_data["edges"],
                 reasoning_edges=pack_data["reasoning_edges"],
                 node_count=len(pack_data["nodes"]),
                 template_id="security-review",
             ),
             template=sample_template,
         )
-        resp = server.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        resp = server.handle_request(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+        )
         tools = resp["result"]["tools"]
         assert len(tools) == 6
         tool_names = [t["name"] for t in tools]
@@ -341,18 +348,26 @@ class TestPackMCPServer:
         gen = PackMCPGenerator()
         server = gen.generate_server(
             MaterializedPack(
-                id="test", nodes=pack_data["nodes"], edges=pack_data["edges"],
+                id="test",
+                nodes=pack_data["nodes"],
+                edges=pack_data["edges"],
                 reasoning_edges=pack_data["reasoning_edges"],
                 node_count=len(pack_data["nodes"]),
                 template_id="security-review",
             ),
             template=sample_template,
         )
-        resp = server.handle_request({
-            "jsonrpc": "2.0", "id": 3,
-            "method": "tools/call",
-            "params": {"name": "check_vulnerability", "arguments": {"code": "user input validation"}},
-        })
+        resp = server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "check_vulnerability",
+                    "arguments": {"code": "user input validation"},
+                },
+            }
+        )
         assert "result" in resp
         content = resp["result"]["content"]
         assert len(content) > 0
@@ -363,32 +378,41 @@ class TestPackMCPServer:
         gen = PackMCPGenerator()
         server = gen.generate_server(
             MaterializedPack(
-                id="test", nodes=pack_data["nodes"], edges=pack_data["edges"],
+                id="test",
+                nodes=pack_data["nodes"],
+                edges=pack_data["edges"],
                 reasoning_edges=pack_data["reasoning_edges"],
                 node_count=len(pack_data["nodes"]),
                 template_id="security-review",
             ),
             template=sample_template,
         )
-        resp = server.handle_request({
-            "jsonrpc": "2.0", "id": 4,
-            "method": "tools/call",
-            "params": {"name": "nonexistent", "arguments": {}},
-        })
+        resp = server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "nonexistent", "arguments": {}},
+            }
+        )
         assert "error" in resp
 
     def test_resources_list(self, pack_data, sample_template):
         gen = PackMCPGenerator()
         server = gen.generate_server(
             MaterializedPack(
-                id="test", nodes=pack_data["nodes"], edges=pack_data["edges"],
+                id="test",
+                nodes=pack_data["nodes"],
+                edges=pack_data["edges"],
                 reasoning_edges=pack_data["reasoning_edges"],
                 node_count=len(pack_data["nodes"]),
                 template_id="security-review",
             ),
             template=sample_template,
         )
-        resp = server.handle_request({"jsonrpc": "2.0", "id": 5, "method": "resources/list", "params": {}})
+        resp = server.handle_request(
+            {"jsonrpc": "2.0", "id": 5, "method": "resources/list", "params": {}}
+        )
         resources = resp["result"]["resources"]
         assert len(resources) == 2
         uris = [r["uri"] for r in resources]
@@ -398,18 +422,23 @@ class TestPackMCPServer:
         gen = PackMCPGenerator()
         server = gen.generate_server(
             MaterializedPack(
-                id="test", nodes=pack_data["nodes"], edges=pack_data["edges"],
+                id="test",
+                nodes=pack_data["nodes"],
+                edges=pack_data["edges"],
                 reasoning_edges=pack_data["reasoning_edges"],
                 node_count=len(pack_data["nodes"]),
                 template_id="security-review",
             ),
             template=sample_template,
         )
-        resp = server.handle_request({
-            "jsonrpc": "2.0", "id": 6,
-            "method": "resources/read",
-            "params": {"uri": "pack://stats"},
-        })
+        resp = server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "resources/read",
+                "params": {"uri": "pack://stats"},
+            }
+        )
         assert "result" in resp
         contents = resp["result"]["contents"]
         assert len(contents) == 1
@@ -418,14 +447,18 @@ class TestPackMCPServer:
         gen = PackMCPGenerator()
         server = gen.generate_server(
             MaterializedPack(
-                id="test", nodes=pack_data["nodes"], edges=pack_data["edges"],
+                id="test",
+                nodes=pack_data["nodes"],
+                edges=pack_data["edges"],
                 reasoning_edges=pack_data["reasoning_edges"],
                 node_count=len(pack_data["nodes"]),
                 template_id="security-review",
             ),
             template=sample_template,
         )
-        resp = server.handle_request({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+        resp = server.handle_request(
+            {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
+        )
         assert resp is None
 
 
@@ -436,7 +469,7 @@ class TestPackExport:
         gen = PackMCPGenerator()
         with tempfile.TemporaryDirectory() as tmpdir:
             output = os.path.join(tmpdir, "my-pack")
-            stats = gen.export(sample_pack, output, template=sample_template)
+            gen.export(sample_pack, output, template=sample_template)
 
             assert os.path.isdir(output)
             assert os.path.isfile(os.path.join(output, "server.py"))
@@ -490,6 +523,7 @@ class TestPackExport:
 
             # Test that runtime can be imported from the export directory
             import importlib.util
+
             spec = importlib.util.spec_from_file_location(
                 "pack_mcp_runtime",
                 os.path.join(output, "pack_mcp_runtime.py"),
@@ -522,11 +556,15 @@ class TestPackExport:
             server = PackMCPServer(pack_data, data["tool_manifest"])
 
             # Test initialize
-            resp = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            resp = server.handle_request(
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+            )
             assert resp["result"]["protocolVersion"] == "2024-11-05"
 
             # Test tools/list
-            resp = server.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+            resp = server.handle_request(
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+            )
             assert len(resp["result"]["tools"]) > 0
 
 
@@ -537,7 +575,9 @@ class TestDefaultToolManifest:
         gen = PackMCPGenerator()
         server = gen.generate_server(sample_pack, template=None)
 
-        resp = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+        resp = server.handle_request(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        )
         tools = resp["result"]["tools"]
         assert len(tools) == 4  # default tools
         tool_names = [t["name"] for t in tools]
@@ -550,11 +590,17 @@ class TestDefaultToolManifest:
         gen = PackMCPGenerator()
         server = gen.generate_server(sample_pack, template=None)
 
-        resp = server.handle_request({
-            "jsonrpc": "2.0", "id": 2,
-            "method": "tools/call",
-            "params": {"name": "search_knowledge", "arguments": {"query": "security validation"}},
-        })
+        resp = server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_knowledge",
+                    "arguments": {"query": "security validation"},
+                },
+            }
+        )
         assert "result" in resp
         text = resp["result"]["content"][0]["text"]
         assert len(text) > 0

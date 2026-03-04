@@ -15,21 +15,18 @@ Covers:
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tempfile
-import shutil
-
-import pytest
 
 # Ensure src is on the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from engineering_brain.learning.code_pattern_miner import (
+    PATTERN_TYPES,
     CodePatternMiner,
     MinedPattern,
-    PATTERN_TYPES,
 )
-
 
 # =============================================================================
 # Temp file helpers
@@ -401,3 +398,110 @@ def test_mine_clean_code_no_bad_patterns():
         assert len(security_patterns) == 0
     finally:
         os.unlink(path)
+
+
+# =============================================================================
+# LLM Code Mining Description
+# =============================================================================
+
+from unittest import mock
+
+
+class TestLLMCodeMining:
+    """Tests for _llm_describe_pattern."""
+
+    def test_flag_off_returns_none(self) -> None:
+        """LLM description skipped when flag is off."""
+        miner = CodePatternMiner()
+        pattern = MinedPattern(
+            pattern_type="error_handling",
+            description="Bare except clause",
+            code_snippet="try:\n    x=1\nexcept:\n    pass",
+            filepath="test.py",
+            line_number=1,
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = miner._llm_describe_pattern(pattern)
+            assert result is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_llm_success_returns_description(self, mock_flag, mock_llm) -> None:
+        """Returns significance text when LLM succeeds."""
+        mock_llm.return_value = (
+            "Bare except swallows all errors including SystemExit, making bugs invisible."
+        )
+        miner = CodePatternMiner()
+        pattern = MinedPattern(
+            pattern_type="error_handling",
+            description="Bare except clause",
+            code_snippet="try:\n    x=1\nexcept:\n    pass",
+            filepath="test.py",
+            line_number=1,
+        )
+        result = miner._llm_describe_pattern(pattern)
+        assert result is not None
+        assert "except" in result.lower() or "error" in result.lower()
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_llm_failure_returns_none(self, mock_flag, mock_llm) -> None:
+        """Returns None when LLM call fails."""
+        mock_llm.return_value = None
+        miner = CodePatternMiner()
+        pattern = MinedPattern(
+            pattern_type="error_handling",
+            description="Bare except",
+            code_snippet="except:\n    pass",
+            filepath="test.py",
+            line_number=1,
+        )
+        assert miner._llm_describe_pattern(pattern) is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_llm_too_short_returns_none(self, mock_flag, mock_llm) -> None:
+        """Returns None when LLM response is under 20 chars."""
+        mock_llm.return_value = "Bad"
+        miner = CodePatternMiner()
+        pattern = MinedPattern(
+            pattern_type="error_handling",
+            description="Bare except",
+            code_snippet="except:\n    pass",
+            filepath="test.py",
+            line_number=1,
+        )
+        assert miner._llm_describe_pattern(pattern) is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_integration_enriches_description(self, mock_flag, mock_llm) -> None:
+        """mine_file enriches pattern descriptions with LLM output."""
+        mock_llm.return_value = (
+            "Swallows SystemExit and KeyboardInterrupt, making process unkillable."
+        )
+        path = _write_temp_file(BARE_EXCEPT_CODE)
+        try:
+            miner = CodePatternMiner()
+            patterns = miner.mine_file(path)
+            error_patterns = [p for p in patterns if p.pattern_type == "error_handling"]
+            # At least one pattern should have enriched description
+            assert any("—" in p.description for p in error_patterns)
+        finally:
+            os.unlink(path)
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_integration_llm_failure_preserves_original(self, mock_flag, mock_llm) -> None:
+        """Original description preserved when LLM fails."""
+        mock_llm.return_value = None
+        path = _write_temp_file(BARE_EXCEPT_CODE)
+        try:
+            miner = CodePatternMiner()
+            patterns = miner.mine_file(path)
+            error_patterns = [p for p in patterns if p.pattern_type == "error_handling"]
+            # Descriptions should still exist (from heuristic)
+            for p in error_patterns:
+                assert p.description != ""
+        finally:
+            os.unlink(path)

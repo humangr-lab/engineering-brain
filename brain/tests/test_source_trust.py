@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from engineering_brain.epistemic.opinion import OpinionTuple
 from engineering_brain.epistemic.source_trust import (
     SOURCE_TRUST_MAP,
     source_to_opinion,
 )
-
 
 # --- SOURCE_TRUST_MAP ---
 

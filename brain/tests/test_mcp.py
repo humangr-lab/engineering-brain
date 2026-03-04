@@ -7,8 +7,8 @@ Does NOT test actual Brain calls (heavy imports).
 
 from __future__ import annotations
 
-import sys
 import os
+import sys
 
 # Ensure src/ is on the path so we can import the module directly.
 _SRC = os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, "src")
@@ -17,35 +17,32 @@ sys.path.insert(0, os.path.abspath(_SRC))
 import pytest
 
 from engineering_brain.mcp_server import (
-    TOOLS,
-    RESOURCES,
-    _handle_request,
-    _make_response,
-    _make_error,
-    _TOOL_HANDLERS,
-    _SERVER_INFO,
     _CAPABILITIES,
+    _SERVER_INFO,
+    _TOOL_HANDLERS,
+    RESOURCES,
+    TOOLS,
+    _handle_request,
+    _make_error,
+    _make_response,
 )
 
-
 # ---------------------------------------------------------------------------
-# 1. TOOLS list has exactly 10 tools
+# 1. TOOLS list has exactly 22 tools
 # ---------------------------------------------------------------------------
 
 
 class TestToolDefinitions:
     """Verify the TOOLS list structure and completeness."""
 
-    def test_tools_count_is_17(self):
-        assert len(TOOLS) == 20, f"Expected 20 tools, got {len(TOOLS)}"
+    def test_tools_count(self):
+        assert len(TOOLS) == 22, f"Expected 22 tools, got {len(TOOLS)}"
 
     def test_every_tool_has_required_keys(self):
         required_keys = {"name", "description", "inputSchema"}
         for tool in TOOLS:
             missing = required_keys - set(tool.keys())
-            assert not missing, (
-                f"Tool {tool.get('name', '???')} is missing keys: {missing}"
-            )
+            assert not missing, f"Tool {tool.get('name', '???')} is missing keys: {missing}"
 
     def test_every_input_schema_has_type_object(self):
         for tool in TOOLS:
@@ -53,12 +50,8 @@ class TestToolDefinitions:
             assert schema.get("type") == "object", (
                 f"Tool {tool['name']} inputSchema.type should be 'object'"
             )
-            assert "properties" in schema, (
-                f"Tool {tool['name']} inputSchema must have 'properties'"
-            )
-            assert "required" in schema, (
-                f"Tool {tool['name']} inputSchema must have 'required'"
-            )
+            assert "properties" in schema, f"Tool {tool['name']} inputSchema must have 'properties'"
+            assert "required" in schema, f"Tool {tool['name']} inputSchema must have 'required'"
 
     def test_tool_names_are_unique(self):
         names = [t["name"] for t in TOOLS]
@@ -87,12 +80,12 @@ class TestToolDefinitions:
             "brain_reinforce",
             "brain_prediction_outcome",
             "brain_mine_code",
+            "brain_agent",
+            "brain_agent_status",
         }
         actual = {t["name"] for t in TOOLS}
         assert expected == actual, (
-            f"Tool name mismatch.\n"
-            f"  Missing: {expected - actual}\n"
-            f"  Extra:   {actual - expected}"
+            f"Tool name mismatch.\n  Missing: {expected - actual}\n  Extra:   {actual - expected}"
         )
 
     def test_descriptions_are_nonempty_strings(self):
@@ -118,9 +111,7 @@ class TestResourceDefinitions:
         required_keys = {"uri", "name", "description", "mimeType"}
         for res in RESOURCES:
             missing = required_keys - set(res.keys())
-            assert not missing, (
-                f"Resource {res.get('name', '???')} is missing keys: {missing}"
-            )
+            assert not missing, f"Resource {res.get('name', '???')} is missing keys: {missing}"
 
     def test_resource_uris_are_unique(self):
         uris = [r["uri"] for r in RESOURCES]
@@ -208,7 +199,7 @@ class TestHandleToolsList:
         assert "result" in response
         result = response["result"]
         assert "tools" in result
-        assert len(result["tools"]) == 20
+        assert len(result["tools"]) == 22
 
     def test_tools_list_is_same_as_module_constant(self):
         request = {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}
@@ -388,41 +379,42 @@ class TestToolHandlersDict:
         tool_names = {t["name"] for t in TOOLS}
         handler_names = set(_TOOL_HANDLERS.keys())
         extra = handler_names - tool_names
-        assert not extra, (
-            f"_TOOL_HANDLERS has handlers not in TOOLS: {extra}"
-        )
+        assert not extra, f"_TOOL_HANDLERS has handlers not in TOOLS: {extra}"
 
     def test_handler_count_matches_tools_count(self):
         assert len(_TOOL_HANDLERS) == len(TOOLS)
 
     def test_all_handlers_are_callable(self):
         for name, handler in _TOOL_HANDLERS.items():
-            assert callable(handler), (
-                f"Handler for {name!r} is not callable: {type(handler)}"
-            )
+            assert callable(handler), f"Handler for {name!r} is not callable: {type(handler)}"
 
-    @pytest.mark.parametrize("tool_name", [
-        "brain_query",
-        "brain_search",
-        "brain_think",
-        "brain_learn",
-        "brain_validate",
-        "brain_stats",
-        "brain_contradictions",
-        "brain_provenance",
-        "brain_communities",
-        "brain_feedback",
-        "brain_reason",
-        "brain_pack",
-        "brain_pack_templates",
-        "brain_pack_export",
-        "brain_pack_compose",
-        "brain_observe_outcome",
-        "brain_promotion_outcome",
-        "brain_reinforce",
-        "brain_prediction_outcome",
-        "brain_mine_code",
-    ])
+    @pytest.mark.parametrize(
+        "tool_name",
+        [
+            "brain_query",
+            "brain_search",
+            "brain_think",
+            "brain_learn",
+            "brain_validate",
+            "brain_stats",
+            "brain_contradictions",
+            "brain_provenance",
+            "brain_communities",
+            "brain_feedback",
+            "brain_reason",
+            "brain_pack",
+            "brain_pack_templates",
+            "brain_pack_export",
+            "brain_pack_compose",
+            "brain_observe_outcome",
+            "brain_promotion_outcome",
+            "brain_reinforce",
+            "brain_prediction_outcome",
+            "brain_mine_code",
+            "brain_agent",
+            "brain_agent_status",
+        ],
+    )
     def test_handler_exists_for_each_tool(self, tool_name: str):
         """Parametrized check: each known tool name has a handler function."""
         assert tool_name in _TOOL_HANDLERS
@@ -478,7 +470,7 @@ class TestRequestRoutingEdgeCases:
         request = {"jsonrpc": "2.0", "id": 202, "method": "tools/list"}
         response = _handle_request(request)
         assert "result" in response
-        assert len(response["result"]["tools"]) == 20
+        assert len(response["result"]["tools"]) == 22
 
     def test_resources_list_with_no_params(self):
         request = {"jsonrpc": "2.0", "id": 203, "method": "resources/list"}
@@ -508,9 +500,7 @@ class TestRequestRoutingEdgeCases:
         for req in requests:
             resp = _handle_request(req)
             assert resp is not None
-            assert resp["jsonrpc"] == "2.0", (
-                f"Response for {req['method']} missing jsonrpc field"
-            )
+            assert resp["jsonrpc"] == "2.0", f"Response for {req['method']} missing jsonrpc field"
 
     def test_response_id_matches_request_id(self):
         """Response id must always match the request id."""

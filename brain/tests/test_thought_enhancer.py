@@ -17,7 +17,6 @@ from engineering_brain.core.types import (
 from engineering_brain.retrieval.context_extractor import ExtractedContext
 from engineering_brain.retrieval.thought_enhancer import ThoughtEnhancer
 
-
 # =========================================================================
 # Fixtures
 # =========================================================================
@@ -41,10 +40,19 @@ def _graph_with_nodes(*nodes):
 
 def _make_rule(
     node_id,
-    b=None, d=None, u=None, a=0.5,
-    confidence=0.5, validation_status="unvalidated",
-    eigentrust_score=0.5, technologies=None, domains=None,
-    text="", why="", how_to_do_right="", severity="medium",
+    b=None,
+    d=None,
+    u=None,
+    a=0.5,
+    confidence=0.5,
+    validation_status="unvalidated",
+    eigentrust_score=0.5,
+    technologies=None,
+    domains=None,
+    text="",
+    why="",
+    how_to_do_right="",
+    severity="medium",
 ):
     node = {
         "id": node_id,
@@ -102,8 +110,13 @@ class TestConfidenceTierClassification:
 
     def test_validated_requires_all_four_signals(self):
         node = _make_rule(
-            "CR-001", b=0.7, d=0.0, u=0.15, a=0.5,
-            validation_status="cross_checked", eigentrust_score=0.5,
+            "CR-001",
+            b=0.7,
+            d=0.0,
+            u=0.15,
+            a=0.5,
+            validation_status="cross_checked",
+            eigentrust_score=0.5,
         )
         g = _graph_with_nodes(node)
         enhancer = ThoughtEnhancer(graph=g)
@@ -112,8 +125,13 @@ class TestConfidenceTierClassification:
 
     def test_contested_overrides_when_disbelief_high(self):
         node = _make_rule(
-            "CR-001", b=0.5, d=0.4, u=0.1, a=0.5,
-            validation_status="cross_checked", eigentrust_score=0.8,
+            "CR-001",
+            b=0.5,
+            d=0.4,
+            u=0.1,
+            a=0.5,
+            validation_status="cross_checked",
+            eigentrust_score=0.8,
         )
         g = _graph_with_nodes(node)
         enhancer = ThoughtEnhancer(graph=g)
@@ -122,8 +140,13 @@ class TestConfidenceTierClassification:
 
     def test_probable_mid_range_epistemic(self):
         node = _make_rule(
-            "CR-001", b=0.55, d=0.0, u=0.45, a=0.5,
-            validation_status="unvalidated", eigentrust_score=0.3,
+            "CR-001",
+            b=0.55,
+            d=0.0,
+            u=0.45,
+            a=0.5,
+            validation_status="unvalidated",
+            eigentrust_score=0.3,
         )
         g = _graph_with_nodes(node)
         enhancer = ThoughtEnhancer(graph=g)
@@ -134,8 +157,13 @@ class TestConfidenceTierClassification:
 
     def test_uncertain_low_epistemic(self):
         node = _make_rule(
-            "CR-001", b=0.2, d=0.0, u=0.8, a=0.5,
-            validation_status="unvalidated", eigentrust_score=0.1,
+            "CR-001",
+            b=0.2,
+            d=0.0,
+            u=0.8,
+            a=0.5,
+            validation_status="unvalidated",
+            eigentrust_score=0.1,
         )
         g = _graph_with_nodes(node)
         enhancer = ThoughtEnhancer(graph=g)
@@ -288,10 +316,7 @@ class TestQueryGapIdentification:
         assert "missing_principles" in types
 
     def test_high_aggregate_uncertainty(self):
-        nodes = [
-            _make_rule(f"CR-{i:03d}", b=0.1, d=0.0, u=0.9)
-            for i in range(5)
-        ]
+        nodes = [_make_rule(f"CR-{i:03d}", b=0.1, d=0.0, u=0.9) for i in range(5)]
         g = _graph_with_nodes(*nodes)
         enhancer = ThoughtEnhancer(graph=g)
 
@@ -337,22 +362,30 @@ class TestOverallConfidence:
         g = MemoryGraphAdapter()
         enhancer = ThoughtEnhancer(graph=g)
         result = enhancer.enhance(
-            query=_query(), query_context=_ctx(),
-            scored_nodes=[], base_result=_base_result(total_queried=0),
+            query=_query(),
+            query_context=_ctx(),
+            scored_nodes=[],
+            base_result=_base_result(total_queried=0),
         )
         assert result.overall_confidence == ""
         assert result.confidence_distribution == {}
 
     def test_single_validated_node_is_validated(self):
         node = _make_rule(
-            "CR-001", b=0.7, d=0.0, u=0.15,
-            validation_status="cross_checked", eigentrust_score=0.5,
+            "CR-001",
+            b=0.7,
+            d=0.0,
+            u=0.15,
+            validation_status="cross_checked",
+            eigentrust_score=0.5,
         )
         g = _graph_with_nodes(node)
         enhancer = ThoughtEnhancer(graph=g)
         result = enhancer.enhance(
-            query=_query(), query_context=_ctx(),
-            scored_nodes=[node], base_result=_base_result(),
+            query=_query(),
+            query_context=_ctx(),
+            scored_nodes=[node],
+            base_result=_base_result(),
         )
         assert result.overall_confidence == ConfidenceTier.VALIDATED.value
 
@@ -367,10 +400,7 @@ class TestMetacognitiveSummary:
         assert "no relevant knowledge" in meta.lower()
 
     def test_high_confidence_message(self):
-        assessments = [
-            {"tier": "validated", "node_id": f"CR-{i:03d}"}
-            for i in range(8)
-        ] + [
+        assessments = [{"tier": "validated", "node_id": f"CR-{i:03d}"} for i in range(8)] + [
             {"tier": "probable", "node_id": "CR-008"},
             {"tier": "uncertain", "node_id": "CR-009"},
         ]
@@ -380,10 +410,7 @@ class TestMetacognitiveSummary:
         assert "HIGH CONFIDENCE" in meta
 
     def test_contested_dominates(self):
-        assessments = [
-            {"tier": "contested", "node_id": f"CR-{i:03d}"}
-            for i in range(5)
-        ] + [
+        assessments = [{"tier": "contested", "node_id": f"CR-{i:03d}"} for i in range(5)] + [
             {"tier": "validated", "node_id": "CR-005"},
         ]
         g = MemoryGraphAdapter()
@@ -393,12 +420,14 @@ class TestMetacognitiveSummary:
 
     def test_contradictions_add_warning(self):
         assessments = [{"tier": "validated", "node_id": "CR-001"}]
-        contradictions = [{
-            "severity": "high",
-            "description": "test conflict",
-            "node_a_id": "CR-001",
-            "node_b_id": "CR-002",
-        }]
+        contradictions = [
+            {
+                "severity": "high",
+                "description": "test conflict",
+                "node_a_id": "CR-001",
+                "node_b_id": "CR-002",
+            }
+        ]
         g = MemoryGraphAdapter()
         enhancer = ThoughtEnhancer(graph=g)
         meta = enhancer._compose_metacognitive_summary(assessments, contradictions, [], 5)
@@ -413,10 +442,7 @@ class TestMetacognitiveSummary:
         assert "Redis" in meta
 
     def test_low_confidence_message(self):
-        assessments = [
-            {"tier": "uncertain", "node_id": f"CR-{i:03d}"}
-            for i in range(8)
-        ]
+        assessments = [{"tier": "uncertain", "node_id": f"CR-{i:03d}"} for i in range(8)]
         g = MemoryGraphAdapter()
         enhancer = ThoughtEnhancer(graph=g)
         meta = enhancer._compose_metacognitive_summary(assessments, [], [], 20)
@@ -437,15 +463,21 @@ class TestEnhancedFormatting:
         enhancer = ThoughtEnhancer(graph=g)
 
         result = enhancer.enhance(
-            query=_query(), query_context=_ctx(),
-            scored_nodes=[node], base_result=_base_result(),
+            query=_query(),
+            query_context=_ctx(),
+            scored_nodes=[node],
+            base_result=_base_result(),
         )
         assert "## Brain Assessment" in result.enhanced_text
 
     def test_tiers_appear_as_sections(self):
         validated = _make_rule(
-            "CR-001", b=0.7, d=0.0, u=0.15,
-            validation_status="cross_checked", eigentrust_score=0.5,
+            "CR-001",
+            b=0.7,
+            d=0.0,
+            u=0.15,
+            validation_status="cross_checked",
+            eigentrust_score=0.5,
             text="Validate inputs",
         )
         uncertain = _make_rule("CR-002", b=0.2, d=0.0, u=0.8, text="Maybe cache")
@@ -453,8 +485,10 @@ class TestEnhancedFormatting:
         enhancer = ThoughtEnhancer(graph=g)
 
         result = enhancer.enhance(
-            query=_query(), query_context=_ctx(),
-            scored_nodes=[validated, uncertain], base_result=_base_result(),
+            query=_query(),
+            query_context=_ctx(),
+            scored_nodes=[validated, uncertain],
+            base_result=_base_result(),
         )
         assert "[VALIDATED]" in result.enhanced_text
         assert "[UNCERTAIN]" in result.enhanced_text
@@ -467,8 +501,10 @@ class TestEnhancedFormatting:
 
         enhancer = ThoughtEnhancer(graph=g)
         result = enhancer.enhance(
-            query=_query(), query_context=_ctx(),
-            scored_nodes=[n1, n2], base_result=_base_result(),
+            query=_query(),
+            query_context=_ctx(),
+            scored_nodes=[n1, n2],
+            base_result=_base_result(),
         )
         assert "## Contradictions Detected" in result.enhanced_text
 
@@ -480,7 +516,8 @@ class TestEnhancedFormatting:
         result = enhancer.enhance(
             query=_query(technologies=["flask", "redis"]),
             query_context=_ctx(technologies=["flask", "redis"]),
-            scored_nodes=[node], base_result=_base_result(),
+            scored_nodes=[node],
+            base_result=_base_result(),
         )
         assert "## Knowledge Gaps" in result.enhanced_text
 
@@ -493,16 +530,22 @@ class TestEnhancedFormatting:
         enhancer = ThoughtEnhancer(graph=g)
 
         result = enhancer.enhance(
-            query=_query(), query_context=_ctx(),
-            scored_nodes=nodes, base_result=_base_result(),
+            query=_query(),
+            query_context=_ctx(),
+            scored_nodes=nodes,
+            base_result=_base_result(),
             budget_chars=500,
         )
         assert len(result.enhanced_text) <= 500
 
     def test_node_tag_format(self):
         node = _make_rule(
-            "CR-001", b=0.7, d=0.0, u=0.15,
-            validation_status="cross_checked", eigentrust_score=0.5,
+            "CR-001",
+            b=0.7,
+            d=0.0,
+            u=0.15,
+            validation_status="cross_checked",
+            eigentrust_score=0.5,
         )
         g = _graph_with_nodes(node)
         enhancer = ThoughtEnhancer(graph=g)
@@ -584,15 +627,118 @@ class TestMCPToolHandler:
     def test_handler_with_technologies(self):
         from engineering_brain.mcp_server import _handle_brain_think
 
-        response = _handle_brain_think({
-            "query": "Flask security",
-            "technologies": ["Flask"],
-        })
+        response = _handle_brain_think(
+            {
+                "query": "Flask security",
+                "technologies": ["Flask"],
+            }
+        )
         assert "Confidence" in response
 
     def test_brain_think_tool_registered(self):
-        from engineering_brain.mcp_server import TOOLS, _TOOL_HANDLERS
+        from engineering_brain.mcp_server import _TOOL_HANDLERS, TOOLS
 
         tool_names = [t["name"] for t in TOOLS]
         assert "brain_think" in tool_names
         assert "brain_think" in _TOOL_HANDLERS
+
+
+# =========================================================================
+# LLM Metacognition
+# =========================================================================
+
+
+from unittest import mock
+
+
+class TestLLMMetacognition:
+    """Tests for _llm_metacognitive_summary."""
+
+    def test_flag_off_returns_none(self) -> None:
+        """LLM metacognition skipped when flag is off."""
+        g = MemoryGraphAdapter()
+        enhancer = ThoughtEnhancer(graph=g)
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            result = enhancer._llm_metacognitive_summary(
+                {"high": 3}, [], ["missing API docs"], "medium"
+            )
+            assert result is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_llm_success_returns_summary(self, mock_flag, mock_llm) -> None:
+        """Returns metacognitive summary when LLM succeeds."""
+        mock_llm.return_value = (
+            "The brain has solid coverage on Flask security patterns with high confidence. "
+            "Watch out for missing database migration rules."
+        )
+        g = MemoryGraphAdapter()
+        enhancer = ThoughtEnhancer(graph=g)
+
+        result = enhancer._llm_metacognitive_summary({"high": 3, "medium": 2}, [], [], "high")
+        assert result is not None
+        assert "confidence" in result.lower() or "brain" in result.lower()
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_llm_failure_returns_none(self, mock_flag, mock_llm) -> None:
+        """Returns None when LLM call fails."""
+        mock_llm.return_value = None
+        g = MemoryGraphAdapter()
+        enhancer = ThoughtEnhancer(graph=g)
+
+        result = enhancer._llm_metacognitive_summary({"low": 1}, [], [], "low")
+        assert result is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_llm_too_short_returns_none(self, mock_flag, mock_llm) -> None:
+        """Returns None when LLM response is under 30 chars."""
+        mock_llm.return_value = "Short."
+        g = MemoryGraphAdapter()
+        enhancer = ThoughtEnhancer(graph=g)
+
+        result = enhancer._llm_metacognitive_summary({}, [], [], "low")
+        assert result is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_integration_llm_first_then_fallback(self, mock_flag, mock_llm) -> None:
+        """Metacognitive summary uses LLM when available."""
+        llm_text = (
+            "The brain has moderate coverage with 5 rules at high confidence. "
+            "Gap in database migration patterns needs attention."
+        )
+        mock_llm.return_value = llm_text
+        node = _make_rule("CR-001", b=0.8, d=0.0, u=0.1, a=0.5, confidence=0.9)
+        g = _graph_with_nodes(node)
+        enhancer = ThoughtEnhancer(graph=g)
+
+        query = KnowledgeQuery(task_description="Flask security", technologies=["Flask"])
+        base_result = KnowledgeResult(total_nodes_queried=1, results=[node])
+        ctx = ExtractedContext(
+            technologies=["Flask"], domains=["security"], file_types=[], phase="exec"
+        )
+        enhanced = enhancer.enhance(query, ctx, [node], base_result)
+
+        assert enhanced.metacognitive_summary == llm_text
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_integration_fallback_on_llm_failure(self, mock_flag, mock_llm) -> None:
+        """Falls back to template when LLM fails."""
+        mock_llm.return_value = None
+        node = _make_rule("CR-001", b=0.8, d=0.0, u=0.1, a=0.5, confidence=0.9)
+        g = _graph_with_nodes(node)
+        enhancer = ThoughtEnhancer(graph=g)
+
+        query = KnowledgeQuery(task_description="Flask security", technologies=["Flask"])
+        base_result = KnowledgeResult(total_nodes_queried=1, results=[node])
+        ctx = ExtractedContext(
+            technologies=["Flask"], domains=["security"], file_types=[], phase="exec"
+        )
+        enhanced = enhancer.enhance(query, ctx, [node], base_result)
+
+        # Template fallback should still produce a summary
+        assert enhanced.metacognitive_summary != ""

@@ -11,50 +11,49 @@ Covers:
 
 from __future__ import annotations
 
-import sys
 import os
+import sys
 
 # Ensure the src directory is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
+from datetime import UTC, datetime, timedelta
+from unittest import mock
+
 import pytest
-from datetime import datetime, timezone, timedelta
 
 from engineering_brain.adapters.memory import MemoryGraphAdapter
 from engineering_brain.core.config import BrainConfig
-from engineering_brain.retrieval.context_extractor import (
-    ExtractedContext,
-    extract_context,
-    build_contextual_text,
-    build_tech_index_from_nodes,
-    expand_domains,
-    build_domain_hierarchy,
-    apply_technology_implications,
-    KnowledgeShoppingList,
-    _infer_node_layer,
-)
-from engineering_brain.retrieval.merger import (
-    merge_results,
-    merge_results_rrf,
-    deduplicate_by_content,
-)
-from engineering_brain.retrieval.scorer import (
-    score_knowledge,
-    rank_results,
-)
 from engineering_brain.retrieval.budget import (
     enforce_budget,
     estimate_total_chars,
 )
-from engineering_brain.retrieval.synonyms import (
-    expand_query_terms,
-    expand_from_graph,
-)
 from engineering_brain.retrieval.communities import (
-    CommunityDetector,
     Community,
+    CommunityDetector,
 )
-
+from engineering_brain.retrieval.context_extractor import (
+    ExtractedContext,
+    KnowledgeShoppingList,
+    _infer_node_layer,
+    apply_technology_implications,
+    build_contextual_text,
+    build_tech_index_from_nodes,
+    extract_context,
+)
+from engineering_brain.retrieval.merger import (
+    deduplicate_by_content,
+    merge_results,
+    merge_results_rrf,
+)
+from engineering_brain.retrieval.scorer import (
+    rank_results,
+    score_knowledge,
+)
+from engineering_brain.retrieval.synonyms import (
+    expand_from_graph,
+    expand_query_terms,
+)
 
 # =============================================================================
 # Fixtures
@@ -77,94 +76,126 @@ def graph() -> MemoryGraphAdapter:
 def populated_graph(graph: MemoryGraphAdapter) -> MemoryGraphAdapter:
     """Return a MemoryGraphAdapter pre-populated with various knowledge nodes."""
     # L1 Principles
-    graph.add_node("Principle", "P-001", {
-        "id": "P-001",
-        "name": "Defense in Depth",
-        "why": "No single layer is perfect",
-        "how_to_apply": "Layer multiple security controls",
-        "domains": ["security"],
-        "technologies": [],
-        "severity": "high",
-        "validation_status": "cross_checked",
-    })
-    graph.add_node("Principle", "P-002", {
-        "id": "P-002",
-        "name": "Fail Fast",
-        "why": "Detect errors early to reduce blast radius",
-        "how_to_apply": "Validate inputs at boundaries",
-        "domains": ["reliability", "architecture"],
-        "technologies": [],
-        "severity": "medium",
-        "validation_status": "human_verified",
-    })
+    graph.add_node(
+        "Principle",
+        "P-001",
+        {
+            "id": "P-001",
+            "name": "Defense in Depth",
+            "why": "No single layer is perfect",
+            "how_to_apply": "Layer multiple security controls",
+            "domains": ["security"],
+            "technologies": [],
+            "severity": "high",
+            "validation_status": "cross_checked",
+        },
+    )
+    graph.add_node(
+        "Principle",
+        "P-002",
+        {
+            "id": "P-002",
+            "name": "Fail Fast",
+            "why": "Detect errors early to reduce blast radius",
+            "how_to_apply": "Validate inputs at boundaries",
+            "domains": ["reliability", "architecture"],
+            "technologies": [],
+            "severity": "medium",
+            "validation_status": "human_verified",
+        },
+    )
 
     # L2 Patterns
-    graph.add_node("Pattern", "PAT-001", {
-        "id": "PAT-001",
-        "name": "Circuit Breaker",
-        "intent": "Prevent cascading failures",
-        "when_to_use": "Calling external services",
-        "technologies": ["Python"],
-        "domains": ["reliability"],
-        "severity": "high",
-        "languages": ["Python"],
-    })
-    graph.add_node("Pattern", "PAT-002", {
-        "id": "PAT-002",
-        "name": "Repository Pattern",
-        "intent": "Abstract data access",
-        "when_to_use": "Decoupling domain from persistence",
-        "technologies": ["Python", "SQLAlchemy"],
-        "domains": ["architecture", "database"],
-        "severity": "medium",
-        "languages": ["Python"],
-    })
+    graph.add_node(
+        "Pattern",
+        "PAT-001",
+        {
+            "id": "PAT-001",
+            "name": "Circuit Breaker",
+            "intent": "Prevent cascading failures",
+            "when_to_use": "Calling external services",
+            "technologies": ["Python"],
+            "domains": ["reliability"],
+            "severity": "high",
+            "languages": ["Python"],
+        },
+    )
+    graph.add_node(
+        "Pattern",
+        "PAT-002",
+        {
+            "id": "PAT-002",
+            "name": "Repository Pattern",
+            "intent": "Abstract data access",
+            "when_to_use": "Decoupling domain from persistence",
+            "technologies": ["Python", "SQLAlchemy"],
+            "domains": ["architecture", "database"],
+            "severity": "medium",
+            "languages": ["Python"],
+        },
+    )
 
     # L3 Rules
-    graph.add_node("Rule", "CR-001", {
-        "id": "CR-001",
-        "text": "Always validate CORS origins explicitly",
-        "why": "Wildcard CORS allows any origin to read responses",
-        "how_to_do_right": "List allowed origins explicitly",
-        "technologies": ["Flask", "FastAPI"],
-        "domains": ["security", "api"],
-        "severity": "critical",
-        "reinforcement_count": 15,
-        "confidence": 0.9,
-        "validation_status": "cross_checked",
-    })
-    graph.add_node("Rule", "CR-002", {
-        "id": "CR-002",
-        "text": "Use parameterized queries to prevent SQL injection",
-        "why": "String concatenation in SQL enables injection attacks",
-        "how_to_do_right": "Use ORM or parameterized placeholders",
-        "technologies": ["Python", "PostgreSQL"],
-        "domains": ["security", "database"],
-        "severity": "critical",
-        "reinforcement_count": 20,
-        "confidence": 0.95,
-        "validation_status": "human_verified",
-    })
-    graph.add_node("Rule", "CR-003", {
-        "id": "CR-003",
-        "text": "Handle async errors with proper try/except",
-        "why": "Unhandled async errors cause silent failures",
-        "how_to_do_right": "Wrap coroutines in try/except, log errors",
-        "technologies": ["Python"],
-        "domains": ["reliability"],
-        "severity": "medium",
-        "reinforcement_count": 5,
-        "confidence": 0.7,
-    })
+    graph.add_node(
+        "Rule",
+        "CR-001",
+        {
+            "id": "CR-001",
+            "text": "Always validate CORS origins explicitly",
+            "why": "Wildcard CORS allows any origin to read responses",
+            "how_to_do_right": "List allowed origins explicitly",
+            "technologies": ["Flask", "FastAPI"],
+            "domains": ["security", "api"],
+            "severity": "critical",
+            "reinforcement_count": 15,
+            "confidence": 0.9,
+            "validation_status": "cross_checked",
+        },
+    )
+    graph.add_node(
+        "Rule",
+        "CR-002",
+        {
+            "id": "CR-002",
+            "text": "Use parameterized queries to prevent SQL injection",
+            "why": "String concatenation in SQL enables injection attacks",
+            "how_to_do_right": "Use ORM or parameterized placeholders",
+            "technologies": ["Python", "PostgreSQL"],
+            "domains": ["security", "database"],
+            "severity": "critical",
+            "reinforcement_count": 20,
+            "confidence": 0.95,
+            "validation_status": "human_verified",
+        },
+    )
+    graph.add_node(
+        "Rule",
+        "CR-003",
+        {
+            "id": "CR-003",
+            "text": "Handle async errors with proper try/except",
+            "why": "Unhandled async errors cause silent failures",
+            "how_to_do_right": "Wrap coroutines in try/except, log errors",
+            "technologies": ["Python"],
+            "domains": ["reliability"],
+            "severity": "medium",
+            "reinforcement_count": 5,
+            "confidence": 0.7,
+        },
+    )
 
     # L4 Evidence / Findings
-    graph.add_node("Finding", "F-001", {
-        "id": "F-001",
-        "description": "CORS wildcard found in production server.py",
-        "severity": "critical",
-        "domains": ["security"],
-        "technologies": ["Flask"],
-    })
+    graph.add_node(
+        "Finding",
+        "F-001",
+        {
+            "id": "F-001",
+            "description": "CORS wildcard found in production server.py",
+            "severity": "critical",
+            "domains": ["security"],
+            "technologies": ["Flask"],
+        },
+    )
 
     # Edges
     graph.add_edge("CR-001", "P-001", "INSTANTIATES")
@@ -205,9 +236,7 @@ class TestExtractContext:
         assert "testing" in ctx.domains
 
     def test_detects_multiple_domains(self):
-        ctx = extract_context(
-            "Implement auth middleware for the REST API with rate limiting"
-        )
+        ctx = extract_context("Implement auth middleware for the REST API with rate limiting")
         assert "security" in ctx.domains
         assert "api" in ctx.domains
 
@@ -252,7 +281,8 @@ class TestExtractContext:
 
     def test_explicit_file_type_override(self):
         ctx = extract_context(
-            "Edit the file", file_type=".go",
+            "Edit the file",
+            file_type=".go",
         )
         assert ".go" in ctx.file_types
 
@@ -430,6 +460,7 @@ class TestBuildTechIndex:
         ]
         build_tech_index_from_nodes(nodes)
         from engineering_brain.retrieval.context_extractor import _dynamic_tech_index
+
         assert "flask" in _dynamic_tech_index
         assert "redis" in _dynamic_tech_index
         assert "fastapi" in _dynamic_tech_index
@@ -440,6 +471,7 @@ class TestBuildTechIndex:
         ]
         build_tech_index_from_nodes(nodes)
         from engineering_brain.retrieval.context_extractor import _dynamic_tech_index
+
         assert "python" in _dynamic_tech_index
         assert "typescript" in _dynamic_tech_index
 
@@ -449,6 +481,7 @@ class TestBuildTechIndex:
         ]
         build_tech_index_from_nodes(nodes)
         from engineering_brain.retrieval.context_extractor import _dynamic_domain_index
+
         assert "security" in _dynamic_domain_index
         assert "api" in _dynamic_domain_index
 
@@ -458,6 +491,7 @@ class TestBuildTechIndex:
         ]
         build_tech_index_from_nodes(nodes)
         from engineering_brain.retrieval.context_extractor import _dynamic_tech_index
+
         assert "x" not in _dynamic_tech_index
 
     def test_handles_empty_nodes(self):
@@ -474,9 +508,7 @@ class TestApplyTechnologyImplications:
         assert "error_handling" in domains
 
     def test_flask_conditional_routes(self):
-        domains = apply_technology_implications(
-            ["Flask"], "add a new route endpoint"
-        )
+        domains = apply_technology_implications(["Flask"], "add a new route endpoint")
         assert "auth_middleware" in domains or "rate_limiting" in domains
 
     def test_no_match_returns_empty(self):
@@ -792,12 +824,8 @@ class TestScoreKnowledge:
             "technologies": ["Flask"],
             "domains": ["security"],
         }
-        score_critical = score_knowledge(
-            {**base, "severity": "critical"}, ["Flask"], ["security"]
-        )
-        score_low = score_knowledge(
-            {**base, "severity": "low"}, ["Flask"], ["security"]
-        )
+        score_critical = score_knowledge({**base, "severity": "critical"}, ["Flask"], ["security"])
+        score_low = score_knowledge({**base, "severity": "low"}, ["Flask"], ["security"])
         assert score_critical > score_low
 
     def test_reinforcement_boosts_score(self):
@@ -824,15 +852,11 @@ class TestScoreKnowledge:
             "domains": ["security"],
             "severity": "medium",
         }
-        recent = datetime.now(timezone.utc).isoformat()
-        old = (datetime.now(timezone.utc) - timedelta(days=365)).isoformat()
+        recent = datetime.now(UTC).isoformat()
+        old = (datetime.now(UTC) - timedelta(days=365)).isoformat()
 
-        score_recent = score_knowledge(
-            {**base, "last_violation": recent}, ["Flask"], ["security"]
-        )
-        score_old = score_knowledge(
-            {**base, "last_violation": old}, ["Flask"], ["security"]
-        )
+        score_recent = score_knowledge({**base, "last_violation": recent}, ["Flask"], ["security"])
+        score_old = score_knowledge({**base, "last_violation": old}, ["Flask"], ["security"])
         assert score_recent > score_old
 
     def test_validated_node_scores_higher(self):
@@ -889,9 +913,7 @@ class TestScoreKnowledge:
         }
         cfg = BrainConfig()
         s1 = score_knowledge(node, ["Flask"], ["security"], config=cfg)
-        s2 = score_knowledge(
-            {**node, "_vector_score": 0.0}, ["Flask"], ["security"], config=cfg
-        )
+        s2 = score_knowledge({**node, "_vector_score": 0.0}, ["Flask"], ["security"], config=cfg)
         assert s1 == pytest.approx(s2)
 
     def test_technology_agnostic_partial_credit(self):
@@ -966,7 +988,14 @@ class TestRankResults:
     def test_returns_sorted_by_score(self):
         nodes = [
             {"id": "low", "text": "low", "technologies": [], "domains": [], "severity": "low"},
-            {"id": "high", "text": "high", "technologies": ["Flask"], "domains": ["security"], "severity": "critical", "reinforcement_count": 20},
+            {
+                "id": "high",
+                "text": "high",
+                "technologies": ["Flask"],
+                "domains": ["security"],
+                "severity": "critical",
+                "reinforcement_count": 20,
+            },
         ]
         ranked = rank_results(nodes, ["Flask"], ["security"], top_k=10)
         assert len(ranked) == 2
@@ -975,7 +1004,13 @@ class TestRankResults:
 
     def test_respects_top_k(self):
         nodes = [
-            {"id": f"N{i}", "text": f"rule {i}", "technologies": ["Flask"], "domains": ["security"], "severity": "medium"}
+            {
+                "id": f"N{i}",
+                "text": f"rule {i}",
+                "technologies": ["Flask"],
+                "domains": ["security"],
+                "severity": "medium",
+            }
             for i in range(20)
         ]
         ranked = rank_results(nodes, ["Flask"], ["security"], top_k=5)
@@ -1004,8 +1039,21 @@ class TestRankResults:
 
     def test_deprecated_nodes_ranked_last(self):
         nodes = [
-            {"id": "active", "text": "active rule", "technologies": ["Flask"], "domains": ["security"], "severity": "high"},
-            {"id": "deprecated", "text": "old rule", "technologies": ["Flask"], "domains": ["security"], "severity": "critical", "deprecated": True},
+            {
+                "id": "active",
+                "text": "active rule",
+                "technologies": ["Flask"],
+                "domains": ["security"],
+                "severity": "high",
+            },
+            {
+                "id": "deprecated",
+                "text": "old rule",
+                "technologies": ["Flask"],
+                "domains": ["security"],
+                "severity": "critical",
+                "deprecated": True,
+            },
         ]
         ranked = rank_results(nodes, ["Flask"], ["security"], top_k=10)
         # Deprecated node scores 0.0, so it should be last
@@ -1014,7 +1062,13 @@ class TestRankResults:
 
     def test_config_affects_scoring(self):
         nodes = [
-            {"id": "A", "text": "test", "technologies": ["Flask"], "domains": ["security"], "severity": "medium"},
+            {
+                "id": "A",
+                "text": "test",
+                "technologies": ["Flask"],
+                "domains": ["security"],
+                "severity": "medium",
+            },
         ]
         cfg1 = BrainConfig()
         cfg1.weight_tech_match = 0.5
@@ -1095,7 +1149,11 @@ class TestEnforceBudget:
         cfg.context_budget_chars = 1  # Extremely small budget
         results = {
             "L3": [
-                {"id": "A", "text": "This is a really long rule text " * 10, "_relevance_score": 0.8},
+                {
+                    "id": "A",
+                    "text": "This is a really long rule text " * 10,
+                    "_relevance_score": 0.8,
+                },
             ],
         }
         trimmed = enforce_budget(results, config=cfg)
@@ -1135,9 +1193,9 @@ class TestEnforceBudget:
         # L3 should be trimmed (has 20 nodes)
         assert len(trimmed["L3"]) < 20
 
-    def test_default_budget_is_3000(self):
+    def test_default_budget_is_50000(self):
         cfg = BrainConfig()
-        assert cfg.context_budget_chars == 3000
+        assert cfg.context_budget_chars == 50000
 
     def test_layer_proportions(self):
         """L3 (rules) should get the largest budget share (~50%)."""
@@ -1146,9 +1204,13 @@ class TestEnforceBudget:
         # Create many small nodes per layer
         results = {
             "L1": [{"id": f"P{i}", "name": f"p{i}", "_relevance_score": 0.5} for i in range(50)],
-            "L2": [{"id": f"PAT{i}", "name": f"pat{i}", "_relevance_score": 0.5} for i in range(50)],
+            "L2": [
+                {"id": f"PAT{i}", "name": f"pat{i}", "_relevance_score": 0.5} for i in range(50)
+            ],
             "L3": [{"id": f"R{i}", "text": f"r{i}", "_relevance_score": 0.5} for i in range(50)],
-            "L4": [{"id": f"F{i}", "description": f"f{i}", "_relevance_score": 0.5} for i in range(50)],
+            "L4": [
+                {"id": f"F{i}", "description": f"f{i}", "_relevance_score": 0.5} for i in range(50)
+            ],
         }
         trimmed = enforce_budget(results, config=cfg)
         # L3 should have more nodes than L1 (larger budget proportion)
@@ -1168,12 +1230,14 @@ class TestEstimateTotalChars:
 
     def test_includes_why_and_how(self):
         results = {
-            "L3": [{
-                "id": "A",
-                "text": "rule text",
-                "why": "because reasons",
-                "how_to_do_right": "do it this way",
-            }],
+            "L3": [
+                {
+                    "id": "A",
+                    "text": "rule text",
+                    "why": "because reasons",
+                    "how_to_do_right": "do it this way",
+                }
+            ],
         }
         total_with = estimate_total_chars(results)
 
@@ -1271,14 +1335,22 @@ class TestExpandFromGraph:
 
     def test_expands_from_tech_node(self):
         graph = MemoryGraphAdapter()
-        graph.add_node("Technology", "tech:flask", {
-            "id": "tech:flask",
-            "name": "Flask",
-        })
-        graph.add_node("Domain", "domain:cors", {
-            "id": "domain:cors",
-            "name": "CORS",
-        })
+        graph.add_node(
+            "Technology",
+            "tech:flask",
+            {
+                "id": "tech:flask",
+                "name": "Flask",
+            },
+        )
+        graph.add_node(
+            "Domain",
+            "domain:cors",
+            {
+                "id": "domain:cors",
+                "name": "CORS",
+            },
+        )
         graph.add_edge("tech:flask", "domain:cors", "RELATES_TO")
 
         result = expand_from_graph(graph, ["flask"])
@@ -1286,14 +1358,22 @@ class TestExpandFromGraph:
 
     def test_expands_from_domain_node(self):
         graph = MemoryGraphAdapter()
-        graph.add_node("Domain", "domain:security", {
-            "id": "domain:security",
-            "name": "Security",
-        })
-        graph.add_node("Domain", "domain:cors", {
-            "id": "domain:cors",
-            "name": "CORS",
-        })
+        graph.add_node(
+            "Domain",
+            "domain:security",
+            {
+                "id": "domain:security",
+                "name": "Security",
+            },
+        )
+        graph.add_node(
+            "Domain",
+            "domain:cors",
+            {
+                "id": "domain:cors",
+                "name": "CORS",
+            },
+        )
         graph.add_edge("domain:security", "domain:cors", "CONTAINS")
 
         result = expand_from_graph(graph, ["security"])
@@ -1301,14 +1381,22 @@ class TestExpandFromGraph:
 
     def test_skips_already_known_terms(self):
         graph = MemoryGraphAdapter()
-        graph.add_node("Technology", "tech:flask", {
-            "id": "tech:flask",
-            "name": "Flask",
-        })
-        graph.add_node("Domain", "domain:api", {
-            "id": "domain:api",
-            "name": "api",
-        })
+        graph.add_node(
+            "Technology",
+            "tech:flask",
+            {
+                "id": "tech:flask",
+                "name": "Flask",
+            },
+        )
+        graph.add_node(
+            "Domain",
+            "domain:api",
+            {
+                "id": "domain:api",
+                "name": "api",
+            },
+        )
         graph.add_edge("tech:flask", "domain:api", "RELATES_TO")
 
         # "api" is already in terms, should not be in the additional list
@@ -1322,14 +1410,22 @@ class TestExpandFromGraph:
 
     def test_skips_long_names(self):
         graph = MemoryGraphAdapter()
-        graph.add_node("Technology", "tech:flask", {
-            "id": "tech:flask",
-            "name": "Flask",
-        })
-        graph.add_node("Rule", "CR-long", {
-            "id": "CR-long",
-            "name": "A" * 100,  # Very long name (>50 chars)
-        })
+        graph.add_node(
+            "Technology",
+            "tech:flask",
+            {
+                "id": "tech:flask",
+                "name": "Flask",
+            },
+        )
+        graph.add_node(
+            "Rule",
+            "CR-long",
+            {
+                "id": "CR-long",
+                "name": "A" * 100,  # Very long name (>50 chars)
+            },
+        )
         graph.add_edge("tech:flask", "CR-long", "RELATES_TO")
 
         result = expand_from_graph(graph, ["flask"])
@@ -1363,15 +1459,19 @@ class TestCommunityDetector:
     def test_single_connected_component(self):
         graph = MemoryGraphAdapter()
         for i in range(5):
-            graph.add_node("Rule", f"R{i}", {
-                "id": f"R{i}",
-                "text": f"Rule {i}",
-                "domains": ["security"],
-                "technologies": ["Flask"],
-            })
+            graph.add_node(
+                "Rule",
+                f"R{i}",
+                {
+                    "id": f"R{i}",
+                    "text": f"Rule {i}",
+                    "domains": ["security"],
+                    "technologies": ["Flask"],
+                },
+            )
         # Connect all nodes in a chain: R0-R1-R2-R3-R4
         for i in range(4):
-            graph.add_edge(f"R{i}", f"R{i+1}", "RELATES_TO")
+            graph.add_edge(f"R{i}", f"R{i + 1}", "RELATES_TO")
 
         detector = CommunityDetector(graph)
         communities = detector.detect(min_community_size=3)
@@ -1383,23 +1483,31 @@ class TestCommunityDetector:
         graph = MemoryGraphAdapter()
         # Component 1: security rules
         for i in range(4):
-            graph.add_node("Rule", f"SEC{i}", {
-                "id": f"SEC{i}",
-                "text": f"Security rule {i}",
-                "domains": ["security"],
-            })
+            graph.add_node(
+                "Rule",
+                f"SEC{i}",
+                {
+                    "id": f"SEC{i}",
+                    "text": f"Security rule {i}",
+                    "domains": ["security"],
+                },
+            )
         for i in range(3):
-            graph.add_edge(f"SEC{i}", f"SEC{i+1}", "RELATES_TO")
+            graph.add_edge(f"SEC{i}", f"SEC{i + 1}", "RELATES_TO")
 
         # Component 2: performance rules
         for i in range(3):
-            graph.add_node("Rule", f"PERF{i}", {
-                "id": f"PERF{i}",
-                "text": f"Performance rule {i}",
-                "domains": ["performance"],
-            })
+            graph.add_node(
+                "Rule",
+                f"PERF{i}",
+                {
+                    "id": f"PERF{i}",
+                    "text": f"Performance rule {i}",
+                    "domains": ["performance"],
+                },
+            )
         for i in range(2):
-            graph.add_edge(f"PERF{i}", f"PERF{i+1}", "RELATES_TO")
+            graph.add_edge(f"PERF{i}", f"PERF{i + 1}", "RELATES_TO")
 
         detector = CommunityDetector(graph)
         communities = detector.detect(min_community_size=3)
@@ -1411,13 +1519,13 @@ class TestCommunityDetector:
         for i in range(10):
             graph.add_node("Rule", f"BIG{i}", {"id": f"BIG{i}", "text": f"big {i}"})
         for i in range(9):
-            graph.add_edge(f"BIG{i}", f"BIG{i+1}", "RELATES_TO")
+            graph.add_edge(f"BIG{i}", f"BIG{i + 1}", "RELATES_TO")
 
         # Small cluster
         for i in range(4):
             graph.add_node("Rule", f"SMALL{i}", {"id": f"SMALL{i}", "text": f"small {i}"})
         for i in range(3):
-            graph.add_edge(f"SMALL{i}", f"SMALL{i+1}", "RELATES_TO")
+            graph.add_edge(f"SMALL{i}", f"SMALL{i + 1}", "RELATES_TO")
 
         detector = CommunityDetector(graph)
         communities = detector.detect(min_community_size=3)
@@ -1446,12 +1554,16 @@ class TestCommunityDetector:
     def test_community_has_summary(self):
         graph = MemoryGraphAdapter()
         for i in range(4):
-            graph.add_node("Rule", f"R{i}", {
-                "id": f"R{i}",
-                "text": f"Rule about topic {i}",
-            })
+            graph.add_node(
+                "Rule",
+                f"R{i}",
+                {
+                    "id": f"R{i}",
+                    "text": f"Rule about topic {i}",
+                },
+            )
         for i in range(3):
-            graph.add_edge(f"R{i}", f"R{i+1}", "RELATES_TO")
+            graph.add_edge(f"R{i}", f"R{i + 1}", "RELATES_TO")
 
         detector = CommunityDetector(graph)
         communities = detector.detect(min_community_size=3)
@@ -1462,13 +1574,17 @@ class TestCommunityDetector:
     def test_community_detects_dominant_domain(self):
         graph = MemoryGraphAdapter()
         for i in range(5):
-            graph.add_node("Rule", f"S{i}", {
-                "id": f"S{i}",
-                "text": f"Security rule {i}",
-                "domains": ["security"],
-            })
+            graph.add_node(
+                "Rule",
+                f"S{i}",
+                {
+                    "id": f"S{i}",
+                    "text": f"Security rule {i}",
+                    "domains": ["security"],
+                },
+            )
         for i in range(4):
-            graph.add_edge(f"S{i}", f"S{i+1}", "RELATES_TO")
+            graph.add_edge(f"S{i}", f"S{i + 1}", "RELATES_TO")
 
         detector = CommunityDetector(graph)
         communities = detector.detect(min_community_size=3)
@@ -1478,13 +1594,17 @@ class TestCommunityDetector:
     def test_community_detects_dominant_technology(self):
         graph = MemoryGraphAdapter()
         for i in range(4):
-            graph.add_node("Rule", f"F{i}", {
-                "id": f"F{i}",
-                "text": f"Flask rule {i}",
-                "technologies": ["Flask"],
-            })
+            graph.add_node(
+                "Rule",
+                f"F{i}",
+                {
+                    "id": f"F{i}",
+                    "text": f"Flask rule {i}",
+                    "technologies": ["Flask"],
+                },
+            )
         for i in range(3):
-            graph.add_edge(f"F{i}", f"F{i+1}", "RELATES_TO")
+            graph.add_edge(f"F{i}", f"F{i + 1}", "RELATES_TO")
 
         detector = CommunityDetector(graph)
         communities = detector.detect(min_community_size=3)
@@ -1523,11 +1643,15 @@ class TestCommunityDetector:
         graph = MemoryGraphAdapter()
         # Create a fully connected 5-node clique
         for i in range(5):
-            graph.add_node("Rule", f"C{i}", {
-                "id": f"C{i}",
-                "text": f"Clique node {i}",
-                "domains": ["api"],
-            })
+            graph.add_node(
+                "Rule",
+                f"C{i}",
+                {
+                    "id": f"C{i}",
+                    "text": f"Clique node {i}",
+                    "domains": ["api"],
+                },
+            )
         for i in range(5):
             for j in range(i + 1, 5):
                 graph.add_edge(f"C{i}", f"C{j}", "RELATES_TO")
@@ -1565,8 +1689,8 @@ class TestQueryRouterIntegration:
     """Integration tests for QueryRouter using in-memory adapters."""
 
     def test_basic_query(self, populated_graph: MemoryGraphAdapter):
-        from engineering_brain.retrieval.router import QueryRouter
         from engineering_brain.core.types import KnowledgeQuery
+        from engineering_brain.retrieval.router import QueryRouter
 
         cfg = BrainConfig()
         cfg.graph_expansion_enabled = False
@@ -1584,8 +1708,8 @@ class TestQueryRouterIntegration:
         assert isinstance(result.formatted_text, str)
 
     def test_query_returns_rules(self, populated_graph: MemoryGraphAdapter):
-        from engineering_brain.retrieval.router import QueryRouter
         from engineering_brain.core.types import KnowledgeQuery
+        from engineering_brain.retrieval.router import QueryRouter
 
         cfg = BrainConfig()
         cfg.graph_expansion_enabled = False
@@ -1604,8 +1728,8 @@ class TestQueryRouterIntegration:
 
     def test_query_with_cache(self, populated_graph: MemoryGraphAdapter):
         from engineering_brain.adapters.memory import MemoryCacheAdapter
-        from engineering_brain.retrieval.router import QueryRouter
         from engineering_brain.core.types import KnowledgeQuery
+        from engineering_brain.retrieval.router import QueryRouter
 
         cfg = BrainConfig()
         cfg.graph_expansion_enabled = False
@@ -1628,8 +1752,8 @@ class TestQueryRouterIntegration:
         assert result2.cache_hit is True
 
     def test_query_with_provenance(self, populated_graph: MemoryGraphAdapter):
-        from engineering_brain.retrieval.router import QueryRouter
         from engineering_brain.core.types import KnowledgeQuery
+        from engineering_brain.retrieval.router import QueryRouter
 
         cfg = BrainConfig()
         cfg.graph_expansion_enabled = False
@@ -1666,8 +1790,8 @@ class TestQueryRouterIntegration:
             assert node.get("retrieval_count", 0) >= 1
 
     def test_query_with_scored_nodes(self, populated_graph: MemoryGraphAdapter):
-        from engineering_brain.retrieval.router import QueryRouter
         from engineering_brain.core.types import KnowledgeQuery
+        from engineering_brain.retrieval.router import QueryRouter
 
         cfg = BrainConfig()
         cfg.graph_expansion_enabled = False
@@ -1684,8 +1808,7 @@ class TestQueryRouterIntegration:
         # scored contains ALL nodes before budget trimming
         # result contains budget-trimmed nodes
         total_in_result = (
-            len(result.principles) + len(result.patterns)
-            + len(result.rules) + len(result.evidence)
+            len(result.principles) + len(result.patterns) + len(result.rules) + len(result.evidence)
         )
         assert len(scored) >= total_in_result
 
@@ -1707,3 +1830,141 @@ class TestQueryRouterIntegration:
         assert "_source" not in cleaned
         assert "_layer" not in cleaned
         assert "_vector_score" not in cleaned
+
+
+# =============================================================================
+# LLM Context Extraction
+# =============================================================================
+
+
+class TestLLMContextExtraction:
+    """Tests for _llm_extract_context and its integration in extract_context."""
+
+    def test_flag_off_skips_llm(self) -> None:
+        """LLM extraction skipped when flag is off."""
+        from engineering_brain.retrieval.context_extractor import _llm_extract_context
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            assert _llm_extract_context("Flask CORS security") is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_llm_success_returns_dict(self, mock_flag, mock_llm) -> None:
+        """Returns structured context dict when LLM succeeds."""
+        from engineering_brain.retrieval.context_extractor import _llm_extract_context
+
+        mock_llm.return_value = {
+            "technologies": ["Flask", "Redis"],
+            "domains": ["security", "api"],
+            "file_type": ".py",
+            "phase": "exec",
+        }
+        result = _llm_extract_context("Implement Flask API with Redis cache")
+        assert result is not None
+        assert "Flask" in result["technologies"]
+        assert "security" in result["domains"]
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_llm_failure_returns_none(self, mock_flag, mock_llm) -> None:
+        """Returns None when LLM call fails."""
+        from engineering_brain.retrieval.context_extractor import _llm_extract_context
+
+        mock_llm.return_value = None
+        assert _llm_extract_context("Flask API") is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_integration_merges_additively(self, mock_flag, mock_llm) -> None:
+        """LLM results merge with keyword results, never replace."""
+        mock_llm.return_value = {
+            "technologies": ["Redis"],
+            "domains": ["performance"],
+        }
+        ctx = extract_context("Create a Flask web server")
+        # Flask should come from keyword detection, Redis from LLM
+        techs_lower = [t.lower() for t in ctx.technologies]
+        assert "flask" in techs_lower
+        assert "redis" in techs_lower
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_integration_deduplicates_case_insensitive(self, mock_flag, mock_llm) -> None:
+        """LLM doesn't add duplicate techs (case-insensitive)."""
+        mock_llm.return_value = {
+            "technologies": ["flask"],  # lowercase duplicate
+            "domains": ["security"],
+        }
+        ctx = extract_context("Create a Flask web server")
+        flask_count = sum(1 for t in ctx.technologies if t.lower() == "flask")
+        assert flask_count == 1
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_integration_llm_failure_preserves_keywords(self, mock_flag, mock_llm) -> None:
+        """When LLM fails, keyword results are preserved unchanged."""
+        mock_llm.return_value = None
+        ctx = extract_context("Create a Flask web server with CORS")
+        techs_lower = [t.lower() for t in ctx.technologies]
+        assert "flask" in techs_lower
+
+
+# =============================================================================
+# LLM Synonym Expansion
+# =============================================================================
+
+
+class TestLLMSynonyms:
+    """Tests for _llm_expand_synonyms in the synonyms module."""
+
+    def test_flag_off_skips_llm(self) -> None:
+        """LLM expansion skipped when flag is off."""
+        from engineering_brain.retrieval.synonyms import _llm_expand_synonyms
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            assert _llm_expand_synonyms(["authentication"]) is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_llm_success_returns_synonyms(self, mock_flag, mock_llm) -> None:
+        """Returns synonym list when LLM succeeds."""
+        from engineering_brain.retrieval.synonyms import _llm_expand_synonyms
+
+        mock_llm.return_value = {"synonyms": ["auth", "login"]}
+        result = _llm_expand_synonyms(["authentication"])
+        assert result == ["auth", "login"]
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_llm_failure_returns_none(self, mock_flag, mock_llm) -> None:
+        """Returns None when LLM call fails."""
+        from engineering_brain.retrieval.synonyms import _llm_expand_synonyms
+
+        mock_llm.return_value = None
+        assert _llm_expand_synonyms(["authentication"]) is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_llm_filters_empty_strings(self, mock_flag, mock_llm) -> None:
+        """Filters out empty strings from LLM response."""
+        from engineering_brain.retrieval.synonyms import _llm_expand_synonyms
+
+        mock_llm.return_value = {"synonyms": ["auth", "", "login", ""]}
+        result = _llm_expand_synonyms(["authentication"])
+        assert result == ["auth", "login"]
+
+    def test_empty_terms_returns_none(self) -> None:
+        """Returns None for empty term list."""
+        from engineering_brain.retrieval.synonyms import _llm_expand_synonyms
+
+        with mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True):
+            assert _llm_expand_synonyms([]) is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_malformed_response_returns_none(self, mock_flag, mock_llm) -> None:
+        """Returns None for malformed LLM response."""
+        from engineering_brain.retrieval.synonyms import _llm_expand_synonyms
+
+        mock_llm.return_value = {"wrong_key": "value"}
+        assert _llm_expand_synonyms(["test"]) is None

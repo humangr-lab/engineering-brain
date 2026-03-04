@@ -18,8 +18,6 @@ import hashlib
 import os
 import sys
 
-import pytest
-
 # Ensure src is on the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
@@ -27,16 +25,16 @@ from engineering_brain.adapters.memory import MemoryGraphAdapter
 from engineering_brain.core.config import BrainConfig
 from engineering_brain.core.schema import EdgeType, NodeType
 from engineering_brain.learning.cross_layer_inferrer import (
+    LAYER_TRANSITIONS,
     CrossLayerEdgeInferrer,
     InferredEdge,
-    LAYER_TRANSITIONS,
     _node_layer,
 )
-
 
 # =============================================================================
 # Mock embedder
 # =============================================================================
+
 
 class MockEmbedder:
     """Deterministic embedder that returns controllable vectors."""
@@ -58,6 +56,7 @@ class MockEmbedder:
 # =============================================================================
 # Helpers
 # =============================================================================
+
 
 def _make_graph() -> MemoryGraphAdapter:
     """Create a fresh in-memory graph adapter."""
@@ -200,10 +199,7 @@ class TestHierarchyConstraints:
         edges = inferrer.infer_edges()
 
         # No direct L0->L3 edge should exist
-        skip_edges = [
-            e for e in edges
-            if e.source_id == "AX-099" and e.target_id == "CR-099"
-        ]
+        skip_edges = [e for e in edges if e.source_id == "AX-099" and e.target_id == "CR-099"]
         assert len(skip_edges) == 0
 
 
@@ -220,15 +216,14 @@ class TestThresholdFiltering:
         _add_node(graph, NodeType.AXIOM.value, "AX-050", text="alpha concept xyz")
         _add_node(graph, NodeType.PRINCIPLE.value, "P-050", text="beta concept abc")
 
-        embedder = MockEmbedder()  # Uses hash-based vectors (low similarity between different texts)
+        embedder = (
+            MockEmbedder()
+        )  # Uses hash-based vectors (low similarity between different texts)
         inferrer = CrossLayerEdgeInferrer(graph, embedder, config)
         edges = inferrer.infer_edges()
 
         # With high threshold and different texts, no edges should be inferred
-        matching = [
-            e for e in edges
-            if e.source_id == "AX-050" and e.target_id == "P-050"
-        ]
+        matching = [e for e in edges if e.source_id == "AX-050" and e.target_id == "P-050"]
         assert len(matching) == 0
 
     def test_threshold_passes_high_similarity(self):
@@ -245,10 +240,7 @@ class TestThresholdFiltering:
         inferrer = CrossLayerEdgeInferrer(graph, embedder, config)
         edges = inferrer.infer_edges()
 
-        matching = [
-            e for e in edges
-            if e.source_id == "AX-051" and e.target_id == "P-051"
-        ]
+        matching = [e for e in edges if e.source_id == "AX-051" and e.target_id == "P-051"]
         assert len(matching) == 1
         assert matching[0].confidence >= 0.1
 
@@ -425,8 +417,12 @@ class TestMergeWithHardcoded:
         hardcoded = {("AX-001", "P-001"), ("AX-002", "P-002")}
 
         inferred = [
-            InferredEdge(source_id="AX-001", target_id="P-001", edge_type=EdgeType.GROUNDS, confidence=0.9),
-            InferredEdge(source_id="AX-003", target_id="P-003", edge_type=EdgeType.GROUNDS, confidence=0.8),
+            InferredEdge(
+                source_id="AX-001", target_id="P-001", edge_type=EdgeType.GROUNDS, confidence=0.9
+            ),
+            InferredEdge(
+                source_id="AX-003", target_id="P-003", edge_type=EdgeType.GROUNDS, confidence=0.8
+            ),
         ]
 
         result = inferrer.merge_with_hardcoded(hardcoded, inferred)
@@ -446,9 +442,18 @@ class TestMergeWithHardcoded:
         hardcoded = {("AX-001", "P-001")}
 
         inferred = [
-            InferredEdge(source_id="AX-010", target_id="P-010", edge_type=EdgeType.GROUNDS, confidence=0.85),
-            InferredEdge(source_id="P-020", target_id="PAT-020", edge_type=EdgeType.INFORMS, confidence=0.75),
-            InferredEdge(source_id="PAT-030", target_id="CR-030", edge_type=EdgeType.INSTANTIATES, confidence=0.65),
+            InferredEdge(
+                source_id="AX-010", target_id="P-010", edge_type=EdgeType.GROUNDS, confidence=0.85
+            ),
+            InferredEdge(
+                source_id="P-020", target_id="PAT-020", edge_type=EdgeType.INFORMS, confidence=0.75
+            ),
+            InferredEdge(
+                source_id="PAT-030",
+                target_id="CR-030",
+                edge_type=EdgeType.INSTANTIATES,
+                confidence=0.65,
+            ),
         ]
 
         result = inferrer.merge_with_hardcoded(hardcoded, inferred)
@@ -466,8 +471,12 @@ class TestMergeWithHardcoded:
         hardcoded = {("AX-001", "P-001"), ("AX-002", "P-002")}
 
         inferred = [
-            InferredEdge(source_id="AX-001", target_id="P-001", edge_type=EdgeType.GROUNDS, confidence=0.9),
-            InferredEdge(source_id="AX-002", target_id="P-002", edge_type=EdgeType.GROUNDS, confidence=0.8),
+            InferredEdge(
+                source_id="AX-001", target_id="P-001", edge_type=EdgeType.GROUNDS, confidence=0.9
+            ),
+            InferredEdge(
+                source_id="AX-002", target_id="P-002", edge_type=EdgeType.GROUNDS, confidence=0.8
+            ),
         ]
 
         result = inferrer.merge_with_hardcoded(hardcoded, inferred)

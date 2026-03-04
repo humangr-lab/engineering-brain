@@ -9,7 +9,7 @@ import pytest
 from engineering_brain.adapters.memory import MemoryGraphAdapter
 from engineering_brain.core.brain import Brain
 from engineering_brain.core.config import BrainConfig
-from engineering_brain.core.schema import EdgeType, NodeType
+from engineering_brain.core.schema import NodeType
 from engineering_brain.learning.cluster_promoter import (
     ClusterPromoter,
     _extract_terms,
@@ -17,10 +17,10 @@ from engineering_brain.learning.cluster_promoter import (
     _text_term_overlap,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helper to create rules
 # ---------------------------------------------------------------------------
+
 
 def _make_rule(
     graph: MemoryGraphAdapter,
@@ -68,6 +68,7 @@ def _config(**overrides) -> BrainConfig:
 # Unit tests for similarity helpers
 # ---------------------------------------------------------------------------
 
+
 class TestSimilarityHelpers:
     def test_jaccard_identical(self):
         assert _jaccard({"a", "b"}, {"a", "b"}) == 1.0
@@ -107,6 +108,7 @@ class TestSimilarityHelpers:
 # ---------------------------------------------------------------------------
 # Cluster crystallization tests
 # ---------------------------------------------------------------------------
+
 
 class TestClusterPromoter:
     def test_basic_cluster_creation(self):
@@ -238,7 +240,8 @@ class TestClusterPromoter:
         rule_ids = ["CR-A-001", "CR-A-002", "CR-A-003"]
         for rid in rule_ids:
             _make_rule(
-                graph, rid,
+                graph,
+                rid,
                 text="Identical text for deterministic test",
                 technologies=["python"],
                 domains=["general"],
@@ -259,12 +262,27 @@ class TestClusterPromoter:
         graph = MemoryGraphAdapter()
         cfg = _config()
 
-        _make_rule(graph, "CR-T-001", text="Path validation security check rule",
-                   technologies=["flask", "python"], domains=["security"])
-        _make_rule(graph, "CR-T-002", text="Path validation security vulnerability check",
-                   technologies=["flask", "python"], domains=["security"])
-        _make_rule(graph, "CR-T-003", text="Path validation security access control",
-                   technologies=["flask"], domains=["security"])
+        _make_rule(
+            graph,
+            "CR-T-001",
+            text="Path validation security check rule",
+            technologies=["flask", "python"],
+            domains=["security"],
+        )
+        _make_rule(
+            graph,
+            "CR-T-002",
+            text="Path validation security vulnerability check",
+            technologies=["flask", "python"],
+            domains=["security"],
+        )
+        _make_rule(
+            graph,
+            "CR-T-003",
+            text="Path validation security access control",
+            technologies=["flask"],
+            domains=["security"],
+        )
 
         cp = ClusterPromoter(graph, cfg)
         created = cp.crystallize()
@@ -283,7 +301,8 @@ class TestClusterPromoter:
         for i in range(3):
             rid = f"CR-PRES-{i:03d}"
             data = _make_rule(
-                graph, rid,
+                graph,
+                rid,
                 text=f"Preservation test rule {i}",
                 technologies=["python"],
                 domains=["testing"],
@@ -312,11 +331,15 @@ class TestClusterPromoter:
 
         for i in range(3):
             _make_rule(
-                graph, f"CR-EP-{i:03d}",
+                graph,
+                f"CR-EP-{i:03d}",
                 text=f"Epistemic aggregation test rule {i}",
                 technologies=["python"],
                 domains=["testing"],
-                ep_b=0.7, ep_d=0.05, ep_u=0.25, ep_a=0.5,
+                ep_b=0.7,
+                ep_d=0.05,
+                ep_u=0.25,
+                ep_a=0.5,
             )
 
         cp = ClusterPromoter(graph, cfg)
@@ -371,12 +394,27 @@ class TestClusterPromoter:
         cfg = _config(crystallize_min_similarity=0.8)  # Very high threshold
 
         # Three rules with different technologies and text
-        _make_rule(graph, "CR-DIV-001", text="Flask CORS security",
-                   technologies=["flask"], domains=["security"])
-        _make_rule(graph, "CR-DIV-002", text="React hooks lifecycle",
-                   technologies=["react"], domains=["ui"])
-        _make_rule(graph, "CR-DIV-003", text="Docker compose networking",
-                   technologies=["docker"], domains=["devops"])
+        _make_rule(
+            graph,
+            "CR-DIV-001",
+            text="Flask CORS security",
+            technologies=["flask"],
+            domains=["security"],
+        )
+        _make_rule(
+            graph,
+            "CR-DIV-002",
+            text="React hooks lifecycle",
+            technologies=["react"],
+            domains=["ui"],
+        )
+        _make_rule(
+            graph,
+            "CR-DIV-003",
+            text="Docker compose networking",
+            technologies=["docker"],
+            domains=["devops"],
+        )
 
         cp = ClusterPromoter(graph, cfg)
         assert cp.crystallize() == []
@@ -396,22 +434,31 @@ class TestClusterPromoter:
             text="High reinforcement CORS validation rule",
             why="Security vulnerability prevention",
             how="Validate origins",
-            technologies=["flask"], domains=["security"],
-            id="CR-COEX-001", reinforcement_count=25, confidence=0.9,
+            technologies=["flask"],
+            domains=["security"],
+            id="CR-COEX-001",
+            reinforcement_count=25,
+            confidence=0.9,
         )
         brain.add_rule(
             text="CORS validation security check rule",
             why="Security vulnerability prevention",
             how="Check origins",
-            technologies=["flask"], domains=["security"],
-            id="CR-COEX-002", reinforcement_count=10, confidence=0.7,
+            technologies=["flask"],
+            domains=["security"],
+            id="CR-COEX-002",
+            reinforcement_count=10,
+            confidence=0.7,
         )
         brain.add_rule(
             text="CORS security validation enforcement rule",
             why="Security vulnerability prevention",
             how="Enforce origins",
-            technologies=["flask"], domains=["security"],
-            id="CR-COEX-003", reinforcement_count=10, confidence=0.7,
+            technologies=["flask"],
+            domains=["security"],
+            id="CR-COEX-003",
+            reinforcement_count=10,
+            confidence=0.7,
         )
 
         promoted = brain.promote()
@@ -428,7 +475,8 @@ class TestClusterPromoter:
 
         for i in range(3):
             _make_rule(
-                graph, f"CR-FLD-{i:03d}",
+                graph,
+                f"CR-FLD-{i:03d}",
                 text=f"Field population test rule number {i}",
                 why="Testing field extraction",
                 technologies=["flask"],
@@ -500,13 +548,15 @@ class TestClusterPromoter:
         # 3 eligible rules + 1 deprecated
         for i in range(3):
             _make_rule(
-                graph, f"CR-DEP-{i:03d}",
+                graph,
+                f"CR-DEP-{i:03d}",
                 text=f"Deprecated exclusion test rule {i}",
                 technologies=["flask"],
                 domains=["security"],
             )
         _make_rule(
-            graph, "CR-DEP-003",
+            graph,
+            "CR-DEP-003",
             text="Deprecated exclusion test rule 3",
             technologies=["flask"],
             domains=["security"],
@@ -520,3 +570,138 @@ class TestClusterPromoter:
         pattern = graph.get_node(created[0])
         assert pattern["_cluster_size"] == 3
         assert "CR-DEP-003" not in pattern["_crystallized_from"]
+
+
+# ---------------------------------------------------------------------------
+# LLM Cluster Promoter
+# ---------------------------------------------------------------------------
+
+import os
+from unittest import mock
+
+
+class TestLLMClusterPromoter:
+    """Tests for LLM-enhanced cluster promotion functions."""
+
+    def test_synthesize_name_flag_off(self) -> None:
+        """LLM name synthesis skipped when flag is off."""
+        graph = MemoryGraphAdapter()
+        cfg = BrainConfig()
+        cp = ClusterPromoter(graph, cfg)
+        cluster = [{"text": "rule 1"}, {"text": "rule 2"}]
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = cp._llm_synthesize_name(cluster)
+            assert result is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_synthesize_name_success(self, mock_flag, mock_llm) -> None:
+        """Returns pattern name when LLM succeeds."""
+        mock_llm.return_value = "Secure Input Validation Pattern"
+        graph = MemoryGraphAdapter()
+        cfg = BrainConfig()
+        cp = ClusterPromoter(graph, cfg)
+        cluster = [{"text": "validate all inputs"}, {"text": "sanitize user data"}]
+
+        result = cp._llm_synthesize_name(cluster)
+        assert result == "Secure Input Validation Pattern"
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_synthesize_name_too_many_words(self, mock_flag, mock_llm) -> None:
+        """Returns None when LLM generates name with > 10 words."""
+        mock_llm.return_value = "This Name Has Way Too Many Words To Be A Good Pattern Name Ever"
+        graph = MemoryGraphAdapter()
+        cfg = BrainConfig()
+        cp = ClusterPromoter(graph, cfg)
+
+        result = cp._llm_synthesize_name([{"text": "r1"}, {"text": "r2"}])
+        assert result is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_synthesize_name_failure(self, mock_flag, mock_llm) -> None:
+        """Returns None when LLM call fails."""
+        mock_llm.return_value = None
+        graph = MemoryGraphAdapter()
+        cfg = BrainConfig()
+        cp = ClusterPromoter(graph, cfg)
+
+        result = cp._llm_synthesize_name([{"text": "r1"}])
+        assert result is None
+
+    def test_synthesize_intent_flag_off(self) -> None:
+        """LLM intent synthesis skipped when flag is off."""
+        graph = MemoryGraphAdapter()
+        cfg = BrainConfig()
+        cp = ClusterPromoter(graph, cfg)
+        cluster = [{"text": "rule 1"}]
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = cp._llm_synthesize_intent(cluster)
+            assert result is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_synthesize_intent_success(self, mock_flag, mock_llm) -> None:
+        """Returns intent sentence when LLM succeeds."""
+        mock_llm.return_value = "Ensure all user inputs are validated before processing."
+        graph = MemoryGraphAdapter()
+        cfg = BrainConfig()
+        cp = ClusterPromoter(graph, cfg)
+
+        result = cp._llm_synthesize_intent([{"text": "r1"}, {"text": "r2"}])
+        assert result is not None
+        assert "validated" in result.lower()
+
+    def test_merge_field_flag_off(self) -> None:
+        """LLM merge field skipped when flag is off."""
+        graph = MemoryGraphAdapter()
+        cfg = BrainConfig()
+        cp = ClusterPromoter(graph, cfg)
+        cluster = [{"why": "reason 1"}, {"why": "reason 2"}]
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = cp._llm_merge_field(cluster, "why", "shared intent")
+            assert result is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_merge_field_success(self, mock_flag, mock_llm) -> None:
+        """Returns merged field text when LLM succeeds."""
+        mock_llm.return_value = (
+            "Prevent security vulnerabilities through systematic input validation."
+        )
+        graph = MemoryGraphAdapter()
+        cfg = BrainConfig()
+        cp = ClusterPromoter(graph, cfg)
+        cluster = [{"why": "prevent XSS"}, {"why": "prevent SQL injection"}]
+
+        result = cp._llm_merge_field(cluster, "why", "shared intent")
+        assert result is not None
+        assert len(result) <= 400
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_merge_field_too_long(self, mock_flag, mock_llm) -> None:
+        """Returns None when LLM response exceeds 400 chars."""
+        mock_llm.return_value = "x" * 500
+        graph = MemoryGraphAdapter()
+        cfg = BrainConfig()
+        cp = ClusterPromoter(graph, cfg)
+
+        result = cp._llm_merge_field([{"why": "r1"}], "why")
+        assert result is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_merge_field_failure(self, mock_flag, mock_llm) -> None:
+        """Returns None when LLM call fails."""
+        mock_llm.return_value = None
+        graph = MemoryGraphAdapter()
+        cfg = BrainConfig()
+        cp = ClusterPromoter(graph, cfg)
+
+        result = cp._llm_merge_field([{"why": "r1"}], "why")
+        assert result is None

@@ -26,14 +26,15 @@ from engineering_brain.learning.adaptive_promotion import (
     BetaPrior,
 )
 
-
 # ---------------------------------------------------------------------------
 # Mock observation log
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _MockObservation:
     """Lightweight stand-in for Observation namedtuple / dataclass."""
+
     event_type: str = "query_served"
     outcome: str = "unknown"
     rule_ids: tuple[str, ...] = ()
@@ -239,7 +240,7 @@ class TestRecordOutcome:
 
         # _compute_priors rebuilds from Jeffreys prior (1,1) + 1 survived outcome
         assert policy._priors["security"].alpha == 2.0  # 1.0 base + 1.0 survived
-        assert policy._priors["security"].beta == 1.0   # 1.0 base, no failure
+        assert policy._priors["security"].beta == 1.0  # 1.0 base, no failure
         assert policy._priors["security"].n_observations == 1
 
     def test_record_outcome_not_survived(self):
@@ -249,8 +250,8 @@ class TestRecordOutcome:
         policy.record_outcome("security", promoted=True, survived=False)
 
         # _compute_priors rebuilds from Jeffreys prior (1,1) + 1 failed outcome
-        assert policy._priors["security"].alpha == 1.0   # 1.0 base, no success
-        assert policy._priors["security"].beta == 2.0    # 1.0 base + 1.0 failure
+        assert policy._priors["security"].alpha == 1.0  # 1.0 base, no success
+        assert policy._priors["security"].beta == 2.0  # 1.0 base + 1.0 failure
         assert policy._priors["security"].n_observations == 1
 
     def test_record_outcome_creates_prior(self):
@@ -264,7 +265,7 @@ class TestRecordOutcome:
         prior = policy._priors["brand_new_domain"]
         # Starts from BetaPrior() defaults then +1 alpha
         assert prior.alpha == 2.0  # 1.0 default + 1.0 survived
-        assert prior.beta == 1.0   # 1.0 default, no failure
+        assert prior.beta == 1.0  # 1.0 default, no failure
         assert prior.n_observations == 1
 
     def test_record_outcome_case_insensitive(self):
@@ -369,8 +370,14 @@ class TestStats:
         result = policy.stats()
 
         expected_keys = {
-            "alpha", "beta", "mean", "confidence", "multiplier",
-            "n_observations", "effective_l4_to_l3", "effective_l3_to_l2",
+            "alpha",
+            "beta",
+            "mean",
+            "confidence",
+            "multiplier",
+            "n_observations",
+            "effective_l4_to_l3",
+            "effective_l3_to_l2",
         }
         for domain, info in result["domains"].items():
             assert expected_keys.issubset(info.keys()), (

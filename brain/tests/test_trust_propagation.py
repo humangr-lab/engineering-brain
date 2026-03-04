@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from engineering_brain.adapters.memory import MemoryGraphAdapter
-from engineering_brain.epistemic.trust_propagation import EigenTrustEngine, TRUST_WEIGHTS
+from engineering_brain.epistemic.trust_propagation import TRUST_WEIGHTS, EigenTrustEngine
 
 
 class TestEigenTrustBasic:
@@ -94,8 +94,8 @@ class TestEigenTrustEdgeTypes:
         g.add_node("Axiom", "AX-001", {"id": "AX-001"})
         g.add_node("Rule", "CR-STRONG", {"id": "CR-STRONG"})
         g.add_node("Rule", "CR-WEAK", {"id": "CR-WEAK"})
-        g.add_edge("AX-001", "CR-STRONG", "GROUNDS")       # weight 1.0
-        g.add_edge("AX-001", "CR-WEAK", "APPLIES_TO")      # weight 0.3
+        g.add_edge("AX-001", "CR-STRONG", "GROUNDS")  # weight 1.0
+        g.add_edge("AX-001", "CR-WEAK", "APPLIES_TO")  # weight 0.3
 
         engine = EigenTrustEngine()
         scores = engine.compute(g)

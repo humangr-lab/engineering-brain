@@ -1,39 +1,40 @@
 """Tier 5 validation tests — checkers, orchestrator, rate limiting, offline mode."""
+
 import asyncio
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 import pytest
-
 
 # =========================================================================
 # I-01: OfficialDocsChecker tests
 # =========================================================================
 
+
 class TestOfficialDocsChecker:
     def test_direct_tech_match(self):
         from engineering_brain.validation.checkers.official_docs import OfficialDocsChecker
+
         checker = OfficialDocsChecker()
-        result = asyncio.get_event_loop().run_until_complete(
-            checker.check_technology("Flask")
-        )
+        result = asyncio.run(checker.check_technology("Flask"))
         assert result is not None
         assert result["exists"] is True
         assert "flask" in result["url"].lower()
 
     def test_unknown_tech_returns_none(self):
         from engineering_brain.validation.checkers.official_docs import OfficialDocsChecker
+
         checker = OfficialDocsChecker()
-        result = asyncio.get_event_loop().run_until_complete(
-            checker.check_technology("NonExistentTech12345")
-        )
+        result = asyncio.run(checker.check_technology("NonExistentTech12345"))
         assert result is None
 
     def test_search_claim_returns_sources(self):
         from engineering_brain.validation.checkers.official_docs import OfficialDocsChecker
+
         checker = OfficialDocsChecker()
-        sources = asyncio.get_event_loop().run_until_complete(
+        sources = asyncio.run(
             checker.search_claim("CORS configuration", ["Flask", "Redis"], ["security"])
         )
         assert len(sources) >= 2
@@ -41,11 +42,10 @@ class TestOfficialDocsChecker:
 
     def test_search_claim_deduplicates_urls(self):
         from engineering_brain.validation.checkers.official_docs import OfficialDocsChecker
+
         checker = OfficialDocsChecker()
         # Flask-SocketIO and Flask should not produce duplicate Flask URL
-        sources = asyncio.get_event_loop().run_until_complete(
-            checker.search_claim("WebSocket", ["Flask", "Flask-SocketIO"], [])
-        )
+        sources = asyncio.run(checker.search_claim("WebSocket", ["Flask", "Flask-SocketIO"], []))
         urls = [s.url for s in sources]
         assert len(urls) == len(set(urls)), "Duplicate URLs in sources"
 
@@ -54,14 +54,17 @@ class TestOfficialDocsChecker:
 # I-02: Technology alias resolution tests
 # =========================================================================
 
+
 class TestTechAliasResolution:
     def test_resolve_exact_match(self):
         from engineering_brain.validation.checkers.official_docs import resolve_technology
+
         assert resolve_technology("Flask") == "Flask"
         assert resolve_technology("Redis") == "Redis"
 
     def test_resolve_alias(self):
         from engineering_brain.validation.checkers.official_docs import resolve_technology
+
         assert resolve_technology("flask-restful") == "Flask"
         assert resolve_technology("expressjs") == "Express"
         assert resolve_technology("k8s") == "Kubernetes"
@@ -69,18 +72,21 @@ class TestTechAliasResolution:
 
     def test_resolve_prefix_match(self):
         from engineering_brain.validation.checkers.official_docs import resolve_technology
+
         # "Flask-Foo" should resolve to "Flask"
         assert resolve_technology("Flask-WTF") == "Flask"
         assert resolve_technology("Flask-Admin") == "Flask"
 
     def test_resolve_case_insensitive(self):
         from engineering_brain.validation.checkers.official_docs import resolve_technology
+
         assert resolve_technology("flask") == "Flask"
         assert resolve_technology("REDIS") == "Redis"
         assert resolve_technology("docker") == "Docker"
 
     def test_resolve_unknown_returns_as_is(self):
         from engineering_brain.validation.checkers.official_docs import resolve_technology
+
         assert resolve_technology("MyCustomLib") == "MyCustomLib"
 
 
@@ -88,29 +94,40 @@ class TestTechAliasResolution:
 # I-03: Rate limiter tests
 # =========================================================================
 
+
 class TestTokenBucketRateLimiter:
     def test_basic_acquire(self):
         from engineering_brain.validation.orchestrator import TokenBucketRateLimiter
+
         limiter = TokenBucketRateLimiter(rate=10.0, burst=5)
+
         # Should acquire 5 tokens without blocking
-        loop = asyncio.get_event_loop()
-        for _ in range(5):
-            loop.run_until_complete(limiter.acquire())
+        async def _run():
+            for _ in range(5):
+                await limiter.acquire()
+
+        asyncio.run(_run())
 
     def test_burst_limit(self):
         import time
+
         from engineering_brain.validation.orchestrator import TokenBucketRateLimiter
+
         limiter = TokenBucketRateLimiter(rate=100.0, burst=2)
-        loop = asyncio.get_event_loop()
+
+        async def _run():
+            for _ in range(3):
+                await limiter.acquire()
+
         start = time.monotonic()
-        for _ in range(3):
-            loop.run_until_complete(limiter.acquire())
+        asyncio.run(_run())
         elapsed = time.monotonic() - start
         # 3 acquires with burst=2 should take minimal time at rate=100/s
         assert elapsed < 1.0
 
     def test_get_rate_limiter_returns_same_instance(self):
         from engineering_brain.validation.orchestrator import _get_rate_limiter
+
         limiter1 = _get_rate_limiter("pypi")
         limiter2 = _get_rate_limiter("pypi")
         assert limiter1 is limiter2
@@ -120,9 +137,11 @@ class TestTokenBucketRateLimiter:
 # I-05: Offline mode tests
 # =========================================================================
 
+
 class TestOfflineMode:
     def test_offline_env_var(self):
         from engineering_brain.validation.orchestrator import _is_offline_mode
+
         old = os.environ.get("BRAIN_VALIDATION_OFFLINE")
         try:
             os.environ["BRAIN_VALIDATION_OFFLINE"] = "true"
@@ -144,9 +163,11 @@ class TestOfflineMode:
 # Integration: ValidationReport
 # =========================================================================
 
+
 class TestValidationReport:
     def test_report_summary(self):
         from engineering_brain.validation.orchestrator import ValidationReport
+
         report = ValidationReport()
         report.total_nodes = 100
         report.validated = 80
@@ -159,6 +180,7 @@ class TestValidationReport:
 
     def test_report_by_checker(self):
         from engineering_brain.validation.orchestrator import ValidationReport
+
         report = ValidationReport()
         report.by_checker["OfficialDocsChecker"] = 50
         report.by_checker["NVDChecker"] = 10
@@ -171,10 +193,13 @@ class TestValidationReport:
 # I-04: ObservationLog.record_feedback test
 # =========================================================================
 
+
 class TestObservationLogFeedback:
     def test_record_feedback(self):
         import tempfile
+
         from engineering_brain.observation.log import ObservationLog
+
         with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
             path = f.name
         try:

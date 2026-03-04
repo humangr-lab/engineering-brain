@@ -9,7 +9,7 @@ import tempfile
 import pytest
 
 from engineering_brain.adapters.memory import MemoryGraphAdapter
-from engineering_brain.epistemic.bootstrap import bootstrap_all_nodes, _node_layer
+from engineering_brain.epistemic.bootstrap import _node_layer, bootstrap_all_nodes
 
 
 class TestNodeLayer:
@@ -46,9 +46,11 @@ class TestBootstrapAllNodes:
         return graph, tmpdir
 
     def test_bootstrap_assigns_ep_fields(self):
-        graph, cache_dir = self._setup_graph_and_cache([
-            ("CR-TEST-001", "Rule", {"confidence": 0.5}),
-        ])
+        graph, cache_dir = self._setup_graph_and_cache(
+            [
+                ("CR-TEST-001", "Rule", {"confidence": 0.5}),
+            ]
+        )
 
         stats = bootstrap_all_nodes(graph, cache_dir)
         assert stats["bootstrapped"] == 1
@@ -86,9 +88,11 @@ class TestBootstrapAllNodes:
         assert with_sources["ep_u"] < without_sources["ep_u"]
 
     def test_axiom_gets_near_dogmatic(self):
-        graph, cache_dir = self._setup_graph_and_cache([
-            ("AX-TEST-001", "Axiom", {}),
-        ])
+        graph, cache_dir = self._setup_graph_and_cache(
+            [
+                ("AX-TEST-001", "Axiom", {}),
+            ]
+        )
 
         bootstrap_all_nodes(graph, cache_dir)
 
@@ -97,9 +101,11 @@ class TestBootstrapAllNodes:
         assert node["ep_u"] <= 0.10
 
     def test_backward_compat_confidence_set(self):
-        graph, cache_dir = self._setup_graph_and_cache([
-            ("CR-TEST-004", "Rule", {"confidence": 0.5}),
-        ])
+        graph, cache_dir = self._setup_graph_and_cache(
+            [
+                ("CR-TEST-004", "Rule", {"confidence": 0.5}),
+            ]
+        )
 
         bootstrap_all_nodes(graph, cache_dir)
 
@@ -120,12 +126,14 @@ class TestBootstrapAllNodes:
         assert stats["bootstrapped"] == 1
 
     def test_multiple_node_types(self):
-        graph, cache_dir = self._setup_graph_and_cache([
-            ("AX-001", "Axiom", {}),
-            ("P-001", "Principle", {}),
-            ("PAT-001", "Pattern", {}),
-            ("CR-001", "Rule", {}),
-        ])
+        graph, cache_dir = self._setup_graph_and_cache(
+            [
+                ("AX-001", "Axiom", {}),
+                ("P-001", "Principle", {}),
+                ("PAT-001", "Pattern", {}),
+                ("CR-001", "Rule", {}),
+            ]
+        )
 
         stats = bootstrap_all_nodes(graph, cache_dir)
         assert stats["bootstrapped"] == 4

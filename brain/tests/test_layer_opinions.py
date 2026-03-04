@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from engineering_brain.epistemic.opinion import OpinionTuple
 from engineering_brain.epistemic.layer_opinions import (
-    initial_opinion_for_layer,
     bootstrap_opinion,
+    initial_opinion_for_layer,
 )
-
 
 # --- initial_opinion_for_layer ---
 
@@ -101,20 +99,29 @@ class TestBootstrapOpinion:
         assert result.u < prior.u
 
     def test_more_sources_less_uncertainty(self):
-        one_source = bootstrap_opinion("L3", [
-            {"source_type": "official_docs"},
-        ])
-        two_sources = bootstrap_opinion("L3", [
-            {"source_type": "official_docs"},
-            {"source_type": "package_registry"},
-        ])
+        one_source = bootstrap_opinion(
+            "L3",
+            [
+                {"source_type": "official_docs"},
+            ],
+        )
+        two_sources = bootstrap_opinion(
+            "L3",
+            [
+                {"source_type": "official_docs"},
+                {"source_type": "package_registry"},
+            ],
+        )
         assert two_sources.u < one_source.u
 
     def test_high_trust_source_boosts_belief(self):
         prior = initial_opinion_for_layer("L3")
-        result = bootstrap_opinion("L3", [
-            {"source_type": "rfc_standard", "verified": True},
-        ])
+        result = bootstrap_opinion(
+            "L3",
+            [
+                {"source_type": "rfc_standard", "verified": True},
+            ],
+        )
         assert result.b > prior.b
 
     def test_result_is_valid_opinion(self):
@@ -128,18 +135,24 @@ class TestBootstrapOpinion:
 
     def test_l0_with_sources_stays_high(self):
         """L0 axioms with good sources should remain near-dogmatic."""
-        result = bootstrap_opinion("L0", [
-            {"source_type": "official_docs", "verified": True},
-            {"source_type": "rfc_standard", "verified": True},
-        ])
+        result = bootstrap_opinion(
+            "L0",
+            [
+                {"source_type": "official_docs", "verified": True},
+                {"source_type": "rfc_standard", "verified": True},
+            ],
+        )
         assert result.b > 0.90
         assert result.u < 0.05
 
     def test_l5_with_weak_source_still_moderate(self):
         """L5 ephemeral with one weak source stays moderate (not high confidence)."""
-        result = bootstrap_opinion("L5", [
-            {"source_type": "stackoverflow", "vote_count": 5},
-        ])
+        result = bootstrap_opinion(
+            "L5",
+            [
+                {"source_type": "stackoverflow", "vote_count": 5},
+            ],
+        )
         # SO base trust=0.60, CBF with L5 prior (b=0.05, u=0.95) → ~0.61
         # Not high confidence, but source evidence carries real weight
         assert result.b < 0.65

@@ -20,10 +20,10 @@ from engineering_brain.retrieval.context_extractor import (
 from engineering_brain.retrieval.merger import merge_results_rrf
 from engineering_brain.retrieval.scorer import score_knowledge
 
-
 # ---------------------------------------------------------------------------
 # RRF Merge
 # ---------------------------------------------------------------------------
+
 
 class TestMergeResultsRRF:
     def test_merges_disjoint_sets(self):
@@ -100,6 +100,7 @@ class TestMergeResultsRRF:
 # Vector score in scorer
 # ---------------------------------------------------------------------------
 
+
 class TestVectorScoreSignal:
     def test_vector_score_boosts_relevance(self):
         """A node with high _vector_score should score higher than without."""
@@ -117,10 +118,16 @@ class TestVectorScoreSignal:
         cfg.vector_score_weight = 0.15
 
         score_without = score_knowledge(
-            base_node, ["flask"], ["security"], config=cfg,
+            base_node,
+            ["flask"],
+            ["security"],
+            config=cfg,
         )
         score_with = score_knowledge(
-            {**base_node, "_vector_score": 0.95}, ["flask"], ["security"], config=cfg,
+            {**base_node, "_vector_score": 0.95},
+            ["flask"],
+            ["security"],
+            config=cfg,
         )
 
         assert score_with > score_without
@@ -145,6 +152,7 @@ class TestVectorScoreSignal:
 # ---------------------------------------------------------------------------
 # Domain expansion
 # ---------------------------------------------------------------------------
+
 
 class TestDomainExpansion:
     def test_build_hierarchy(self):

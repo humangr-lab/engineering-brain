@@ -222,3 +222,118 @@ class TestDemotion:
         node = {"id": "CR-061", "epistemic_status": "E0"}
         updated = ladder.demote(node)
         assert updated["epistemic_status"] == "E0"
+
+
+# ---------------------------------------------------------------------------
+# LLM Epistemic Suggestion
+# ---------------------------------------------------------------------------
+
+import os
+from unittest import mock
+
+
+class TestLLMEpistemicSuggestion:
+    """Tests for _llm_suggest_classification (advisory only)."""
+
+    def test_flag_off_returns_none(self, ladder) -> None:
+        """LLM suggestion skipped when flag is off."""
+        node = {"id": "CR-070", "text": "Always use parameterized queries"}
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = ladder._llm_suggest_classification(node)
+            assert result is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_llm_success_returns_status(self, mock_flag, mock_llm, ladder) -> None:
+        """Returns EpistemicStatus when LLM suggests valid classification."""
+        mock_llm.return_value = {"status": "E3", "reasoning": "Well-tested pattern"}
+        node = {
+            "id": "CR-071",
+            "text": "Always use parameterized queries",
+            "reinforcement_count": 5,
+            "validation_status": "validated",
+        }
+
+        result = ladder._llm_suggest_classification(node)
+        assert result is not None
+        assert result.value == "E3"
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_llm_stores_advisory_metadata(self, mock_flag, mock_llm, ladder) -> None:
+        """Stores suggestion as metadata on node, never overrides classify()."""
+        mock_llm.return_value = {"status": "E4", "reasoning": "Proven across projects"}
+        node = {
+            "id": "CR-072",
+            "text": "Use type hints",
+            "reinforcement_count": 10,
+            "validation_status": "cross_checked",
+        }
+
+        ladder._llm_suggest_classification(node)
+        assert node["_llm_suggested_status"] == "E4"
+        assert "Proven" in node["_llm_suggested_reasoning"]
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_llm_invalid_status_returns_none(self, mock_flag, mock_llm, ladder) -> None:
+        """Returns None when LLM suggests invalid status."""
+        mock_llm.return_value = {"status": "E99", "reasoning": "Invalid level"}
+        node = {"id": "CR-073", "text": "test"}
+
+        result = ladder._llm_suggest_classification(node)
+        assert result is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_llm_failure_returns_none(self, mock_flag, mock_llm, ladder) -> None:
+        """Returns None when LLM call fails."""
+        mock_llm.return_value = None
+        node = {"id": "CR-074", "text": "test"}
+
+        result = ladder._llm_suggest_classification(node)
+        assert result is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_reasoning_truncated(self, mock_flag, mock_llm, ladder) -> None:
+        """Reasoning is truncated to 200 chars."""
+        mock_llm.return_value = {"status": "E2", "reasoning": "x" * 500}
+        node = {"id": "CR-075", "text": "test"}
+
+        ladder._llm_suggest_classification(node)
+        assert len(node.get("_llm_suggested_reasoning", "")) <= 200
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_never_overrides_deterministic_classify(self, mock_flag, mock_llm, ladder) -> None:
+        """Advisory suggestion does NOT change deterministic classification."""
+        mock_llm.return_value = {"status": "E5", "reasoning": "LLM says axiom"}
+        node = {
+            "id": "CR-076",
+            "text": "test",
+            "reinforcement_count": 0,
+            "validation_status": "unvalidated",
+        }
+
+        # Deterministic classify should give E0 or E1 for zero reinforcements
+        det_result = ladder.classify(node)
+        ladder._llm_suggest_classification(node)
+
+        # Re-classify — should be unchanged
+        assert ladder.classify(node) == det_result
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_batch_classify_calls_llm(self, mock_flag, mock_llm, ladder) -> None:
+        """batch_classify invokes LLM suggestion for each node."""
+        mock_llm.return_value = {"status": "E2", "reasoning": "Observed pattern"}
+        nodes = [
+            {"id": "CR-077", "text": "rule 1", "reinforcement_count": 2},
+            {"id": "CR-078", "text": "rule 2", "reinforcement_count": 3},
+        ]
+
+        ladder.batch_classify(nodes)
+        # Each node should have advisory metadata
+        for n in nodes:
+            assert "_llm_suggested_status" in n

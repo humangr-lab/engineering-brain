@@ -12,7 +12,7 @@ Verifies:
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -26,10 +26,10 @@ from engineering_brain.retrieval.embedder import (
     reset_embedder,
 )
 
-
 # ---------------------------------------------------------------------------
 # cosine_similarity
 # ---------------------------------------------------------------------------
+
 
 class TestCosineSimilarity:
     def test_identical_vectors(self):
@@ -59,25 +59,30 @@ class TestCosineSimilarity:
 # node_to_text
 # ---------------------------------------------------------------------------
 
+
 class TestNodeToText:
     def setup_method(self):
         self.embedder = BrainEmbedder(MemoryVectorAdapter())
 
     def test_rule_fields(self):
-        text = self.embedder.node_to_text({
-            "text": "Validate CORS origins",
-            "why": "Prevent XSS",
-            "how_to_do_right": "Use allowlist",
-        })
+        text = self.embedder.node_to_text(
+            {
+                "text": "Validate CORS origins",
+                "why": "Prevent XSS",
+                "how_to_do_right": "Use allowlist",
+            }
+        )
         assert "Validate CORS origins" in text
         assert "Prevent XSS" in text
         assert "Use allowlist" in text
 
     def test_pattern_fields(self):
-        text = self.embedder.node_to_text({
-            "name": "Deny By Default",
-            "intent": "Block unknown input",
-        })
+        text = self.embedder.node_to_text(
+            {
+                "name": "Deny By Default",
+                "intent": "Block unknown input",
+            }
+        )
         assert "Deny By Default" in text
         assert "Block unknown input" in text
 
@@ -86,10 +91,12 @@ class TestNodeToText:
         assert "All input is hostile" in text
 
     def test_finding_fields(self):
-        text = self.embedder.node_to_text({
-            "description": "CORS wildcard found",
-            "resolution": "Restrict origins",
-        })
+        text = self.embedder.node_to_text(
+            {
+                "description": "CORS wildcard found",
+                "resolution": "Restrict origins",
+            }
+        )
         assert "CORS wildcard found" in text
         assert "Restrict origins" in text
 
@@ -102,11 +109,13 @@ class TestNodeToText:
 
     def test_primary_field_priority(self):
         """'text' has priority over 'name' over 'statement'."""
-        text = self.embedder.node_to_text({
-            "text": "TEXT_FIELD",
-            "name": "NAME_FIELD",
-            "statement": "STATEMENT_FIELD",
-        })
+        text = self.embedder.node_to_text(
+            {
+                "text": "TEXT_FIELD",
+                "name": "NAME_FIELD",
+                "statement": "STATEMENT_FIELD",
+            }
+        )
         assert "TEXT_FIELD" in text
         # Only first non-empty primary field is used
         assert "NAME_FIELD" not in text
@@ -115,6 +124,7 @@ class TestNodeToText:
 # ---------------------------------------------------------------------------
 # Graceful degradation (no provider)
 # ---------------------------------------------------------------------------
+
 
 class TestGracefulDegradation:
     def test_embed_text_no_provider(self):
@@ -134,9 +144,14 @@ class TestGracefulDegradation:
 
     def test_embed_all_nodes_fast_exit(self):
         graph = MemoryGraphAdapter()
-        graph.add_node(NodeType.RULE.value, "CR-001", {
-            "id": "CR-001", "text": "test",
-        })
+        graph.add_node(
+            NodeType.RULE.value,
+            "CR-001",
+            {
+                "id": "CR-001",
+                "text": "test",
+            },
+        )
         embedder = BrainEmbedder(MemoryVectorAdapter())
         embedder._provider_attempted = True
         stats = embedder.embed_all_nodes(graph)
@@ -148,6 +163,7 @@ class TestGracefulDegradation:
 # embed_all_nodes with mock provider
 # ---------------------------------------------------------------------------
 
+
 class TestEmbedAllNodes:
     def test_embeds_and_stores_nodes(self):
         graph = MemoryGraphAdapter()
@@ -155,11 +171,15 @@ class TestEmbedAllNodes:
 
         # Add rules (CR- prefix → L3 → brain_rules collection)
         for i in range(3):
-            graph.add_node(NodeType.RULE.value, f"CR-TEST-{i:03d}", {
-                "id": f"CR-TEST-{i:03d}",
-                "text": f"Test rule {i}",
-                "technologies": ["python"],
-            })
+            graph.add_node(
+                NodeType.RULE.value,
+                f"CR-TEST-{i:03d}",
+                {
+                    "id": f"CR-TEST-{i:03d}",
+                    "text": f"Test rule {i}",
+                    "technologies": ["python"],
+                },
+            )
 
         embedder = BrainEmbedder(vector)
         # Mock the provider to return fake embeddings
@@ -176,12 +196,23 @@ class TestEmbedAllNodes:
         graph = MemoryGraphAdapter()
         vector = MemoryVectorAdapter()
 
-        graph.add_node(NodeType.RULE.value, "CR-ACTIVE", {
-            "id": "CR-ACTIVE", "text": "Active rule",
-        })
-        graph.add_node(NodeType.RULE.value, "CR-DEP", {
-            "id": "CR-DEP", "text": "Deprecated rule", "deprecated": True,
-        })
+        graph.add_node(
+            NodeType.RULE.value,
+            "CR-ACTIVE",
+            {
+                "id": "CR-ACTIVE",
+                "text": "Active rule",
+            },
+        )
+        graph.add_node(
+            NodeType.RULE.value,
+            "CR-DEP",
+            {
+                "id": "CR-DEP",
+                "text": "Deprecated rule",
+                "deprecated": True,
+            },
+        )
 
         embedder = BrainEmbedder(vector)
         mock_provider = MagicMock()
@@ -197,9 +228,14 @@ class TestEmbedAllNodes:
         graph = MemoryGraphAdapter()
         vector = MemoryVectorAdapter()
 
-        graph.add_node("Unknown", "UNKNOWN-001", {
-            "id": "UNKNOWN-001", "text": "Unknown type",
-        })
+        graph.add_node(
+            "Unknown",
+            "UNKNOWN-001",
+            {
+                "id": "UNKNOWN-001",
+                "text": "Unknown type",
+            },
+        )
 
         embedder = BrainEmbedder(vector)
         mock_provider = MagicMock()
@@ -214,6 +250,7 @@ class TestEmbedAllNodes:
 # ---------------------------------------------------------------------------
 # Singleton
 # ---------------------------------------------------------------------------
+
 
 class TestSingleton:
     def setup_method(self):

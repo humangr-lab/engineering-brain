@@ -14,12 +14,10 @@ import os
 import tempfile
 import textwrap
 
-import pytest
-
-
 # ──────────────────────────────────────────────────────────────────────
 # Layer 1: EXPLICIT keyword detection (existing behavior preserved)
 # ──────────────────────────────────────────────────────────────────────
+
 
 def test_layer1_explicit_keyword_detection():
     """Layer 1 detects technologies from task description keywords."""
@@ -61,6 +59,7 @@ def test_layer1_empty_description():
 # Layer 2: TIG — Technology Implication Graph
 # ──────────────────────────────────────────────────────────────────────
 
+
 def test_layer2_tig_always_domains():
     """TIG 'always' domains are added unconditionally for detected tech."""
     from engineering_brain.retrieval.context_extractor import apply_technology_implications
@@ -77,7 +76,9 @@ def test_layer2_tig_conditional_routes():
     from engineering_brain.retrieval.context_extractor import apply_technology_implications
 
     # With route keywords
-    domains_with = apply_technology_implications(["Flask"], "create web server with routes and endpoints")
+    domains_with = apply_technology_implications(
+        ["Flask"], "create web server with routes and endpoints"
+    )
     assert "path_traversal" in domains_with
     assert "auth_middleware" in domains_with
 
@@ -135,24 +136,28 @@ def test_layer2_full_auto_tag_with_tig():
     assert "Flask" in task["knowledge_tags"]
     # TIG should add cors, error_handling etc.
     domains = task["knowledge_domains"]
-    assert any(d in domains for d in ["cors", "error_handling", "input_validation"]), \
+    assert any(d in domains for d in ["cors", "error_handling", "input_validation"]), (
         f"Expected TIG domains in {domains}"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Layer 3: AST — Code analysis
 # ──────────────────────────────────────────────────────────────────────
 
+
 def test_layer3_ast_import_detection():
     """AST analysis detects technologies from Python imports."""
     from engineering_brain.retrieval.context_extractor import extract_ast_context
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-        f.write(textwrap.dedent("""\
+        f.write(
+            textwrap.dedent("""\
             import flask
             from sqlalchemy import Column
             import subprocess
-        """))
+        """)
+        )
         f.flush()
         path = f.name
 
@@ -213,6 +218,7 @@ def test_layer3_ast_from_import():
 # Provenance tracking
 # ──────────────────────────────────────────────────────────────────────
 
+
 def test_provenance_tracking():
     """auto_tag_task records provenance for each detected tag."""
     from engineering_brain.retrieval.task_knowledge import auto_tag_task
@@ -232,6 +238,7 @@ def test_provenance_tracking():
 # ──────────────────────────────────────────────────────────────────────
 # KnowledgeShoppingList
 # ──────────────────────────────────────────────────────────────────────
+
 
 def test_shopping_list_merge():
     """KnowledgeShoppingList.merge() deduplicates and preserves priority."""
@@ -264,6 +271,7 @@ def test_shopping_list_merge():
 # ──────────────────────────────────────────────────────────────────────
 # Epoch versioning
 # ──────────────────────────────────────────────────────────────────────
+
 
 def test_brain_version_counter():
     """Brain.version increments on add_rule."""
@@ -301,12 +309,12 @@ def test_brain_version_all_write_methods():
 
 def test_check_knowledge_delta():
     """check_knowledge_delta detects changes between snapshots."""
-    from engineering_brain.retrieval.task_knowledge import (
-        init_task_knowledge,
-        get_brain_version,
-        check_knowledge_delta,
-    )
     from engineering_brain import Brain
+    from engineering_brain.retrieval.task_knowledge import (
+        check_knowledge_delta,
+        get_brain_version,
+        init_task_knowledge,
+    )
 
     brain = Brain(adapter="memory")
     init_task_knowledge(brain)
@@ -323,12 +331,12 @@ def test_check_knowledge_delta():
 
 def test_check_knowledge_delta_no_change():
     """check_knowledge_delta reports no change when nothing written."""
-    from engineering_brain.retrieval.task_knowledge import (
-        init_task_knowledge,
-        get_brain_version,
-        check_knowledge_delta,
-    )
     from engineering_brain import Brain
+    from engineering_brain.retrieval.task_knowledge import (
+        check_knowledge_delta,
+        get_brain_version,
+        init_task_knowledge,
+    )
 
     brain = Brain(adapter="memory")
     init_task_knowledge(brain)
@@ -344,13 +352,14 @@ def test_check_knowledge_delta_no_change():
 # Batch enrichment with 3-layer tagging
 # ──────────────────────────────────────────────────────────────────────
 
+
 def test_enrich_tasks_batch():
     """enrich_tasks_batch works with the new 3-layer tagging."""
-    from engineering_brain.retrieval.task_knowledge import (
-        init_task_knowledge,
-        enrich_tasks_batch,
-    )
     from engineering_brain import Brain
+    from engineering_brain.retrieval.task_knowledge import (
+        enrich_tasks_batch,
+        init_task_knowledge,
+    )
 
     brain = Brain(adapter="memory")
     brain.seed()
@@ -373,6 +382,7 @@ def test_enrich_tasks_batch():
 # TIG graceful degradation
 # ──────────────────────────────────────────────────────────────────────
 
+
 def test_tig_graceful_degradation():
     """TIG falls back to inline data if YAML is missing."""
     from engineering_brain.retrieval import context_extractor
@@ -387,3 +397,83 @@ def test_tig_graceful_degradation():
         assert "flask" in tig  # Should have at least flask from inline or YAML
     finally:
         context_extractor._TIG_DATA = original
+
+
+# ──────────────────────────────────────────────────────────────────────
+# LLM Task Tagging
+# ──────────────────────────────────────────────────────────────────────
+
+from unittest import mock
+
+
+class TestLLMTaskTagging:
+    """Tests for _llm_extract_tags and integration in auto_tag_task."""
+
+    def test_flag_off_skips_llm(self) -> None:
+        """LLM tagging skipped when flag is off."""
+        from engineering_brain.retrieval.task_knowledge import _llm_extract_tags
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            assert _llm_extract_tags("Flask CORS security") is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_llm_success_returns_tags(self, mock_flag, mock_llm) -> None:
+        """Returns tag dict when LLM succeeds."""
+        from engineering_brain.retrieval.task_knowledge import _llm_extract_tags
+
+        mock_llm.return_value = {"technologies": ["Flask"], "domains": ["security"]}
+        result = _llm_extract_tags("Implement Flask CORS")
+        assert result is not None
+        assert "Flask" in result["technologies"]
+        assert "security" in result["domains"]
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_llm_failure_returns_none(self, mock_flag, mock_llm) -> None:
+        """Returns None when LLM call fails."""
+        from engineering_brain.retrieval.task_knowledge import _llm_extract_tags
+
+        mock_llm.return_value = None
+        assert _llm_extract_tags("some task") is None
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_integration_merges_llm_tags(self, mock_flag, mock_llm) -> None:
+        """LLM tags merge into auto_tag_task result."""
+        from engineering_brain.retrieval.task_knowledge import auto_tag_task
+
+        mock_llm.return_value = {"technologies": ["Redis"], "domains": ["performance"]}
+        task = {"description": "Create a Flask web server"}
+        result = auto_tag_task(task)
+        # knowledge_tags is a list of technology strings
+        all_techs = result.get("knowledge_tags", [])
+        assert any(t.lower() == "flask" for t in all_techs)
+        assert any(t.lower() == "redis" for t in all_techs)
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_integration_llm_failure_preserves_keywords(self, mock_flag, mock_llm) -> None:
+        """Keyword detection still works when LLM fails."""
+        from engineering_brain.retrieval.task_knowledge import auto_tag_task
+
+        mock_llm.return_value = None
+        task = {"description": "Create a Flask web server"}
+        result = auto_tag_task(task)
+        all_techs = result.get("knowledge_tags", [])
+        assert any(t.lower() == "flask" for t in all_techs)
+
+    @mock.patch("engineering_brain.llm_helpers.brain_llm_call_json")
+    @mock.patch("engineering_brain.llm_helpers.is_llm_enabled", return_value=True)
+    def test_integration_exact_duplicate_skipped(self, mock_flag, mock_llm) -> None:
+        """LLM doesn't add exact duplicate technologies (case-sensitive)."""
+        from engineering_brain.retrieval.task_knowledge import auto_tag_task
+
+        # Use exact same casing as keyword detection would produce
+        mock_llm.return_value = {"technologies": ["Flask"], "domains": []}
+        task = {"description": "Create a Flask web server"}
+        result = auto_tag_task(task)
+        all_techs = result.get("knowledge_tags", [])
+        # Exact match "Flask" should not be duplicated
+        flask_exact = sum(1 for t in all_techs if t == "Flask")
+        assert flask_exact == 1

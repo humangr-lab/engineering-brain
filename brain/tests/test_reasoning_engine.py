@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-from typing import Any
 
 import pytest
 import yaml
@@ -18,24 +17,21 @@ from engineering_brain.core.config import BrainConfig
 from engineering_brain.core.types import (
     BrainProfile,
     ChainResult,
-    Pack,
     ReasoningResult,
-    ReasoningStep,
-    ReasoningTemplate,
 )
 from engineering_brain.retrieval.brain_profiles import (
     clear_profile_cache,
     get_available_profiles,
     load_profile,
 )
-from engineering_brain.retrieval.context_extractor import ExtractedContext, extract_context
+from engineering_brain.retrieval.context_extractor import ExtractedContext
 from engineering_brain.retrieval.pack_manager import PackManager, _infer_layer, _jaccard
 from engineering_brain.retrieval.reasoning_engine import ReasoningEngine
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _cfg() -> BrainConfig:
     return BrainConfig(embedding_enabled=False, adapter="memory")
@@ -45,57 +41,124 @@ def _graph_with_nodes() -> MemoryGraphAdapter:
     """Create a graph with enough nodes for pack generation and reasoning."""
     g = MemoryGraphAdapter()
     # L1 principles
-    g.add_node("Principle", "P-SEC-001", {
-        "id": "P-SEC-001", "name": "Deny by Default",
-        "why": "Minimize attack surface", "domains": ["security"],
-    })
-    g.add_node("Principle", "P-REL-001", {
-        "id": "P-REL-001", "name": "Design for Failure",
-        "why": "Everything fails eventually", "domains": ["reliability"],
-    })
+    g.add_node(
+        "Principle",
+        "P-SEC-001",
+        {
+            "id": "P-SEC-001",
+            "name": "Deny by Default",
+            "why": "Minimize attack surface",
+            "domains": ["security"],
+        },
+    )
+    g.add_node(
+        "Principle",
+        "P-REL-001",
+        {
+            "id": "P-REL-001",
+            "name": "Design for Failure",
+            "why": "Everything fails eventually",
+            "domains": ["reliability"],
+        },
+    )
     # L2 patterns
-    g.add_node("Pattern", "PAT-CB-001", {
-        "id": "PAT-CB-001", "name": "Circuit Breaker",
-        "intent": "Prevent cascading failures", "domains": ["reliability"],
-        "technologies": ["General"],
-    })
+    g.add_node(
+        "Pattern",
+        "PAT-CB-001",
+        {
+            "id": "PAT-CB-001",
+            "name": "Circuit Breaker",
+            "intent": "Prevent cascading failures",
+            "domains": ["reliability"],
+            "technologies": ["General"],
+        },
+    )
     # L3 rules (Flask security cluster)
-    g.add_node("Rule", "CR-SEC-CORS-001", {
-        "id": "CR-SEC-CORS-001", "text": "Validate CORS origins explicitly",
-        "why": "Prevents cross-origin attacks", "severity": "high",
-        "technologies": ["Flask"], "domains": ["security"],
-    })
-    g.add_node("Rule", "CR-SEC-CORS-002", {
-        "id": "CR-SEC-CORS-002", "text": "Set SameSite attribute on cookies",
-        "why": "Prevents CSRF via cookies", "severity": "high",
-        "technologies": ["Flask"], "domains": ["security"],
-    })
-    g.add_node("Rule", "CR-SEC-CORS-003", {
-        "id": "CR-SEC-CORS-003", "text": "Enforce HTTPS-only in production",
-        "why": "Prevents MITM attacks", "severity": "critical",
-        "technologies": ["Flask"], "domains": ["security"],
-    })
-    g.add_node("Rule", "CR-SEC-SQL-001", {
-        "id": "CR-SEC-SQL-001", "text": "Use parameterized queries",
-        "why": "Prevents SQL injection", "severity": "critical",
-        "technologies": ["Flask", "PostgreSQL"], "domains": ["security", "database"],
-    })
+    g.add_node(
+        "Rule",
+        "CR-SEC-CORS-001",
+        {
+            "id": "CR-SEC-CORS-001",
+            "text": "Validate CORS origins explicitly",
+            "why": "Prevents cross-origin attacks",
+            "severity": "high",
+            "technologies": ["Flask"],
+            "domains": ["security"],
+        },
+    )
+    g.add_node(
+        "Rule",
+        "CR-SEC-CORS-002",
+        {
+            "id": "CR-SEC-CORS-002",
+            "text": "Set SameSite attribute on cookies",
+            "why": "Prevents CSRF via cookies",
+            "severity": "high",
+            "technologies": ["Flask"],
+            "domains": ["security"],
+        },
+    )
+    g.add_node(
+        "Rule",
+        "CR-SEC-CORS-003",
+        {
+            "id": "CR-SEC-CORS-003",
+            "text": "Enforce HTTPS-only in production",
+            "why": "Prevents MITM attacks",
+            "severity": "critical",
+            "technologies": ["Flask"],
+            "domains": ["security"],
+        },
+    )
+    g.add_node(
+        "Rule",
+        "CR-SEC-SQL-001",
+        {
+            "id": "CR-SEC-SQL-001",
+            "text": "Use parameterized queries",
+            "why": "Prevents SQL injection",
+            "severity": "critical",
+            "technologies": ["Flask", "PostgreSQL"],
+            "domains": ["security", "database"],
+        },
+    )
     # L3 rules (Kafka reliability cluster)
-    g.add_node("Rule", "CR-KFK-001", {
-        "id": "CR-KFK-001", "text": "Implement consumer idempotency",
-        "why": "Exactly-once semantics", "severity": "critical",
-        "technologies": ["Kafka"], "domains": ["reliability", "data_engineering"],
-    })
-    g.add_node("Rule", "CR-KFK-002", {
-        "id": "CR-KFK-002", "text": "Use dead letter queues for failed messages",
-        "why": "Prevents message loss", "severity": "high",
-        "technologies": ["Kafka"], "domains": ["reliability", "data_engineering"],
-    })
-    g.add_node("Rule", "CR-KFK-003", {
-        "id": "CR-KFK-003", "text": "Set appropriate consumer group commit strategy",
-        "why": "Balance throughput vs reliability", "severity": "high",
-        "technologies": ["Kafka"], "domains": ["reliability", "data_engineering"],
-    })
+    g.add_node(
+        "Rule",
+        "CR-KFK-001",
+        {
+            "id": "CR-KFK-001",
+            "text": "Implement consumer idempotency",
+            "why": "Exactly-once semantics",
+            "severity": "critical",
+            "technologies": ["Kafka"],
+            "domains": ["reliability", "data_engineering"],
+        },
+    )
+    g.add_node(
+        "Rule",
+        "CR-KFK-002",
+        {
+            "id": "CR-KFK-002",
+            "text": "Use dead letter queues for failed messages",
+            "why": "Prevents message loss",
+            "severity": "high",
+            "technologies": ["Kafka"],
+            "domains": ["reliability", "data_engineering"],
+        },
+    )
+    g.add_node(
+        "Rule",
+        "CR-KFK-003",
+        {
+            "id": "CR-KFK-003",
+            "text": "Set appropriate consumer group commit strategy",
+            "why": "Balance throughput vs reliability",
+            "severity": "high",
+            "technologies": ["Kafka"],
+            "domains": ["reliability", "data_engineering"],
+        },
+    )
     # Add a CONFLICTS_WITH edge for contradiction testing
     g.add_edge("CR-SEC-CORS-001", "CR-SEC-CORS-002", "CONFLICTS_WITH")
     # Add a GROUNDS edge for reasoning edge mapping
@@ -127,6 +190,7 @@ def _ctx_kafka() -> ExtractedContext:
 # Test _infer_layer helper
 # ===========================================================================
 
+
 class TestInferLayer:
     def test_principle(self):
         assert _infer_layer("P-SEC-001") == "L1"
@@ -154,6 +218,7 @@ class TestInferLayer:
 # Test Jaccard helper
 # ===========================================================================
 
+
 class TestJaccard:
     def test_identical(self):
         assert _jaccard(["a", "b"], ["a", "b"]) == 1.0
@@ -174,6 +239,7 @@ class TestJaccard:
 # ===========================================================================
 # TestPackManager
 # ===========================================================================
+
 
 class TestPackManager:
     def test_auto_generate_creates_packs(self):
@@ -280,6 +346,7 @@ class TestPackManager:
 # TestReasoningEdgeGeneration
 # ===========================================================================
 
+
 class TestReasoningEdgeGeneration:
     def test_l1_to_l3_triggers(self):
         g = _graph_with_nodes()
@@ -336,6 +403,7 @@ class TestReasoningEdgeGeneration:
 # TestTemplateSelection
 # ===========================================================================
 
+
 class TestTemplateSelection:
     def test_security_template_selected(self):
         g = _graph_with_nodes()
@@ -348,7 +416,8 @@ class TestTemplateSelection:
         g = _graph_with_nodes()
         eng = ReasoningEngine(graph=g, config=_cfg())
         ctx = ExtractedContext(
-            technologies=["Kafka"], domains=["data_engineering"],
+            technologies=["Kafka"],
+            domains=["data_engineering"],
             raw_text="Kafka streaming pipeline",
         )
         tmpl = eng._select_template(ctx)
@@ -358,7 +427,8 @@ class TestTemplateSelection:
         g = _graph_with_nodes()
         eng = ReasoningEngine(graph=g, config=_cfg())
         ctx = ExtractedContext(
-            technologies=["React"], domains=["ui"],
+            technologies=["React"],
+            domains=["ui"],
             raw_text="React component rendering",
         )
         tmpl = eng._select_template(ctx)
@@ -369,7 +439,8 @@ class TestTemplateSelection:
         eng = ReasoningEngine(graph=g, config=_cfg())
         profile = BrainProfile(id="test", default_template="T-SEC-API-REVIEW")
         ctx = ExtractedContext(
-            technologies=["React"], domains=["ui"],
+            technologies=["React"],
+            domains=["ui"],
             raw_text="React UI stuff",
         )
         tmpl = eng._select_template(ctx, profile=profile)
@@ -379,6 +450,7 @@ class TestTemplateSelection:
 # ===========================================================================
 # TestChainExecution
 # ===========================================================================
+
 
 class TestChainExecution:
     def test_execute_chain_returns_chain_result(self):
@@ -434,6 +506,7 @@ class TestChainExecution:
 # TestCrossChainSynthesis
 # ===========================================================================
 
+
 class TestCrossChainSynthesis:
     def test_single_chain_passthrough(self):
         g = _graph_with_nodes()
@@ -478,6 +551,7 @@ class TestCrossChainSynthesis:
 # TestOutputFormatting
 # ===========================================================================
 
+
 class TestOutputFormatting:
     def test_formatted_text_has_sections(self):
         g = _graph_with_nodes()
@@ -501,7 +575,8 @@ class TestOutputFormatting:
             pytest.skip("No packs")
         # Query for a domain not covered → should have gaps
         ctx = ExtractedContext(
-            technologies=["Flask"], domains=["security", "compliance"],
+            technologies=["Flask"],
+            domains=["security", "compliance"],
             raw_text="Flask API compliance audit",
         )
         result = eng.reason(ctx, packs=packs)
@@ -523,6 +598,7 @@ class TestOutputFormatting:
 # ===========================================================================
 # TestBrainProfiles
 # ===========================================================================
+
 
 class TestBrainProfiles:
     def test_load_existing_profile(self):
@@ -566,6 +642,7 @@ class TestBrainProfiles:
 # ===========================================================================
 # TestReasonIntegration
 # ===========================================================================
+
 
 class TestReasonIntegration:
     def test_reason_returns_result(self):
@@ -644,15 +721,18 @@ class TestReasonIntegration:
 # TestMCPHandler
 # ===========================================================================
 
+
 class TestMCPHandler:
     def test_tool_definition_exists(self):
-        from engineering_brain.mcp_server import TOOLS, _TOOL_HANDLERS
+        from engineering_brain.mcp_server import _TOOL_HANDLERS, TOOLS
+
         tool_names = [t["name"] for t in TOOLS]
         assert "brain_reason" in tool_names
         assert "brain_reason" in _TOOL_HANDLERS
 
     def test_tool_schema_valid(self):
         from engineering_brain.mcp_server import TOOLS
+
         reason_tool = next(t for t in TOOLS if t["name"] == "brain_reason")
         schema = reason_tool["inputSchema"]
         assert schema["type"] == "object"

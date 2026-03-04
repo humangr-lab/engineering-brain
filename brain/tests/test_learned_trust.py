@@ -103,7 +103,7 @@ class TestLearnedSourceTrust:
         learner = LearnedSourceTrust()
         # After initialization, divergence should be ~0
         div = learner.divergence_from_static()
-        for source_type, delta in div.items():
+        for _source_type, delta in div.items():
             assert abs(delta) < 0.01
 
     def test_divergence_after_observations(self):

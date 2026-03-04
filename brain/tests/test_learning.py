@@ -11,9 +11,9 @@ Covers all five learning modules:
 from __future__ import annotations
 
 import hashlib
-import sys
 import os
-from datetime import datetime, timedelta, timezone
+import sys
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,6 +24,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 from engineering_brain.adapters.memory import MemoryGraphAdapter
 from engineering_brain.core.config import BrainConfig
 from engineering_brain.core.schema import EdgeType, NodeType
+from engineering_brain.learning.cluster_promoter import (
+    ClusterPromoter,
+    _extract_terms,
+    _jaccard,
+    _text_term_overlap,
+)
 from engineering_brain.learning.crystallizer import (
     KnowledgeCrystallizer,
     _derive_rule_text,
@@ -36,17 +42,11 @@ from engineering_brain.learning.crystallizer import (
 from engineering_brain.learning.promoter import KnowledgePromoter
 from engineering_brain.learning.pruner import KnowledgePruner
 from engineering_brain.learning.reinforcer import EvidenceReinforcer
-from engineering_brain.learning.cluster_promoter import (
-    ClusterPromoter,
-    _extract_terms,
-    _jaccard,
-    _text_term_overlap,
-)
-
 
 # =============================================================================
 # Shared helpers
 # =============================================================================
+
 
 def _make_graph() -> MemoryGraphAdapter:
     """Create a fresh in-memory graph adapter."""
@@ -119,7 +119,7 @@ def _config(**overrides) -> BrainConfig:
 
 def _old_timestamp(days_ago: int) -> str:
     """Create an ISO timestamp N days in the past."""
-    dt = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    dt = datetime.now(UTC) - timedelta(days=days_ago)
     return dt.isoformat()
 
 
@@ -671,7 +671,8 @@ class TestKnowledgePromoter:
         for i in range(3):
             fid = f"F-link-{i:03d}"
             _add_finding(
-                graph, fid,
+                graph,
+                fid,
                 description="Link test finding",
                 reinforcement_count=1,
                 confidence=0.5,
@@ -694,7 +695,8 @@ class TestKnowledgePromoter:
         cfg = _config(promote_l3_to_l2_threshold=10)
 
         _add_rule(
-            graph, "CR-promL2-001",
+            graph,
+            "CR-promL2-001",
             text="Validate all user input before processing",
             why="Prevents injection attacks",
             reinforcement_count=15,
@@ -719,7 +721,8 @@ class TestKnowledgePromoter:
         cfg = _config(promote_l3_to_l2_threshold=20)
 
         _add_rule(
-            graph, "CR-low-001",
+            graph,
+            "CR-low-001",
             text="Low reinforcement rule",
             reinforcement_count=5,  # Well below 20
             confidence=0.9,
@@ -735,7 +738,8 @@ class TestKnowledgePromoter:
         cfg = _config(promote_l3_to_l2_threshold=10)
 
         _add_rule(
-            graph, "CR-lowconf-001",
+            graph,
+            "CR-lowconf-001",
             text="Low confidence rule",
             reinforcement_count=25,
             confidence=0.5,  # Below 0.8 threshold
@@ -751,7 +755,8 @@ class TestKnowledgePromoter:
         cfg = _config(promote_l3_to_l2_threshold=10)
 
         _add_rule(
-            graph, "CR-idemL2-001",
+            graph,
+            "CR-idemL2-001",
             text="Idempotent L2 promotion test",
             reinforcement_count=15,
             confidence=0.9,
@@ -772,7 +777,8 @@ class TestKnowledgePromoter:
         cfg = _config(promote_l3_to_l2_threshold=10)
 
         _add_rule(
-            graph, "CR-edge-001",
+            graph,
+            "CR-edge-001",
             text="Edge test rule",
             reinforcement_count=15,
             confidence=0.9,
@@ -792,7 +798,8 @@ class TestKnowledgePromoter:
         cfg = _config(promote_l3_to_l2_threshold=10)
 
         _add_rule(
-            graph, "CR-tech-001",
+            graph,
+            "CR-tech-001",
             text="Technology inheritance test",
             reinforcement_count=20,
             confidence=0.9,
@@ -820,14 +827,16 @@ class TestKnowledgePromoter:
         # L4->L3 candidates
         for i in range(2):
             _add_finding(
-                graph, f"F-combo-{i}",
+                graph,
+                f"F-combo-{i}",
                 description="Combo test finding",
                 reinforcement_count=1,
             )
 
         # L3->L2 candidates
         _add_rule(
-            graph, "CR-combo-001",
+            graph,
+            "CR-combo-001",
             text="High reinforcement combo rule",
             reinforcement_count=15,
             confidence=0.9,
@@ -849,14 +858,16 @@ class TestKnowledgePromoter:
 
         # Near threshold (70% of 20 = 14)
         _add_rule(
-            graph, "CR-near-001",
+            graph,
+            "CR-near-001",
             text="Near promotion rule",
             reinforcement_count=16,
             confidence=0.7,
         )
         # Below 70% of threshold
         _add_rule(
-            graph, "CR-far-001",
+            graph,
+            "CR-far-001",
             text="Far from promotion rule",
             reinforcement_count=5,
             confidence=0.3,
@@ -876,7 +887,8 @@ class TestKnowledgePromoter:
 
         # High belief, low uncertainty => eligible
         _add_rule(
-            graph, "CR-ep-001",
+            graph,
+            "CR-ep-001",
             text="Epistemic eligible rule",
             reinforcement_count=15,
             confidence=0.9,
@@ -888,7 +900,8 @@ class TestKnowledgePromoter:
 
         # High uncertainty => not eligible
         _add_rule(
-            graph, "CR-ep-002",
+            graph,
+            "CR-ep-002",
             text="Epistemic ineligible rule",
             reinforcement_count=15,
             confidence=0.5,
@@ -920,7 +933,8 @@ class TestKnowledgePruner:
         cfg = _config(prune_after_days=30, prune_min_reinforcements=0)
 
         _add_rule(
-            graph, "CR-stale-001",
+            graph,
+            "CR-stale-001",
             text="Old unreinforced rule",
             reinforcement_count=0,
             created_at=_old_timestamp(60),  # 60 days old
@@ -940,7 +954,8 @@ class TestKnowledgePruner:
         cfg = _config(prune_after_days=30, prune_min_reinforcements=0)
 
         _add_rule(
-            graph, "CR-reinforced-001",
+            graph,
+            "CR-reinforced-001",
             text="Reinforced rule",
             reinforcement_count=5,
             created_at=_old_timestamp(60),
@@ -959,7 +974,8 @@ class TestKnowledgePruner:
         cfg = _config(prune_after_days=30, prune_min_reinforcements=0)
 
         _add_rule(
-            graph, "CR-young-001",
+            graph,
+            "CR-young-001",
             text="Young rule",
             reinforcement_count=0,
             created_at=_old_timestamp(5),  # Only 5 days old
@@ -976,7 +992,8 @@ class TestKnowledgePruner:
         cfg = _config(prune_after_days=30, prune_min_reinforcements=0)
 
         _add_rule(
-            graph, "CR-deprecated-001",
+            graph,
+            "CR-deprecated-001",
             text="Already deprecated rule",
             reinforcement_count=0,
             created_at=_old_timestamp(60),
@@ -993,12 +1010,16 @@ class TestKnowledgePruner:
         graph = _make_graph()
         cfg = _config()
 
-        old_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-        graph.add_node(NodeType.TASK.value, "task-old-001", {
-            "id": "task-old-001",
-            "ttl_minutes": 60,  # 1 hour TTL
-            "created_at": old_time,  # 2 hours ago -> expired
-        })
+        old_time = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        graph.add_node(
+            NodeType.TASK.value,
+            "task-old-001",
+            {
+                "id": "task-old-001",
+                "ttl_minutes": 60,  # 1 hour TTL
+                "created_at": old_time,  # 2 hours ago -> expired
+            },
+        )
 
         pruner = KnowledgePruner(graph, cfg)
         results = pruner.prune()
@@ -1011,12 +1032,16 @@ class TestKnowledgePruner:
         graph = _make_graph()
         cfg = _config()
 
-        fresh_time = datetime.now(timezone.utc).isoformat()
-        graph.add_node(NodeType.TASK.value, "task-fresh-001", {
-            "id": "task-fresh-001",
-            "ttl_minutes": 60,
-            "created_at": fresh_time,  # Just created -> not expired
-        })
+        fresh_time = datetime.now(UTC).isoformat()
+        graph.add_node(
+            NodeType.TASK.value,
+            "task-fresh-001",
+            {
+                "id": "task-fresh-001",
+                "ttl_minutes": 60,
+                "created_at": fresh_time,  # Just created -> not expired
+            },
+        )
 
         pruner = KnowledgePruner(graph, cfg)
         results = pruner.prune()
@@ -1043,7 +1068,8 @@ class TestKnowledgePruner:
         cfg = _config(prune_after_days=30, prune_min_reinforcements=0)
 
         _add_rule(
-            graph, "CR-dryrun-001",
+            graph,
+            "CR-dryrun-001",
             text="Dry run test",
             reinforcement_count=0,
             created_at=_old_timestamp(60),
@@ -1065,7 +1091,8 @@ class TestKnowledgePruner:
         cfg = _config()
 
         _add_rule(
-            graph, "CR-lowc-001",
+            graph,
+            "CR-lowc-001",
             text="Very low confidence rule",
             reinforcement_count=1,
             confidence=0.01,  # Below 0.05 threshold
@@ -1108,7 +1135,8 @@ class TestKnowledgePruner:
 
         for i in range(5):
             _add_rule(
-                graph, f"CR-multi-{i:03d}",
+                graph,
+                f"CR-multi-{i:03d}",
                 text=f"Multi prune rule {i}",
                 reinforcement_count=0,
                 created_at=_old_timestamp(90),
@@ -1268,13 +1296,15 @@ class TestEvidenceReinforcer:
         """get_weak_rules returns low-confidence rules."""
         graph = _make_graph()
         _add_rule(
-            graph, "CR-weak-001",
+            graph,
+            "CR-weak-001",
             text="Weak rule",
             confidence=0.2,
             observation_count=1,
         )
         _add_rule(
-            graph, "CR-strong-001",
+            graph,
+            "CR-strong-001",
             text="Strong rule",
             confidence=0.9,
             observation_count=50,
@@ -1310,7 +1340,8 @@ class TestEvidenceReinforcer:
         """Rules with few observations and low confidence are weak."""
         graph = _make_graph()
         _add_rule(
-            graph, "CR-few-001",
+            graph,
+            "CR-few-001",
             confidence=0.2,
             observation_count=1,
         )
@@ -1325,12 +1356,14 @@ class TestEvidenceReinforcer:
         """get_strong_rules returns high-confidence, well-reinforced rules."""
         graph = _make_graph()
         _add_rule(
-            graph, "CR-str-001",
+            graph,
+            "CR-str-001",
             confidence=0.9,
             reinforcement_count=15,
         )
         _add_rule(
-            graph, "CR-str-002",
+            graph,
+            "CR-str-002",
             confidence=0.3,
             reinforcement_count=2,
         )
@@ -1376,9 +1409,13 @@ class TestEvidenceReinforcer:
         """With ep_* fields, positive reinforcement increases belief."""
         graph = _make_graph()
         _add_rule(
-            graph, "CR-eppos-001",
+            graph,
+            "CR-eppos-001",
             confidence=0.5,
-            ep_b=0.6, ep_d=0.0, ep_u=0.4, ep_a=0.5,
+            ep_b=0.6,
+            ep_d=0.0,
+            ep_u=0.4,
+            ep_a=0.5,
         )
 
         reinforcer = EvidenceReinforcer(graph)
@@ -1392,9 +1429,13 @@ class TestEvidenceReinforcer:
         """With ep_* fields, negative reinforcement increases disbelief."""
         graph = _make_graph()
         _add_rule(
-            graph, "CR-epneg-001",
+            graph,
+            "CR-epneg-001",
             confidence=0.5,
-            ep_b=0.6, ep_d=0.0, ep_u=0.4, ep_a=0.5,
+            ep_b=0.6,
+            ep_d=0.0,
+            ep_u=0.4,
+            ep_a=0.5,
         )
 
         reinforcer = EvidenceReinforcer(graph)
@@ -1426,7 +1467,8 @@ class TestClusterPromoterLearning:
 
         for i in range(3):
             _add_rule(
-                graph, f"CR-clust-{i:03d}",
+                graph,
+                f"CR-clust-{i:03d}",
                 text=f"CORS origin validation security rule {i}",
                 why="CORS misconfiguration enables cross-site attacks",
                 technologies=["flask"],
@@ -1457,7 +1499,8 @@ class TestClusterPromoterLearning:
 
         for i in range(2):
             _add_rule(
-                graph, f"CR-small-{i:03d}",
+                graph,
+                f"CR-small-{i:03d}",
                 text=f"Small cluster test rule {i}",
                 technologies=["flask"],
                 domains=["security"],
@@ -1480,7 +1523,8 @@ class TestClusterPromoterLearning:
 
         for i in range(3):
             _add_rule(
-                graph, f"CR-lowrc-{i:03d}",
+                graph,
+                f"CR-lowrc-{i:03d}",
                 text=f"Low reinforcement rule {i}",
                 technologies=["python"],
                 reinforcement_count=2,  # Below 10
@@ -1502,7 +1546,8 @@ class TestClusterPromoterLearning:
 
         for i in range(3):
             _add_rule(
-                graph, f"CR-lowcf-{i:03d}",
+                graph,
+                f"CR-lowcf-{i:03d}",
                 text=f"Low confidence rule {i}",
                 technologies=["python"],
                 reinforcement_count=10,
@@ -1524,7 +1569,8 @@ class TestClusterPromoterLearning:
 
         for i in range(3):
             _add_rule(
-                graph, f"CR-dep-{i:03d}",
+                graph,
+                f"CR-dep-{i:03d}",
                 text=f"Clustering with deprecated rule {i}",
                 technologies=["flask"],
                 domains=["security"],
@@ -1533,7 +1579,8 @@ class TestClusterPromoterLearning:
             )
         # Add a 4th deprecated rule
         _add_rule(
-            graph, "CR-dep-003",
+            graph,
+            "CR-dep-003",
             text="Clustering with deprecated rule 3",
             technologies=["flask"],
             domains=["security"],
@@ -1560,7 +1607,8 @@ class TestClusterPromoterLearning:
 
         for i in range(3):
             _add_rule(
-                graph, f"CR-idem-{i:03d}",
+                graph,
+                f"CR-idem-{i:03d}",
                 text=f"Idempotent cluster rule {i}",
                 technologies=["python"],
                 domains=["testing"],
@@ -1588,7 +1636,8 @@ class TestClusterPromoterLearning:
         for i in range(3):
             rid = f"CR-inst-{i:03d}"
             _add_rule(
-                graph, rid,
+                graph,
+                rid,
                 text=f"INSTANTIATES edge test rule {i}",
                 technologies=["flask"],
                 domains=["security"],
@@ -1620,7 +1669,8 @@ class TestClusterPromoterLearning:
         # Cluster A: Flask security
         for i in range(3):
             _add_rule(
-                graph, f"CR-flask-{i:03d}",
+                graph,
+                f"CR-flask-{i:03d}",
                 text=f"Flask CORS origin validation security rule {i}",
                 why="CORS security misconfiguration risk",
                 technologies=["flask"],
@@ -1632,7 +1682,8 @@ class TestClusterPromoterLearning:
         # Cluster B: React UI
         for i in range(3):
             _add_rule(
-                graph, f"CR-react-{i:03d}",
+                graph,
+                f"CR-react-{i:03d}",
                 text=f"React hooks state management lifecycle pattern {i}",
                 why="React state consistency and rendering performance",
                 technologies=["react"],
@@ -1655,21 +1706,33 @@ class TestClusterPromoterLearning:
             embedding_enabled=False,
         )
 
-        _add_rule(graph, "CR-tech-001",
-                   text="Path validation security check rule",
-                   technologies=["flask", "python"],
-                   domains=["security"],
-                   reinforcement_count=10, confidence=0.7)
-        _add_rule(graph, "CR-tech-002",
-                   text="Path validation security vulnerability check",
-                   technologies=["flask", "python"],
-                   domains=["security"],
-                   reinforcement_count=10, confidence=0.7)
-        _add_rule(graph, "CR-tech-003",
-                   text="Path validation security access control check",
-                   technologies=["flask"],
-                   domains=["security"],
-                   reinforcement_count=10, confidence=0.7)
+        _add_rule(
+            graph,
+            "CR-tech-001",
+            text="Path validation security check rule",
+            technologies=["flask", "python"],
+            domains=["security"],
+            reinforcement_count=10,
+            confidence=0.7,
+        )
+        _add_rule(
+            graph,
+            "CR-tech-002",
+            text="Path validation security vulnerability check",
+            technologies=["flask", "python"],
+            domains=["security"],
+            reinforcement_count=10,
+            confidence=0.7,
+        )
+        _add_rule(
+            graph,
+            "CR-tech-003",
+            text="Path validation security access control check",
+            technologies=["flask"],
+            domains=["security"],
+            reinforcement_count=10,
+            confidence=0.7,
+        )
 
         cp = ClusterPromoter(graph, cfg)
         created = cp.crystallize()
@@ -1692,7 +1755,8 @@ class TestClusterPromoterLearning:
         for i in range(3):
             rid = f"CR-pres-{i:03d}"
             data = _add_rule(
-                graph, rid,
+                graph,
+                rid,
                 text=f"Preservation test rule {i}",
                 technologies=["python"],
                 domains=["testing"],
@@ -1733,7 +1797,8 @@ class TestClusterPromoterLearning:
         rule_ids = ["CR-det-001", "CR-det-002", "CR-det-003"]
         for rid in rule_ids:
             _add_rule(
-                graph, rid,
+                graph,
+                rid,
                 text="Identical text for deterministic pattern id test",
                 technologies=["python"],
                 domains=["general"],
@@ -1760,18 +1825,33 @@ class TestClusterPromoterLearning:
             embedding_enabled=False,
         )
 
-        _add_rule(graph, "CR-wt-001",
-                   text="Weighted confidence test rule A",
-                   technologies=["python"], domains=["testing"],
-                   reinforcement_count=10, confidence=0.9)
-        _add_rule(graph, "CR-wt-002",
-                   text="Weighted confidence test rule B",
-                   technologies=["python"], domains=["testing"],
-                   reinforcement_count=10, confidence=0.7)
-        _add_rule(graph, "CR-wt-003",
-                   text="Weighted confidence test rule C",
-                   technologies=["python"], domains=["testing"],
-                   reinforcement_count=10, confidence=0.5)
+        _add_rule(
+            graph,
+            "CR-wt-001",
+            text="Weighted confidence test rule A",
+            technologies=["python"],
+            domains=["testing"],
+            reinforcement_count=10,
+            confidence=0.9,
+        )
+        _add_rule(
+            graph,
+            "CR-wt-002",
+            text="Weighted confidence test rule B",
+            technologies=["python"],
+            domains=["testing"],
+            reinforcement_count=10,
+            confidence=0.7,
+        )
+        _add_rule(
+            graph,
+            "CR-wt-003",
+            text="Weighted confidence test rule C",
+            technologies=["python"],
+            domains=["testing"],
+            reinforcement_count=10,
+            confidence=0.5,
+        )
 
         cp = ClusterPromoter(graph, cfg)
         created = cp.crystallize()
@@ -1793,13 +1873,17 @@ class TestClusterPromoterLearning:
 
         for i in range(3):
             _add_rule(
-                graph, f"CR-epagg-{i:03d}",
+                graph,
+                f"CR-epagg-{i:03d}",
                 text=f"Epistemic aggregation test rule {i}",
                 technologies=["python"],
                 domains=["testing"],
                 reinforcement_count=10,
                 confidence=0.7,
-                ep_b=0.7, ep_d=0.05, ep_u=0.25, ep_a=0.5,
+                ep_b=0.7,
+                ep_d=0.05,
+                ep_u=0.25,
+                ep_a=0.5,
             )
 
         cp = ClusterPromoter(graph, cfg)
@@ -1829,7 +1913,7 @@ class TestLearningPipelineIntegration:
         reinforcer = EvidenceReinforcer(graph)
 
         # Step 1: Crystallize a finding into a rule
-        finding_id = crystallizer.learn_from_finding(
+        crystallizer.learn_from_finding(
             description="SQL injection via string concatenation",
             severity="critical",
             resolution="Use parameterized queries",
@@ -1898,7 +1982,8 @@ class TestLearningPipelineIntegration:
         """Rules weakened by negative evidence appear in get_weak_rules."""
         graph = _make_graph()
         _add_rule(
-            graph, "CR-weaken-001",
+            graph,
+            "CR-weaken-001",
             text="Initially confident rule",
             confidence=0.5,
             observation_count=0,
@@ -1930,7 +2015,8 @@ class TestLearningPipelineIntegration:
         # Add clusterable rules
         for i in range(3):
             _add_rule(
-                graph, f"CR-cprom-{i:03d}",
+                graph,
+                f"CR-cprom-{i:03d}",
                 text=f"Cluster promotion path test rule {i}",
                 why="Testing cluster promotion via check_and_promote",
                 technologies=["python"],
