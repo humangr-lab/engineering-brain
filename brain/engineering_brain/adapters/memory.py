@@ -7,7 +7,7 @@ dependencies required. Supports graph, vector, and cache operations.
 from __future__ import annotations
 
 import copy
-import hashlib
+import logging
 import math
 import time
 from collections import OrderedDict, defaultdict
@@ -15,6 +15,8 @@ from collections.abc import Iterator
 from typing import Any
 
 from engineering_brain.adapters.base import CacheAdapter, GraphAdapter, VectorAdapter
+
+logger = logging.getLogger(__name__)
 
 
 def _list_prefix_match(query_tags: list[str], node_tags: list[str]) -> bool:
@@ -26,11 +28,12 @@ def _list_prefix_match(query_tags: list[str], node_tags: list[str]) -> bool:
     # Try hierarchy-aware matching first
     try:
         from engineering_brain.core.taxonomy import get_registry
+
         registry = get_registry()
         if registry.size > 0:
             return registry.match_flat(query_tags, node_tags)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("TagRegistry-based matching failed, using prefix fallback: %s", exc)
 
     # Fallback: original prefix matching
     for qt in query_tags:
@@ -90,14 +93,12 @@ class MemoryGraphAdapter(GraphAdapter):
         # Remove outgoing edges
         for edge in self._edges_out.pop(node_id, []):
             self._edges_in[edge["to_id"]] = [
-                e for e in self._edges_in.get(edge["to_id"], [])
-                if e["from_id"] != node_id
+                e for e in self._edges_in.get(edge["to_id"], []) if e["from_id"] != node_id
             ]
         # Remove incoming edges
         for edge in self._edges_in.pop(node_id, []):
             self._edges_out[edge["from_id"]] = [
-                e for e in self._edges_out.get(edge["from_id"], [])
-                if e["to_id"] != node_id
+                e for e in self._edges_out.get(edge["from_id"], []) if e["to_id"] != node_id
             ]
         return True
 
@@ -116,11 +117,13 @@ class MemoryGraphAdapter(GraphAdapter):
         }
         # Upsert: remove existing edge of same type between same nodes
         self._edges_out[from_id] = [
-            e for e in self._edges_out.get(from_id, [])
+            e
+            for e in self._edges_out.get(from_id, [])
             if not (e["to_id"] == to_id and e["edge_type"] == edge_type)
         ]
         self._edges_in[to_id] = [
-            e for e in self._edges_in.get(to_id, [])
+            e
+            for e in self._edges_in.get(to_id, [])
             if not (e["from_id"] == from_id and e["edge_type"] == edge_type)
         ]
         self._edges_out[from_id].append(edge)
@@ -141,7 +144,11 @@ class MemoryGraphAdapter(GraphAdapter):
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         if label:
-            candidates = [self._nodes[nid] for nid in self._label_index.get(label, set()) if nid in self._nodes]
+            candidates = [
+                self._nodes[nid]
+                for nid in self._label_index.get(label, set())
+                if nid in self._nodes
+            ]
         else:
             candidates = list(self._nodes.values())
 
@@ -243,8 +250,10 @@ class MemoryGraphAdapter(GraphAdapter):
         count = 0
         for edge in edges:
             if self.add_edge(
-                edge["from_id"], edge["to_id"],
-                edge["edge_type"], edge.get("properties"),
+                edge["from_id"],
+                edge["to_id"],
+                edge["edge_type"],
+                edge.get("properties"),
             ):
                 count += 1
         return count
@@ -301,7 +310,7 @@ class MemoryGraphAdapter(GraphAdapter):
     def get_nodes_paginated(self, page_size: int = 500) -> Iterator[list[dict[str, Any]]]:
         items = list(self._nodes.values())
         for i in range(0, max(len(items), 1), page_size):
-            page = items[i:i + page_size]
+            page = items[i : i + page_size]
             if page:
                 yield page
 
@@ -339,8 +348,11 @@ class MemoryVectorAdapter(VectorAdapter):
         count = 0
         for doc in documents:
             if self.upsert(
-                collection, doc["id"], doc.get("text", ""),
-                doc["vector"], doc.get("metadata"),
+                collection,
+                doc["id"],
+                doc.get("text", ""),
+                doc["vector"],
+                doc.get("metadata"),
             ):
                 count += 1
         return count
@@ -526,7 +538,7 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Compute cosine similarity between two vectors."""
     if len(a) != len(b) or not a:
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(x * x for x in b))
     if norm_a == 0.0 or norm_b == 0.0:

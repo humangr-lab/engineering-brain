@@ -62,6 +62,7 @@ class KnowledgePromoter:
 
         # Group findings by a content key (description hash)
         import hashlib
+
         groups: dict[str, list[dict]] = {}
         for f in findings:
             desc = f.get("description", f.get("text", ""))
@@ -80,7 +81,20 @@ class KnowledgePromoter:
             else:
                 threshold = base_threshold
 
-            if total_reinforcements < threshold:
+            # LLM promotion assessment (advisory — boosts effective_count only)
+            effective_count = total_reinforcements
+            try:
+                llm_assess = self._llm_assess_promotion(
+                    best.get("description", best.get("text", "")),
+                    total_reinforcements,
+                    threshold,
+                )
+                if llm_assess and llm_assess.get("worthy") and llm_assess.get("boost", 0) > 0:
+                    effective_count = total_reinforcements + llm_assess["boost"]
+            except Exception as exc:
+                logger.debug("LLM promotion assessment failed: %s", exc)
+
+            if effective_count < threshold:
                 continue
 
             rule_id = f"CR-L4-{key}"
@@ -111,10 +125,37 @@ class KnowledgePromoter:
                 promoted.append(rule_id)
                 logger.info(
                     "Promoted %d L4 findings → rule %s (reinforcements=%d)",
-                    len(group), rule_id, total_reinforcements,
+                    len(group),
+                    rule_id,
+                    total_reinforcements,
                 )
 
         return promoted
+
+    def _llm_assess_promotion(self, description: str, count: int, threshold: int) -> dict | None:
+        """LLM promotion assessment. Boost capped at threshold//2. Returns None on failure."""
+        from engineering_brain.llm_helpers import brain_llm_call_json, is_llm_enabled
+
+        if not is_llm_enabled("BRAIN_LLM_PROMOTION_ASSESSMENT"):
+            return None
+        system = (
+            "Assess if a finding deserves accelerated promotion to a rule. "
+            'Return ONLY JSON: {"worthy": true, "reasoning": "brief", "boost": 2}. '
+            "boost: 0=no acceleration, max=half the threshold."
+        )
+        user = f"Finding: {description[:400]}\nCurrent count: {count}, Threshold: {threshold}"
+        result = brain_llm_call_json(system, user, max_tokens=150)
+        if not result:
+            return None
+        try:
+            boost = max(0, min(int(result.get("boost", 0)), threshold // 2))
+            return {
+                "worthy": bool(result.get("worthy", False)),
+                "reasoning": str(result.get("reasoning", ""))[:200],
+                "boost": boost,
+            }
+        except (TypeError, ValueError):
+            return None
 
     def _cluster_crystallize(self) -> list[str]:
         """Run additive cluster crystallization."""
@@ -122,6 +163,7 @@ class KnowledgePromoter:
             return []
         try:
             from engineering_brain.learning.cluster_promoter import ClusterPromoter
+
             cp = ClusterPromoter(self._graph, self._config)
             return cp.crystallize()
         except Exception as exc:
@@ -164,7 +206,10 @@ class KnowledgePromoter:
                     promoted.append(pattern_id)
                     logger.info(
                         "Promoted rule %s → pattern %s (reinforcement=%d, confidence=%.2f)",
-                        rule.get("id"), pattern_id, reinforcement, confidence,
+                        rule.get("id"),
+                        pattern_id,
+                        reinforcement,
+                        confidence,
                     )
 
         return promoted
@@ -188,7 +233,9 @@ class KnowledgePromoter:
             "category": "learned",
             "intent": str(rule.get("why", "")),
             "when_to_use": str(rule.get("how_to_do_right", "")),
-            "when_not_to_use": str(rule.get("example_bad", ""))[:200] if rule.get("example_bad") else "",
+            "when_not_to_use": str(rule.get("example_bad", ""))[:200]
+            if rule.get("example_bad")
+            else "",
             "languages": rule.get("technologies", []),
             "example_good": str(rule.get("example_good", "")),
             "example_bad": str(rule.get("example_bad", "")),
@@ -204,7 +251,7 @@ class KnowledgePromoter:
             self._graph.add_edge(pattern_id, rule_id, EdgeType.INSTANTIATES.value)
 
             # Copy technology edges
-            for tech in (rule.get("technologies") or []):
+            for tech in rule.get("technologies") or []:
                 tech_id = f"tech:{tech.lower()}"
                 self._graph.add_edge(pattern_id, tech_id, EdgeType.USED_IN.value)
 
@@ -218,7 +265,8 @@ class KnowledgePromoter:
 
         rules = self._graph.query(label=NodeType.RULE.value, limit=500)
         near_promotion = [
-            r for r in rules
+            r
+            for r in rules
             if int(r.get("reinforcement_count", 0)) >= l3_threshold * 0.7
             and float(r.get("confidence", 0)) >= 0.6
         ]

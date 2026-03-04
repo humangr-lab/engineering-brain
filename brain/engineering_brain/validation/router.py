@@ -51,8 +51,19 @@ class ValidationRouter:
                 selected.append(self._checkers["owasp"])
 
         # Web technologies → MDN
-        web_techs = {"html", "css", "javascript", "react", "vue", "angular",
-                     "svelte", "typescript", "next.js", "htmx", "alpine.js"}
+        web_techs = {
+            "html",
+            "css",
+            "javascript",
+            "react",
+            "vue",
+            "angular",
+            "svelte",
+            "typescript",
+            "next.js",
+            "htmx",
+            "alpine.js",
+        }
         web_domains = {"web", "frontend", "css", "html", "javascript", "browser"}
         if any(t in web_techs for t in techs_lower) or (set(domains) & web_domains):
             if "mdn" in self._checkers:
@@ -68,16 +79,34 @@ class ValidationRouter:
 
         # High-severity or high-reinforcement → also SO for community validation
         reinforcement = node.get("reinforcement_count", 0)
-        if (severity in ("critical", "high") or reinforcement >= 3):
-            if "stackoverflow" in self._checkers and self._checkers["stackoverflow"] not in selected:
+        if severity in ("critical", "high") or reinforcement >= 3:
+            if (
+                "stackoverflow" in self._checkers
+                and self._checkers["stackoverflow"] not in selected
+            ):
                 selected.append(self._checkers["stackoverflow"])
 
         # Architecture/design patterns checker — for nodes without technologies
-        pattern_domains = {"architecture", "design", "patterns", "agile",
-                           "project_management", "product_management", "planning",
-                           "strategy", "spec_writing", "devops", "testing",
-                           "performance", "metrics", "risk", "ui", "ux",
-                           "code_quality", "research"}
+        pattern_domains = {
+            "architecture",
+            "design",
+            "patterns",
+            "agile",
+            "project_management",
+            "product_management",
+            "planning",
+            "strategy",
+            "spec_writing",
+            "devops",
+            "testing",
+            "performance",
+            "metrics",
+            "risk",
+            "ui",
+            "ux",
+            "code_quality",
+            "research",
+        }
         if "architecture_patterns" in self._checkers:
             if not technologies or (set(domains) & pattern_domains):
                 selected.append(self._checkers["architecture_patterns"])

@@ -22,7 +22,9 @@ def generate_llm_schema() -> str:
     lines.append("")
     lines.append("### Layers (6 cortical levels)")
     for layer in Layer:
-        lines.append(f"- **{layer.value}** ({layer.name}): stability={layer.stability:.1f}, max_ttl_days={layer.max_ttl_days}")
+        lines.append(
+            f"- **{layer.value}** ({layer.name}): stability={layer.stability:.1f}, max_ttl_days={layer.max_ttl_days}"
+        )
     lines.append("")
 
     lines.append("### Node Types")
@@ -41,7 +43,9 @@ def generate_llm_schema() -> str:
 
     lines.append("### Query API")
     lines.append("```")
-    lines.append('brain.query(task_description="...", technologies=["Flask"], file_type=".py", phase="exec")')
+    lines.append(
+        'brain.query(task_description="...", technologies=["Flask"], file_type=".py", phase="exec")'
+    )
     lines.append("```")
     lines.append("Returns: KnowledgeResult with formatted_text (budget-capped, layered)")
 
@@ -59,7 +63,13 @@ def generate_llm_inventory(graph: GraphAdapter) -> str:
     lines.append("")
 
     # Count per layer
-    for nt in (NodeType.AXIOM, NodeType.PRINCIPLE, NodeType.PATTERN, NodeType.RULE, NodeType.FINDING):
+    for nt in (
+        NodeType.AXIOM,
+        NodeType.PRINCIPLE,
+        NodeType.PATTERN,
+        NodeType.RULE,
+        NodeType.FINDING,
+    ):
         count = graph.count(nt.value)
         lines.append(f"- **{nt.value}**: {count} nodes")
 

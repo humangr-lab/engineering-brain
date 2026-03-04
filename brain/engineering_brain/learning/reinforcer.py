@@ -8,7 +8,7 @@ count increase. When a finding contradicts a rule, confidence decreases.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from engineering_brain.adapters.base import GraphAdapter
@@ -42,7 +42,7 @@ class EvidenceReinforcer:
 
         count = int(rule.get("reinforcement_count", 0))
         confidence = float(rule.get("confidence", 0.5))
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         now_unix = int(now.timestamp())
 
         # Check if epistemic opinion exists
@@ -50,8 +50,8 @@ class EvidenceReinforcer:
         use_epistemic = ep_b is not None
 
         if use_epistemic:
-            from engineering_brain.epistemic.opinion import OpinionTuple
             from engineering_brain.epistemic.fusion import cbf
+            from engineering_brain.epistemic.opinion import OpinionTuple
 
             current = OpinionTuple(
                 b=float(rule["ep_b"]),
@@ -142,8 +142,8 @@ class EvidenceReinforcer:
                     positive=positive,
                     evidence_id=evidence_id,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Failed to record reinforcement observation: %s", exc)
 
         logger.debug(
             "Rule %s %s (count=%d, confidence=%.2f)",
@@ -168,7 +168,7 @@ class EvidenceReinforcer:
         """
         rules = self._graph.query(label=NodeType.RULE.value, limit=500)
         weak: list[dict[str, Any]] = []
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         for rule in rules:
             confidence = float(rule.get("confidence", 0.5))
@@ -194,11 +194,14 @@ class EvidenceReinforcer:
 
         return weak
 
-    def get_strong_rules(self, min_confidence: float = 0.8, min_reinforcements: int = 10) -> list[dict[str, Any]]:
+    def get_strong_rules(
+        self, min_confidence: float = 0.8, min_reinforcements: int = 10
+    ) -> list[dict[str, Any]]:
         """Find highly-reinforced, high-confidence rules (promotion candidates)."""
         rules = self._graph.query(label=NodeType.RULE.value, limit=500)
         return [
-            r for r in rules
+            r
+            for r in rules
             if float(r.get("confidence", 0)) >= min_confidence
             and int(r.get("reinforcement_count", 0)) >= min_reinforcements
         ]

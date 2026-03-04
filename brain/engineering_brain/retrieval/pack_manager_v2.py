@@ -186,7 +186,10 @@ class ScalablePackManager:
 
         logger.info(
             "Pack v2 created: %s (nodes=%d, quality=%.3f, layers=%s)",
-            pack.id, pack.node_count, pack.quality_score, pack.layers_present,
+            pack.id,
+            pack.node_count,
+            pack.quality_score,
+            pack.layers_present,
         )
         return pack
 
@@ -197,6 +200,7 @@ class ScalablePackManager:
     def auto_generate_packs(self) -> list[Pack]:
         """Delegate to v1 — batch offline operation, O(N) is acceptable."""
         from engineering_brain.retrieval.pack_manager import PackManager
+
         v1 = PackManager(self._graph, self._vector, self._config, self._query_router)
         return v1.auto_generate_packs()
 
@@ -208,6 +212,7 @@ class ScalablePackManager:
     ) -> Pack:
         """Delegate to v1 — explicit IDs, already O(K)."""
         from engineering_brain.retrieval.pack_manager import PackManager
+
         v1 = PackManager(self._graph, self._vector, self._config, self._query_router)
         return v1.create_pack_from_nodes(pack_id, node_ids, description)
 
@@ -220,6 +225,7 @@ class ScalablePackManager:
     ) -> list[Pack]:
         """Delegate to v1 — operates on pack list, already O(K)."""
         from engineering_brain.retrieval.pack_manager import PackManager
+
         v1 = PackManager(self._graph, self._vector, self._config, self._query_router)
         return v1.select_packs(ctx, packs, profile=profile, top_n=top_n)
 
@@ -289,7 +295,7 @@ class ScalablePackManager:
         if self._vector and self._embedder:
             query_vector = self._embedder.embed_text(query_text)
             if query_vector:
-                for layer_key, collection in _LAYER_COLLECTIONS.items():
+                for _layer_key, collection in _LAYER_COLLECTIONS.items():
                     try:
                         hits = self._vector.search(
                             collection=collection,
@@ -315,11 +321,12 @@ class ScalablePackManager:
                     except Exception as e:
                         logger.debug(
                             "Pack v2 vector search failed for %s (non-blocking): %s",
-                            collection, e,
+                            collection,
+                            e,
                         )
 
         # --- Graph filtered queries ---
-        for layer_key, label in _LAYER_LABELS.items():
+        for _layer_key, label in _LAYER_LABELS.items():
             filters: dict[str, Any] = {}
             if ctx.technologies:
                 filters["technologies"] = ctx.technologies
@@ -336,7 +343,8 @@ class ScalablePackManager:
             except Exception as e:
                 logger.debug(
                     "Pack v2 graph query failed for %s (non-blocking): %s",
-                    label, e,
+                    label,
+                    e,
                 )
 
         return vector_results, graph_results
@@ -386,14 +394,15 @@ class ScalablePackManager:
                     filters=filters if filters else None,
                     limit=graph_limit,
                 )
-            except Exception:
+            except Exception as exc:
+                logger.debug("Graph query failed for label %s: %s", label, exc)
                 pool = []
 
             # Filter out already-included and deprecated nodes
             pool = [
-                n for n in pool
-                if str(n.get("id", "")) not in candidate_ids
-                and not n.get("deprecated")
+                n
+                for n in pool
+                if str(n.get("id", "")) not in candidate_ids and not n.get("deprecated")
             ]
 
             if not pool:

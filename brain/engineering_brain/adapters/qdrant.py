@@ -12,9 +12,8 @@ When used standalone (open-source install), falls back gracefully:
 from __future__ import annotations
 
 import logging
-from typing import Any
-
 from dataclasses import dataclass, field
+from typing import Any
 
 from engineering_brain.adapters.base import VectorAdapter
 from engineering_brain.core.config import BrainConfig
@@ -31,16 +30,18 @@ class _VectorDocument:
     vector: list[float]
     metadata: dict[str, Any] = field(default_factory=dict)
 
+
 _qdrant_client = None
 
 
-def _get_client(config: BrainConfig | None = None):
+def _get_client(config: BrainConfig | None = None) -> Any:
     """Lazy-load and return the Qdrant client singleton."""
     global _qdrant_client
     if _qdrant_client is not None:
         return _qdrant_client
     try:
         from pipeline_autonomo.qdrant_client import get_qdrant_client
+
         _qdrant_client = get_qdrant_client()
         return _qdrant_client
     except ImportError:
@@ -56,10 +57,10 @@ class QdrantVectorAdapter(VectorAdapter):
 
     def __init__(self, config: BrainConfig | None = None) -> None:
         self._config = config
-        self._prefix = (config.qdrant_collection_prefix if config else "brain_")
-        self._dimension = (config.embedding_dimension if config else 1024)
+        self._prefix = config.qdrant_collection_prefix if config else "brain_"
+        self._dimension = config.embedding_dimension if config else 1024
 
-    def _client(self):
+    def _client(self) -> Any:
         return _get_client(self._config)
 
     def _full_collection_name(self, collection: str) -> str:
@@ -112,12 +113,14 @@ class QdrantVectorAdapter(VectorAdapter):
                 VectorDocument = _VectorDocument
             docs = []
             for doc in documents:
-                docs.append(VectorDocument(
-                    id=doc["id"],
-                    text=doc.get("text", ""),
-                    vector=doc["vector"],
-                    metadata=doc.get("metadata", {}),
-                ))
+                docs.append(
+                    VectorDocument(
+                        id=doc["id"],
+                        text=doc.get("text", ""),
+                        vector=doc["vector"],
+                        metadata=doc.get("metadata", {}),
+                    )
+                )
             return client.upsert_batch(full_name, docs)
         except Exception as e:
             logger.error("Qdrant batch_upsert failed: %s", e)
@@ -188,7 +191,9 @@ class QdrantVectorAdapter(VectorAdapter):
                     if existing_dim and existing_dim != dimension:
                         logger.warning(
                             "Brain dimension mismatch for '%s': existing=%d, required=%d. Recreating.",
-                            full_name, existing_dim, dimension,
+                            full_name,
+                            existing_dim,
+                            dimension,
                         )
                         client.delete_collection(full_name)
                         created = client.create_collection(full_name, dimension=dimension)
@@ -209,10 +214,11 @@ class QdrantVectorAdapter(VectorAdapter):
         if client is None:
             return
         try:
-            raw = getattr(client, '_client', None)
+            raw = getattr(client, "_client", None)
             if raw is None:
                 return
             from qdrant_client.models import PayloadSchemaType
+
             for field in ("layer", "domain", "technologies"):
                 try:
                     raw.create_payload_index(
@@ -220,8 +226,10 @@ class QdrantVectorAdapter(VectorAdapter):
                         field_name=field,
                         field_schema=PayloadSchemaType.KEYWORD,
                     )
-                except Exception:
-                    pass  # Index may already exist or field not present
+                except Exception as exc:
+                    logger.debug(
+                        "Qdrant payload index creation skipped for field %s: %s", field, exc
+                    )
         except ImportError:
             pass  # qdrant_client not available
         except Exception as e:
@@ -246,16 +254,18 @@ class QdrantVectorAdapter(VectorAdapter):
             client = self._client()
             if client is None:
                 return False
-            raw = getattr(client, '_client', None)
+            raw = getattr(client, "_client", None)
             if raw:
                 raw.get_collections()
             return True
-        except Exception:
+        except Exception as exc:
+            logger.debug("Qdrant health check failed: %s", exc)
             return False
 
     def is_available(self) -> bool:
         try:
             client = self._client()
             return client is not None
-        except Exception:
+        except Exception as exc:
+            logger.debug("Qdrant availability check failed: %s", exc)
             return False

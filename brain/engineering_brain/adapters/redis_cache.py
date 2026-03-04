@@ -18,13 +18,14 @@ logger = logging.getLogger(__name__)
 _redis_client = None
 
 
-def _get_redis(config: BrainConfig | None = None):
+def _get_redis(config: BrainConfig | None = None) -> Any:
     """Lazy-load Redis connection."""
     global _redis_client
     if _redis_client is not None:
         return _redis_client
     try:
         import redis
+
         cfg = config or BrainConfig()
         _redis_client = redis.Redis(
             host=cfg.redis_host,
@@ -55,7 +56,7 @@ class RedisCacheAdapter(CacheAdapter):
         self._hits = 0
         self._misses = 0
 
-    def _client(self):
+    def _client(self) -> Any:
         return _get_redis(self._config)
 
     def _key(self, key: str) -> str:
@@ -130,7 +131,8 @@ class RedisCacheAdapter(CacheAdapter):
             try:
                 keys = list(client.scan_iter(match=f"{self._prefix}*", count=1000))
                 base["size"] = len(keys)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Redis cache size scan failed: %s", exc)
                 base["size"] = -1
         else:
             base["size"] = 0
@@ -142,5 +144,6 @@ class RedisCacheAdapter(CacheAdapter):
             return False
         try:
             return client.ping()
-        except Exception:
+        except Exception as exc:
+            logger.debug("Redis availability check (ping) failed: %s", exc)
             return False

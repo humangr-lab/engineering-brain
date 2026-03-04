@@ -19,7 +19,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from engineering_brain.epistemic.conflict_resolution import (
@@ -41,11 +41,11 @@ class ContradictionTensor:
     id: str
     node_a_id: str
     node_b_id: str
-    conflict_factor: float          # Dempster-Shafer K value
+    conflict_factor: float  # Dempster-Shafer K value
     conflict_type: str = "logical"  # logical, empirical, temporal, scope
-    severity: str = "moderate"      # from ConflictSeverity
-    discovered_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    resolution: str | None = None   # None = unresolved
+    severity: str = "moderate"  # from ConflictSeverity
+    discovered_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    resolution: str | None = None  # None = unresolved
     resolution_strategy: str | None = None  # cbf, murphy, demotion, scope_split
     resolved_at: datetime | None = None
     evidence_for_a: list[str] = field(default_factory=list)
@@ -130,8 +130,9 @@ class ContradictionManager:
             opinion_b={"b": op_b.b, "d": op_b.d, "u": op_b.u, "a": op_b.a},
         )
         self._tensors[ct_id] = tensor
-        logger.info("Detected contradiction %s: %s vs %s (K=%.3f, %s)",
-                     ct_id, a_id, b_id, k, severity.value)
+        logger.info(
+            "Detected contradiction %s: %s vs %s (K=%.3f, %s)", ct_id, a_id, b_id, k, severity.value
+        )
         return tensor
 
     def resolve(
@@ -172,9 +173,7 @@ class ContradictionManager:
             resolution_text = "Fused via CBF (low conflict)"
 
         elif strategy == "murphy":
-            resolved_opinion = murphy_weighted_average(
-                [op_a, op_b], weights=[trust_a, trust_b]
-            )
+            resolved_opinion = murphy_weighted_average([op_a, op_b], weights=[trust_a, trust_b])
             resolution_text = "Fused via Murphy's WBF"
 
         elif strategy == "demotion":
@@ -192,7 +191,7 @@ class ContradictionManager:
 
         tensor.resolution = resolution_text
         tensor.resolution_strategy = strategy
-        tensor.resolved_at = datetime.now(timezone.utc)
+        tensor.resolved_at = datetime.now(UTC)
 
         logger.info("Resolved %s via %s: %s", tensor.id, strategy, resolution_text)
 
@@ -205,7 +204,9 @@ class ContradictionManager:
                 "d": resolved_opinion.d,
                 "u": resolved_opinion.u,
                 "a": resolved_opinion.a,
-            } if resolved_opinion else None,
+            }
+            if resolved_opinion
+            else None,
         }
 
     def get_unresolved(self) -> list[ContradictionTensor]:
@@ -219,8 +220,7 @@ class ContradictionManager:
     def get_for_node(self, node_id: str) -> list[ContradictionTensor]:
         """Get all contradictions involving a specific node."""
         return [
-            t for t in self._tensors.values()
-            if t.node_a_id == node_id or t.node_b_id == node_id
+            t for t in self._tensors.values() if t.node_a_id == node_id or t.node_b_id == node_id
         ]
 
     def add_evidence(

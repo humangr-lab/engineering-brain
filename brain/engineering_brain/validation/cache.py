@@ -75,7 +75,9 @@ class ValidationCache:
     def stats(self) -> dict[str, int]:
         """Cache statistics."""
         now = time.time()
-        expired = sum(1 for v in self._data.values() if now - v.get("_cached_at", 0) > self._ttl_seconds)
+        expired = sum(
+            1 for v in self._data.values() if now - v.get("_cached_at", 0) > self._ttl_seconds
+        )
         return {
             "total": len(self._data),
             "valid": len(self._data) - expired,

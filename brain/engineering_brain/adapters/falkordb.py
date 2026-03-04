@@ -23,11 +23,11 @@ from engineering_brain.core.config import BrainConfig
 
 logger = logging.getLogger(__name__)
 
-_CYPHER_IDENT_RE = re.compile(r'[^a-zA-Z0-9_]')
+_CYPHER_IDENT_RE = re.compile(r"[^a-zA-Z0-9_]")
 
 
 def _sanitize_cypher_identifier(s: str) -> str:
-    sanitized = _CYPHER_IDENT_RE.sub('', s)
+    sanitized = _CYPHER_IDENT_RE.sub("", s)
     if not sanitized:
         raise ValueError(f"Invalid Cypher identifier: {s!r}")
     return sanitized
@@ -35,7 +35,7 @@ def _sanitize_cypher_identifier(s: str) -> str:
 
 def _sanitize_property_key(k: str) -> str:
     """Validate property key is safe for Cypher interpolation (alphanumeric + underscore only)."""
-    sanitized = _CYPHER_IDENT_RE.sub('', k)
+    sanitized = _CYPHER_IDENT_RE.sub("", k)
     if not sanitized or sanitized != k:
         raise ValueError(f"Invalid property key: {k!r}")
     return k
@@ -46,13 +46,14 @@ _falkordb_client = None
 _falkordb_enhanced = None
 
 
-def _get_client(config: BrainConfig | None = None):
+def _get_client(config: BrainConfig | None = None) -> Any:
     """Lazy-load and return the FalkorDB client singleton."""
     global _falkordb_client
     if _falkordb_client is not None:
         return _falkordb_client
     try:
         from pipeline_autonomo.falkordb_client import get_falkordb_client
+
         _falkordb_client = get_falkordb_client()
         return _falkordb_client
     except ImportError:
@@ -99,14 +100,14 @@ class FalkorDBGraphAdapter(GraphAdapter):
 
     def __init__(self, config: BrainConfig | None = None) -> None:
         self._config = config
-        self._graph_name = (config.falkordb_database if config else "engineering_brain")
+        self._graph_name = config.falkordb_database if config else "engineering_brain"
         self._graph_instance = None
         self._indexes_ensured = False
 
-    def _client(self):
+    def _client(self) -> Any:
         return _get_client(self._config)
 
-    def _graph(self):
+    def _graph(self) -> Any:
         """Get the FalkorDB graph instance (cached after first access)."""
         if self._graph_instance is not None:
             return self._graph_instance
@@ -115,7 +116,8 @@ class FalkorDBGraphAdapter(GraphAdapter):
             return None
         try:
             self._graph_instance = client._client.select_graph(self._graph_name)
-        except Exception:
+        except Exception as exc:
+            logger.debug("FalkorDB select_graph via _client failed, trying _graph attr: %s", exc)
             try:
                 self._graph_instance = client._graph
             except Exception as e:
@@ -130,8 +132,21 @@ class FalkorDBGraphAdapter(GraphAdapter):
         graph = self._graph_instance
         if graph is None:
             return
-        for label in ("Rule", "Principle", "Pattern", "Finding", "Axiom", "Technology", "Domain",
-                      "CodeExample", "TestResult", "Task", "Sprint", "Source", "ValidationRun"):
+        for label in (
+            "Rule",
+            "Principle",
+            "Pattern",
+            "Finding",
+            "Axiom",
+            "Technology",
+            "Domain",
+            "CodeExample",
+            "TestResult",
+            "Task",
+            "Sprint",
+            "Source",
+            "ValidationRun",
+        ):
             for prop in ("id",):
                 try:
                     graph.query(f"CREATE INDEX FOR (n:{label}) ON (n.{prop})")
@@ -168,7 +183,9 @@ class FalkorDBGraphAdapter(GraphAdapter):
                 row = result.result_set[0]
                 if row:
                     node = row[0]
-                    return _deserialize_node(node.properties if hasattr(node, "properties") else dict(node))
+                    return _deserialize_node(
+                        node.properties if hasattr(node, "properties") else dict(node)
+                    )
             return None
         except Exception as e:
             logger.error("FalkorDB get_node failed: %s", e)
@@ -184,11 +201,9 @@ class FalkorDBGraphAdapter(GraphAdapter):
             offset = 0
             all_nodes: list[dict[str, Any]] = []
             while True:
-                result = graph.query(
-                    f"MATCH (n) RETURN n SKIP {offset} LIMIT {page_size}"
-                )
+                result = graph.query(f"MATCH (n) RETURN n SKIP {offset} LIMIT {page_size}")
                 batch = []
-                for row in (result.result_set or []):
+                for row in result.result_set or []:
                     if row:
                         node = row[0]
                         props = node.properties if hasattr(node, "properties") else dict(node)
@@ -245,14 +260,13 @@ class FalkorDBGraphAdapter(GraphAdapter):
             return False
         try:
             edge_type = _sanitize_cypher_identifier(edge_type)
-            props = {_sanitize_property_key(k): _serialize_value(v) for k, v in (properties or {}).items()}
-            if props:
-                prop_str = " {" + ", ".join(f"{k}: ${k}" for k in props) + "}"
-            else:
-                prop_str = ""
+            props = {
+                _sanitize_property_key(k): _serialize_value(v)
+                for k, v in (properties or {}).items()
+            }
+            prop_str = " {" + ", ".join(f"{k}: ${k}" for k in props) + "}" if props else ""
             cypher = (
-                f"MATCH (a {{id: $from_id}}), (b {{id: $to_id}}) "
-                f"MERGE (a)-[r:{edge_type}]->(b) "
+                f"MATCH (a {{id: $from_id}}), (b {{id: $to_id}}) MERGE (a)-[r:{edge_type}]->(b) "
             )
             if prop_str:
                 cypher += f"SET r += {prop_str}"
@@ -301,7 +315,7 @@ class FalkorDBGraphAdapter(GraphAdapter):
             cypher += f" RETURN n LIMIT {limit}"
             result = graph.query(cypher, params)
             nodes = []
-            for row in (result.result_set or []):
+            for row in result.result_set or []:
                 if row:
                     node = row[0]
                     props = node.properties if hasattr(node, "properties") else dict(node)
@@ -336,7 +350,7 @@ class FalkorDBGraphAdapter(GraphAdapter):
             cypher = f"MATCH (start {{id: $start_id}}){pattern}(n) RETURN DISTINCT n LIMIT {limit}"
             result = graph.query(cypher, {"start_id": start_id})
             nodes = []
-            for row in (result.result_set or []):
+            for row in result.result_set or []:
                 if row:
                     node = row[0]
                     props = node.properties if hasattr(node, "properties") else dict(node)
@@ -387,7 +401,7 @@ class FalkorDBGraphAdapter(GraphAdapter):
                     )
             result = graph.query(cypher, params)
             edges: list[dict[str, Any]] = []
-            for row in (result.result_set or []):
+            for row in result.result_set or []:
                 if row and len(row) >= 3:
                     edge: dict[str, Any] = {
                         "from_id": row[0],
@@ -415,14 +429,14 @@ class FalkorDBGraphAdapter(GraphAdapter):
                 edge_type = _sanitize_cypher_identifier(edge_type)
             rel = f":{edge_type}" if edge_type else ""
             result = graph.query(
-                f"MATCH (a {{id: $from_id}})-[r{rel}]->(b {{id: $to_id}}) "
-                f"RETURN count(r) AS cnt",
+                f"MATCH (a {{id: $from_id}})-[r{rel}]->(b {{id: $to_id}}) RETURN count(r) AS cnt",
                 {"from_id": from_id, "to_id": to_id},
             )
             if result.result_set and result.result_set[0]:
                 return int(result.result_set[0][0]) > 0
             return False
-        except Exception:
+        except Exception as exc:
+            logger.debug("FalkorDB has_edge check failed: %s", exc)
             return False
 
     def batch_add_nodes(self, label: str, nodes: list[dict[str, Any]]) -> int:
@@ -442,14 +456,11 @@ class FalkorDBGraphAdapter(GraphAdapter):
         if not serialized:
             return 0
         try:
-            cypher = (
-                f"UNWIND $nodes AS props "
-                f"MERGE (n:{label} {{id: props.id}}) "
-                f"SET n += props"
-            )
+            cypher = f"UNWIND $nodes AS props MERGE (n:{label} {{id: props.id}}) SET n += props"
             graph.query(cypher, {"nodes": serialized})
             return len(serialized)
-        except Exception:
+        except Exception as exc:
+            logger.debug("FalkorDB batch add failed, falling back to individual inserts: %s", exc)
             # Fallback to individual inserts
             count = 0
             for node in nodes:
@@ -462,8 +473,10 @@ class FalkorDBGraphAdapter(GraphAdapter):
         count = 0
         for edge in edges:
             if self.add_edge(
-                edge["from_id"], edge["to_id"],
-                edge["edge_type"], edge.get("properties"),
+                edge["from_id"],
+                edge["to_id"],
+                edge["edge_type"],
+                edge.get("properties"),
             ):
                 count += 1
         return count
@@ -496,14 +509,27 @@ class FalkorDBGraphAdapter(GraphAdapter):
             try:
                 result = graph.query("MATCH ()-[r]->() RETURN count(r) as cnt")
                 edge_count = int(result.result_set[0][0]) if result.result_set else 0
-            except Exception:
+            except Exception as exc:
+                logger.debug("FalkorDB edge count query failed: %s", exc)
                 edge_count = 0
 
             # Label counts
             node_labels: dict[str, int] = {}
-            for label in ("Rule", "Principle", "Pattern", "Finding", "Axiom",
-                          "Technology", "Domain", "CodeExample", "TestResult",
-                          "Task", "Sprint", "Source", "ValidationRun"):
+            for label in (
+                "Rule",
+                "Principle",
+                "Pattern",
+                "Finding",
+                "Axiom",
+                "Technology",
+                "Domain",
+                "CodeExample",
+                "TestResult",
+                "Task",
+                "Sprint",
+                "Source",
+                "ValidationRun",
+            ):
                 try:
                     cnt = self.count(label)
                     if cnt > 0:
@@ -514,10 +540,8 @@ class FalkorDBGraphAdapter(GraphAdapter):
             # Edge type counts
             edge_types: dict[str, int] = {}
             try:
-                result = graph.query(
-                    "MATCH ()-[r]->() RETURN type(r) AS t, count(r) AS cnt"
-                )
-                for row in (result.result_set or []):
+                result = graph.query("MATCH ()-[r]->() RETURN type(r) AS t, count(r) AS cnt")
+                for row in result.result_set or []:
                     if row and len(row) >= 2:
                         edge_types[str(row[0])] = int(row[1])
             except Exception as exc:
@@ -561,11 +585,9 @@ class FalkorDBGraphAdapter(GraphAdapter):
         offset = 0
         while True:
             try:
-                result = graph.query(
-                    f"MATCH (n) RETURN n SKIP {offset} LIMIT {page_size}"
-                )
+                result = graph.query(f"MATCH (n) RETURN n SKIP {offset} LIMIT {page_size}")
                 batch = []
-                for row in (result.result_set or []):
+                for row in result.result_set or []:
                     if row:
                         node = row[0]
                         props = node.properties if hasattr(node, "properties") else dict(node)
@@ -587,7 +609,8 @@ class FalkorDBGraphAdapter(GraphAdapter):
                 return False
             graph.query("RETURN 1")
             return True
-        except Exception:
+        except Exception as exc:
+            logger.debug("FalkorDB health check failed: %s", exc)
             self._graph_instance = None  # Force reconnect on next call
             return False
 
@@ -595,5 +618,6 @@ class FalkorDBGraphAdapter(GraphAdapter):
         try:
             client = self._client()
             return client is not None and client.is_available()
-        except Exception:
+        except Exception as exc:
+            logger.debug("FalkorDB availability check failed: %s", exc)
             return False

@@ -87,7 +87,8 @@ class CommunityDetector:
         adj: dict[str, set[str]] = {}
         try:
             edges = self._graph.get_edges()
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to fetch edges for community detection: %s", exc)
             return adj
 
         for edge in edges:
@@ -101,7 +102,8 @@ class CommunityDetector:
         return adj
 
     def _leiden_communities(
-        self, adjacency: dict[str, set[str]],
+        self,
+        adjacency: dict[str, set[str]],
     ) -> list[list[str]] | None:
         """Try Leiden algorithm via python-igraph + leidenalg."""
         try:
@@ -131,7 +133,8 @@ class CommunityDetector:
         return list(communities.values())
 
     def _label_propagation(
-        self, adjacency: dict[str, set[str]],
+        self,
+        adjacency: dict[str, set[str]],
     ) -> list[list[str]] | None:
         """Label propagation community detection (pure Python)."""
         import random
@@ -170,7 +173,8 @@ class CommunityDetector:
         return list(communities.values())
 
     def _connected_components(
-        self, adjacency: dict[str, set[str]],
+        self,
+        adjacency: dict[str, set[str]],
     ) -> list[list[str]]:
         """Simple connected components (always works, no dependencies)."""
         visited: set[str] = set()
@@ -207,16 +211,12 @@ class CommunityDetector:
                 continue
 
             # Collect domain/tech stats
-            for d in (node.get("domains") or []):
+            for d in node.get("domains") or []:
                 domain_counts[d] = domain_counts.get(d, 0) + 1
-            for t in (node.get("technologies") or node.get("languages") or []):
+            for t in node.get("technologies") or node.get("languages") or []:
                 tech_counts[t] = tech_counts.get(t, 0) + 1
 
-            text = (
-                node.get("text", "")
-                or node.get("name", "")
-                or node.get("statement", "")
-            )
+            text = node.get("text", "") or node.get("name", "") or node.get("statement", "")
             if text:
                 top_nodes.append({"id": nid, "text": text[:100]})
 

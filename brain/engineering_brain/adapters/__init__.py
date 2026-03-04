@@ -4,6 +4,9 @@ from engineering_brain.adapters.base import CacheAdapter, GraphAdapter, VectorAd
 from engineering_brain.adapters.neo4j import Neo4jGraphAdapter, Neo4jVectorAdapter
 
 __all__ = [
-    "GraphAdapter", "VectorAdapter", "CacheAdapter",
-    "Neo4jGraphAdapter", "Neo4jVectorAdapter",
+    "GraphAdapter",
+    "VectorAdapter",
+    "CacheAdapter",
+    "Neo4jGraphAdapter",
+    "Neo4jVectorAdapter",
 ]

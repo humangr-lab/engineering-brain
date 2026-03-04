@@ -19,7 +19,7 @@ Feature flag: BRAIN_EPISTEMIC_LADDER (default OFF)
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from engineering_brain.core.types import EpistemicStatus
@@ -72,9 +72,7 @@ class EpistemicLadder:
         # Default: rumor
         return EpistemicStatus.E0_RUMOR
 
-    def can_promote(
-        self, node: dict[str, Any], target: EpistemicStatus
-    ) -> tuple[bool, str]:
+    def can_promote(self, node: dict[str, Any], target: EpistemicStatus) -> tuple[bool, str]:
         """Check if a node meets the requirements for promotion to target level.
 
         Returns:
@@ -108,14 +106,18 @@ class EpistemicLadder:
         if target == EpistemicStatus.E4_PROVEN and validation != "human_verified":
             return False, f"E4 requires validation_status=human_verified, got {validation}"
 
-        if target == EpistemicStatus.E3_TESTED and validation not in ("human_verified", "cross_checked"):
-            return False, f"E3 requires validation_status in (human_verified, cross_checked), got {validation}"
+        if target == EpistemicStatus.E3_TESTED and validation not in (
+            "human_verified",
+            "cross_checked",
+        ):
+            return (
+                False,
+                f"E3 requires validation_status in (human_verified, cross_checked), got {validation}",
+            )
 
         return True, "Requirements met"
 
-    def promote(
-        self, node: dict[str, Any], target: EpistemicStatus
-    ) -> dict[str, Any]:
+    def promote(self, node: dict[str, Any], target: EpistemicStatus) -> dict[str, Any]:
         """Promote a node to the target epistemic status.
 
         Updates the node dict in place and returns it.
@@ -125,12 +127,15 @@ class EpistemicLadder:
             raise ValueError(f"Cannot promote {node.get('id')}: {reason}")
 
         node["epistemic_status"] = target.value
-        node["epistemic_promoted_at"] = datetime.now(timezone.utc).isoformat()
+        node["epistemic_promoted_at"] = datetime.now(UTC).isoformat()
         logger.info("Promoted %s to %s", node.get("id"), target.value)
         return node
 
     def demote(
-        self, node: dict[str, Any], reason: str = "", to_e0: bool = False,
+        self,
+        node: dict[str, Any],
+        reason: str = "",
+        to_e0: bool = False,
     ) -> dict[str, Any]:
         """Demote a node by one epistemic level on contradiction or invalidation.
 
@@ -138,25 +143,61 @@ class EpistemicLadder:
         Pass to_e0=True to force demotion to E0 (for severe contradictions).
         """
         _LEVEL_ORDER = [
-            EpistemicStatus.E0_RUMOR, EpistemicStatus.E1_HYPOTHESIS,
-            EpistemicStatus.E2_OBSERVATION, EpistemicStatus.E3_TESTED,
-            EpistemicStatus.E4_PROVEN, EpistemicStatus.E5_AXIOM,
+            EpistemicStatus.E0_RUMOR,
+            EpistemicStatus.E1_HYPOTHESIS,
+            EpistemicStatus.E2_OBSERVATION,
+            EpistemicStatus.E3_TESTED,
+            EpistemicStatus.E4_PROVEN,
+            EpistemicStatus.E5_AXIOM,
         ]
         old_status = node.get("epistemic_status", "E0")
         if to_e0:
             new_status = EpistemicStatus.E0_RUMOR
         else:
-            current_level = int(old_status[1]) if len(old_status) == 2 and old_status[1].isdigit() else 0
+            current_level = (
+                int(old_status[1]) if len(old_status) == 2 and old_status[1].isdigit() else 0
+            )
             target_level = max(0, current_level - 1)
             new_status = _LEVEL_ORDER[target_level]
         node["epistemic_status"] = new_status.value
-        node["epistemic_demoted_at"] = datetime.now(timezone.utc).isoformat()
+        node["epistemic_demoted_at"] = datetime.now(UTC).isoformat()
         node["epistemic_demotion_reason"] = reason
         logger.info(
             "Demoted %s from %s to %s: %s",
-            node.get("id"), old_status, new_status.value, reason,
+            node.get("id"),
+            old_status,
+            new_status.value,
+            reason,
         )
         return node
+
+    def _llm_suggest_classification(self, node: dict) -> EpistemicStatus | None:
+        """Advisory-only LLM suggestion. NEVER overrides classify(). Stores as metadata."""
+        from engineering_brain.llm_helpers import brain_llm_call_json, is_llm_enabled
+
+        if not is_llm_enabled("BRAIN_LLM_EPISTEMIC_SUGGESTION"):
+            return None
+        system = (
+            "Suggest epistemic status for a knowledge node. "
+            "Levels: E0=rumor, E1=hypothesis, E2=observed, E3=tested, E4=proven, E5=axiom. "
+            'Return ONLY JSON: {"status": "E2", "reasoning": "brief reason"}.'
+        )
+        summary = {
+            "id": node.get("id", ""),
+            "text": str(node.get("text") or node.get("statement") or "")[:150],
+            "reinforcements": node.get("reinforcement_count", 0),
+            "validation": node.get("validation_status", "unvalidated"),
+        }
+        result = brain_llm_call_json(system, f"Node: {summary}", max_tokens=100)
+        if not result:
+            return None
+        try:
+            status = EpistemicStatus(result.get("status", ""))
+            node["_llm_suggested_status"] = status.value
+            node["_llm_suggested_reasoning"] = str(result.get("reasoning", ""))[:200]
+            return status
+        except ValueError:
+            return None
 
     def batch_classify(self, nodes: list[dict[str, Any]]) -> dict[str, EpistemicStatus]:
         """Classify all nodes and return a mapping of node_id -> status."""
@@ -165,4 +206,9 @@ class EpistemicLadder:
             nid = node.get("id", "")
             if nid:
                 result[nid] = self.classify(node)
+                # Advisory LLM suggestion (never overrides deterministic result)
+                try:
+                    self._llm_suggest_classification(node)
+                except Exception as exc:
+                    logger.debug("LLM classification suggestion failed for %s: %s", nid, exc)
         return result

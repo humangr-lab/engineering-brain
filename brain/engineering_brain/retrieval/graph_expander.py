@@ -24,10 +24,10 @@ logger = logging.getLogger(__name__)
 
 # Expansion edges and their traversal direction
 _EXPANSION_EDGES: list[tuple[str, str]] = [
-    ("INSTANTIATES", "incoming"),   # Pattern -> Rule: follow backward to find pattern
-    ("INFORMS", "incoming"),        # Principle -> Pattern: follow backward
-    ("EVIDENCED_BY", "outgoing"),   # Rule -> Finding: follow forward
-    ("GROUNDS", "incoming"),        # Axiom -> Principle: follow backward
+    ("INSTANTIATES", "incoming"),  # Pattern -> Rule: follow backward to find pattern
+    ("INFORMS", "incoming"),  # Principle -> Pattern: follow backward
+    ("EVIDENCED_BY", "outgoing"),  # Rule -> Finding: follow forward
+    ("GROUNDS", "incoming"),  # Axiom -> Principle: follow backward
 ]
 
 
@@ -69,7 +69,8 @@ def expand_top_results(
                     max_depth=max_hops,
                     limit=3,
                 )
-            except Exception:
+            except Exception as exc:
+                logger.debug("Graph traversal failed for node %s: %s", node_id, exc)
                 continue
 
             for neighbor in neighbors:

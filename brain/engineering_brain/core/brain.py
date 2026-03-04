@@ -15,13 +15,19 @@ import json
 import logging
 import os
 import time
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from engineering_brain.adapters.base import CacheAdapter, GraphAdapter, VectorAdapter
-from engineering_brain.adapters.memory import MemoryCacheAdapter, MemoryGraphAdapter, MemoryVectorAdapter, MultiTierCache
+from engineering_brain.adapters.memory import (
+    MemoryCacheAdapter,
+    MemoryGraphAdapter,
+    MemoryVectorAdapter,
+    MultiTierCache,
+)
 from engineering_brain.adapters.sharding import ShardRouter
 from engineering_brain.core.config import BrainConfig, get_brain_config
 from engineering_brain.core.schema import EdgeType, Layer, NodeType
@@ -38,7 +44,6 @@ from engineering_brain.core.types import (
     Rule,
     SeedFile,
     Source,
-    ValidationStatus,
 )
 from engineering_brain.learning.crystallizer import KnowledgeCrystallizer
 from engineering_brain.learning.promoter import KnowledgePromoter
@@ -79,9 +84,11 @@ class Brain:
             self._graph = graph
         elif adapter_name == "falkordb":
             from engineering_brain.adapters.falkordb import FalkorDBGraphAdapter
+
             self._graph = FalkorDBGraphAdapter(self._config)
         elif adapter_name == "neo4j":
             from engineering_brain.adapters.neo4j import Neo4jGraphAdapter
+
             self._graph = Neo4jGraphAdapter(self._config)
         else:
             self._graph = MemoryGraphAdapter()
@@ -91,14 +98,18 @@ class Brain:
         elif adapter_name == "neo4j":
             try:
                 from engineering_brain.adapters.neo4j import Neo4jVectorAdapter
+
                 self._vector = Neo4jVectorAdapter(self._config)
-            except Exception:
+            except Exception as exc:
+                logger.warning("Neo4j vector adapter unavailable, falling back to memory: %s", exc)
                 self._vector = MemoryVectorAdapter()
         elif adapter_name in ("falkordb", "qdrant", "full"):
             try:
                 from engineering_brain.adapters.qdrant import QdrantVectorAdapter
+
                 self._vector = QdrantVectorAdapter(self._config)
-            except Exception:
+            except Exception as exc:
+                logger.warning("Qdrant vector adapter unavailable, falling back to memory: %s", exc)
                 self._vector = MemoryVectorAdapter()
         else:
             self._vector = MemoryVectorAdapter()
@@ -112,9 +123,13 @@ class Brain:
             )
             try:
                 from engineering_brain.adapters.redis_cache import RedisCacheAdapter
+
                 l2 = RedisCacheAdapter(self._config)
                 self._cache = MultiTierCache(l1=l1, l2=l2)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "Redis cache adapter unavailable, falling back to memory-only cache: %s", exc
+                )
                 self._cache = l1
         else:
             self._cache = MemoryCacheAdapter(
@@ -127,6 +142,7 @@ class Brain:
         if self._config.observation_log_enabled:
             try:
                 from engineering_brain.observation.log import ObservationLog
+
                 self._observation_log = ObservationLog(self._config.observation_log_path)
             except Exception as exc:
                 logger.debug("ObservationLog init failed (non-blocking): %s", exc)
@@ -136,6 +152,7 @@ class Brain:
         if self._config.embedding_enabled:
             try:
                 from engineering_brain.retrieval.embedder import BrainEmbedder
+
                 self._embedder = BrainEmbedder(self._vector, self._config)
             except Exception as exc:
                 logger.debug("BrainEmbedder init failed (non-blocking): %s", exc)
@@ -162,7 +179,10 @@ class Brain:
         if self._config.adaptive_weights_enabled and self._observation_log:
             try:
                 from engineering_brain.learning.adaptive_weights import AdaptiveWeightOptimizer
-                self._adaptive_weights = AdaptiveWeightOptimizer(self._observation_log, self._config)
+
+                self._adaptive_weights = AdaptiveWeightOptimizer(
+                    self._observation_log, self._config
+                )
                 # Wire optimizer into the query pipeline (Gap 4)
                 self._query_router._weight_optimizer = self._adaptive_weights
             except Exception as exc:
@@ -172,8 +192,10 @@ class Brain:
         if self._config.adaptive_promotion_enabled and self._observation_log:
             try:
                 from engineering_brain.learning.adaptive_promotion import AdaptivePromotionPolicy
+
                 self._adaptive_promotion = AdaptivePromotionPolicy(
-                    observation_log=self._observation_log, config=self._config,
+                    observation_log=self._observation_log,
+                    config=self._config,
                 )
                 self._promoter._adaptive_policy = self._adaptive_promotion
             except Exception as exc:
@@ -316,7 +338,7 @@ class Brain:
         domains: list[str] | None = None,
         profile: str | None = None,
         max_chains: int | None = None,
-    ) -> "ReasoningResult":
+    ) -> ReasoningResult:
         """Structured epistemic reasoning with chains, packs, and synthesis.
 
         Builds reasoning chains with causal edges (PREREQUISITE, DEEPENS,
@@ -352,6 +374,7 @@ class Brain:
         brain_profile = None
         if profile:
             from engineering_brain.retrieval.brain_profiles import load_profile
+
             brain_profile = load_profile(profile)
 
         engine = ReasoningEngine(
@@ -370,7 +393,7 @@ class Brain:
         domains: list[str] | None = None,
         min_score: float = 0.3,
         max_nodes: int = 80,
-    ) -> "Pack":
+    ) -> Pack:
         """Create a knowledge pack from a natural language description.
 
         A pack is a "frozen query" — a materialized subgraph with reasoning edges.
@@ -390,17 +413,24 @@ class Brain:
         """
         if self._config.pack_v2_enabled:
             from engineering_brain.retrieval.pack_manager_v2 import ScalablePackManager
+
             mgr = ScalablePackManager(
-                self._graph, self._vector, self._config,
+                self._graph,
+                self._vector,
+                self._config,
                 query_router=self._query_router,
                 embedder=self._embedder,
             )
         else:
             from engineering_brain.retrieval.pack_manager import PackManager
+
             mgr = PackManager(self._graph, self._vector, self._config, self._query_router)
         return mgr.create_pack(
-            description, technologies=technologies,
-            domains=domains, min_score=min_score, max_nodes=max_nodes,
+            description,
+            technologies=technologies,
+            domains=domains,
+            min_score=min_score,
+            max_nodes=max_nodes,
         )
 
     def pack(
@@ -409,7 +439,7 @@ class Brain:
         technologies: list[str] | None = None,
         domains: list[str] | None = None,
         **kwargs: Any,
-    ) -> "MaterializedPack":
+    ) -> MaterializedPack:
         """Create a knowledge pack from a template — one-liner API.
 
         Args:
@@ -451,7 +481,7 @@ class Brain:
         technologies: list[str] | None = None,
         domains: list[str] | None = None,
         **kwargs: Any,
-    ) -> "MaterializedPack":
+    ) -> MaterializedPack:
         """Compose multiple template packs into one.
 
         Args:
@@ -477,7 +507,7 @@ class Brain:
         ]
         return materializer.compose(packs)
 
-    def auto_generate_packs(self) -> list["Pack"]:
+    def auto_generate_packs(self) -> list[Pack]:
         """Auto-generate packs from knowledge graph structure.
 
         Groups nodes by (technology, domain) pairs and creates packs
@@ -487,6 +517,7 @@ class Brain:
             List of Pack objects, sorted by quality score descending
         """
         from engineering_brain.retrieval.pack_manager import PackManager
+
         mgr = PackManager(self._graph, self._vector, self._config, self._query_router)
         return mgr.auto_generate_packs()
 
@@ -507,11 +538,17 @@ class Brain:
 
     def add_axiom(self, statement: str, domain: str = "general", **kwargs: Any) -> str:
         """Add an L0 axiom (immutable truth)."""
-        axiom = Axiom(id=kwargs.get("id", f"AX-{_short_hash(statement)}"), statement=statement, domain=domain, **{k: v for k, v in kwargs.items() if k != "id"})
+        axiom = Axiom(
+            id=kwargs.get("id", f"AX-{_short_hash(statement)}"),
+            statement=statement,
+            domain=domain,
+            **{k: v for k, v in kwargs.items() if k != "id"},
+        )
         self._graph.add_node(NodeType.AXIOM.value, axiom.id, axiom.model_dump(mode="json"))
         if self._embedder and not self._ingesting:
             try:
                 from engineering_brain.core.schema import VECTOR_COLLECTIONS
+
                 coll = VECTOR_COLLECTIONS.get("L0", "brain_axioms")
                 self._embedder.embed_and_store(axiom.model_dump(mode="json"), coll)
             except Exception as exc:
@@ -539,18 +576,23 @@ class Brain:
         """
         pid = kwargs.get("id", f"P-{_short_hash(name)}")
         principle = Principle(
-            id=pid, name=name, why=why, how_to_apply=how,
-            mental_model=mental_model, domains=domains or [],
+            id=pid,
+            name=name,
+            why=why,
+            how_to_apply=how,
+            mental_model=mental_model,
+            domains=domains or [],
             **{k: v for k, v in kwargs.items() if k not in ("id", "domains")},
         )
         self._graph.add_node(NodeType.PRINCIPLE.value, pid, principle.model_dump(mode="json"))
-        for domain in (domains or []):
+        for domain in domains or []:
             did = f"domain:{domain.lower()}"
             self._graph.add_node(NodeType.DOMAIN.value, did, {"id": did, "name": domain})
             self._graph.add_edge(pid, did, EdgeType.IN_DOMAIN.value)
         if self._embedder and not self._ingesting:
             try:
                 from engineering_brain.core.schema import VECTOR_COLLECTIONS
+
                 coll = VECTOR_COLLECTIONS.get("L1", "brain_principles")
                 self._embedder.embed_and_store(principle.model_dump(mode="json"), coll)
             except Exception as exc:
@@ -572,19 +614,25 @@ class Brain:
         """Add an L2 pattern (established practice)."""
         pid = kwargs.get("id", f"PAT-{_short_hash(name)}")
         pattern = Pattern(
-            id=pid, name=name, intent=intent, when_to_use=when_to_use,
-            when_not_to_use=when_not_to_use, languages=languages or [],
-            example_good=example_good, example_bad=example_bad,
+            id=pid,
+            name=name,
+            intent=intent,
+            when_to_use=when_to_use,
+            when_not_to_use=when_not_to_use,
+            languages=languages or [],
+            example_good=example_good,
+            example_bad=example_bad,
             **{k: v for k, v in kwargs.items() if k not in ("id", "languages")},
         )
         self._graph.add_node(NodeType.PATTERN.value, pid, pattern.model_dump(mode="json"))
-        for lang in (languages or []):
+        for lang in languages or []:
             tid = f"tech:{lang.lower()}"
             self._graph.add_node(NodeType.TECHNOLOGY.value, tid, {"id": tid, "name": lang})
             self._graph.add_edge(pid, tid, EdgeType.USED_IN.value)
         if self._embedder and not self._ingesting:
             try:
                 from engineering_brain.core.schema import VECTOR_COLLECTIONS
+
                 coll = VECTOR_COLLECTIONS.get("L2", "brain_patterns")
                 self._embedder.embed_and_store(pattern.model_dump(mode="json"), coll)
             except Exception as exc:
@@ -622,19 +670,24 @@ class Brain:
         shard_domain = (domains[0] if domains else "general").lower()
         shard_target = self._shard_router.route_write(shard_domain, Layer.L3_RULES)
         rule = Rule(
-            id=rid, text=text, why=why, how_to_do_right=how,
-            severity=severity, technologies=technologies or [],
-            domains=domains or [], example_good=example_good,
+            id=rid,
+            text=text,
+            why=why,
+            how_to_do_right=how,
+            severity=severity,
+            technologies=technologies or [],
+            domains=domains or [],
+            example_good=example_good,
             example_bad=example_bad,
             shard_id=shard_target.shard_key,
             **{k: v for k, v in kwargs.items() if k not in ("id", "technologies", "domains")},
         )
         self._graph.add_node(NodeType.RULE.value, rid, rule.model_dump(mode="json"))
-        for tech in (technologies or []):
+        for tech in technologies or []:
             tid = f"tech:{tech.lower()}"
             self._graph.add_node(NodeType.TECHNOLOGY.value, tid, {"id": tid, "name": tech})
             self._graph.add_edge(rid, tid, EdgeType.APPLIES_TO.value)
-        for domain in (domains or []):
+        for domain in domains or []:
             did = f"domain:{domain.lower()}"
             self._graph.add_node(NodeType.DOMAIN.value, did, {"id": did, "name": domain})
             self._graph.add_edge(rid, did, EdgeType.IN_DOMAIN.value)
@@ -642,6 +695,7 @@ class Brain:
         if self._embedder and not self._ingesting:
             try:
                 from engineering_brain.core.schema import VECTOR_COLLECTIONS
+
                 coll = VECTOR_COLLECTIONS.get("L3", "brain_rules")
                 self._embedder.embed_and_store(rule.model_dump(mode="json"), coll)
             except Exception as exc:
@@ -667,7 +721,8 @@ class Brain:
             text = rd.get("text", "")
             rid = rd.get("id", f"CR-{_short_hash(text)}")
             rule = Rule(
-                id=rid, text=text,
+                id=rid,
+                text=text,
                 why=rd.get("why", ""),
                 how_to_do_right=rd.get("how", rd.get("how_to_do_right", "")),
                 severity=rd.get("severity", "medium"),
@@ -678,10 +733,10 @@ class Brain:
             )
             nodes.append(rule.model_dump(mode="json"))
             ids.append(rid)
-            for tech in (rd.get("technologies") or []):
+            for tech in rd.get("technologies") or []:
                 tid = f"tech:{tech.lower()}"
                 edge_ops.append((rid, tid, EdgeType.APPLIES_TO.value))
-            for domain in (rd.get("domains") or []):
+            for domain in rd.get("domains") or []:
                 did = f"domain:{domain.lower()}"
                 edge_ops.append((rid, did, EdgeType.IN_DOMAIN.value))
 
@@ -702,7 +757,8 @@ class Brain:
             name = pd.get("name", "")
             pid = pd.get("id", f"PAT-{_short_hash(name)}")
             pattern = Pattern(
-                id=pid, name=name,
+                id=pid,
+                name=name,
                 intent=pd.get("intent", ""),
                 when_to_use=pd.get("when_to_use", ""),
                 when_not_to_use=pd.get("when_not_to_use", ""),
@@ -712,7 +768,7 @@ class Brain:
             )
             nodes.append(pattern.model_dump(mode="json"))
             ids.append(pid)
-            for lang in (pd.get("languages") or []):
+            for lang in pd.get("languages") or []:
                 tid = f"tech:{lang.lower()}"
                 edge_ops.append((pid, tid, EdgeType.USED_IN.value))
 
@@ -733,7 +789,8 @@ class Brain:
             name = pd.get("name", "")
             pid = pd.get("id", f"P-{_short_hash(name)}")
             principle = Principle(
-                id=pid, name=name,
+                id=pid,
+                name=name,
                 why=pd.get("why", ""),
                 how_to_apply=pd.get("how", pd.get("how_to_apply", "")),
                 mental_model=pd.get("mental_model", ""),
@@ -741,7 +798,7 @@ class Brain:
             )
             nodes.append(principle.model_dump(mode="json"))
             ids.append(pid)
-            for domain in (pd.get("domains") or []):
+            for domain in pd.get("domains") or []:
                 did = f"domain:{domain.lower()}"
                 edge_ops.append((pid, did, EdgeType.IN_DOMAIN.value))
 
@@ -790,11 +847,11 @@ class Brain:
         """
         cfg = self._config
         results: dict[str, Any] = {}
-        if (crystallize if crystallize is not None else cfg.maintenance_crystallize):
+        if crystallize if crystallize is not None else cfg.maintenance_crystallize:
             results["crystallized"] = self.crystallize()
-        if (promote if promote is not None else cfg.maintenance_promote):
+        if promote if promote is not None else cfg.maintenance_promote:
             results["promoted"] = self.promote()
-        if (prune if prune is not None else cfg.maintenance_prune):
+        if prune if prune is not None else cfg.maintenance_prune:
             results["pruned"] = self.prune()
 
         # Gap 4: Update adaptive weights from observation log feedback
@@ -803,14 +860,18 @@ class Brain:
                 self._adaptive_weights._update_from_log()
                 results["adaptive_weights"] = self._adaptive_weights.stats()
             except Exception as exc:
-                logger.debug("Adaptive weights update failed during maintenance (non-blocking): %s", exc)
+                logger.debug(
+                    "Adaptive weights update failed during maintenance (non-blocking): %s", exc
+                )
 
         # Gap 7: Record promotion outcomes for adaptive thresholds
         if self._adaptive_promotion:
             try:
                 results["adaptive_promotion"] = self._adaptive_promotion.stats()
             except Exception as exc:
-                logger.debug("Adaptive promotion stats failed during maintenance (non-blocking): %s", exc)
+                logger.debug(
+                    "Adaptive promotion stats failed during maintenance (non-blocking): %s", exc
+                )
 
         return results
 
@@ -846,11 +907,15 @@ class Brain:
         succeeded = int(rule.get("prediction_success_count", 0)) + (1 if success else 0)
         confidence = float(rule.get("confidence", 0.5))
         label = _node_type_for_id(rule_id)
-        self._graph.add_node(label, rule_id, {
-            **rule,
-            "prediction_tested_count": tested,
-            "prediction_success_count": succeeded,
-        })
+        self._graph.add_node(
+            label,
+            rule_id,
+            {
+                **rule,
+                "prediction_tested_count": tested,
+                "prediction_success_count": succeeded,
+            },
+        )
         if self._observation_log is not None:
             try:
                 self._observation_log.record_prediction_test(
@@ -867,6 +932,7 @@ class Brain:
         if self._observation_log is None:
             return []
         from engineering_brain.observation.calibrator import ConfidenceCalibrator
+
         calibrator = ConfidenceCalibrator(self._observation_log)
         return calibrator.compute_calibration()
 
@@ -900,7 +966,6 @@ class Brain:
 
         # 2. Update adaptive weights (Thompson Sampling) if enabled
         if self._adaptive_weights is not None:
-            from engineering_brain.retrieval.scorer import score_knowledge
             for nid in node_ids:
                 node = self._graph.get_node(nid)
                 if node is None:
@@ -909,7 +974,11 @@ class Brain:
                     self._adaptive_weights.record_feedback(nid, helpful)
                     count += 1
                 except Exception as exc:
-                    logger.debug("Adaptive weight feedback recording failed for node %s (non-blocking): %s", nid, exc)
+                    logger.debug(
+                        "Adaptive weight feedback recording failed for node %s (non-blocking): %s",
+                        nid,
+                        exc,
+                    )
 
         # 3. Record in observation log
         if self._observation_log is not None:
@@ -950,7 +1019,8 @@ class Brain:
         try:
             self._adaptive_promotion.record_outcome(domain, promoted, survived)
             return True
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to record adaptive promotion outcome: %s", exc)
             return False
 
     # =========================================================================
@@ -971,12 +1041,15 @@ class Brain:
             List of Finding proposals with pattern_type, description, confidence
         """
         from engineering_brain.learning.code_pattern_miner import CodePatternMiner
+
         miner = CodePatternMiner(self._graph, self._config)
         miner.mine_directory(path, batch_size=10)
         findings = miner.propose_findings(min_frequency=min_frequency)
         logger.info(
             "Mined %d finding proposals from %s (stats: %s)",
-            len(findings), path, miner.stats(),
+            len(findings),
+            path,
+            miner.stats(),
         )
         return findings
 
@@ -994,7 +1067,9 @@ class Brain:
             List of predicted links with source_id, target_id, edge_type, confidence
         """
         if not self._link_predictor:
-            logger.warning("Link predictor not initialized (enable BRAIN_LINK_PREDICTION=true and call seed())")
+            logger.warning(
+                "Link predictor not initialized (enable BRAIN_LINK_PREDICTION=true and call seed())"
+            )
             return []
         predictions = self._link_predictor.predict_links(top_k=top_k)
         return [
@@ -1038,6 +1113,7 @@ class Brain:
         if not self._config.crystallize_enabled:
             return []
         from engineering_brain.learning.cluster_promoter import ClusterPromoter
+
         cp = ClusterPromoter(self._graph, self._config)
         return cp.crystallize()
 
@@ -1069,16 +1145,22 @@ class Brain:
         Returns:
             ValidationReport (all) or dict (single node)
         """
-        from engineering_brain.validation.orchestrator import validate_all as _validate_all, validate_node as _validate_node
+        from engineering_brain.validation.orchestrator import validate_all as _validate_all
+        from engineering_brain.validation.orchestrator import validate_node as _validate_node
 
         if node_id:
             return await _validate_node(
-                self, node_id, config=self._config, force_refresh=force_refresh,
+                self,
+                node_id,
+                config=self._config,
+                force_refresh=force_refresh,
             )
         else:
             return await _validate_all(
-                self, config=self._config,
-                force_refresh=force_refresh, dry_run=dry_run,
+                self,
+                config=self._config,
+                force_refresh=force_refresh,
+                dry_run=dry_run,
                 layer_filter=layer_filter,
                 progress_callback=progress_callback,
             )
@@ -1097,7 +1179,7 @@ class Brain:
         import hashlib as _hl
 
         try:
-            with open(path, "r") as f:
+            with open(path) as f:
                 content = f.read()
             version_hash = _hl.sha256(content.encode()).hexdigest()[:16]
 
@@ -1164,6 +1246,7 @@ class Brain:
         if self._config.cross_layer_inference_enabled and self._embedder and not skip_bulk_embed:
             try:
                 from engineering_brain.learning.cross_layer_inferrer import CrossLayerEdgeInferrer
+
                 inferrer = CrossLayerEdgeInferrer(self._graph, self._embedder, self._config)
                 self._cross_layer_inferrer = inferrer
                 inferred = inferrer.infer_edges(batch_size=20)
@@ -1175,7 +1258,8 @@ class Brain:
                 if inferred_count > 0:
                     logger.info(
                         "Inferred %d cross-layer edges (threshold=%.2f)",
-                        inferred_count, self._config.cross_layer_similarity_threshold,
+                        inferred_count,
+                        self._config.cross_layer_similarity_threshold,
                     )
             except Exception as e:
                 logger.warning("Cross-layer inference failed (non-blocking): %s", e)
@@ -1192,7 +1276,9 @@ class Brain:
                 stats = self._embedder.embed_all_nodes(self._graph)
                 logger.info(
                     "Embedded %d nodes (%d skipped, %d failed)",
-                    stats.get("embedded", 0), stats.get("skipped", 0), stats.get("failed", 0),
+                    stats.get("embedded", 0),
+                    stats.get("skipped", 0),
+                    stats.get("failed", 0),
                 )
             except Exception as e:
                 logger.warning("Embedding failed (non-blocking): %s", e)
@@ -1203,15 +1289,23 @@ class Brain:
         if self._config.link_prediction_enabled and self._embedder:
             try:
                 from engineering_brain.learning.link_predictor import LinkPredictor
+
                 hake = None
                 if self._config.hake_enabled:
                     try:
                         from engineering_brain.retrieval.hake_embeddings import HAKEEncoder
+
                         hake = HAKEEncoder(self._config)
                     except Exception as exc:
-                        logger.debug("HAKEEncoder init failed, falling back to cosine-only link prediction: %s", exc)
+                        logger.debug(
+                            "HAKEEncoder init failed, falling back to cosine-only link prediction: %s",
+                            exc,
+                        )
                 self._link_predictor = LinkPredictor(
-                    self._graph, self._embedder, hake=hake, config=self._config,
+                    self._graph,
+                    self._embedder,
+                    hake=hake,
+                    config=self._config,
                 )
             except Exception as e:
                 logger.warning("Link predictor init failed (non-blocking): %s", e)
@@ -1232,9 +1326,11 @@ class Brain:
             all_nodes.extend(page)
         build_tech_index_from_nodes(all_nodes)
         from engineering_brain.retrieval.context_extractor import _dynamic_tech_index
+
         logger.info(
             "Built dynamic tech index: %d technologies from %d nodes",
-            len(_dynamic_tech_index), len(all_nodes),
+            len(_dynamic_tech_index),
+            len(all_nodes),
         )
 
     def _build_tag_registry(self, seeds_dir: str, *, skip_embeddings: bool = False) -> None:
@@ -1243,8 +1339,8 @@ class Brain:
         Populates the global TagRegistry singleton with tags discovered from
         both the static TAXONOMY.yaml tree and the actual node data.
         """
-        from engineering_brain.core.taxonomy_bootstrap import bootstrap_registry
         from engineering_brain.core.taxonomy import set_registry
+        from engineering_brain.core.taxonomy_bootstrap import bootstrap_registry
 
         all_nodes: list[dict[str, Any]] = []
         for page in self._graph.get_nodes_paginated(page_size=500):
@@ -1254,21 +1350,25 @@ class Brain:
         set_registry(registry)
         logger.info(
             "Built tag registry: %d tags from TAXONOMY.yaml + %d nodes",
-            registry.size, len(all_nodes),
+            registry.size,
+            len(all_nodes),
         )
 
         # Tier 1: Embed tags in Qdrant for semantic matching (non-blocking)
         if self._embedder and self._config.embedding_enabled and not skip_embeddings:
             try:
                 from engineering_brain.retrieval.tag_embeddings import (
-                    TagEmbeddingIndex, set_tag_index,
+                    TagEmbeddingIndex,
+                    set_tag_index,
                 )
+
                 tag_index = TagEmbeddingIndex(self._embedder, registry)
                 stats = tag_index.index_all(batch_size=20)
                 set_tag_index(tag_index)
                 logger.info(
                     "Tag embeddings: %d indexed, %d skipped",
-                    stats.get("indexed", 0), stats.get("skipped", 0),
+                    stats.get("indexed", 0),
+                    stats.get("skipped", 0),
                 )
             except Exception as e:
                 logger.warning("Tag embedding failed (non-blocking): %s", e)
@@ -1278,8 +1378,10 @@ class Brain:
             try:
                 from engineering_brain.retrieval.tag_embeddings import get_tag_index
                 from engineering_brain.retrieval.taxonomy_expander import (
-                    TaxonomyExpander, set_expander,
+                    TaxonomyExpander,
+                    set_expander,
                 )
+
                 tag_index = get_tag_index()
                 if tag_index and tag_index.is_indexed:
                     expander = TaxonomyExpander(registry, tag_index)
@@ -1291,7 +1393,11 @@ class Brain:
                             suggestions,
                             min_confidence=self._config.auto_expand_min_confidence,
                         )
-                        logger.info("Auto-expanded %d polyhierarchy links from %d suggestions", applied, len(suggestions))
+                        logger.info(
+                            "Auto-expanded %d polyhierarchy links from %d suggestions",
+                            applied,
+                            len(suggestions),
+                        )
                     set_expander(expander)
             except Exception as e:
                 logger.warning("Taxonomy auto-expansion failed (non-blocking): %s", e)
@@ -1300,6 +1406,7 @@ class Brain:
         if self._config.relationship_learning_enabled:
             try:
                 from engineering_brain.learning.relationship_learner import RelationshipLearner
+
                 learner = RelationshipLearner(registry)
                 learner.observe_batch(all_nodes, batch_size=50)
                 suggestions = learner.suggest_relationships(min_cooccurrence=3)
@@ -1307,7 +1414,8 @@ class Brain:
                 if suggestions:
                     logger.info(
                         "Relationship learner: %d suggestions from %d nodes",
-                        len(suggestions), learner.stats["nodes_observed"],
+                        len(suggestions),
+                        learner.stats["nodes_observed"],
                     )
             except Exception as e:
                 logger.warning("Relationship learning failed (non-blocking): %s", e)
@@ -1329,88 +1437,87 @@ class Brain:
         # =====================================================================
         grounds_map: list[tuple[str, str]] = [
             # Type Theory axioms → principles
-            ("AX-TYPE-001", "P-API-CONTRACT"),      # type sig is contract → API as contract
-            ("AX-TYPE-002", "P-ERR-FAIL-FAST"),      # null handling → fail fast
-            ("AX-TYPE-003", "P-SEC-BOUNDARY"),        # type narrowing → validate at boundary
+            ("AX-TYPE-001", "P-API-CONTRACT"),  # type sig is contract → API as contract
+            ("AX-TYPE-002", "P-ERR-FAIL-FAST"),  # null handling → fail fast
+            ("AX-TYPE-003", "P-SEC-BOUNDARY"),  # type narrowing → validate at boundary
             # State axioms → principles
-            ("AX-STATE-001", "P-CONC-ATOMIC"),        # shared mutable state → atomic updates
-            ("AX-STATE-002", "P-CONC-ATOMIC"),        # atomic transitions → atomic updates
-            ("AX-STATE-003", "P-CFG-CONSERVATIVE"),   # defaults ARE policy → conservative defaults
+            ("AX-STATE-001", "P-CONC-ATOMIC"),  # shared mutable state → atomic updates
+            ("AX-STATE-002", "P-CONC-ATOMIC"),  # atomic transitions → atomic updates
+            ("AX-STATE-003", "P-CFG-CONSERVATIVE"),  # defaults ARE policy → conservative defaults
             # Security axioms → principles
-            ("AX-SEC-001", "P-SEC-BOUNDARY"),          # enforce at boundary → validate at boundary
-            ("AX-SEC-002", "P-SEC-DENY"),              # authn→authz→process → deny-by-default
-            ("AX-SEC-003", "P-SEC-LEAST-PRIV"),        # least privilege → principle of least privilege
-            ("AX-SEC-004", "P-SEC-DENY"),              # deny-by-default axiom → deny principle
-            ("AX-SEC-004", "P-CFG-CONSERVATIVE"),      # deny-by-default → conservative defaults
+            ("AX-SEC-001", "P-SEC-BOUNDARY"),  # enforce at boundary → validate at boundary
+            ("AX-SEC-002", "P-SEC-DENY"),  # authn→authz→process → deny-by-default
+            ("AX-SEC-003", "P-SEC-LEAST-PRIV"),  # least privilege → principle of least privilege
+            ("AX-SEC-004", "P-SEC-DENY"),  # deny-by-default axiom → deny principle
+            ("AX-SEC-004", "P-CFG-CONSERVATIVE"),  # deny-by-default → conservative defaults
             # Correctness axioms → principles
-            ("AX-CORRECT-001", "P-TEST-PYRAMID"),      # untested=broken → testing pyramid
-            ("AX-CORRECT-001", "P-TEST-DETERMINISTIC"), # untested=broken → deterministic tests
-            ("AX-CORRECT-002", "P-ERR-FAIL-FAST"),     # handle errors → fail fast
-            ("AX-CORRECT-002", "P-ERR-ACTIONABLE"),    # handle errors → actionable errors
-            ("AX-CORRECT-003", "P-ARCH-EXPLICIT"),     # side effects → explicit over implicit
+            ("AX-CORRECT-001", "P-TEST-PYRAMID"),  # untested=broken → testing pyramid
+            ("AX-CORRECT-001", "P-TEST-DETERMINISTIC"),  # untested=broken → deterministic tests
+            ("AX-CORRECT-002", "P-ERR-FAIL-FAST"),  # handle errors → fail fast
+            ("AX-CORRECT-002", "P-ERR-ACTIONABLE"),  # handle errors → actionable errors
+            ("AX-CORRECT-003", "P-ARCH-EXPLICIT"),  # side effects → explicit over implicit
             # Architecture axioms → principles
-            ("AX-ARCH-001", "P-ARCH-SINGLE-RESP"),     # minimize coupling → single responsibility
-            ("AX-ARCH-001", "P-ARCH-SEPARATION"),      # minimize coupling → separation of concerns
-            ("AX-ARCH-002", "P-ARCH-DRY"),             # single source of truth → DRY
-            ("AX-ARCH-003", "P-ARCH-SINGLE-RESP"),     # eliminate accidental complexity → SRP
+            ("AX-ARCH-001", "P-ARCH-SINGLE-RESP"),  # minimize coupling → single responsibility
+            ("AX-ARCH-001", "P-ARCH-SEPARATION"),  # minimize coupling → separation of concerns
+            ("AX-ARCH-002", "P-ARCH-DRY"),  # single source of truth → DRY
+            ("AX-ARCH-003", "P-ARCH-SINGLE-RESP"),  # eliminate accidental complexity → SRP
             # Communication axioms → principles
-            ("AX-COMM-001", "P-API-CONTRACT"),          # interfaces are contracts → API as contract
-            ("AX-COMM-002", "P-API-IDEMPOTENT"),        # network fails → idempotent operations
+            ("AX-COMM-001", "P-API-CONTRACT"),  # interfaces are contracts → API as contract
+            ("AX-COMM-002", "P-API-IDEMPOTENT"),  # network fails → idempotent operations
             # Data axioms → principles
-            ("AX-DATA-001", "P-API-CONTRACT"),           # data outlives code → API contract
-            ("AX-DATA-002", "P-SEC-BOUNDARY"),           # validate at boundary → boundary validation
+            ("AX-DATA-001", "P-API-CONTRACT"),  # data outlives code → API contract
+            ("AX-DATA-002", "P-SEC-BOUNDARY"),  # validate at boundary → boundary validation
             # Performance → principles
-            ("AX-PERF-001", "P-PERF-MEASURE"),          # measure before optimizing
+            ("AX-PERF-001", "P-PERF-MEASURE"),  # measure before optimizing
             # DRY → principles
-            ("AX-DRY-001", "P-ARCH-DRY"),               # single representation → DRY
+            ("AX-DRY-001", "P-ARCH-DRY"),  # single representation → DRY
             # Observability → principles
-            ("AX-OBS-001", "P-OBS-STRUCTURED"),          # can't improve unmeasured → structured logging
-            ("AX-OBS-001", "P-PERF-MEASURE"),            # can't improve unmeasured → measure first
+            ("AX-OBS-001", "P-OBS-STRUCTURED"),  # can't improve unmeasured → structured logging
+            ("AX-OBS-001", "P-PERF-MEASURE"),  # can't improve unmeasured → measure first
             # Idempotency → principles
-            ("AX-IDEMP-001", "P-API-IDEMPOTENT"),        # idempotent ops → idempotent operations
-
+            ("AX-IDEMP-001", "P-API-IDEMPOTENT"),  # idempotent ops → idempotent operations
             # === Extended axioms (axioms_extended.yaml) → principles ===
             # Database axioms → principles
-            ("AX-DB-001", "P-DB-NORMALIZE"),               # read/write scaling → normalize strategy
-            ("AX-DB-001", "P-SCALE-CQRS"),                 # read/write scaling → CQRS
-            ("AX-DB-002", "P-DB-INDEX"),                   # index tradeoff → index strategy
+            ("AX-DB-001", "P-DB-NORMALIZE"),  # read/write scaling → normalize strategy
+            ("AX-DB-001", "P-SCALE-CQRS"),  # read/write scaling → CQRS
+            ("AX-DB-002", "P-DB-INDEX"),  # index tradeoff → index strategy
             # Testing axioms → principles
-            ("AX-TEST-001", "P-TEST-PYRAMID"),             # falsifiable tests → testing pyramid
-            ("AX-TEST-002", "P-TEST-PYRAMID"),             # bug cost distance → test early
-            ("AX-TEST-002", "P-ERR-FAIL-FAST"),            # bug cost distance → fail fast
+            ("AX-TEST-001", "P-TEST-PYRAMID"),  # falsifiable tests → testing pyramid
+            ("AX-TEST-002", "P-TEST-PYRAMID"),  # bug cost distance → test early
+            ("AX-TEST-002", "P-ERR-FAIL-FAST"),  # bug cost distance → fail fast
             # Distributed systems axioms → principles
-            ("AX-DIST-001", "P-MSG-IDEMPOTENT"),           # exactly-once impossible → idempotent handlers
-            ("AX-DIST-001", "P-API-IDEMPOTENT"),           # exactly-once impossible → idempotent ops
-            ("AX-DIST-002", "P-DIST-EVENTUAL-CONSIST"),    # CAP theorem → eventual consistency
-            ("AX-DIST-003", "P-DIST-SAGA"),                # clock sync → logical ordering via sagas
+            ("AX-DIST-001", "P-MSG-IDEMPOTENT"),  # exactly-once impossible → idempotent handlers
+            ("AX-DIST-001", "P-API-IDEMPOTENT"),  # exactly-once impossible → idempotent ops
+            ("AX-DIST-002", "P-DIST-EVENTUAL-CONSIST"),  # CAP theorem → eventual consistency
+            ("AX-DIST-003", "P-DIST-SAGA"),  # clock sync → logical ordering via sagas
             # Reliability axioms → principles
-            ("AX-REL-001", "P-REL-GRACEFUL-DEGRADE"),      # everything fails → graceful degradation
-            ("AX-REL-001", "P-REL-REDUNDANCY"),             # everything fails → redundancy
-            ("AX-REL-002", "P-REL-REDUNDANCY"),             # redundancy tradeoff → redundancy principle
+            ("AX-REL-001", "P-REL-GRACEFUL-DEGRADE"),  # everything fails → graceful degradation
+            ("AX-REL-001", "P-REL-REDUNDANCY"),  # everything fails → redundancy
+            ("AX-REL-002", "P-REL-REDUNDANCY"),  # redundancy tradeoff → redundancy principle
             # Scalability axioms → principles
-            ("AX-SCALE-001", "P-SCALE-HORIZONTAL"),         # vertical ceiling → horizontal scaling
+            ("AX-SCALE-001", "P-SCALE-HORIZONTAL"),  # vertical ceiling → horizontal scaling
             # Concurrency axioms → principles
-            ("AX-CONC-001", "P-CONC-ATOMIC"),               # deadlock prevention → atomic updates
-            ("AX-CONC-002", "P-CONC-ATOMIC"),               # lock-free tradeoff → atomic alternatives
+            ("AX-CONC-001", "P-CONC-ATOMIC"),  # deadlock prevention → atomic updates
+            ("AX-CONC-002", "P-CONC-ATOMIC"),  # lock-free tradeoff → atomic alternatives
             # UX axioms → principles
-            ("AX-UX-001", "P-UX-FEEDBACK"),                 # mental models → immediate feedback
-            ("AX-UX-002", "P-UX-FEEDBACK"),                 # cognitive load → immediate feedback
+            ("AX-UX-001", "P-UX-FEEDBACK"),  # mental models → immediate feedback
+            ("AX-UX-002", "P-UX-FEEDBACK"),  # cognitive load → immediate feedback
             # Cost axioms → principles
-            ("AX-COST-001", "P-AI-COST"),                   # resource cost → AI cost control
-            ("AX-COST-001", "P-PERF-MEASURE"),              # resource cost → measure before optimize
+            ("AX-COST-001", "P-AI-COST"),  # resource cost → AI cost control
+            ("AX-COST-001", "P-PERF-MEASURE"),  # resource cost → measure before optimize
             # Learning axioms → principles
-            ("AX-LEARN-001", "P-OBS-STRUCTURED"),           # feedback loops → structured observability
-            ("AX-LEARN-001", "P-ML-MONITORING"),            # feedback loops → model monitoring
-            ("AX-LEARN-002", "P-REL-CHAOS"),                # failure is knowledge → chaos engineering
+            ("AX-LEARN-001", "P-OBS-STRUCTURED"),  # feedback loops → structured observability
+            ("AX-LEARN-001", "P-ML-MONITORING"),  # feedback loops → model monitoring
+            ("AX-LEARN-002", "P-REL-CHAOS"),  # failure is knowledge → chaos engineering
             # Abstraction axioms → principles
-            ("AX-ABSTR-001", "P-ARCH-SEPARATION"),          # leaky abstractions → separation of concerns
-            ("AX-ABSTR-002", "P-ARCH-EXPLICIT"),            # right abstraction level → explicit design
+            ("AX-ABSTR-001", "P-ARCH-SEPARATION"),  # leaky abstractions → separation of concerns
+            ("AX-ABSTR-002", "P-ARCH-EXPLICIT"),  # right abstraction level → explicit design
             # Feedback axioms → principles
-            ("AX-FEEDBACK-001", "P-OBS-STRUCTURED"),        # feedback loops → structured observability
-            ("AX-FEEDBACK-001", "P-ML-MONITORING"),          # feedback loops → model monitoring
+            ("AX-FEEDBACK-001", "P-OBS-STRUCTURED"),  # feedback loops → structured observability
+            ("AX-FEEDBACK-001", "P-ML-MONITORING"),  # feedback loops → model monitoring
             # Data axioms → new data principles
-            ("AX-DATA-001", "P-DB-MIGRATION"),              # data outlives code → safe migrations
-            ("AX-DATA-001", "P-DATA-SCHEMA-EVOLUTION"),     # data outlives code → schema evolution
+            ("AX-DATA-001", "P-DB-MIGRATION"),  # data outlives code → safe migrations
+            ("AX-DATA-001", "P-DATA-SCHEMA-EVOLUTION"),  # data outlives code → schema evolution
         ]
 
         for axiom_id, principle_id in grounds_map:
@@ -1426,36 +1533,39 @@ class Brain:
         # =====================================================================
         informs_map: list[tuple[str, str]] = [
             # Security principles → patterns
-            ("P-SEC-DENY", "PAT-SEC-AUTH-DECO"),       # deny-by-default → auth decorator
-            ("P-SEC-DENY", "PAT-CFG-ENV"),             # deny-by-default → env config (safe defaults)
+            ("P-SEC-DENY", "PAT-SEC-AUTH-DECO"),  # deny-by-default → auth decorator
+            ("P-SEC-DENY", "PAT-CFG-ENV"),  # deny-by-default → env config (safe defaults)
             ("P-SEC-BOUNDARY", "PAT-SEC-INPUT-VALID"),  # boundary validation → input validation
             ("P-SEC-LEAST-PRIV", "PAT-SEC-AUTH-DECO"),  # least privilege → auth decorator
             # Error handling principles → patterns
-            ("P-ERR-ACTIONABLE", "PAT-ERR-RESULT"),     # actionable errors → result type
-            ("P-ERR-FAIL-FAST", "PAT-ERR-GRACEFUL"),    # fail fast → graceful degradation (complement)
+            ("P-ERR-ACTIONABLE", "PAT-ERR-RESULT"),  # actionable errors → result type
+            (
+                "P-ERR-FAIL-FAST",
+                "PAT-ERR-GRACEFUL",
+            ),  # fail fast → graceful degradation (complement)
             # Architecture principles → patterns
             ("P-ARCH-SINGLE-RESP", "PAT-ARCH-REPOSITORY"),  # SRP → repository pattern
-            ("P-ARCH-SEPARATION", "PAT-ARCH-FACTORY"),      # separation → factory pattern
-            ("P-ARCH-DRY", "PAT-TEST-FIXTURE"),              # DRY → fixture composition
-            ("P-ARCH-EXPLICIT", "PAT-ARCH-FACTORY"),         # explicit → factory (explicit construction)
-            ("P-ARCH-EXPLICIT", "PAT-CFG-ENV"),              # explicit → env config
+            ("P-ARCH-SEPARATION", "PAT-ARCH-FACTORY"),  # separation → factory pattern
+            ("P-ARCH-DRY", "PAT-TEST-FIXTURE"),  # DRY → fixture composition
+            ("P-ARCH-EXPLICIT", "PAT-ARCH-FACTORY"),  # explicit → factory (explicit construction)
+            ("P-ARCH-EXPLICIT", "PAT-CFG-ENV"),  # explicit → env config
             # State principles → patterns
-            ("P-CONC-ATOMIC", "PAT-STATE-ATOMIC"),      # atomic updates → atomic state pattern
+            ("P-CONC-ATOMIC", "PAT-STATE-ATOMIC"),  # atomic updates → atomic state pattern
             # API principles → patterns
-            ("P-API-CONTRACT", "PAT-API-PAGINATION"),    # contract → pagination pattern
+            ("P-API-CONTRACT", "PAT-API-PAGINATION"),  # contract → pagination pattern
             ("P-API-IDEMPOTENT", "PAT-API-PAGINATION"),  # idempotent → cursor pagination
             # Observability → patterns
-            ("P-OBS-STRUCTURED", "PAT-OBS-CONTEXT"),     # structured logging → request context
+            ("P-OBS-STRUCTURED", "PAT-OBS-CONTEXT"),  # structured logging → request context
             # Testing → patterns
-            ("P-TEST-PYRAMID", "PAT-TEST-FIXTURE"),      # pyramid → fixture composition
+            ("P-TEST-PYRAMID", "PAT-TEST-FIXTURE"),  # pyramid → fixture composition
             ("P-TEST-DETERMINISTIC", "PAT-TEST-FIXTURE"),  # deterministic → fixture composition
             # UX → patterns
-            ("P-UX-FEEDBACK", "PAT-STATE-ATOMIC"),        # immediate feedback → atomic UI updates
+            ("P-UX-FEEDBACK", "PAT-STATE-ATOMIC"),  # immediate feedback → atomic UI updates
             # Config → patterns
-            ("P-CFG-CONSERVATIVE", "PAT-CFG-ENV"),         # conservative defaults → env config
+            ("P-CFG-CONSERVATIVE", "PAT-CFG-ENV"),  # conservative defaults → env config
             # Reliability → patterns
-            ("P-REL-CHAOS", "PAT-DIST-CIRCUIT-BREAKER"),   # chaos engineering → circuit breaker
-            ("P-REL-CHAOS", "PAT-DIST-BULKHEAD"),           # chaos engineering → bulkhead isolation
+            ("P-REL-CHAOS", "PAT-DIST-CIRCUIT-BREAKER"),  # chaos engineering → circuit breaker
+            ("P-REL-CHAOS", "PAT-DIST-BULKHEAD"),  # chaos engineering → bulkhead isolation
         ]
 
         for principle_id, pattern_id in informs_map:
@@ -1474,72 +1584,80 @@ class Brain:
             # Input validation → validation rules
             ("PAT-SEC-INPUT-VALID", "CR-SEC-PATH-001"),  # Path traversal
             # CORS pattern (deny-by-default) → CORS rules
-            ("PAT-CFG-ENV", "CR-SEC-CORS-001"),          # env config → CORS config from env
+            ("PAT-CFG-ENV", "CR-SEC-CORS-001"),  # env config → CORS config from env
             # Error handling patterns → rules
-            ("PAT-ERR-RESULT", "CR-ERR-STRUCT-001"),     # result type → structured errors
-            ("PAT-ERR-RESULT", "CR-ERR-STRUCT-002"),     # result type → exception hierarchy
+            ("PAT-ERR-RESULT", "CR-ERR-STRUCT-001"),  # result type → structured errors
+            ("PAT-ERR-RESULT", "CR-ERR-STRUCT-002"),  # result type → exception hierarchy
             ("PAT-ERR-GRACEFUL", "CR-ERR-DEGRADE-001"),  # graceful degradation → fallback values
             ("PAT-ERR-GRACEFUL", "CR-ERR-DEGRADE-002"),  # graceful degradation → health checks
             # Factory pattern → Flask rules
-            ("PAT-ARCH-FACTORY", "CR-FLASK-001"),        # factory → Flask app factory
+            ("PAT-ARCH-FACTORY", "CR-FLASK-001"),  # factory → Flask app factory
             # Repository pattern → architecture rules
-            ("PAT-ARCH-REPOSITORY", "CR-FLASK-003"),     # repository → Flask JSON responses
+            ("PAT-ARCH-REPOSITORY", "CR-FLASK-003"),  # repository → Flask JSON responses
             # Atomic state pattern → JS/CSS rules
-            ("PAT-STATE-ATOMIC", "CR-JS-STATE-001"),     # atomic updates → JS state management
-            ("PAT-STATE-ATOMIC", "CR-JS-STATE-002"),     # atomic updates → JS state consistency
-            ("PAT-STATE-ATOMIC", "CR-CSS-STATE-001"),    # atomic updates → CSS state classes
+            ("PAT-STATE-ATOMIC", "CR-JS-STATE-001"),  # atomic updates → JS state management
+            ("PAT-STATE-ATOMIC", "CR-JS-STATE-002"),  # atomic updates → JS state consistency
+            ("PAT-STATE-ATOMIC", "CR-CSS-STATE-001"),  # atomic updates → CSS state classes
             # Config pattern → Docker/DevOps rules
-            ("PAT-CFG-ENV", "CR-COMPOSE-003"),           # env config → compose secrets
-            ("PAT-CFG-ENV", "CR-ERR-TIMEOUT-002"),       # env config → configurable timeouts
+            ("PAT-CFG-ENV", "CR-COMPOSE-003"),  # env config → compose secrets
+            ("PAT-CFG-ENV", "CR-ERR-TIMEOUT-002"),  # env config → configurable timeouts
             # Test fixture pattern → testing rules
-            ("PAT-TEST-FIXTURE", "CR-TEST-001"),         # fixture → AAA pattern
-            ("PAT-TEST-FIXTURE", "CR-TEST-003"),         # fixture → fixture usage
+            ("PAT-TEST-FIXTURE", "CR-TEST-001"),  # fixture → AAA pattern
+            ("PAT-TEST-FIXTURE", "CR-TEST-003"),  # fixture → fixture usage
             # Pagination pattern → API rules
-            ("PAT-API-PAGINATION", "CR-FLASK-002"),      # pagination → HTTP status codes
+            ("PAT-API-PAGINATION", "CR-FLASK-002"),  # pagination → HTTP status codes
             # Observability pattern → logging rules
-            ("PAT-OBS-CONTEXT", "CR-ERR-LOG-001"),       # request context → contextual logging
-            ("PAT-OBS-CONTEXT", "CR-ERR-LOG-002"),       # request context → log levels
-
+            ("PAT-OBS-CONTEXT", "CR-ERR-LOG-001"),  # request context → contextual logging
+            ("PAT-OBS-CONTEXT", "CR-ERR-LOG-002"),  # request context → log levels
             # === Extended patterns → existing rules ===
             # Database patterns → database rules
-            ("PAT-DB-CQRS", "CR-SYS-REPLICA-001"),       # CQRS → read replicas
-            ("PAT-DB-CQRS", "CR-SYS-HSCALE-001"),        # CQRS → horizontal scaling
+            ("PAT-DB-CQRS", "CR-SYS-REPLICA-001"),  # CQRS → read replicas
+            ("PAT-DB-CQRS", "CR-SYS-HSCALE-001"),  # CQRS → horizontal scaling
             ("PAT-DB-CDC-OUTBOX", "CR-DIST-OUTBOX-001"),  # CDC outbox → outbox rule
-            ("PAT-DB-CDC-OUTBOX", "CR-KAFKA-001"),        # CDC outbox → Kafka durable writes
-            ("PAT-DB-MIGRATION-SAFE", "CR-PG-IDX-001"),   # safe migration → index management
-            ("PAT-DB-REPO", "CR-PG-CON-001"),             # repository → connection management
-            ("PAT-DB-EVENT-SOURCING", "CR-KAFKA-004"),     # event sourcing → commit after processing
+            ("PAT-DB-CDC-OUTBOX", "CR-KAFKA-001"),  # CDC outbox → Kafka durable writes
+            ("PAT-DB-MIGRATION-SAFE", "CR-PG-IDX-001"),  # safe migration → index management
+            ("PAT-DB-REPO", "CR-PG-CON-001"),  # repository → connection management
+            ("PAT-DB-EVENT-SOURCING", "CR-KAFKA-004"),  # event sourcing → commit after processing
             # Caching patterns → caching/Redis rules
-            ("PAT-CACHE-ASIDE", "CR-SYS-CACHE-001"),      # cache-aside → cache-aside rule
-            ("PAT-CACHE-ASIDE", "CR-RED-DS-001"),          # cache-aside → Redis data structures
-            ("PAT-CACHE-STAMPEDE-GUARD", "CR-SYS-STAMPEDE-001"),  # stampede → thundering herd prevention
+            ("PAT-CACHE-ASIDE", "CR-SYS-CACHE-001"),  # cache-aside → cache-aside rule
+            ("PAT-CACHE-ASIDE", "CR-RED-DS-001"),  # cache-aside → Redis data structures
+            (
+                "PAT-CACHE-STAMPEDE-GUARD",
+                "CR-SYS-STAMPEDE-001",
+            ),  # stampede → thundering herd prevention
             # Distributed patterns → distributed/resilience rules
-            ("PAT-DIST-CIRCUIT-BREAKER", "CR-DIST-CIRCUIT-001"),  # circuit breaker → circuit breaker rule
-            ("PAT-DIST-CIRCUIT-BREAKER", "CR-SRE-CASCADE-001"),   # circuit breaker → cascade prevention
-            ("PAT-DIST-SAGA", "CR-DIST-SAGA-001"),         # saga → saga rule
-            ("PAT-DIST-SAGA", "CR-ARCH-SAG-001"),          # saga → saga architecture
-            ("PAT-DIST-BULKHEAD", "CR-DIST-BULKHEAD-001"), # bulkhead → bulkhead rule
+            (
+                "PAT-DIST-CIRCUIT-BREAKER",
+                "CR-DIST-CIRCUIT-001",
+            ),  # circuit breaker → circuit breaker rule
+            (
+                "PAT-DIST-CIRCUIT-BREAKER",
+                "CR-SRE-CASCADE-001",
+            ),  # circuit breaker → cascade prevention
+            ("PAT-DIST-SAGA", "CR-DIST-SAGA-001"),  # saga → saga rule
+            ("PAT-DIST-SAGA", "CR-ARCH-SAG-001"),  # saga → saga architecture
+            ("PAT-DIST-BULKHEAD", "CR-DIST-BULKHEAD-001"),  # bulkhead → bulkhead rule
             ("PAT-DIST-RETRY-BACKOFF", "CR-SRE-ERR-001"),  # retry backoff → retry with backoff
-            ("PAT-DIST-SIDECAR", "CR-K8S-CORE-005"),       # sidecar → K8s sidecar pattern
-            ("PAT-DIST-DLQ", "CR-SYS-DLQ-001"),            # DLQ → dead letter queue
-            ("PAT-DIST-DLQ", "CR-KAFKA-002"),               # DLQ → idempotent producer
-            ("PAT-DIST-EVENT-DRIVEN", "CR-KAFKA-007"),     # event-driven → partition key selection
+            ("PAT-DIST-SIDECAR", "CR-K8S-CORE-005"),  # sidecar → K8s sidecar pattern
+            ("PAT-DIST-DLQ", "CR-SYS-DLQ-001"),  # DLQ → dead letter queue
+            ("PAT-DIST-DLQ", "CR-KAFKA-002"),  # DLQ → idempotent producer
+            ("PAT-DIST-EVENT-DRIVEN", "CR-KAFKA-007"),  # event-driven → partition key selection
             ("PAT-DIST-LEADER-ELECTION", "CR-DIST-RAFT-001"),  # leader election → Raft consensus
             # AI/LLM patterns → AI/LLM rules
-            ("PAT-LLM-RAG", "CR-RAG-CHUNK-001"),           # RAG → semantic chunking
-            ("PAT-LLM-RAG", "CR-RAG-HYBRID-001"),          # RAG → hybrid search
-            ("PAT-LLM-RAG", "CR-RAG-RERANK-001"),          # RAG → reranking
+            ("PAT-LLM-RAG", "CR-RAG-CHUNK-001"),  # RAG → semantic chunking
+            ("PAT-LLM-RAG", "CR-RAG-HYBRID-001"),  # RAG → hybrid search
+            ("PAT-LLM-RAG", "CR-RAG-RERANK-001"),  # RAG → reranking
             ("PAT-LLM-CHAIN-OF-THOUGHT", "CR-LLM-COT-001"),  # CoT → chain-of-thought rule
-            ("PAT-LLM-TOOL-USE", "CR-LLM-REACT-001"),     # tool use → ReAct pattern
-            ("PAT-LLM-TOOL-USE", "CR-LLM-STRUCTURED-001"), # tool use → structured output
-            ("PAT-LLM-GUARDRAIL", "CR-AISAFE-INJECT-001"), # guardrail → prompt injection defense
-            ("PAT-LLM-GUARDRAIL", "CR-AISAFE-OUTPUT-001"), # guardrail → output filtering
-            ("PAT-LLM-GUARDRAIL", "CR-AISAFE-PII-001"),   # guardrail → PII masking
+            ("PAT-LLM-TOOL-USE", "CR-LLM-REACT-001"),  # tool use → ReAct pattern
+            ("PAT-LLM-TOOL-USE", "CR-LLM-STRUCTURED-001"),  # tool use → structured output
+            ("PAT-LLM-GUARDRAIL", "CR-AISAFE-INJECT-001"),  # guardrail → prompt injection defense
+            ("PAT-LLM-GUARDRAIL", "CR-AISAFE-OUTPUT-001"),  # guardrail → output filtering
+            ("PAT-LLM-GUARDRAIL", "CR-AISAFE-PII-001"),  # guardrail → PII masking
             ("PAT-LLM-EVAL-HARNESS", "CR-LLM-SYSPROMPT-001"),  # eval harness → system prompt arch
-            ("PAT-LLM-SEMANTIC-CACHE", "CR-RED-DS-001"),   # semantic cache → Redis structures
+            ("PAT-LLM-SEMANTIC-CACHE", "CR-RED-DS-001"),  # semantic cache → Redis structures
             ("PAT-AI-FALLBACK-CHAIN", "CR-DIST-CIRCUIT-001"),  # fallback chain → circuit breaker
             ("PAT-AI-HUMAN-IN-LOOP", "CR-AISAFE-AUDIT-001"),  # human-in-loop → audit logging
-            ("PAT-AI-AB-TEST", "CR-AISAFE-BIAS-001"),      # A/B test → bias detection
+            ("PAT-AI-AB-TEST", "CR-AISAFE-BIAS-001"),  # A/B test → bias detection
         ]
 
         for pattern_id, rule_id in instantiates_map:
@@ -1625,7 +1743,8 @@ class Brain:
                     why=entry.why,
                     how=entry.how_to_do_right or entry.how_to_apply,
                     severity=entry.severity,
-                    technologies=entry.technologies or ([seed.technology] if seed.technology else []),
+                    technologies=entry.technologies
+                    or ([seed.technology] if seed.technology else []),
                     domains=entry.domains or ([seed.domain] if seed.domain else []),
                     example_good=entry.example_good,
                     example_bad=entry.example_bad,
@@ -1641,7 +1760,8 @@ class Brain:
                     "text": entry.text or entry.name,
                     "description": entry.text or entry.name,
                     "severity": entry.severity or "medium",
-                    "technologies": entry.technologies or ([seed.technology] if seed.technology else []),
+                    "technologies": entry.technologies
+                    or ([seed.technology] if seed.technology else []),
                     "domains": entry.domains or ([seed.domain] if seed.domain else []),
                     "created_at": time.time(),
                 }
@@ -1711,7 +1831,8 @@ class Brain:
             if node is not None:
                 label = _node_type_for_id(node_id)
                 self._graph.add_node(
-                    label, node_id,
+                    label,
+                    node_id,
                     {**node, "eigentrust_score": score},
                 )
 
@@ -1740,11 +1861,12 @@ class Brain:
 
         Returns {decayed: N, unchanged: M}.
         """
-        from datetime import datetime, timezone
-        from engineering_brain.epistemic.temporal import get_decay_engine
-        from engineering_brain.epistemic.opinion import OpinionTuple
+        from datetime import datetime
 
-        now = now_unix or int(datetime.now(timezone.utc).timestamp())
+        from engineering_brain.epistemic.opinion import OpinionTuple
+        from engineering_brain.epistemic.temporal import get_decay_engine
+
+        now = now_unix or int(datetime.now(UTC).timestamp())
         decayed = 0
         unchanged = 0
 
@@ -1773,7 +1895,8 @@ class Brain:
                 if abs(result.b - opinion.b) > 1e-9 or abs(result.d - opinion.d) > 1e-9:
                     label = _node_type_for_id(node_id)
                     self._graph.add_node(
-                        label, node_id,
+                        label,
+                        node_id,
                         {
                             **node,
                             "ep_b": result.b,
@@ -1885,6 +2008,63 @@ class Brain:
         return [c.to_dict() for c in communities]
 
     # =========================================================================
+    # Agent API (deep LLM reasoning over brain knowledge)
+    # =========================================================================
+
+    def agent(
+        self,
+        question: str,
+        intent: str = "analysis",
+        domain_hints: list[str] | None = None,
+        technology_hints: list[str] | None = None,
+        context: str = "",
+        constraints: list[str] | None = None,
+        max_depth: int = 2,
+    ) -> Any:
+        """Deep LLM reasoning over brain knowledge.
+
+        Requires BRAIN_AGENT_ENABLED=true and BRAIN_AGENT_API_KEY set.
+        For simple queries, uses fast path (zero LLM). For complex queries,
+        decomposes into sub-questions, dispatches domain workers, synthesizes.
+
+        Args:
+            question: The question to reason about
+            intent: Query intent (decision, analysis, investigation, explanation, synthesis)
+            domain_hints: Domain hints (e.g. ['security', 'performance'])
+            technology_hints: Technology hints (e.g. ['flask', 'kafka'])
+            context: Additional context
+            constraints: Answer constraints
+            max_depth: Reasoning depth (1-5)
+
+        Returns:
+            ComposedKnowledge with claims, evidence, confidence, gaps
+        """
+        from engineering_brain.agent import run_agent
+        from engineering_brain.agent.types import AgentQuery, QueryIntent
+
+        try:
+            query_intent = QueryIntent(intent)
+        except ValueError:
+            query_intent = QueryIntent.ANALYSIS
+
+        query = AgentQuery(
+            question=question,
+            intent=query_intent,
+            domain_hints=domain_hints or [],
+            technology_hints=technology_hints or [],
+            context=context,
+            constraints=constraints or [],
+            max_depth=max_depth,
+        )
+        return run_agent(self, query)
+
+    def agent_status(self) -> dict[str, Any]:
+        """Check agent system availability."""
+        from engineering_brain.agent import agent_status
+
+        return agent_status(self)
+
+    # =========================================================================
     # Stats API
     # =========================================================================
 
@@ -1895,7 +2075,13 @@ class Brain:
 
         # Count per layer
         layer_counts = {}
-        for node_type in (NodeType.AXIOM, NodeType.PRINCIPLE, NodeType.PATTERN, NodeType.RULE, NodeType.FINDING):
+        for node_type in (
+            NodeType.AXIOM,
+            NodeType.PRINCIPLE,
+            NodeType.PATTERN,
+            NodeType.RULE,
+            NodeType.FINDING,
+        ):
             layer_counts[node_type.value] = self._graph.count(node_type.value)
 
         return {
@@ -1948,10 +2134,15 @@ class Brain:
             json.dump(data, f, default=str)
 
         logger.info("Brain saved: %d nodes, %d edges → %s", len(nodes), len(edges), path)
-        return {"nodes": len(nodes), "edges": len(edges), "version": self._write_counter, "path": str(path)}
+        return {
+            "nodes": len(nodes),
+            "edges": len(edges),
+            "version": self._write_counter,
+            "path": str(path),
+        }
 
     @classmethod
-    def load(cls, path: str | Path, config: BrainConfig | None = None) -> "Brain":
+    def load(cls, path: str | Path, config: BrainConfig | None = None) -> Brain:
         """Load brain state from a previously saved JSON file.
 
         Creates a new Brain instance (memory adapter) and populates it
@@ -2011,7 +2202,8 @@ class Brain:
 
         logger.info(
             "Auto-maintenance triggered: %d writes, %.0fs elapsed",
-            writes_since, elapsed,
+            writes_since,
+            elapsed,
         )
         results = self.maintenance()
         self._last_maintenance_at = now
@@ -2021,8 +2213,8 @@ class Brain:
 
 _ID_PREFIX_TO_TYPE: list[tuple[str, str]] = [
     ("AX-", NodeType.AXIOM.value),
-    ("PAT-", NodeType.PATTERN.value),       # before P- (prefix overlap)
-    ("CPAT-", NodeType.PATTERN.value),      # cluster pattern
+    ("PAT-", NodeType.PATTERN.value),  # before P- (prefix overlap)
+    ("CPAT-", NodeType.PATTERN.value),  # cluster pattern
     ("P-", NodeType.PRINCIPLE.value),
     ("F-", NodeType.FINDING.value),
     ("CE-", NodeType.CODE_EXAMPLE.value),
@@ -2082,26 +2274,38 @@ def _coerce_seed_sources(raw_sources: list[dict[str, Any]]) -> list[Source]:
     for s in raw_sources:
         try:
             result.append(Source(**s))
-        except Exception:
+        except Exception as exc:
             # Gracefully skip malformed source entries
-            pass
+            logger.debug("Skipping malformed source entry: %s", exc)
     return result
 
 
 def _short_hash(text: str) -> str:
     """Generate a short hash for ID generation."""
     import hashlib
+
     return hashlib.sha256(text.encode()).hexdigest()[:8]
 
 
 def _normalize_layer(layer_str: str) -> str:
     """Normalize layer string to L0/L1/L2/L3/L4/L5 format."""
     mapping = {
-        "axioms": "L0", "axiom": "L0", "l0": "L0",
-        "principles": "L1", "principle": "L1", "l1": "L1",
-        "patterns": "L2", "pattern": "L2", "l2": "L2",
-        "rules": "L3", "rule": "L3", "l3": "L3",
-        "evidence": "L4", "findings": "L4", "l4": "L4",
-        "context": "L5", "l5": "L5",
+        "axioms": "L0",
+        "axiom": "L0",
+        "l0": "L0",
+        "principles": "L1",
+        "principle": "L1",
+        "l1": "L1",
+        "patterns": "L2",
+        "pattern": "L2",
+        "l2": "L2",
+        "rules": "L3",
+        "rule": "L3",
+        "l3": "L3",
+        "evidence": "L4",
+        "findings": "L4",
+        "l4": "L4",
+        "context": "L5",
+        "l5": "L5",
     }
     return mapping.get(layer_str.lower().strip(), layer_str.upper())

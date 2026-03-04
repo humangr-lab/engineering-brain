@@ -27,9 +27,9 @@ class BM25Index:
     def __init__(self, k1: float = 1.5, b: float = 0.75) -> None:
         self.k1 = k1
         self.b = b
-        self._doc_freqs: dict[str, int] = {}      # term -> count of docs containing it
-        self._doc_lens: dict[str, int] = {}        # node_id -> doc length
-        self._doc_tfs: dict[str, Counter] = {}     # node_id -> term frequency counter
+        self._doc_freqs: dict[str, int] = {}  # term -> count of docs containing it
+        self._doc_lens: dict[str, int] = {}  # node_id -> doc length
+        self._doc_tfs: dict[str, Counter] = {}  # node_id -> term frequency counter
         self._avg_dl: float = 0.0
         self._n_docs: int = 0
 
@@ -97,9 +97,18 @@ class BM25Index:
     def _node_to_text(node: dict[str, Any]) -> str:
         """Extract searchable text from a knowledge node."""
         parts: list[str] = []
-        for field in ("text", "name", "statement", "intent", "why",
-                       "how_to_do_right", "how_to_apply", "description",
-                       "when_applies", "when_not_applies"):
+        for field in (
+            "text",
+            "name",
+            "statement",
+            "intent",
+            "why",
+            "how_to_do_right",
+            "how_to_apply",
+            "description",
+            "when_applies",
+            "when_not_applies",
+        ):
             val = node.get(field, "")
             if val:
                 parts.append(str(val))

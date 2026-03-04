@@ -67,7 +67,7 @@ class TagEmbeddingIndex:
 
         # Process in batches
         for i in range(0, len(all_tags), batch_size):
-            batch = all_tags[i:i + batch_size]
+            batch = all_tags[i : i + batch_size]
             texts = [_tag_to_text(tag, self._registry) for tag in batch]
             try:
                 vectors = self._embedder.embed_batch(texts)
@@ -76,7 +76,7 @@ class TagEmbeddingIndex:
                 failed += len(batch)
                 continue
 
-            for tag, text, vec in zip(batch, texts, vectors):
+            for tag, text, vec in zip(batch, texts, vectors, strict=False):
                 if not vec:
                     skipped += 1
                     continue
@@ -89,7 +89,8 @@ class TagEmbeddingIndex:
                     }
                     vector.upsert(COLLECTION, tag.id, text, vec, metadata)
                     indexed += 1
-                except Exception:
+                except Exception as exc:
+                    logger.debug("Failed to index tag %s: %s", tag.id, exc)
                     failed += 1
 
             # Brief pause between batches to be MacBook-friendly
@@ -99,7 +100,9 @@ class TagEmbeddingIndex:
         self._indexed = indexed > 0
         logger.info(
             "Tag embedding index: %d indexed, %d skipped, %d failed",
-            indexed, skipped, failed,
+            indexed,
+            skipped,
+            failed,
         )
         return {"indexed": indexed, "skipped": skipped, "failed": failed}
 
@@ -133,8 +136,11 @@ class TagEmbeddingIndex:
         try:
             filters = {"facet": facet} if facet else None
             results = self._embedder._vector.search(
-                COLLECTION, query_vec, top_k=top_k,
-                filters=filters, score_threshold=0.3,
+                COLLECTION,
+                query_vec,
+                top_k=top_k,
+                filters=filters,
+                score_threshold=0.3,
             )
         except Exception as e:
             logger.debug("Tag semantic search failed: %s", e)
@@ -171,17 +177,16 @@ class TagEmbeddingIndex:
 
         try:
             results = self._embedder._vector.search(
-                COLLECTION, vec, top_k=top_k + 1,
+                COLLECTION,
+                vec,
+                top_k=top_k + 1,
                 score_threshold=0.3,
             )
-        except Exception:
+        except Exception as exc:
+            logger.debug("Tag embedding search failed: %s", exc)
             return []
 
-        return [
-            (r["id"], r["score"])
-            for r in results
-            if r["id"] != tag_id
-        ][:top_k]
+        return [(r["id"], r["score"]) for r in results if r["id"] != tag_id][:top_k]
 
     @property
     def is_indexed(self) -> bool:
@@ -191,6 +196,7 @@ class TagEmbeddingIndex:
 # -----------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------
+
 
 def _tag_to_text(tag: Tag, registry: TagRegistry) -> str:
     """Build rich text representation of a tag for embedding.

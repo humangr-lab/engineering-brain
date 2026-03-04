@@ -5,39 +5,39 @@ opinion-based quality scoring of knowledge nodes. Independent
 of pipeline_v2's ESL — same math, zero external dependencies.
 """
 
-from engineering_brain.epistemic.opinion import OpinionTuple
-from engineering_brain.epistemic.fusion import cbf, multi_source_cbf
-from engineering_brain.epistemic.source_trust import (
-    SOURCE_TRUST_MAP,
-    source_to_opinion,
-)
-from engineering_brain.epistemic.layer_opinions import (
-    initial_opinion_for_layer,
-    bootstrap_opinion,
-)
 from engineering_brain.epistemic.conflict_resolution import (
+    ConflictSeverity,
+    classify_conflict,
     dempster_conflict,
     murphy_weighted_average,
-    classify_conflict,
-    ConflictSeverity,
 )
-from engineering_brain.epistemic.temporal import (
-    HawkesDecayEngine,
-    LAYER_DECAY_PROFILES,
-    get_decay_engine,
-)
-from engineering_brain.epistemic.provenance import ProvenanceRecord, ProvenanceChain
-from engineering_brain.epistemic.edge_opinion import (
-    edge_prior,
-    compute_edge_opinion,
-    EDGE_TYPE_PRIORS,
-)
-from engineering_brain.epistemic.learned_trust import LearnedSourceTrust, BetaPrior
 from engineering_brain.epistemic.contradiction import (
     ContradictionDetector,
     ContradictionReport,
 )
+from engineering_brain.epistemic.edge_opinion import (
+    EDGE_TYPE_PRIORS,
+    compute_edge_opinion,
+    edge_prior,
+)
+from engineering_brain.epistemic.fusion import cbf, multi_source_cbf
 from engineering_brain.epistemic.gap_analysis import GapAnalyzer, KnowledgeGap
+from engineering_brain.epistemic.layer_opinions import (
+    bootstrap_opinion,
+    initial_opinion_for_layer,
+)
+from engineering_brain.epistemic.learned_trust import BetaPrior, LearnedSourceTrust
+from engineering_brain.epistemic.opinion import OpinionTuple
+from engineering_brain.epistemic.provenance import ProvenanceChain, ProvenanceRecord
+from engineering_brain.epistemic.source_trust import (
+    SOURCE_TRUST_MAP,
+    source_to_opinion,
+)
+from engineering_brain.epistemic.temporal import (
+    LAYER_DECAY_PROFILES,
+    HawkesDecayEngine,
+    get_decay_engine,
+)
 from engineering_brain.epistemic.trust_propagation import EigenTrustEngine
 
 __all__ = [

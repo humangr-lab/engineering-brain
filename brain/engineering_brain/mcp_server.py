@@ -1,7 +1,7 @@
 """Engineering Brain MCP Server — pull-based knowledge delivery for agents.
 
 MCP server (JSON-RPC 2.0 over stdio) that wraps the Engineering Knowledge Brain.
-20 tools + 5 resources for full knowledge graph access.
+22 tools + 5 resources for full knowledge graph access.
 
 Usage (stdio):
     PYTHONPATH=src python -m engineering_brain.mcp_server
@@ -35,9 +35,8 @@ logger = logging.getLogger(__name__)
 
 from engineering_brain.core.brain_factory import get_brain as _get_brain  # noqa: E402
 
-
 # ---------------------------------------------------------------------------
-# Tool definitions (20 tools)
+# Tool definitions (22 tools)
 # ---------------------------------------------------------------------------
 
 TOOLS: list[dict[str, Any]] = [
@@ -576,6 +575,72 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["path"],
         },
     },
+    {
+        "name": "brain_agent",
+        "description": (
+            "Deep LLM reasoning over the Engineering Brain's knowledge graph. "
+            "Uses Opus to decompose complex questions, dispatch domain-specialist "
+            "workers (architecture, security, performance, debugging), and synthesize "
+            "composed knowledge that no single LLM call can produce. "
+            "Requires BRAIN_AGENT_ENABLED=true and BRAIN_AGENT_API_KEY. "
+            "For simple queries, uses a fast path with zero LLM tokens."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": (
+                        "The question to reason about. Be specific. "
+                        "E.g. 'Should we use JWT or session cookies for our Flask API "
+                        "considering we need WebSocket support and horizontal scaling?'"
+                    ),
+                },
+                "intent": {
+                    "type": "string",
+                    "enum": ["decision", "analysis", "investigation", "explanation", "synthesis"],
+                    "description": "What kind of answer you need. Default: analysis.",
+                },
+                "domain_hints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Domains to focus on (e.g. ['security', 'performance']).",
+                },
+                "technology_hints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Technologies involved (e.g. ['flask', 'redis']).",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Additional context about your situation.",
+                },
+                "constraints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Constraints the answer must satisfy.",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "Reasoning depth 1-5 (default 2). Higher = more workers.",
+                },
+            },
+            "required": ["question"],
+        },
+    },
+    {
+        "name": "brain_agent_status",
+        "description": (
+            "Check if the Engineering Brain agent system is available. "
+            "Returns configuration status: enabled, API key configured, "
+            "model settings, max workers."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -653,8 +718,7 @@ def _handle_brain_query(args: dict[str, Any]) -> str:
     )
 
     header = (
-        f"## Engineering Brain — {result.total_nodes_queried} rules matched\n"
-        f"Query: {query}\n\n"
+        f"## Engineering Brain — {result.total_nodes_queried} rules matched\nQuery: {query}\n\n"
     )
     return header + result.formatted_text
 
@@ -769,23 +833,23 @@ def _handle_brain_validate(args: dict[str, Any]) -> str:
 
     try:
         import asyncio
+
         loop = asyncio.new_event_loop()
-        result = loop.run_until_complete(brain.validate(
-            node_id=node_id,
-            force_refresh=force_refresh,
-            dry_run=dry_run,
-            layer_filter=layer_filter,
-        ))
+        result = loop.run_until_complete(
+            brain.validate(
+                node_id=node_id,
+                force_refresh=force_refresh,
+                dry_run=dry_run,
+                layer_filter=layer_filter,
+            )
+        )
         loop.close()
 
         if isinstance(result, dict):
             validated = result.get("validated", 0)
             failed = result.get("failed", 0)
             skipped = result.get("skipped", 0)
-            return (
-                f"Validation complete: {validated} validated, {failed} failed, "
-                f"{skipped} skipped"
-            )
+            return f"Validation complete: {validated} validated, {failed} failed, {skipped} skipped"
         return f"Validation result: {result}"
     except Exception as exc:
         return f"Validation failed: {exc}"
@@ -821,30 +885,38 @@ def _handle_brain_stats(args: dict[str, Any]) -> str:
 
     config = stats.get("config", {})
     if config:
-        lines.extend([
-            "", "### Config",
-            f"  Adapter: {config.get('adapter', 'memory')}",
-            f"  Sharding: {config.get('sharding', False)}",
-            f"  Budget: {config.get('budget_chars', 3000)} chars",
-        ])
+        lines.extend(
+            [
+                "",
+                "### Config",
+                f"  Adapter: {config.get('adapter', 'memory')}",
+                f"  Sharding: {config.get('sharding', False)}",
+                f"  Budget: {config.get('budget_chars', 3000)} chars",
+            ]
+        )
 
     # O-10: Extended health metrics
     try:
         weak_count = len(brain._reinforcer.get_weak_rules()) if hasattr(brain, "_reinforcer") else 0
         lines.extend(["", "### Health", f"  Weak rules: {weak_count}"])
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to collect weak-rules health metric: %s", exc)
     try:
-        maint_ago = int(time.time() - brain._last_maintenance_at) if hasattr(brain, "_last_maintenance_at") else -1
+        maint_ago = (
+            int(time.time() - brain._last_maintenance_at)
+            if hasattr(brain, "_last_maintenance_at")
+            else -1
+        )
         lines.append(f"  Last maintenance: {maint_ago}s ago")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to collect maintenance health metric: %s", exc)
     try:
         from engineering_brain.observability.dead_letter import get_dead_letter_queue
+
         dlq_count = get_dead_letter_queue().count()
         lines.append(f"  Dead letters: {dlq_count}")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to collect dead-letter health metric: %s", exc)
 
     return "\n".join(lines)
 
@@ -860,7 +932,8 @@ def _handle_brain_contradictions(args: dict[str, Any]) -> str:
         severity_order = {"low": 0, "medium": 1, "high": 2, "critical": 3}
         min_level = severity_order.get(min_severity, 0)
         contradictions = [
-            c for c in contradictions
+            c
+            for c in contradictions
             if severity_order.get(c.get("severity", "low"), 0) >= min_level
         ]
 
@@ -963,10 +1036,7 @@ def _handle_brain_feedback(args: dict[str, Any]) -> str:
             except (AttributeError, Exception):
                 pass  # record_feedback may not exist yet
 
-        return (
-            f"Feedback recorded: rule {rule_id} weakened. "
-            f"Reason: {reason[:100]}"
-        )
+        return f"Feedback recorded: rule {rule_id} weakened. Reason: {reason[:100]}"
     except Exception as exc:
         return f"Feedback recording failed: {exc}"
 
@@ -1114,10 +1184,7 @@ def _handle_brain_pack_templates(args: dict[str, Any]) -> str:
     registry = get_template_registry(get_brain_config())
     tags = args.get("tags")
 
-    if tags:
-        templates = registry.search(tags=tags)
-    else:
-        templates = registry.list_templates()
+    templates = registry.search(tags=tags) if tags else registry.list_templates()
 
     if not templates:
         return "No pack templates found."
@@ -1269,8 +1336,8 @@ def _handle_brain_mine_code(args: dict[str, Any]) -> str:
                     file_path=(f.get("source_files") or [""])[0],
                 )
                 ingested += 1
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Failed to ingest finding as L4 node: %s", exc)
 
     lines = [f"Mined {len(findings)} findings from {path}"]
     if ingest:
@@ -1281,6 +1348,51 @@ def _handle_brain_mine_code(args: dict[str, Any]) -> str:
             f"[{f['pattern_type']}] freq={f['frequency']} conf={f['confidence']:.1f} "
             f"| {f['description'][:80]}"
         )
+    return "\n".join(lines)
+
+
+def _handle_brain_agent(args: dict[str, Any]) -> str:
+    """Handle brain_agent tool call — deep LLM reasoning.
+
+    Exceptions propagate to the top-level handler which sets isError: True,
+    ensuring MCP clients can distinguish success from failure.
+    """
+    brain = _get_brain()
+    question = args.get("question", "")
+    if not question:
+        raise ValueError("'question' parameter is required.")
+
+    intent = args.get("intent", "analysis")
+    domain_hints = args.get("domain_hints")
+    technology_hints = args.get("technology_hints")
+    context = args.get("context", "")
+    constraints = args.get("constraints")
+    max_depth = min(max(int(args.get("max_depth", 2)), 1), 5)
+
+    result = brain.agent(
+        question=question,
+        intent=intent,
+        domain_hints=domain_hints,
+        technology_hints=technology_hints,
+        context=context,
+        constraints=constraints,
+        max_depth=max_depth,
+    )
+    return result.format_markdown()
+
+
+def _handle_brain_agent_status(args: dict[str, Any]) -> str:
+    """Handle brain_agent_status tool call."""
+    brain = _get_brain()
+    status = brain.agent_status()
+    lines = [
+        "## Brain Agent Status",
+        f"Enabled: {status['enabled']}",
+        f"Configured: {status['configured']}",
+        f"Model: {status['model']}",
+        f"Orchestrator Model: {status['orchestrator_model']}",
+        f"Max Workers: {status['max_workers']}",
+    ]
     return "\n".join(lines)
 
 
@@ -1305,6 +1417,8 @@ _TOOL_HANDLERS = {
     "brain_pack_export": _handle_brain_pack_export,
     "brain_pack_compose": _handle_brain_pack_compose,
     "brain_mine_code": _handle_brain_mine_code,
+    "brain_agent": _handle_brain_agent,
+    "brain_agent_status": _handle_brain_agent_status,
 }
 
 
@@ -1339,7 +1453,11 @@ def _handle_resource(uri: str) -> dict[str, Any] | None:
 
     if uri == "brain://layers":
         stats = brain.stats()
-        return {"uri": uri, "mimeType": "application/json", "text": json.dumps(stats.get("layers", {}), indent=2)}
+        return {
+            "uri": uri,
+            "mimeType": "application/json",
+            "text": json.dumps(stats.get("layers", {}), indent=2),
+        }
 
     if uri == "brain://gaps":
         gaps = brain.analyze_gaps()
@@ -1385,11 +1503,14 @@ def _handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     if method == "initialize":
-        return _make_response(req_id, {
-            "protocolVersion": "2024-11-05",
-            "capabilities": _CAPABILITIES,
-            "serverInfo": _SERVER_INFO,
-        })
+        return _make_response(
+            req_id,
+            {
+                "protocolVersion": "2024-11-05",
+                "capabilities": _CAPABILITIES,
+                "serverInfo": _SERVER_INFO,
+            },
+        )
 
     if method == "tools/list":
         return _make_response(req_id, {"tools": TOOLS})
@@ -1402,15 +1523,21 @@ def _handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
             return _make_error(req_id, -32601, f"Unknown tool: {tool_name}")
         try:
             text = handler(arguments)
-            return _make_response(req_id, {
-                "content": [{"type": "text", "text": text}],
-            })
+            return _make_response(
+                req_id,
+                {
+                    "content": [{"type": "text", "text": text}],
+                },
+            )
         except Exception as exc:
             logger.error("Tool %s failed: %s", tool_name, exc)
-            return _make_response(req_id, {
-                "content": [{"type": "text", "text": f"Error: {exc}"}],
-                "isError": True,
-            })
+            return _make_response(
+                req_id,
+                {
+                    "content": [{"type": "text", "text": f"Error: {exc}"}],
+                    "isError": True,
+                },
+            )
 
     # Resource methods (O-02)
     if method == "resources/list":

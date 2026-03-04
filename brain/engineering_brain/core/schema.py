@@ -6,37 +6,45 @@ for industrial-scale knowledge graph operations.
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 
-class Layer(str, Enum):
+class Layer(StrEnum):
     """6 cortical layers of the knowledge brain, from deepest to surface."""
 
-    L0_AXIOMS = "L0"       # Immutable truths — permanent
-    L1_PRINCIPLES = "L1"   # Stable wisdom — decades
-    L2_PATTERNS = "L2"     # Established practices — years
-    L3_RULES = "L3"        # Learned constraints — months to years
-    L4_EVIDENCE = "L4"     # Concrete instances — months
-    L5_CONTEXT = "L5"      # Ephemeral session state — minutes to hours
+    L0_AXIOMS = "L0"  # Immutable truths — permanent
+    L1_PRINCIPLES = "L1"  # Stable wisdom — decades
+    L2_PATTERNS = "L2"  # Established practices — years
+    L3_RULES = "L3"  # Learned constraints — months to years
+    L4_EVIDENCE = "L4"  # Concrete instances — months
+    L5_CONTEXT = "L5"  # Ephemeral session state — minutes to hours
 
     @property
     def stability(self) -> float:
         """Higher = more stable (0.0 ephemeral → 1.0 permanent)."""
         return {
-            "L0": 1.0, "L1": 0.9, "L2": 0.7,
-            "L3": 0.5, "L4": 0.3, "L5": 0.1,
+            "L0": 1.0,
+            "L1": 0.9,
+            "L2": 0.7,
+            "L3": 0.5,
+            "L4": 0.3,
+            "L5": 0.1,
         }[self.value]
 
     @property
     def max_ttl_days(self) -> int | None:
         """Maximum time-to-live in days. None = permanent."""
         return {
-            "L0": None, "L1": None, "L2": None,
-            "L3": 365, "L4": 90, "L5": 1,
+            "L0": None,
+            "L1": None,
+            "L2": None,
+            "L3": 365,
+            "L4": 90,
+            "L5": 1,
         }[self.value]
 
 
-class NodeType(str, Enum):
+class NodeType(StrEnum):
     """All node types in the knowledge graph."""
 
     # Layer nodes
@@ -66,54 +74,54 @@ class NodeType(str, Enum):
         return _NODE_LAYER_MAP.get(self)
 
 
-class EdgeType(str, Enum):
+class EdgeType(StrEnum):
     """All relationship types in the knowledge graph (32 total)."""
 
     # Hierarchical (layer-to-layer)
-    GROUNDS = "GROUNDS"               # Axiom → Principle
-    INFORMS = "INFORMS"               # Principle → Pattern
-    INSTANTIATES = "INSTANTIATES"     # Pattern → Rule
-    EVIDENCED_BY = "EVIDENCED_BY"     # Rule → Finding
+    GROUNDS = "GROUNDS"  # Axiom → Principle
+    INFORMS = "INFORMS"  # Principle → Pattern
+    INSTANTIATES = "INSTANTIATES"  # Pattern → Rule
+    EVIDENCED_BY = "EVIDENCED_BY"  # Rule → Finding
     DEMONSTRATED_BY = "DEMONSTRATED_BY"  # Rule → CodeExample
 
     # Cross-layer (semantic)
-    APPLIES_TO = "APPLIES_TO"         # Rule/Pattern → Technology/FileType
-    IN_DOMAIN = "IN_DOMAIN"           # Rule/Pattern → Domain
-    USED_IN = "USED_IN"               # Pattern → Technology
-    CAUGHT_BY = "CAUGHT_BY"           # Finding → HumanLayer
-    VIOLATED = "VIOLATED"             # Finding → Rule
-    IN_SPRINT = "IN_SPRINT"           # Finding → Sprint
+    APPLIES_TO = "APPLIES_TO"  # Rule/Pattern → Technology/FileType
+    IN_DOMAIN = "IN_DOMAIN"  # Rule/Pattern → Domain
+    USED_IN = "USED_IN"  # Pattern → Technology
+    CAUGHT_BY = "CAUGHT_BY"  # Finding → HumanLayer
+    VIOLATED = "VIOLATED"  # Finding → Rule
+    IN_SPRINT = "IN_SPRINT"  # Finding → Sprint
 
     # Evolution (learning)
-    SUPERSEDES = "SUPERSEDES"         # Rule → Rule (newer version)
+    SUPERSEDES = "SUPERSEDES"  # Rule → Rule (newer version)
     CONFLICTS_WITH = "CONFLICTS_WITH"  # Rule ↔ Rule (contradiction)
-    VARIANT_OF = "VARIANT_OF"         # Pattern → Pattern (family)
-    REINFORCES = "REINFORCES"         # Evidence → Rule
-    WEAKENS = "WEAKENS"               # Evidence → Rule
+    VARIANT_OF = "VARIANT_OF"  # Pattern → Pattern (family)
+    REINFORCES = "REINFORCES"  # Evidence → Rule
+    WEAKENS = "WEAKENS"  # Evidence → Rule
 
     # Causal
-    CAUSED_BY = "CAUSED_BY"           # Finding → Finding
-    PREVENTS = "PREVENTS"             # Rule → Pattern (anti-pattern)
+    CAUSED_BY = "CAUSED_BY"  # Finding → Finding
+    PREVENTS = "PREVENTS"  # Rule → Pattern (anti-pattern)
 
     # Context
-    REQUIRES = "REQUIRES"             # Task → Technology
-    PRODUCES = "PRODUCES"             # Task → FileType
-    SUBDOMAIN_OF = "SUBDOMAIN_OF"     # Domain → Domain
+    REQUIRES = "REQUIRES"  # Task → Technology
+    PRODUCES = "PRODUCES"  # Task → FileType
+    SUBDOMAIN_OF = "SUBDOMAIN_OF"  # Domain → Domain
 
     # Source attribution
-    CITES = "CITES"                   # Knowledge → Source
-    SOURCED_FROM = "SOURCED_FROM"     # Rule → Source (creation link)
-    VALIDATED_BY = "VALIDATED_BY"     # Knowledge → ValidationRun
+    CITES = "CITES"  # Knowledge → Source
+    SOURCED_FROM = "SOURCED_FROM"  # Rule → Source (creation link)
+    VALIDATED_BY = "VALIDATED_BY"  # Knowledge → ValidationRun
 
     # Reasoning edges (used by pack_manager, reasoning_engine)
-    RELATES_TO = "RELATES_TO"         # Generic relationship
-    STRENGTHENS = "STRENGTHENS"       # Evidence strengthens knowledge
-    PREREQUISITE = "PREREQUISITE"     # Knowledge depends on prior knowledge
-    DEEPENS = "DEEPENS"               # Knowledge deepens understanding
-    ALTERNATIVE = "ALTERNATIVE"       # Alternative approach
-    TRIGGERS = "TRIGGERS"             # Event triggers consequence
-    COMPLEMENTS = "COMPLEMENTS"       # Knowledge complements another
-    VALIDATES = "VALIDATES"           # Knowledge validates another
+    RELATES_TO = "RELATES_TO"  # Generic relationship
+    STRENGTHENS = "STRENGTHENS"  # Evidence strengthens knowledge
+    PREREQUISITE = "PREREQUISITE"  # Knowledge depends on prior knowledge
+    DEEPENS = "DEEPENS"  # Knowledge deepens understanding
+    ALTERNATIVE = "ALTERNATIVE"  # Alternative approach
+    TRIGGERS = "TRIGGERS"  # Event triggers consequence
+    COMPLEMENTS = "COMPLEMENTS"  # Knowledge complements another
+    VALIDATES = "VALIDATES"  # Knowledge validates another
 
 
 # --- Partitioning & Sharding ---

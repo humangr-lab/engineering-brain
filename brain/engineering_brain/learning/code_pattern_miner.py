@@ -71,9 +71,9 @@ class CodePatternMiner:
     def mine_file(self, filepath: str) -> list[MinedPattern]:
         """Mine patterns from a single Python file via AST."""
         try:
-            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            with open(filepath, encoding="utf-8", errors="ignore") as f:
                 source = f.read()
-        except (OSError, IOError):
+        except OSError:
             return []
 
         try:
@@ -95,6 +95,15 @@ class CodePatternMiner:
             p.frequency = self._pattern_freq[p.signature]
             self._patterns[p.pattern_type].append(p)
 
+        # LLM enrichment (best-effort, silent failure)
+        from engineering_brain.llm_helpers import is_llm_enabled
+
+        if is_llm_enabled("BRAIN_LLM_CODE_MINING_DESCRIPTION"):
+            for p in found:
+                llm_desc = self._llm_describe_pattern(p)
+                if llm_desc:
+                    p.description = f"{p.description} — {llm_desc}"
+
         return found
 
     def mine_directory(
@@ -115,12 +124,30 @@ class CodePatternMiner:
                     py_files.append(os.path.join(root, fname))
 
         for i in range(0, len(py_files), batch_size):
-            batch = py_files[i:i + batch_size]
+            batch = py_files[i : i + batch_size]
             for fpath in batch:
                 patterns = self.mine_file(fpath)
                 all_patterns.extend(patterns)
 
         return all_patterns
+
+    def _llm_describe_pattern(self, pattern: MinedPattern) -> str | None:
+        """LLM-generated engineering significance. Returns None on failure."""
+        from engineering_brain.llm_helpers import brain_llm_call, is_llm_enabled
+
+        if not is_llm_enabled("BRAIN_LLM_CODE_MINING_DESCRIPTION"):
+            return None
+        system = (
+            "Explain the engineering significance of a code pattern found by AST analysis. "
+            "What risk does it represent? What's the consequence? Max 200 chars. Be concrete."
+        )
+        user = (
+            f"Type: {pattern.pattern_type}\n"
+            f"Code: {pattern.code_snippet[:300]}\n"
+            f"Description: {pattern.description[:200]}"
+        )
+        result = brain_llm_call(system, user, max_tokens=120)
+        return result if result and len(result) >= 20 else None
 
     def _extract_error_patterns(
         self,
@@ -146,20 +173,20 @@ class CodePatternMiner:
 
                 # Detect bare except (bad practice)
                 if handler.type is None:
-                    patterns.append(MinedPattern(
-                        pattern_type="error_handling",
-                        description="Bare except clause catches all exceptions including SystemExit/KeyboardInterrupt",
-                        code_snippet=f"except:  # line {handler.lineno}",
-                        filepath=filepath,
-                        line_number=handler.lineno,
-                        domains=["code_quality"],
-                        signature="error_handling:bare_except",
-                    ))
+                    patterns.append(
+                        MinedPattern(
+                            pattern_type="error_handling",
+                            description="Bare except clause catches all exceptions including SystemExit/KeyboardInterrupt",
+                            code_snippet=f"except:  # line {handler.lineno}",
+                            filepath=filepath,
+                            line_number=handler.lineno,
+                            domains=["code_quality"],
+                            signature="error_handling:bare_except",
+                        )
+                    )
                 elif exc_name == "Exception":
                     # Check if it's re-raised or logged
-                    has_reraise = any(
-                        isinstance(s, ast.Raise) for s in handler.body
-                    )
+                    has_reraise = any(isinstance(s, ast.Raise) for s in handler.body)
                     has_log = any(
                         isinstance(s, ast.Expr)
                         and isinstance(getattr(s, "value", None), ast.Call)
@@ -167,37 +194,43 @@ class CodePatternMiner:
                         for s in handler.body
                     )
                     if not has_reraise and not has_log:
-                        patterns.append(MinedPattern(
-                            pattern_type="error_handling",
-                            description=f"Catching {exc_name} without re-raising or logging silences errors",
-                            code_snippet=f"except {exc_name}:  # line {handler.lineno}",
-                            filepath=filepath,
-                            line_number=handler.lineno,
-                            domains=["code_quality"],
-                            signature="error_handling:silent_exception",
-                        ))
+                        patterns.append(
+                            MinedPattern(
+                                pattern_type="error_handling",
+                                description=f"Catching {exc_name} without re-raising or logging silences errors",
+                                code_snippet=f"except {exc_name}:  # line {handler.lineno}",
+                                filepath=filepath,
+                                line_number=handler.lineno,
+                                domains=["code_quality"],
+                                signature="error_handling:silent_exception",
+                            )
+                        )
                     elif has_log:
-                        patterns.append(MinedPattern(
-                            pattern_type="error_handling",
-                            description=f"Catching {exc_name} with logging — good practice",
-                            code_snippet=f"except {exc_name}: log(...)  # line {handler.lineno}",
-                            filepath=filepath,
-                            line_number=handler.lineno,
-                            domains=["code_quality"],
-                            signature="error_handling:logged_exception",
-                        ))
+                        patterns.append(
+                            MinedPattern(
+                                pattern_type="error_handling",
+                                description=f"Catching {exc_name} with logging — good practice",
+                                code_snippet=f"except {exc_name}: log(...)  # line {handler.lineno}",
+                                filepath=filepath,
+                                line_number=handler.lineno,
+                                domains=["code_quality"],
+                                signature="error_handling:logged_exception",
+                            )
+                        )
 
                 # Detect pass-only handlers
                 if len(handler.body) == 1 and isinstance(handler.body[0], ast.Pass):
-                    patterns.append(MinedPattern(
-                        pattern_type="error_handling",
-                        description=f"Exception handler with only 'pass' silently swallows {exc_name or 'all'} errors",
-                        code_snippet=f"except {exc_name or '...'}: pass  # line {handler.lineno}",
-                        filepath=filepath,
-                        line_number=handler.lineno,
-                        domains=["code_quality"],
-                        signature="error_handling:pass_only",
-                    ))
+                    patterns.append(
+                        MinedPattern(
+                            pattern_type="error_handling",
+                            description=f"Exception handler with only 'pass' silently swallows {exc_name or 'all'} errors",
+                            code_snippet=f"except {exc_name or '...'}: pass  # line {handler.lineno}",
+                            filepath=filepath,
+                            line_number=handler.lineno,
+                            domains=["code_quality"],
+                            signature="error_handling:pass_only",
+                        )
+                    )
 
         return patterns
 
@@ -224,28 +257,35 @@ class CodePatternMiner:
                     elif "fastapi" in dec_text.lower() or "router." in dec_text.lower():
                         techs = ["fastapi"]
 
-                    patterns.append(MinedPattern(
-                        pattern_type="api_convention",
-                        description=f"API endpoint: {node.name}()",
-                        code_snippet=f"@...route  def {node.name}():  # line {node.lineno}",
-                        filepath=filepath,
-                        line_number=node.lineno,
-                        technologies=techs,
-                        domains=["api"],
-                        signature=f"api_convention:route_{node.name}",
-                    ))
+                    patterns.append(
+                        MinedPattern(
+                            pattern_type="api_convention",
+                            description=f"API endpoint: {node.name}()",
+                            code_snippet=f"@...route  def {node.name}():  # line {node.lineno}",
+                            filepath=filepath,
+                            line_number=node.lineno,
+                            technologies=techs,
+                            domains=["api"],
+                            signature=f"api_convention:route_{node.name}",
+                        )
+                    )
 
                 # Auth decorators
-                if any(kw in dec_text.lower() for kw in ["login_required", "auth", "permission", "jwt_required"]):
-                    patterns.append(MinedPattern(
-                        pattern_type="security_check",
-                        description=f"Auth-protected endpoint: {node.name}()",
-                        code_snippet=f"@auth_decorator def {node.name}():  # line {node.lineno}",
-                        filepath=filepath,
-                        line_number=node.lineno,
-                        domains=["security"],
-                        signature=f"security_check:auth_{node.name}",
-                    ))
+                if any(
+                    kw in dec_text.lower()
+                    for kw in ["login_required", "auth", "permission", "jwt_required"]
+                ):
+                    patterns.append(
+                        MinedPattern(
+                            pattern_type="security_check",
+                            description=f"Auth-protected endpoint: {node.name}()",
+                            code_snippet=f"@auth_decorator def {node.name}():  # line {node.lineno}",
+                            filepath=filepath,
+                            line_number=node.lineno,
+                            domains=["security"],
+                            signature=f"security_check:auth_{node.name}",
+                        )
+                    )
 
         return patterns
 
@@ -266,27 +306,33 @@ class CodePatternMiner:
                     # Check if f-string or format is used
                     for arg in node.args:
                         if isinstance(arg, ast.JoinedStr):  # f-string
-                            patterns.append(MinedPattern(
-                                pattern_type="security_check",
-                                description="SQL query built with f-string — potential SQL injection",
-                                code_snippet=f"execute(f'...')  # line {node.lineno}",
-                                filepath=filepath,
-                                line_number=node.lineno,
-                                domains=["security", "database"],
-                                signature="security_check:sql_fstring",
-                            ))
+                            patterns.append(
+                                MinedPattern(
+                                    pattern_type="security_check",
+                                    description="SQL query built with f-string — potential SQL injection",
+                                    code_snippet=f"execute(f'...')  # line {node.lineno}",
+                                    filepath=filepath,
+                                    line_number=node.lineno,
+                                    domains=["security", "database"],
+                                    signature="security_check:sql_fstring",
+                                )
+                            )
 
                 # Input validation patterns
-                if any(kw in call_text.lower() for kw in ["validate", "sanitize", "escape", "clean"]):
-                    patterns.append(MinedPattern(
-                        pattern_type="security_check",
-                        description="Input validation/sanitization call detected",
-                        code_snippet=f"validate/sanitize call  # line {node.lineno}",
-                        filepath=filepath,
-                        line_number=node.lineno,
-                        domains=["security"],
-                        signature="security_check:input_validation",
-                    ))
+                if any(
+                    kw in call_text.lower() for kw in ["validate", "sanitize", "escape", "clean"]
+                ):
+                    patterns.append(
+                        MinedPattern(
+                            pattern_type="security_check",
+                            description="Input validation/sanitization call detected",
+                            code_snippet=f"validate/sanitize call  # line {node.lineno}",
+                            filepath=filepath,
+                            line_number=node.lineno,
+                            domains=["security"],
+                            signature="security_check:input_validation",
+                        )
+                    )
 
         return patterns
 
@@ -302,9 +348,8 @@ class CodePatternMiner:
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     imports.append(alias.name.split(".")[0])
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    imports.append(node.module.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imports.append(node.module.split(".")[0])
 
         if len(imports) < 2:
             return []
@@ -313,14 +358,16 @@ class CodePatternMiner:
         unique_imports = sorted(set(imports))
         if len(unique_imports) > 1:
             cluster_key = ",".join(unique_imports[:10])  # Cap at 10
-            return [MinedPattern(
-                pattern_type="import_cluster",
-                description=f"Import cluster: {', '.join(unique_imports[:8])}",
-                code_snippet=f"imports: {cluster_key}",
-                filepath=filepath,
-                line_number=1,
-                signature=f"import_cluster:{cluster_key}",
-            )]
+            return [
+                MinedPattern(
+                    pattern_type="import_cluster",
+                    description=f"Import cluster: {', '.join(unique_imports[:8])}",
+                    code_snippet=f"imports: {cluster_key}",
+                    filepath=filepath,
+                    line_number=1,
+                    signature=f"import_cluster:{cluster_key}",
+                )
+            ]
 
         return []
 
@@ -333,7 +380,7 @@ class CodePatternMiner:
         findings: list[dict[str, Any]] = []
         seen_sigs: set[str] = set()
 
-        for ptype, patterns in self._patterns.items():
+        for _ptype, patterns in self._patterns.items():
             for pattern in patterns:
                 freq = self._pattern_freq.get(pattern.signature, pattern.frequency)
                 if freq < min_frequency:
@@ -343,23 +390,29 @@ class CodePatternMiner:
                 seen_sigs.add(pattern.signature)
 
                 confidence = min(1.0, freq / 10.0)
-                findings.append({
-                    "pattern_type": pattern.pattern_type,
-                    "description": pattern.description,
-                    "code_snippet": pattern.code_snippet,
-                    "frequency": freq,
-                    "confidence": confidence,
-                    "technologies": pattern.technologies,
-                    "domains": pattern.domains,
-                    "source_files": [pattern.filepath],
-                    "severity": "medium" if pattern.pattern_type != "security_check" else "high",
-                })
+                findings.append(
+                    {
+                        "pattern_type": pattern.pattern_type,
+                        "description": pattern.description,
+                        "code_snippet": pattern.code_snippet,
+                        "frequency": freq,
+                        "confidence": confidence,
+                        "technologies": pattern.technologies,
+                        "domains": pattern.domains,
+                        "source_files": [pattern.filepath],
+                        "severity": "medium"
+                        if pattern.pattern_type != "security_check"
+                        else "high",
+                    }
+                )
 
         # Sort by frequency descending
         findings.sort(key=lambda f: f["frequency"], reverse=True)
         logger.info(
             "Proposed %d findings from %d patterns (min_frequency=%d)",
-            len(findings), sum(len(v) for v in self._patterns.values()), min_frequency,
+            len(findings),
+            sum(len(v) for v in self._patterns.values()),
+            min_frequency,
         )
         return findings
 

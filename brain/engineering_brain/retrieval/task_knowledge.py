@@ -49,7 +49,7 @@ def init_task_knowledge(brain: Any) -> None:
     _brain_instance = brain
 
 
-def _get_brain():
+def _get_brain() -> Any:
     """Get the Brain singleton via centralized factory."""
     global _brain_instance
     if _brain_instance is not None:
@@ -62,6 +62,21 @@ def _get_brain():
         logger.warning("task_knowledge: Brain not available: %s", e)
         return None
     return _brain_instance
+
+
+def _llm_extract_tags(task_description: str) -> dict | None:
+    """LLM-enhanced tag extraction. Returns None on failure."""
+    from engineering_brain.llm_helpers import brain_llm_call_json, is_llm_enabled
+
+    if not is_llm_enabled("BRAIN_LLM_TASK_TAGGING"):
+        return None
+    system = (
+        "Extract engineering tags from a task description. "
+        'Return ONLY JSON: {"technologies": ["Flask"], "domains": ["security"]}. '
+        "domains from: security, api, database, testing, performance, architecture, "
+        "devops, ui, general. Return empty lists if nothing clearly applies."
+    )
+    return brain_llm_call_json(system, f"Task: {task_description[:1200]}", max_tokens=150)
 
 
 def auto_tag_task(task: dict[str, Any]) -> dict[str, Any]:
@@ -81,9 +96,9 @@ def auto_tag_task(task: dict[str, Any]) -> dict[str, Any]:
     Already-present tags are preserved (explicit > auto-detected).
     """
     from engineering_brain.retrieval.context_extractor import (
-        extract_context,
         apply_technology_implications,
         extract_ast_context,
+        extract_context,
     )
 
     # Build description from available task fields
@@ -104,6 +119,17 @@ def auto_tag_task(task: dict[str, Any]) -> dict[str, Any]:
         domains=task.get("knowledge_domains"),
     )
 
+    # LLM tag augmentation (before TIG and AST layers)
+    llm_tags = _llm_extract_tags(desc)
+    if llm_tags:
+        for t in llm_tags.get("technologies") or []:
+            if isinstance(t, str) and t and t not in ctx.technologies:
+                ctx.technologies.append(t)
+        for d in llm_tags.get("domains") or []:
+            d_lower = d.lower() if isinstance(d, str) else ""
+            if d_lower and d_lower not in ctx.domains:
+                ctx.domains.append(d_lower)
+
     provenance: dict[str, str] = {}
     for t in ctx.technologies:
         provenance[t] = "explicit"
@@ -119,8 +145,8 @@ def auto_tag_task(task: dict[str, Any]) -> dict[str, Any]:
                 ctx.domains.append(d)
             if d not in provenance:
                 provenance[d] = "tig"
-    except Exception:
-        pass  # TIG failure is non-blocking
+    except Exception as exc:
+        logger.debug("Technology implications (TIG) failed: %s", exc)
 
     # Layer 3: CONTEXTUAL — AST analysis (if file paths available)
     file_paths = _extract_file_paths(task)
@@ -137,8 +163,8 @@ def auto_tag_task(task: dict[str, Any]) -> dict[str, Any]:
                     ctx.domains.append(d)
                 if d not in provenance:
                     provenance[d] = "ast"
-        except Exception:
-            pass  # AST failure is non-blocking
+        except Exception as exc:
+            logger.debug("AST context extraction failed: %s", exc)
 
     # Store tags — don't overwrite explicit values
     if "knowledge_tags" not in task:
@@ -213,8 +239,8 @@ def get_knowledge_for_task(task: dict[str, Any], budget_chars: int | None = None
                         technologies=tags or [],
                         file_type=file_type,
                     )
-                except Exception:
-                    pass  # Never block on feedback
+                except Exception as exc:
+                    logger.debug("Failed to record brain query observation: %s", exc)
                 # Store node IDs on task for later outcome feedback
                 task["_brain_node_ids"] = served_ids
 
@@ -279,7 +305,8 @@ def enrich_tasks_batch(
 
     logger.info(
         "task_knowledge: enriched %d tasks (%d unique knowledge sets)",
-        len(enriched), len(cache),
+        len(enriched),
+        len(cache),
     )
     return enriched
 
@@ -289,7 +316,14 @@ def _extract_task_description(task: dict[str, Any]) -> str:
 
     Tasks can have different field names depending on pipeline context.
     """
-    for field in ("description", "instruction", "task_description", "task_prompt", "prompt", "objective"):
+    for field in (
+        "description",
+        "instruction",
+        "task_description",
+        "task_prompt",
+        "prompt",
+        "objective",
+    ):
         val = task.get(field)
         if val and isinstance(val, str):
             return val

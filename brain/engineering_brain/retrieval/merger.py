@@ -24,7 +24,7 @@ def merge_results(
     merged: dict[str, dict[str, Any]] = {}
 
     # Process cache results first (highest priority — already scored)
-    for node in (cache_results or []):
+    for node in cache_results or []:
         nid = _node_id(node)
         if nid:
             node["_source"] = node.get("_source", "cache")

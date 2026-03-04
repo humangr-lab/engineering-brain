@@ -7,7 +7,7 @@ in referenced technologies. Requires GITHUB_TOKEN for rate limits.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -19,19 +19,28 @@ logger = logging.getLogger(__name__)
 
 # Map brain tech names → GitHub ecosystem
 _ECOSYSTEM_MAP: dict[str, str] = {
-    "Flask": "pip", "FastAPI": "pip", "Django": "pip",
-    "Pydantic": "pip", "SQLAlchemy": "pip",
-    "Flask-SocketIO": "pip", "Flask-CORS": "pip",
-    "React": "npm", "Vue": "npm", "Angular": "npm",
-    "Express": "npm", "Next.js": "npm", "Socket.IO": "npm",
-    "Svelte": "npm", "Nuxt": "npm",
+    "Flask": "pip",
+    "FastAPI": "pip",
+    "Django": "pip",
+    "Pydantic": "pip",
+    "SQLAlchemy": "pip",
+    "Flask-SocketIO": "pip",
+    "Flask-CORS": "pip",
+    "React": "npm",
+    "Vue": "npm",
+    "Angular": "npm",
+    "Express": "npm",
+    "Next.js": "npm",
+    "Socket.IO": "npm",
+    "Svelte": "npm",
+    "Nuxt": "npm",
 }
 
 
 class GitHubAdvisoryChecker(SourceChecker):
     """Validates security claims against GitHub Security Advisories."""
 
-    def __init__(self, token: str = "", rate_limit: float = 0.3):
+    def __init__(self, token: str = "", rate_limit: float = 0.3) -> None:
         super().__init__(rate_limit=rate_limit)
         self._token = token
 
@@ -46,7 +55,9 @@ class GitHubAdvisoryChecker(SourceChecker):
         """Not used for technology existence checks."""
         return None
 
-    async def search_claim(self, claim_text: str, technologies: list[str], domains: list[str]) -> list[Source]:
+    async def search_claim(
+        self, claim_text: str, technologies: list[str], domains: list[str]
+    ) -> list[Source]:
         """Search GitHub Advisories for security issues."""
         if "security" not in domains:
             return []
@@ -98,14 +109,16 @@ class GitHubAdvisoryChecker(SourceChecker):
                 cvss = advisory.get("cvss", {})
                 cvss_score = cvss.get("score") if cvss else None
 
-                sources.append(Source(
-                    url=html_url,
-                    title=f"GHSA {ghsa_id}: {summary[:80]} [{severity}]",
-                    source_type=SourceType.GITHUB_ADVISORY,
-                    retrieved_at=datetime.now(timezone.utc),
-                    cvss_score=cvss_score,
-                    verified=True,
-                ))
+                sources.append(
+                    Source(
+                        url=html_url,
+                        title=f"GHSA {ghsa_id}: {summary[:80]} [{severity}]",
+                        source_type=SourceType.GITHUB_ADVISORY,
+                        retrieved_at=datetime.now(UTC),
+                        cvss_score=cvss_score,
+                        verified=True,
+                    )
+                )
 
             return sources
 

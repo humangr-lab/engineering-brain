@@ -12,12 +12,19 @@ Ranks knowledge nodes using 6 base weighted signals + 1 optional vector signal:
 
 from __future__ import annotations
 
+import logging
 import math
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from engineering_brain.core.config import BrainConfig
+
+logger = logging.getLogger(__name__)
+
+# Scoring constants
+_REINFORCEMENT_CAP = 20.0  # Reinforcement count at which score saturates to 1.0
+_GENERAL_DOMAIN_SCORE = 0.3  # Partial credit for general/untagged knowledge
 
 # Lazy-loaded at module level (not per-call) to avoid import overhead in the scoring hot path
 _get_decay_engine = None
@@ -30,8 +37,9 @@ def _ensure_epistemic_imports() -> bool:
     if _get_decay_engine is not None:
         return True
     try:
-        from engineering_brain.epistemic.temporal import get_decay_engine
         from engineering_brain.epistemic.opinion import OpinionTuple
+        from engineering_brain.epistemic.temporal import get_decay_engine
+
         _get_decay_engine = get_decay_engine
         _OpinionTuple = OpinionTuple
         return True
@@ -80,7 +88,7 @@ def score_knowledge(
         domain_overlap = _hierarchy_overlap_count(query_domains, node_domains)
         domain_score = min(domain_overlap / max(len(query_domains), 1), 1.0)
     elif not node_domains or node_domains == ["general"]:
-        domain_score = 0.3  # General knowledge gets partial credit
+        domain_score = _GENERAL_DOMAIN_SCORE
     else:
         domain_score = 0.0
 
@@ -90,24 +98,30 @@ def score_knowledge(
 
     # 4. Reinforcement count
     reinforcement = int(node.get("reinforcement_count", 0))
-    reinforcement_score = min(reinforcement / 20.0, 1.0)  # 20+ = max score
+    reinforcement_score = min(reinforcement / _REINFORCEMENT_CAP, 1.0)
 
     # 5. Recency (with Hawkes decay if epistemic timestamps present)
     recency_score = _compute_recency(node)
-    if node.get("event_timestamps") and node.get("ep_b") is not None and _ensure_epistemic_imports():
+    if (
+        node.get("event_timestamps")
+        and node.get("ep_b") is not None
+        and _ensure_epistemic_imports()
+    ):
         try:
             layer = _infer_layer(node)
             engine = _get_decay_engine(layer)
             op = _OpinionTuple(
-                b=float(node["ep_b"]), d=float(node.get("ep_d", 0.0)),
-                u=float(node.get("ep_u", 0.5)), a=float(node.get("ep_a", 0.5)),
+                b=float(node["ep_b"]),
+                d=float(node.get("ep_d", 0.0)),
+                u=float(node.get("ep_u", 0.5)),
+                a=float(node.get("ep_a", 0.5)),
             )
             now_ts = int(time.time())
             last_decay = int(node.get("last_decay_at", 0))
             decayed = engine.apply_decay(op, now_ts, last_decay, node["event_timestamps"])
             recency_score = max(recency_score, decayed.projected_probability)
-        except Exception:
-            pass  # Hawkes decay is a bonus signal, never blocks
+        except Exception as exc:
+            logger.debug("Hawkes decay computation failed (non-blocking): %s", exc)
 
     # 6. Confidence (from validation status or epistemic opinion)
     confidence_score = _compute_confidence(node)
@@ -127,8 +141,8 @@ def score_knowledge(
     if calibrator is not None:
         try:
             confidence_score = calibrator.calibrated_confidence(confidence_score)
-        except Exception:
-            pass  # Calibration is optional, never blocks scoring
+        except Exception as exc:
+            logger.debug("Confidence calibration failed (non-blocking): %s", exc)
 
     # 8. EigenTrust propagated score (if available)
     eigentrust_score = float(node.get("eigentrust_score", 0.5))
@@ -196,6 +210,7 @@ def rank_results(
     if weight_optimizer:
         try:
             from dataclasses import replace as _replace
+
             adaptive = weight_optimizer.get_weights()
             base = cfg or BrainConfig()
             cfg = _replace(
@@ -207,8 +222,8 @@ def rank_results(
                 weight_recency=adaptive.get("recency", base.weight_recency),
                 weight_confidence=adaptive.get("confidence", base.weight_confidence),
             )
-        except Exception:
-            pass  # Adaptive weights are optional, never block scoring
+        except Exception as exc:
+            logger.debug("Adaptive weight application failed (non-blocking): %s", exc)
 
     scored: list[tuple[float, dict[str, Any]]] = []
     for node in nodes:
@@ -259,10 +274,10 @@ def _compute_recency(node: dict[str, Any]) -> float:
         if isinstance(timestamp_str, datetime):
             ts = timestamp_str
         elif isinstance(timestamp_str, (int, float)):
-            ts = datetime.fromtimestamp(timestamp_str, tz=timezone.utc)
+            ts = datetime.fromtimestamp(timestamp_str, tz=UTC)
         else:
             ts = datetime.fromisoformat(str(timestamp_str).replace("Z", "+00:00"))
-        age_days = max((datetime.now(timezone.utc) - ts).days, 0)
+        age_days = max((datetime.now(UTC) - ts).days, 0)
         half_life = 90.0
         decay_rate = math.log(2) / half_life
         return max(math.exp(-decay_rate * age_days), 0.05)
@@ -288,11 +303,12 @@ def _hierarchy_overlap_count(query_tags: list[str], node_tags: list[str]) -> int
     """
     try:
         from engineering_brain.core.taxonomy import get_registry
+
         registry = get_registry()
         if registry.size > 0:
             return registry.overlap_count(query_tags, node_tags)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("TagRegistry overlap_count failed: %s", exc)
     # Fallback: exact match
     sq = {t.lower() for t in query_tags}
     sn = {t.lower() for t in node_tags}

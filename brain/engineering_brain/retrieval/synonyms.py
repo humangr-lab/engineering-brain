@@ -12,7 +12,10 @@ Example:
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # Curated synonym dictionary: canonical term → list of aliases
@@ -31,7 +34,13 @@ _SYNONYMS: dict[str, list[str]] = {
     "idor": ["insecure direct object reference"],
     # Architecture
     "dry": ["don't repeat yourself", "single source of truth", "deduplication"],
-    "solid": ["single responsibility", "open closed", "liskov", "interface segregation", "dependency inversion"],
+    "solid": [
+        "single responsibility",
+        "open closed",
+        "liskov",
+        "interface segregation",
+        "dependency inversion",
+    ],
     "srp": ["single responsibility", "single responsibility principle"],
     "microservice": ["microservices", "service-oriented", "soa"],
     "monolith": ["monolithic", "single-deployment"],
@@ -84,6 +93,25 @@ for _canonical, _aliases in _SYNONYMS.items():
         _REVERSE_INDEX[_alias.lower()] = _canonical
 
 
+def _llm_expand_synonyms(terms: list[str]) -> list[str] | None:
+    """LLM-generated synonym expansion. Returns None on failure."""
+    from engineering_brain.llm_helpers import brain_llm_call_json, is_llm_enabled
+
+    if not is_llm_enabled("BRAIN_LLM_SYNONYMS"):
+        return None
+    if not terms:
+        return None
+    system = (
+        "Suggest up to 3 additional engineering term synonyms/aliases. "
+        'Return ONLY JSON: {"synonyms": ["term1"]}. '
+        "Only include terms engineers actually use. No duplicates of input."
+    )
+    result = brain_llm_call_json(system, f"Terms: {terms[:10]}", max_tokens=120)
+    if result and isinstance(result.get("synonyms"), list):
+        return [s for s in result["synonyms"] if isinstance(s, str) and s]
+    return None
+
+
 def expand_query_terms(terms: list[str]) -> list[str]:
     """Expand query terms with synonyms. Additive — never removes terms.
 
@@ -116,6 +144,17 @@ def expand_query_terms(terms: list[str]) -> list[str]:
                 if alias.lower() not in seen:
                     expanded.append(alias)
                     seen.add(alias.lower())
+
+    # LLM augmentation (additive, silent failure)
+    try:
+        llm_terms = _llm_expand_synonyms(terms)
+        if llm_terms:
+            for t in llm_terms:
+                if t.lower() not in seen:
+                    expanded.append(t)
+                    seen.add(t.lower())
+    except Exception as exc:
+        logger.debug("LLM synonym expansion failed: %s", exc)
 
     return expanded
 
@@ -164,15 +203,11 @@ def expand_from_graph(
                 neighbor = graph.get_node(neighbor_id)
                 if not neighbor:
                     continue
-                name = (
-                    neighbor.get("name", "")
-                    or neighbor.get("text", "")
-                    or ""
-                ).strip()
+                name = (neighbor.get("name", "") or neighbor.get("text", "") or "").strip()
                 if name and name.lower() not in seen and len(name) < 50:
                     additional.append(name)
                     seen.add(name.lower())
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Graph expansion failed for term '%s': %s", term, exc)
 
     return additional

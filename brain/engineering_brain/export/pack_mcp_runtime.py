@@ -17,10 +17,10 @@ import re
 import sys
 from typing import Any
 
-
 # =============================================================================
 # PackIndex — in-memory index over pack nodes
 # =============================================================================
+
 
 class PackIndex:
     """In-memory index over pack nodes for fast lookups."""
@@ -46,10 +46,10 @@ class PackIndex:
             layer = self._infer_layer(nid)
             self._by_layer.setdefault(layer, []).append(node)
 
-            for d in (node.get("domains") or []):
+            for d in node.get("domains") or []:
                 self._by_domain.setdefault(d.lower(), []).append(node)
 
-            for t in (node.get("technologies") or node.get("languages") or []):
+            for t in node.get("technologies") or node.get("languages") or []:
                 self._by_technology.setdefault(t.lower(), []).append(node)
 
             severity = node.get("severity", "")
@@ -96,7 +96,7 @@ class PackIndex:
     def search(self, query: str, top_k: int = 10) -> list[dict[str, Any]]:
         """Keyword search with scoring."""
         query_lower = query.lower()
-        query_words = set(re.findall(r'\w+', query_lower))
+        query_words = set(re.findall(r"\w+", query_lower))
         scored: list[tuple[float, dict[str, Any]]] = []
 
         for node in self.nodes:
@@ -117,10 +117,20 @@ class PackIndex:
         score = 0.0
 
         # Text fields to search
-        searchable = " ".join(str(node.get(f, "")) for f in (
-            "text", "name", "why", "how_to_do_right", "how_to_apply",
-            "intent", "statement", "description", "mental_model",
-        )).lower()
+        searchable = " ".join(
+            str(node.get(f, ""))
+            for f in (
+                "text",
+                "name",
+                "why",
+                "how_to_do_right",
+                "how_to_apply",
+                "intent",
+                "statement",
+                "description",
+                "mental_model",
+            )
+        ).lower()
 
         if not searchable:
             return 0.0
@@ -130,7 +140,7 @@ class PackIndex:
             score += 3.0
 
         # Word overlap
-        node_words = set(re.findall(r'\w+', searchable))
+        node_words = set(re.findall(r"\w+", searchable))
         overlap = query_words & node_words
         if overlap:
             score += len(overlap) / max(len(query_words), 1)
@@ -157,6 +167,7 @@ class PackIndex:
 # Handler strategies
 # =============================================================================
 
+
 def handle_query(index: PackIndex, args: dict[str, Any], config: dict[str, Any]) -> str:
     """Search by relevance — keyword search + boosts."""
     query = args.get("query", args.get("code", args.get("topic", args.get("description", ""))))
@@ -179,7 +190,8 @@ def handle_query(index: PackIndex, args: dict[str, Any], config: dict[str, Any])
     domains = config.get("domains")
     if domains:
         results = [
-            n for n in results
+            n
+            for n in results
             if any(d.lower() in [x.lower() for x in (n.get("domains") or [])] for d in domains)
             or not n.get("domains")
         ]
@@ -301,11 +313,8 @@ def handle_aggregate(index: PackIndex, args: dict[str, Any], config: dict[str, A
     for layer in layers:
         layer_nodes = index.get_by_layer(layer)
         # Score against topic
-        query_words = set(re.findall(r'\w+', topic.lower()))
-        scored = [
-            (index._relevance_score(n, topic.lower(), query_words), n)
-            for n in layer_nodes
-        ]
+        query_words = set(re.findall(r"\w+", topic.lower()))
+        scored = [(index._relevance_score(n, topic.lower(), query_words), n) for n in layer_nodes]
         scored = [(s, n) for s, n in scored if s > 0]
         scored.sort(key=lambda x: x[0], reverse=True)
         top = [n for _, n in scored[:3]]
@@ -328,16 +337,16 @@ def handle_stats(index: PackIndex, args: dict[str, Any], config: dict[str, Any])
 
     tech_counts: dict[str, int] = {}
     for node in index.nodes:
-        for t in (node.get("technologies") or node.get("languages") or []):
+        for t in node.get("technologies") or node.get("languages") or []:
             tech_counts[t] = tech_counts.get(t, 0) + 1
 
     domain_counts: dict[str, int] = {}
     for node in index.nodes:
-        for d in (node.get("domains") or []):
+        for d in node.get("domains") or []:
             domain_counts[d] = domain_counts.get(d, 0) + 1
 
     lines = [
-        f"## Pack Statistics",
+        "## Pack Statistics",
         f"Template: {metadata.get('template_id', 'N/A')}",
         f"Total nodes: {len(index.nodes)}",
         f"Total edges: {len(index.edges)}",
@@ -364,8 +373,11 @@ def handle_stats(index: PackIndex, args: dict[str, Any], config: dict[str, Any])
 # =============================================================================
 
 _LAYER_NAMES = {
-    "L0": "Axioms", "L1": "Principles", "L2": "Patterns",
-    "L3": "Rules", "L4": "Findings",
+    "L0": "Axioms",
+    "L1": "Principles",
+    "L2": "Patterns",
+    "L3": "Rules",
+    "L4": "Findings",
 }
 
 
@@ -431,10 +443,15 @@ def format_single_node(node: dict[str, Any], config: dict[str, Any]) -> str:
         lines.append("")
 
     for field, label in [
-        ("why", "WHY"), ("how_to_do_right", "HOW"), ("how_to_apply", "HOW"),
-        ("when_applies", "WHEN"), ("when_not_applies", "WHEN NOT"),
-        ("mental_model", "MENTAL MODEL"), ("intent", "INTENT"),
-        ("when_to_use", "WHEN TO USE"), ("when_not_to_use", "WHEN NOT TO USE"),
+        ("why", "WHY"),
+        ("how_to_do_right", "HOW"),
+        ("how_to_apply", "HOW"),
+        ("when_applies", "WHEN"),
+        ("when_not_applies", "WHEN NOT"),
+        ("mental_model", "MENTAL MODEL"),
+        ("intent", "INTENT"),
+        ("when_to_use", "WHEN TO USE"),
+        ("when_not_to_use", "WHEN NOT TO USE"),
         ("violation_consequence", "CONSEQUENCE"),
     ]:
         val = node.get(field, "")
@@ -518,6 +535,7 @@ _HANDLER_MAP = {
 # PackMCPServer — in-process MCP server
 # =============================================================================
 
+
 class PackMCPServer:
     """In-process MCP server for a pack. Handles JSON-RPC 2.0 over stdio."""
 
@@ -562,23 +580,30 @@ class PackMCPServer:
             return None
 
         if method == "initialize":
-            return _make_response(req_id, {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}, "resources": {}},
-                "serverInfo": {
-                    "name": self.metadata.get("server_name", "pack-server"),
-                    "version": self.metadata.get("version", "1.0.0"),
+            return _make_response(
+                req_id,
+                {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}, "resources": {}},
+                    "serverInfo": {
+                        "name": self.metadata.get("server_name", "pack-server"),
+                        "version": self.metadata.get("version", "1.0.0"),
+                    },
                 },
-            })
+            )
 
         if method == "tools/list":
             tools = []
             for tool in self.tool_manifest:
-                tools.append({
-                    "name": tool["name"],
-                    "description": tool.get("description", ""),
-                    "inputSchema": tool.get("input_schema", {"type": "object", "properties": {}, "required": []}),
-                })
+                tools.append(
+                    {
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "inputSchema": tool.get(
+                            "input_schema", {"type": "object", "properties": {}, "required": []}
+                        ),
+                    }
+                )
             return _make_response(req_id, {"tools": tools})
 
         if method == "tools/call":
@@ -590,14 +615,20 @@ class PackMCPServer:
             handler_fn, handler_config = handler_entry
             try:
                 text = handler_fn(self.index, arguments, handler_config)
-                return _make_response(req_id, {
-                    "content": [{"type": "text", "text": text}],
-                })
+                return _make_response(
+                    req_id,
+                    {
+                        "content": [{"type": "text", "text": text}],
+                    },
+                )
             except Exception as exc:
-                return _make_response(req_id, {
-                    "content": [{"type": "text", "text": f"Error: {exc}"}],
-                    "isError": True,
-                })
+                return _make_response(
+                    req_id,
+                    {
+                        "content": [{"type": "text", "text": f"Error: {exc}"}],
+                        "isError": True,
+                    },
+                )
 
         if method == "resources/list":
             return _make_response(req_id, {"resources": self._resources})
@@ -646,6 +677,7 @@ class PackMCPServer:
 # JSON-RPC helpers
 # =============================================================================
 
+
 def _make_response(req_id: Any, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
@@ -657,6 +689,7 @@ def _make_error(req_id: Any, code: int, message: str) -> dict[str, Any]:
 # =============================================================================
 # Standalone entry point (used by exported server.py)
 # =============================================================================
+
 
 def run_server(pack_data_path: str) -> None:
     """Load pack data and run the MCP server."""

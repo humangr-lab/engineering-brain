@@ -7,7 +7,7 @@ Uses GitHub raw content API (no rate limit) + HEAD checks.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -53,7 +53,7 @@ _MDN_RAW_BASE = "https://raw.githubusercontent.com/mdn/content/main/files/en-us"
 class MDNChecker(SourceChecker):
     """Validates web platform claims against MDN Web Docs."""
 
-    def __init__(self, rate_limit: float = 0.2):
+    def __init__(self, rate_limit: float = 0.2) -> None:
         super().__init__(rate_limit=rate_limit)
 
     @property
@@ -81,13 +81,25 @@ class MDNChecker(SourceChecker):
             logger.debug("MDN check failed for %s: %s", tech_name, e)
             return None
 
-    async def search_claim(self, claim_text: str, technologies: list[str], domains: list[str]) -> list[Source]:
+    async def search_claim(
+        self, claim_text: str, technologies: list[str], domains: list[str]
+    ) -> list[Source]:
         """Search MDN for relevant web platform docs."""
         web_domains = {"web", "frontend", "css", "html", "javascript", "browser"}
         if not (set(d.lower() for d in domains) & web_domains):
             # Also check if technologies suggest web context
-            web_techs = {"html", "css", "javascript", "react", "vue", "angular",
-                         "svelte", "typescript", "next.js", "htmx"}
+            web_techs = {
+                "html",
+                "css",
+                "javascript",
+                "react",
+                "vue",
+                "angular",
+                "svelte",
+                "typescript",
+                "next.js",
+                "htmx",
+            }
             if not any(t.lower() in web_techs for t in technologies):
                 return []
 
@@ -99,13 +111,15 @@ class MDNChecker(SourceChecker):
             if slug:
                 url = f"{_MDN_BASE}/{slug}"
                 # Known MDN slug URLs are trusted
-                sources.append(Source(
-                    url=url,
-                    title=f"MDN: {tech}",
-                    source_type=SourceType.MDN,
-                    retrieved_at=datetime.now(timezone.utc),
-                    verified=True,
-                ))
+                sources.append(
+                    Source(
+                        url=url,
+                        title=f"MDN: {tech}",
+                        source_type=SourceType.MDN,
+                        retrieved_at=datetime.now(UTC),
+                        verified=True,
+                    )
+                )
 
         # Try keyword-based slug construction from claim text
         for keyword in _extract_web_keywords(claim_text):
@@ -113,13 +127,15 @@ class MDNChecker(SourceChecker):
             if slug:
                 url = f"{_MDN_BASE}/{slug}"
                 if not any(s.url == url for s in sources):
-                    sources.append(Source(
-                        url=url,
-                        title=f"MDN: {keyword}",
-                        source_type=SourceType.MDN,
-                        retrieved_at=datetime.now(timezone.utc),
-                        verified=True,
-                    ))
+                    sources.append(
+                        Source(
+                            url=url,
+                            title=f"MDN: {keyword}",
+                            source_type=SourceType.MDN,
+                            retrieved_at=datetime.now(UTC),
+                            verified=True,
+                        )
+                    )
 
         return sources[:3]
 
@@ -130,7 +146,8 @@ class MDNChecker(SourceChecker):
             async with httpx.AsyncClient(timeout=8) as client:
                 resp = await client.head(url, follow_redirects=True)
                 return resp.status_code == 200
-        except Exception:
+        except Exception as exc:
+            logger.debug("MDN head check failed for %s: %s", url, exc)
             return False
 
 
@@ -141,16 +158,40 @@ def _find_mdn_slug(term: str) -> str:
     if lower in _MDN_SLUGS:
         return _MDN_SLUGS[lower]
     # Try as HTML element
-    if lower in ("div", "span", "form", "input", "button", "select",
-                 "textarea", "table", "canvas", "video", "audio", "img"):
+    if lower in (
+        "div",
+        "span",
+        "form",
+        "input",
+        "button",
+        "select",
+        "textarea",
+        "table",
+        "canvas",
+        "video",
+        "audio",
+        "img",
+    ):
         return f"Web/HTML/Element/{lower}"
     # Try as CSS property
     if lower.startswith("css ") or "-" in lower:
         prop = lower.replace("css ", "").strip()
         return f"Web/CSS/{prop}"
     # Try as JavaScript global
-    if lower in ("array", "object", "map", "set", "weakmap", "weakset",
-                 "symbol", "bigint", "regexp", "date", "json", "math"):
+    if lower in (
+        "array",
+        "object",
+        "map",
+        "set",
+        "weakmap",
+        "weakset",
+        "symbol",
+        "bigint",
+        "regexp",
+        "date",
+        "json",
+        "math",
+    ):
         return f"Web/JavaScript/Reference/Global_Objects/{lower.capitalize()}"
     return ""
 

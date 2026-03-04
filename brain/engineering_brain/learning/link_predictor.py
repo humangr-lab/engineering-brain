@@ -21,7 +21,7 @@ Model Calibration for Link Prediction (WWW 2024).
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from engineering_brain.adapters.base import GraphAdapter
@@ -86,7 +86,7 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Compute cosine similarity between two vectors."""
     if not a or not b or len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     norm_a = sum(x * x for x in a) ** 0.5
     norm_b = sum(x * x for x in b) ** 0.5
     if norm_a == 0.0 or norm_b == 0.0:
@@ -182,7 +182,8 @@ class LinkPredictor:
         if hasattr(self._embedder, "embed_batch") and len(texts) > 1:
             try:
                 vectors = self._embedder.embed_batch(texts)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Batch embedding failed, falling back to one-by-one: %s", exc)
                 vectors = []
 
         # Fallback to one-by-one
@@ -192,10 +193,11 @@ class LinkPredictor:
                 try:
                     vec = self._embedder.embed_text(text)
                     vectors.append(vec if vec else [])
-                except Exception:
+                except Exception as exc:
+                    logger.debug("Single text embedding failed: %s", exc)
                     vectors.append([])
 
-        return {nid: vec for nid, vec in zip(ids, vectors) if vec}
+        return {nid: vec for nid, vec in zip(ids, vectors, strict=False) if vec}
 
     def predict_links(
         self,
@@ -213,15 +215,19 @@ class LinkPredictor:
         """
         # Collect nodes by label
         nodes_by_label: dict[str, list[dict[str, Any]]] = {}
-        for label_val in [NodeType.AXIOM.value, NodeType.PRINCIPLE.value,
-                          NodeType.PATTERN.value, NodeType.RULE.value]:
+        for label_val in [
+            NodeType.AXIOM.value,
+            NodeType.PRINCIPLE.value,
+            NodeType.PATTERN.value,
+            NodeType.RULE.value,
+        ]:
             nodes = self._graph.query(label=label_val, limit=500)
             if nodes:
                 nodes_by_label[label_val] = nodes
 
         # Batch-embed all nodes
         embeddings: dict[str, list[float]] = {}
-        for label, nodes in nodes_by_label.items():
+        for _label, nodes in nodes_by_label.items():
             node_vecs = self._embed_nodes(nodes)
             embeddings.update(node_vecs)
 
@@ -269,7 +275,7 @@ class LinkPredictor:
             # Per-type-constraint top-K
             constraint_preds.sort(key=lambda p: p.confidence, reverse=True)
             if self._top_k_per_type > 0:
-                constraint_preds = constraint_preds[:self._top_k_per_type]
+                constraint_preds = constraint_preds[: self._top_k_per_type]
 
             predictions.extend(constraint_preds)
 
@@ -279,8 +285,11 @@ class LinkPredictor:
         seen_pairs: dict[tuple[str, str, str], PredictedLink] = {}
         for pred in predictions:
             if pred.edge_type in _SYMMETRIC_EDGE_TYPES:
-                pair = (min(pred.source_id, pred.target_id),
-                        max(pred.source_id, pred.target_id), pred.edge_type)
+                pair = (
+                    min(pred.source_id, pred.target_id),
+                    max(pred.source_id, pred.target_id),
+                    pred.edge_type,
+                )
             else:
                 pair = (pred.source_id, pred.target_id, pred.edge_type)
             existing = seen_pairs.get(pair)
@@ -308,7 +317,8 @@ class LinkPredictor:
 
         try:
             node_vec = self._embedder.embed_text(text)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to embed node %s for link prediction: %s", node_id, exc)
             return []
         if not node_vec:
             return []
@@ -330,11 +340,14 @@ class LinkPredictor:
                         continue
                     try:
                         cand_vec = self._embedder.embed_text(cand_text)
-                    except Exception:
+                    except Exception as exc:
+                        logger.debug("Failed to embed candidate %s: %s", cid, exc)
                         continue
                     if not cand_vec:
                         continue
-                    link = self._score_pair(node_id, cid, node_vec, cand_vec, node, cand, edge_types)
+                    link = self._score_pair(
+                        node_id, cid, node_vec, cand_vec, node, cand, edge_types
+                    )
                     if link and link.confidence >= self._threshold:
                         predictions.append(link)
 
@@ -350,11 +363,14 @@ class LinkPredictor:
                         continue
                     try:
                         cand_vec = self._embedder.embed_text(cand_text)
-                    except Exception:
+                    except Exception as exc:
+                        logger.debug("Failed to embed candidate %s: %s", cid, exc)
                         continue
                     if not cand_vec:
                         continue
-                    link = self._score_pair(cid, node_id, cand_vec, node_vec, cand, node, edge_types)
+                    link = self._score_pair(
+                        cid, node_id, cand_vec, node_vec, cand, node, edge_types
+                    )
                     if link and link.confidence >= self._threshold:
                         predictions.append(link)
 
@@ -386,12 +402,16 @@ class LinkPredictor:
         if self._hake:
             try:
                 hake_score = 1.0 - self._hake.hierarchy_distance(src_vec, tgt_vec)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("HAKE hierarchy distance failed: %s", exc)
 
         # Technology overlap
-        s_techs = set(t.lower() for t in (source.get("technologies") or source.get("languages") or []))
-        t_techs = set(t.lower() for t in (target.get("technologies") or target.get("languages") or []))
+        s_techs = set(
+            t.lower() for t in (source.get("technologies") or source.get("languages") or [])
+        )
+        t_techs = set(
+            t.lower() for t in (target.get("technologies") or target.get("languages") or [])
+        )
         if s_techs and t_techs:
             tech_overlap = len(s_techs & t_techs) / max(len(s_techs | t_techs), 1)
         elif not s_techs and not t_techs:
@@ -411,7 +431,9 @@ class LinkPredictor:
 
         # Combined score with normalized cosine
         if self._hake:
-            confidence = norm_cosine * 0.40 + hake_score * 0.20 + tech_overlap * 0.20 + domain_overlap * 0.20
+            confidence = (
+                norm_cosine * 0.40 + hake_score * 0.20 + tech_overlap * 0.20 + domain_overlap * 0.20
+            )
         else:
             confidence = norm_cosine * 0.50 + tech_overlap * 0.25 + domain_overlap * 0.25
 

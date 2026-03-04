@@ -22,6 +22,10 @@ def _sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
 
 
+_MAX_TRUST = 0.95  # Trust ceiling — even the best source isn't 100% certain
+_ACCEPTED_ANSWER_BONUS = 0.15  # StackOverflow accepted answer trust boost
+_CVSS_TRUST_SCALAR = 0.95  # CVSS score → trust multiplier (cvss/10 * scalar)
+
 # Base trust weights by source type (ordered by authority)
 SOURCE_TRUST_MAP: dict[str, float] = {
     "official_docs": 0.90,
@@ -65,9 +69,9 @@ def source_to_opinion(source: Any, polarity: str = "positive") -> OpinionTuple:
         base = SOURCE_TRUST_MAP.get("stackoverflow", 0.60)
         trust = max(base, base * _sigmoid(votes / 20.0))
         if is_accepted:
-            trust = min(0.95, trust + 0.15)
+            trust = min(_MAX_TRUST, trust + _ACCEPTED_ANSWER_BONUS)
     elif st == "security_cve" and cvss_score is not None:
-        trust = 0.95 * (float(cvss_score) / 10.0)
+        trust = _CVSS_TRUST_SCALAR * (float(cvss_score) / 10.0)
     else:
         trust = SOURCE_TRUST_MAP.get(st, 0.50)
 

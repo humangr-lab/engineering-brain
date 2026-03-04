@@ -26,7 +26,7 @@ from engineering_brain.epistemic.conflict_resolution import (
     dempster_conflict,
     murphy_weighted_average,
 )
-from engineering_brain.epistemic.fusion import cbf, multi_source_cbf
+from engineering_brain.epistemic.fusion import multi_source_cbf
 from engineering_brain.epistemic.opinion import OpinionTuple
 from engineering_brain.epistemic.source_trust import SOURCE_TRUST_MAP
 

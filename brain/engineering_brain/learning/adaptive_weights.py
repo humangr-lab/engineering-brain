@@ -16,15 +16,19 @@ from __future__ import annotations
 import logging
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
 SIGNAL_NAMES = [
-    "tech_match", "domain_match", "severity",
-    "reinforcement", "recency", "confidence",
+    "tech_match",
+    "domain_match",
+    "severity",
+    "reinforcement",
+    "recency",
+    "confidence",
 ]
 DEFAULT_WEIGHTS = [0.28, 0.18, 0.18, 0.13, 0.13, 0.10]
 
@@ -39,11 +43,14 @@ class SignalDistribution:
 
     @property
     def mean(self) -> float:
-        return self.alpha / (self.alpha + self.beta)
+        ab = self.alpha + self.beta
+        return self.alpha / ab if ab > 0 else 0.5
 
     @property
     def variance(self) -> float:
         ab = self.alpha + self.beta
+        if ab <= 0:
+            return 0.0
         return (self.alpha * self.beta) / (ab * ab * (ab + 1))
 
     def sample(self) -> float:
@@ -72,7 +79,7 @@ class AdaptiveWeightOptimizer:
 
         # Initialize distributions from default weights
         self._distributions: dict[str, SignalDistribution] = {}
-        for name, w in zip(SIGNAL_NAMES, DEFAULT_WEIGHTS):
+        for name, w in zip(SIGNAL_NAMES, DEFAULT_WEIGHTS, strict=False):
             # Use default weight to set initial alpha/beta ratio
             # alpha = w * 20, beta = (1-w) * 20 → mean = w
             self._distributions[name] = SignalDistribution(
@@ -119,7 +126,7 @@ class AdaptiveWeightOptimizer:
         If not provided, updates all signals equally.
         """
         if signal_scores:
-            for name, score in signal_scores.items():
+            for name, _score in signal_scores.items():
                 dist = self._distributions.get(name)
                 if dist is None:
                     continue
@@ -151,7 +158,7 @@ class AdaptiveWeightOptimizer:
         total = sum(samples.values())
         if total <= 0:
             # Fallback to defaults
-            return dict(zip(SIGNAL_NAMES, DEFAULT_WEIGHTS))
+            return dict(zip(SIGNAL_NAMES, DEFAULT_WEIGHTS, strict=False))
 
         return {name: val / total for name, val in samples.items()}
 
@@ -170,11 +177,12 @@ class AdaptiveWeightOptimizer:
 
         try:
             observations = self._log.read_all()
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to read observation log for weight update: %s", exc)
             return
 
         # H13: Only process entries past the watermark
-        new_observations = observations[self._log_watermark:]
+        new_observations = observations[self._log_watermark :]
         self._log_watermark = len(observations)
 
         positive_count = 0
@@ -201,7 +209,7 @@ class AdaptiveWeightOptimizer:
         means = {name: dist.mean for name, dist in self._distributions.items()}
         total = sum(means.values())
         if total <= 0:
-            return dict(zip(SIGNAL_NAMES, DEFAULT_WEIGHTS))
+            return dict(zip(SIGNAL_NAMES, DEFAULT_WEIGHTS, strict=False))
         return {name: val / total for name, val in means.items()}
 
     def stats(self) -> dict[str, Any]:

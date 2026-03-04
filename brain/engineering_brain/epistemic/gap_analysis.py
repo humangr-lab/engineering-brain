@@ -26,10 +26,10 @@ logger = logging.getLogger(__name__)
 class KnowledgeGap:
     """A specific gap in the brain's knowledge."""
 
-    gap_type: str           # "high_uncertainty", "missing_evidence", etc.
-    node_id: str | None     # specific node, or None for structural gaps
+    gap_type: str  # "high_uncertainty", "missing_evidence", etc.
+    node_id: str | None  # specific node, or None for structural gaps
     description: str
-    severity: float         # 0-1, higher = more urgent
+    severity: float  # 0-1, higher = more urgent
     suggested_action: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -87,13 +87,15 @@ class GapAnalyzer:
 
             node_id = node.get("id", "")
             severity = min(1.0, ep_u * 0.8 + (1.0 if reinforcement == 0 else 0.0) * 0.2)
-            gaps.append(KnowledgeGap(
-                gap_type="high_uncertainty",
-                node_id=node_id,
-                description=f"Node {node_id} has uncertainty {ep_u:.2f} with {reinforcement} reinforcements",
-                severity=severity,
-                suggested_action=f"Find authoritative sources for {node_id}",
-            ))
+            gaps.append(
+                KnowledgeGap(
+                    gap_type="high_uncertainty",
+                    node_id=node_id,
+                    description=f"Node {node_id} has uncertainty {ep_u:.2f} with {reinforcement} reinforcements",
+                    severity=severity,
+                    suggested_action=f"Find authoritative sources for {node_id}",
+                )
+            )
         return gaps
 
     def _find_unsupported_rules(self) -> list[KnowledgeGap]:
@@ -108,13 +110,15 @@ class GapAnalyzer:
                 node_id=node_id, edge_type="EVIDENCED_BY", direction="outgoing"
             )
             if len(evidence_edges) == 0:
-                gaps.append(KnowledgeGap(
-                    gap_type="missing_evidence",
-                    node_id=node_id,
-                    description=f"Rule {node_id} has no evidence (EVIDENCED_BY edges)",
-                    severity=0.6,
-                    suggested_action=f"Add L4 evidence for rule {node_id}",
-                ))
+                gaps.append(
+                    KnowledgeGap(
+                        gap_type="missing_evidence",
+                        node_id=node_id,
+                        description=f"Rule {node_id} has no evidence (EVIDENCED_BY edges)",
+                        severity=0.6,
+                        suggested_action=f"Add L4 evidence for rule {node_id}",
+                    )
+                )
         return gaps
 
     def _find_orphan_patterns(self) -> list[KnowledgeGap]:
@@ -129,13 +133,15 @@ class GapAnalyzer:
                 node_id=node_id, edge_type="INSTANTIATES", direction="incoming"
             )
             if len(inst_edges) == 0:
-                gaps.append(KnowledgeGap(
-                    gap_type="orphan_pattern",
-                    node_id=node_id,
-                    description=f"Pattern {node_id} has no instantiating rules",
-                    severity=0.5,
-                    suggested_action=f"Create L3 rules that instantiate {node_id}",
-                ))
+                gaps.append(
+                    KnowledgeGap(
+                        gap_type="orphan_pattern",
+                        node_id=node_id,
+                        description=f"Pattern {node_id} has no instantiating rules",
+                        severity=0.5,
+                        suggested_action=f"Create L3 rules that instantiate {node_id}",
+                    )
+                )
         return gaps
 
     def _find_ungrounded_principles(self) -> list[KnowledgeGap]:
@@ -150,13 +156,15 @@ class GapAnalyzer:
                 node_id=node_id, edge_type="GROUNDS", direction="incoming"
             )
             if len(ground_edges) == 0:
-                gaps.append(KnowledgeGap(
-                    gap_type="ungrounded_principle",
-                    node_id=node_id,
-                    description=f"Principle {node_id} has no grounding axioms",
-                    severity=0.4,
-                    suggested_action=f"Link {node_id} to an L0 axiom via GROUNDS",
-                ))
+                gaps.append(
+                    KnowledgeGap(
+                        gap_type="ungrounded_principle",
+                        node_id=node_id,
+                        description=f"Principle {node_id} has no grounding axioms",
+                        severity=0.4,
+                        suggested_action=f"Link {node_id} to an L0 axiom via GROUNDS",
+                    )
+                )
         return gaps
 
     def _find_contradicted_without_resolution(self) -> list[KnowledgeGap]:
@@ -175,11 +183,13 @@ class GapAnalyzer:
                     continue
                 # If node has no recorded resolution
                 if not node.get("contradiction_resolved"):
-                    gaps.append(KnowledgeGap(
-                        gap_type="unresolved_contradiction",
-                        node_id=nid,
-                        description=f"Node {nid} has unresolved contradictions",
-                        severity=0.7,
-                        suggested_action=f"Resolve contradictions for {nid}",
-                    ))
+                    gaps.append(
+                        KnowledgeGap(
+                            gap_type="unresolved_contradiction",
+                            node_id=nid,
+                            description=f"Node {nid} has unresolved contradictions",
+                            severity=0.7,
+                            suggested_action=f"Resolve contradictions for {nid}",
+                        )
+                    )
         return gaps

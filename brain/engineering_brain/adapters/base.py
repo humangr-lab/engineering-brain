@@ -143,7 +143,7 @@ class GraphAdapter(ABC):
         """
         all_nodes = self.get_all_nodes()
         for i in range(0, max(len(all_nodes), 1), page_size):
-            page = all_nodes[i:i + page_size]
+            page = all_nodes[i : i + page_size]
             if page:
                 yield page
 

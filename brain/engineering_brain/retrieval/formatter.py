@@ -141,7 +141,7 @@ def _shorten_url(url: str, max_len: int = 60) -> str:
     """Shorten URL to domain+path for display."""
     url = url.replace("https://", "").replace("http://", "")
     if len(url) > max_len:
-        url = url[:max_len - 3] + "..."
+        url = url[: max_len - 3] + "..."
     return url
 
 
@@ -223,7 +223,9 @@ def format_for_human(
             lines.append(f"## {rid}: {text}")
             when = r.get("when_applies", "")
             when_not = r.get("when_not_applies", "")
-            lines.append(f"**Severity**: {severity} | **Reinforced**: {reinforcement}x | **Validation**: {validation}")
+            lines.append(
+                f"**Severity**: {severity} | **Reinforced**: {reinforcement}x | **Validation**: {validation}"
+            )
             if why:
                 lines.append(f"**Why**: {why}")
             if when:

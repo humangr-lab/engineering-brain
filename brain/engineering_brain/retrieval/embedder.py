@@ -29,7 +29,7 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     """Cosine similarity between two vectors. Pure Python, no deps."""
     if len(a) != len(b) or not a:
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(x * x for x in b))
     if norm_a == 0.0 or norm_b == 0.0:
@@ -55,6 +55,7 @@ class BrainEmbedder:
         self._provider_attempted = True
         try:
             from pipeline_autonomo.embedding_provider import get_embedding_provider
+
             self._provider = get_embedding_provider()
             return self._provider
         except ImportError:
@@ -167,7 +168,7 @@ class BrainEmbedder:
 
         # ID prefix → layer key mapping
         prefix_to_layer = {
-            "AX-": "L1",   # Axioms stored with principles (small count)
+            "AX-": "L1",  # Axioms stored with principles (small count)
             "P-": "L1",
             "PAT-": "L2",
             "CPAT-": "L2",
@@ -205,11 +206,12 @@ class BrainEmbedder:
         # Batch embed per collection
         for collection, nodes in by_collection.items():
             self._vector.ensure_collection(
-                collection, self._config.embedding_dimension,
+                collection,
+                self._config.embedding_dimension,
             )
 
             for i in range(0, len(nodes), bs):
-                batch = nodes[i:i + bs]
+                batch = nodes[i : i + bs]
                 texts = [self.node_to_text(n) for n in batch]
                 vectors = self.embed_batch(texts)
 
@@ -222,7 +224,7 @@ class BrainEmbedder:
                             stats["failed"] += 1
                     continue
 
-                for node, text, vec in zip(batch, texts, vectors):
+                for node, text, vec in zip(batch, texts, vectors, strict=False):
                     nid = node.get("id", "")
                     if not vec or not nid:
                         stats["failed"] += 1
@@ -263,6 +265,7 @@ def get_embedder(
             return _embedder
         if vector is None:
             from engineering_brain.adapters.memory import MemoryVectorAdapter
+
             vector = MemoryVectorAdapter()
         _embedder = BrainEmbedder(vector, cfg)
     return _embedder

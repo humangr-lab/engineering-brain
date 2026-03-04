@@ -15,7 +15,7 @@ previous) for tamper-evidence, but the current design prioritizes simplicity.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 
@@ -23,11 +23,11 @@ from typing import Any
 class ProvenanceRecord:
     """Single provenance entry for an opinion computation."""
 
-    operation: str      # "bootstrap", "cbf_reinforce", "decay", "contradiction_resolve"
-    timestamp: str      # ISO 8601
+    operation: str  # "bootstrap", "cbf_reinforce", "decay", "contradiction_resolve"
+    timestamp: str  # ISO 8601
     inputs: tuple[dict[str, Any], ...]  # tuple for frozen hashability
-    output: dict[str, Any]              # {ep_b, ep_d, ep_u, ep_a}
-    reason: str         # human-readable explanation
+    output: dict[str, Any]  # {ep_b, ep_d, ep_u, ep_a}
+    reason: str  # human-readable explanation
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -69,7 +69,7 @@ class ProvenanceChain:
         """Create and append a provenance record with current timestamp."""
         rec = ProvenanceRecord(
             operation=operation,
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=datetime.now(UTC).isoformat(),
             inputs=tuple(inputs),
             output=output,
             reason=reason,

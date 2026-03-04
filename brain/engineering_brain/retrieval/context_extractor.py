@@ -11,16 +11,19 @@ fallback for when the brain hasn't been loaded yet.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Auto-populated registry (filled by build_tech_index_from_nodes)
 # ──────────────────────────────────────────────────────────────────────
 _dynamic_tech_index: dict[str, str] = {}  # lowercase keyword → canonical name
-_dynamic_domain_index: set[str] = set()   # all known domains
+_dynamic_domain_index: set[str] = set()  # all known domains
 
 
 def build_tech_index_from_nodes(nodes: list[dict[str, Any]]) -> None:
@@ -38,7 +41,7 @@ def build_tech_index_from_nodes(nodes: list[dict[str, Any]]) -> None:
 
     for node in nodes:
         # Extract technologies (with hierarchical path decomposition)
-        for t in (node.get("technologies") or node.get("languages") or []):
+        for t in node.get("technologies") or node.get("languages") or []:
             canonical = str(t).strip()
             if not canonical or len(canonical) < 2:
                 continue
@@ -76,7 +79,7 @@ def build_tech_index_from_nodes(nodes: list[dict[str, Any]]) -> None:
                     techs[key_hyphen] = canonical
 
         # Extract domains (with hierarchical path decomposition)
-        for d in (node.get("domains") or []):
+        for d in node.get("domains") or []:
             domain = str(d).strip().lower()
             if domain and len(domain) >= 2:
                 domains.add(domain)
@@ -100,48 +103,191 @@ def build_tech_index_from_nodes(nodes: list[dict[str, Any]]) -> None:
 # These are a minimal bootstrap set — the dynamic index supersedes them
 # ──────────────────────────────────────────────────────────────────────
 _FALLBACK_TECH_PATTERNS: dict[str, str] = {
-    "flask": "Flask", "fastapi": "FastAPI", "django": "Django",
-    "express": "Express", "react": "React", "vue": "Vue", "angular": "Angular",
-    "nextjs": "Next.js", "typescript": "TypeScript", "python": "Python",
-    "javascript": "JavaScript", "websocket": "WebSocket", "cors": "CORS",
-    "redis": "Redis", "postgresql": "PostgreSQL", "mongodb": "MongoDB",
-    "docker": "Docker", "kubernetes": "Kubernetes", "aws": "AWS",
-    "graphql": "GraphQL", "kafka": "Kafka", "terraform": "Terraform",
-    "rust": "Rust", "golang": "Go", "solidity": "Solidity",
+    "flask": "Flask",
+    "fastapi": "FastAPI",
+    "django": "Django",
+    "express": "Express",
+    "react": "React",
+    "vue": "Vue",
+    "angular": "Angular",
+    "nextjs": "Next.js",
+    "typescript": "TypeScript",
+    "python": "Python",
+    "javascript": "JavaScript",
+    "websocket": "WebSocket",
+    "cors": "CORS",
+    "redis": "Redis",
+    "postgresql": "PostgreSQL",
+    "mongodb": "MongoDB",
+    "docker": "Docker",
+    "kubernetes": "Kubernetes",
+    "aws": "AWS",
+    "graphql": "GraphQL",
+    "kafka": "Kafka",
+    "terraform": "Terraform",
+    "rust": "Rust",
+    "golang": "Go",
+    "solidity": "Solidity",
 }
 
 # Domain detection keywords (always active — complements dynamic index)
 _DOMAIN_KEYWORDS: dict[str, list[str]] = {
-    "security": ["auth", "security", "cors", "csrf", "xss", "injection",
-                  "encrypt", "token", "password", "vulnerability", "owasp"],
-    "testing": ["test", "pytest", "mock", "fixture", "assertion", "coverage",
-                "e2e", "integration test", "unit test"],
-    "api": ["endpoint", "route", "api", "rest", "graphql", "http",
-            "middleware", "handler", "grpc", "webhook"],
-    "ui": ["button", "form", "modal", "css", "html", "dom", "component",
-           "layout", "responsive", "accessibility", "aria"],
-    "architecture": ["pattern", "microservice", "event-driven", "cqrs",
-                     "ddd", "clean architecture", "hexagonal", "saga"],
-    "database": ["query", "schema", "migration", "orm", "sql", "transaction",
-                 "index", "sharding", "replication", "nosql"],
-    "performance": ["cache", "optimize", "latency", "throughput", "async",
-                    "concurrent", "parallel", "lazy load", "cdn"],
-    "devops": ["deploy", "ci", "cd", "docker", "kubernetes", "container",
-               "monitoring", "terraform", "helm"],
-    "reliability": ["retry", "circuit breaker", "timeout", "fallback",
-                    "resilience", "health check", "backoff", "idempotent"],
-    "observability": ["trace", "metric", "opentelemetry", "prometheus",
-                      "grafana", "datadog", "dashboard", "apm"],
-    "data_engineering": ["etl", "streaming", "batch", "warehouse", "lake",
-                         "kafka", "spark", "flink", "airflow"],
-    "blockchain": ["smart contract", "solidity", "ethereum", "web3",
-                   "defi", "consensus", "validator", "wallet"],
-    "mobile": ["ios", "android", "react native", "flutter", "swift",
-               "kotlin", "mobile", "push notification"],
-    "ai_ml": ["llm", "embedding", "rag", "fine-tune", "prompt", "vector",
-              "inference", "training", "agent"],
-    "compliance": ["gdpr", "hipaa", "sox", "pci", "compliance", "audit",
-                   "regulation", "privacy"],
+    "security": [
+        "auth",
+        "security",
+        "cors",
+        "csrf",
+        "xss",
+        "injection",
+        "encrypt",
+        "token",
+        "password",
+        "vulnerability",
+        "owasp",
+    ],
+    "testing": [
+        "test",
+        "pytest",
+        "mock",
+        "fixture",
+        "assertion",
+        "coverage",
+        "e2e",
+        "integration test",
+        "unit test",
+    ],
+    "api": [
+        "endpoint",
+        "route",
+        "api",
+        "rest",
+        "graphql",
+        "http",
+        "middleware",
+        "handler",
+        "grpc",
+        "webhook",
+    ],
+    "ui": [
+        "button",
+        "form",
+        "modal",
+        "css",
+        "html",
+        "dom",
+        "component",
+        "layout",
+        "responsive",
+        "accessibility",
+        "aria",
+    ],
+    "architecture": [
+        "pattern",
+        "microservice",
+        "event-driven",
+        "cqrs",
+        "ddd",
+        "clean architecture",
+        "hexagonal",
+        "saga",
+    ],
+    "database": [
+        "query",
+        "schema",
+        "migration",
+        "orm",
+        "sql",
+        "transaction",
+        "index",
+        "sharding",
+        "replication",
+        "nosql",
+    ],
+    "performance": [
+        "cache",
+        "optimize",
+        "latency",
+        "throughput",
+        "async",
+        "concurrent",
+        "parallel",
+        "lazy load",
+        "cdn",
+    ],
+    "devops": [
+        "deploy",
+        "ci",
+        "cd",
+        "docker",
+        "kubernetes",
+        "container",
+        "monitoring",
+        "terraform",
+        "helm",
+    ],
+    "reliability": [
+        "retry",
+        "circuit breaker",
+        "timeout",
+        "fallback",
+        "resilience",
+        "health check",
+        "backoff",
+        "idempotent",
+    ],
+    "observability": [
+        "trace",
+        "metric",
+        "opentelemetry",
+        "prometheus",
+        "grafana",
+        "datadog",
+        "dashboard",
+        "apm",
+    ],
+    "data_engineering": [
+        "etl",
+        "streaming",
+        "batch",
+        "warehouse",
+        "lake",
+        "kafka",
+        "spark",
+        "flink",
+        "airflow",
+    ],
+    "blockchain": [
+        "smart contract",
+        "solidity",
+        "ethereum",
+        "web3",
+        "defi",
+        "consensus",
+        "validator",
+        "wallet",
+    ],
+    "mobile": [
+        "ios",
+        "android",
+        "react native",
+        "flutter",
+        "swift",
+        "kotlin",
+        "mobile",
+        "push notification",
+    ],
+    "ai_ml": [
+        "llm",
+        "embedding",
+        "rag",
+        "fine-tune",
+        "prompt",
+        "vector",
+        "inference",
+        "training",
+        "agent",
+    ],
+    "compliance": ["gdpr", "hipaa", "sox", "pci", "compliance", "audit", "regulation", "privacy"],
 }
 
 # Domain hierarchy (parent → children sub-domains for query expansion)
@@ -161,10 +307,7 @@ def build_domain_hierarchy() -> None:
         # (e.g., "cors" under "security" if "cors" is also a domain key)
         # OR keywords long enough to be meaningful sub-concepts (>= 4 chars)
         # but NOT the parent domain itself
-        children = [
-            k for k in keywords
-            if k != parent and (k in _DOMAIN_KEYWORDS or len(k) >= 5)
-        ]
+        children = [k for k in keywords if k != parent and (k in _DOMAIN_KEYWORDS or len(k) >= 5)]
         _DOMAIN_HIERARCHY[parent] = children
 
 
@@ -203,18 +346,20 @@ def _load_tig() -> dict[str, dict[str, list[str]]]:
         return _TIG_DATA
 
     try:
-        import yaml
         import os
+
+        import yaml
+
         tig_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)),
             "technology_implications.yaml",
         )
         if os.path.isfile(tig_path):
-            with open(tig_path, "r") as f:
+            with open(tig_path) as f:
                 _TIG_DATA = yaml.safe_load(f) or {}
             return _TIG_DATA
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to load technology_implications.yaml: %s", exc)
 
     # Fallback: inline minimal TIG
     _TIG_DATA = {
@@ -365,19 +510,19 @@ def extract_ast_context(file_paths: list[str]) -> tuple[list[str], list[str]]:
         if not _os.path.isfile(path):
             continue
         try:
-            with open(path, "r") as f:
+            with open(path) as f:
                 source = f.read()
             tree = _ast.parse(source)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to parse file %s for AST context: %s", path, exc)
             continue  # Graceful degradation on parse error
 
         for node in _ast.walk(tree):
             module_names: list[str] = []
             if isinstance(node, _ast.Import):
                 module_names = [alias.name for alias in node.names if alias.name]
-            elif isinstance(node, _ast.ImportFrom):
-                if node.module:
-                    module_names = [node.module]
+            elif isinstance(node, _ast.ImportFrom) and node.module:
+                module_names = [node.module]
 
             for mod in module_names:
                 # Check full module name and first segment
@@ -396,6 +541,7 @@ def extract_ast_context(file_paths: list[str]) -> tuple[list[str], list[str]]:
 # Knowledge Shopping List — structured output with provenance
 # ──────────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class KnowledgeShoppingList:
     """What knowledge a task needs, with provenance per item.
@@ -407,11 +553,12 @@ class KnowledgeShoppingList:
     - "ast": from AST analysis of existing code (Layer 3)
     - "ast:<import_name>": from specific import detection
     """
+
     technologies: list[str] = field(default_factory=list)
     domains: list[str] = field(default_factory=list)
     provenance: dict[str, str] = field(default_factory=dict)
 
-    def merge(self, other: "KnowledgeShoppingList") -> "KnowledgeShoppingList":
+    def merge(self, other: KnowledgeShoppingList) -> KnowledgeShoppingList:
         """Merge two shopping lists, preserving highest-priority provenance.
 
         Priority: explicit > tig > ast
@@ -535,19 +682,41 @@ def _infer_node_layer(node_id: str) -> str:
 
 # File type detection
 _FILE_TYPE_PATTERNS: dict[str, str] = {
-    r"\.py\b": ".py", r"\.js\b": ".js", r"\.ts\b": ".ts",
-    r"\.tsx\b": ".tsx", r"\.jsx\b": ".jsx", r"\.html\b": ".html",
-    r"\.css\b": ".css", r"\.scss\b": ".scss", r"\.yaml\b": ".yaml",
-    r"\.yml\b": ".yaml", r"\.json\b": ".json", r"\.sql\b": ".sql",
-    r"\.go\b": ".go", r"\.rs\b": ".rs", r"\.java\b": ".java",
-    r"\.kt\b": ".kt", r"\.swift\b": ".swift", r"\.sol\b": ".sol",
-    r"\.dart\b": ".dart", r"\.rb\b": ".rb", r"\.cs\b": ".cs",
-    r"\.tf\b": ".tf", r"\.proto\b": ".proto", r"\.graphql\b": ".graphql",
-    r"\.wasm\b": ".wasm", r"dockerfile": "Dockerfile", r"\.toml\b": ".toml",
-    r"python|\.py": ".py", r"javascript|\.js": ".js",
-    r"typescript|\.ts": ".ts", r"golang|\.go": ".go",
-    r"rust|\.rs": ".rs", r"kotlin|\.kt": ".kt",
-    r"swift|\.swift": ".swift", r"solidity|\.sol": ".sol",
+    r"\.py\b": ".py",
+    r"\.js\b": ".js",
+    r"\.ts\b": ".ts",
+    r"\.tsx\b": ".tsx",
+    r"\.jsx\b": ".jsx",
+    r"\.html\b": ".html",
+    r"\.css\b": ".css",
+    r"\.scss\b": ".scss",
+    r"\.yaml\b": ".yaml",
+    r"\.yml\b": ".yaml",
+    r"\.json\b": ".json",
+    r"\.sql\b": ".sql",
+    r"\.go\b": ".go",
+    r"\.rs\b": ".rs",
+    r"\.java\b": ".java",
+    r"\.kt\b": ".kt",
+    r"\.swift\b": ".swift",
+    r"\.sol\b": ".sol",
+    r"\.dart\b": ".dart",
+    r"\.rb\b": ".rb",
+    r"\.cs\b": ".cs",
+    r"\.tf\b": ".tf",
+    r"\.proto\b": ".proto",
+    r"\.graphql\b": ".graphql",
+    r"\.wasm\b": ".wasm",
+    r"dockerfile": "Dockerfile",
+    r"\.toml\b": ".toml",
+    r"python|\.py": ".py",
+    r"javascript|\.js": ".js",
+    r"typescript|\.ts": ".ts",
+    r"golang|\.go": ".go",
+    r"rust|\.rs": ".rs",
+    r"kotlin|\.kt": ".kt",
+    r"swift|\.swift": ".swift",
+    r"solidity|\.sol": ".sol",
     r"ruby|\.rb": ".rb",
 }
 
@@ -616,6 +785,22 @@ def contextual_text_for_embedding(node: dict[str, Any]) -> str:
     if preamble:
         return f"{preamble} --- {body}"
     return body
+
+
+def _llm_extract_context(task_description: str) -> dict | None:
+    """LLM-enhanced context extraction. Returns None on failure."""
+    from engineering_brain.llm_helpers import brain_llm_call_json, is_llm_enabled
+
+    if not is_llm_enabled("BRAIN_LLM_CONTEXT_EXTRACTION"):
+        return None
+    system = (
+        "Extract structured context from an engineering task description. "
+        'Return ONLY JSON: {"technologies": ["Flask"], "domains": ["security"], '
+        '"file_type": ".py", "phase": "exec"}. '
+        "domains from: security, api, database, testing, performance, architecture, "
+        "devops, ui, general. Be precise — only include clearly mentioned or implied items."
+    )
+    return brain_llm_call_json(system, f"Task: {task_description[:1000]}", max_tokens=200)
 
 
 def extract_context(
@@ -701,6 +886,7 @@ def extract_context(
     # --- Facet tags (from TagRegistry, graceful fallback) ---
     try:
         from engineering_brain.core.taxonomy import get_registry
+
         registry = get_registry()
         if registry.size > 0:
             for t in ctx.technologies:
@@ -712,7 +898,17 @@ def extract_context(
                 for facet, ids in decomposed.items():
                     ctx.facet_tags.setdefault(facet, []).extend(ids)
             ctx.facet_tags = {f: list(dict.fromkeys(ids)) for f, ids in ctx.facet_tags.items()}
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Facet tag enrichment failed: %s", exc)
+
+    # LLM augmentation (merges with keyword results, never replaces)
+    llm_ctx = _llm_extract_context(task_description)
+    if llm_ctx:
+        for t in llm_ctx.get("technologies") or []:
+            if isinstance(t, str) and t and t.lower() not in {x.lower() for x in ctx.technologies}:
+                ctx.technologies.append(t)
+        for d in llm_ctx.get("domains") or []:
+            if isinstance(d, str) and d.lower() not in {x.lower() for x in ctx.domains}:
+                ctx.domains.append(d.lower())
 
     return ctx

@@ -22,7 +22,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import random
-import os
 import re
 from collections import Counter, defaultdict
 from typing import Any
@@ -34,17 +33,87 @@ from engineering_brain.core.schema import EdgeType, NodeType
 logger = logging.getLogger(__name__)
 
 # Stop words for term overlap computation
-_STOP_WORDS = frozenset({
-    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "must", "shall", "can", "need", "dare",
-    "to", "of", "in", "for", "on", "with", "at", "by", "from", "up",
-    "about", "into", "through", "during", "before", "after", "above",
-    "below", "between", "out", "off", "over", "under", "again", "further",
-    "then", "once", "and", "but", "or", "nor", "not", "no", "so", "if",
-    "this", "that", "these", "those", "it", "its", "used", "using",
-    "use", "don", "always", "never", "ensure", "make", "sure",
-})
+_STOP_WORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+        "may",
+        "might",
+        "must",
+        "shall",
+        "can",
+        "need",
+        "dare",
+        "to",
+        "of",
+        "in",
+        "for",
+        "on",
+        "with",
+        "at",
+        "by",
+        "from",
+        "up",
+        "about",
+        "into",
+        "through",
+        "during",
+        "before",
+        "after",
+        "above",
+        "below",
+        "between",
+        "out",
+        "off",
+        "over",
+        "under",
+        "again",
+        "further",
+        "then",
+        "once",
+        "and",
+        "but",
+        "or",
+        "nor",
+        "not",
+        "no",
+        "so",
+        "if",
+        "this",
+        "that",
+        "these",
+        "those",
+        "it",
+        "its",
+        "used",
+        "using",
+        "use",
+        "don",
+        "always",
+        "never",
+        "ensure",
+        "make",
+        "sure",
+    }
+)
 
 
 def _extract_terms(text: str) -> set[str]:
@@ -130,9 +199,10 @@ class ClusterPromoter:
         if self._config.embedding_enabled:
             try:
                 from engineering_brain.retrieval.embedder import get_embedder
+
                 self._embedder = get_embedder()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Embedder initialization failed for cluster promoter: %s", exc)
 
     def crystallize(self) -> list[str]:
         """Run cluster crystallization. Returns list of created pattern IDs."""
@@ -164,7 +234,8 @@ class ClusterPromoter:
         if created:
             logger.info(
                 "Cluster crystallization: %d patterns from %d eligible rules",
-                len(created), len(rules),
+                len(created),
+                len(rules),
             )
 
         return created
@@ -238,6 +309,7 @@ class ClusterPromoter:
         vec_b = self._get_node_embedding(b)
         if vec_a and vec_b:
             from engineering_brain.retrieval.embedder import cosine_similarity
+
             embed_sim = cosine_similarity(vec_a, vec_b)
             return 0.25 * tech_sim + 0.15 * domain_sim + 0.60 * embed_sim
 
@@ -248,9 +320,7 @@ class ClusterPromoter:
 
         return 0.40 * tech_sim + 0.25 * domain_sim + 0.35 * text_sim
 
-    def _compute_pairwise_similarity(
-        self, rules: list[dict[str, Any]]
-    ) -> list[tuple[int, int]]:
+    def _compute_pairwise_similarity(self, rules: list[dict[str, Any]]) -> list[tuple[int, int]]:
         """Compute pairwise similarity and return edges above threshold.
 
         Uses MinHash/LSH for O(n * bands) candidate detection when n >= 1000,
@@ -265,9 +335,7 @@ class ClusterPromoter:
             lsh = _MinHashLSH(num_hashes=128, num_bands=16)
             fingerprints: list[list[int]] = []
             for rule in rules:
-                terms = _extract_terms(
-                    f"{rule.get('text', '')} {rule.get('why', '')}"
-                )
+                terms = _extract_terms(f"{rule.get('text', '')} {rule.get('why', '')}")
                 techs = {t.lower() for t in (rule.get("technologies") or [])}
                 domains = {d.lower() for d in (rule.get("domains") or [])}
                 fingerprints.append(lsh.fingerprint(terms | techs | domains))
@@ -275,7 +343,9 @@ class ClusterPromoter:
             candidates = lsh.find_candidates(fingerprints)
             logger.info(
                 "MinHash/LSH: %d candidates from %d rules (vs %d brute force)",
-                len(candidates), n, n * (n - 1) // 2,
+                len(candidates),
+                n,
+                n * (n - 1) // 2,
             )
 
             for i, j in candidates:
@@ -325,9 +395,7 @@ class ClusterPromoter:
 
         return list(groups.values())
 
-    def _create_pattern_from_cluster(
-        self, cluster: list[dict[str, Any]]
-    ) -> str | None:
+    def _create_pattern_from_cluster(self, cluster: list[dict[str, Any]]) -> str | None:
         """Create an L2 pattern from a cluster of similar L3 rules."""
         # Deterministic ID from sorted member rule IDs
         member_ids = sorted(r.get("id", "") for r in cluster)
@@ -343,9 +411,7 @@ class ClusterPromoter:
         pattern_data = self._extract_pattern_fields(cluster, pattern_id, member_ids)
 
         # Add pattern node
-        success = self._graph.add_node(
-            NodeType.PATTERN.value, pattern_id, pattern_data
-        )
+        success = self._graph.add_node(NodeType.PATTERN.value, pattern_id, pattern_data)
         if not success:
             return None
 
@@ -367,7 +433,9 @@ class ClusterPromoter:
 
         logger.info(
             "Crystallized %d rules into pattern %s: %s",
-            len(cluster), pattern_id, pattern_data.get("name", ""),
+            len(cluster),
+            pattern_id,
+            pattern_data.get("name", ""),
         )
         return pattern_id
 
@@ -387,9 +455,7 @@ class ClusterPromoter:
         best = by_conf[0]
 
         # Shared technologies (intersection, fallback to >50% occurrence)
-        tech_sets = [
-            {t.lower() for t in (r.get("technologies") or [])} for r in cluster
-        ]
+        tech_sets = [{t.lower() for t in (r.get("technologies") or [])} for r in cluster]
         shared_techs = tech_sets[0].copy() if tech_sets else set()
         for ts in tech_sets[1:]:
             shared_techs &= ts
@@ -404,7 +470,7 @@ class ClusterPromoter:
         # All domains (union)
         all_domains: set[str] = set()
         for r in cluster:
-            for d in (r.get("domains") or []):
+            for d in r.get("domains") or []:
                 all_domains.add(d.lower())
 
         # Synthesize name from common terms
@@ -414,21 +480,30 @@ class ClusterPromoter:
         llm_intent = None
         if self._config.llm_concept_naming_enabled:
             llm_intent = self._llm_synthesize_intent(cluster)
-        intent = llm_intent or self._merge_field(cluster, "why", max_chars=500)
-        when_to_use = self._merge_field(cluster, "when_applies", max_chars=300)
-        when_not_to_use = self._merge_field(cluster, "when_not_applies", max_chars=300)
+        intent = (
+            llm_intent
+            or self._llm_merge_field(cluster, "why", "shared intent")
+            or self._merge_field(cluster, "why", max_chars=500)
+        )
+        when_to_use = self._llm_merge_field(
+            cluster, "when_applies", "when to apply"
+        ) or self._merge_field(cluster, "when_applies", max_chars=300)
+        when_not_to_use = self._llm_merge_field(
+            cluster, "when_not_applies", "when NOT to apply"
+        ) or self._merge_field(cluster, "when_not_applies", max_chars=300)
 
         # Epistemic aggregation
         ep_fields = self._aggregate_epistemic(cluster)
 
         # Weighted average confidence
-        total_weight = max(
-            sum(int(r.get("reinforcement_count", 1)) for r in cluster), 1
+        total_weight = max(sum(int(r.get("reinforcement_count", 1)) for r in cluster), 1)
+        weighted_conf = (
+            sum(
+                float(r.get("confidence", 0)) * int(r.get("reinforcement_count", 1))
+                for r in cluster
+            )
+            / total_weight
         )
-        weighted_conf = sum(
-            float(r.get("confidence", 0)) * int(r.get("reinforcement_count", 1))
-            for r in cluster
-        ) / total_weight
 
         return {
             "id": pattern_id,
@@ -476,58 +551,58 @@ class ClusterPromoter:
         return str(best.get("text", ""))[:80]
 
     def _llm_synthesize_name(self, cluster: list[dict[str, Any]]) -> str | None:
-        """Ask Claude to synthesize a meaningful pattern name."""
-        try:
-            import anthropic
-            client = anthropic.Anthropic()
+        """Synthesize a meaningful pattern name via LLM."""
+        from engineering_brain.llm_helpers import brain_llm_call, is_llm_enabled
 
-            rules_text = "\n".join(
-                f"- {r.get('text', '')[:100]}" for r in cluster[:8]
-            )
-            prompt = (
-                f"Given these {len(cluster)} engineering rules that were clustered together:\n"
-                f"{rules_text}\n\n"
-                "Synthesize a single abstract pattern name (3-7 words, Title Case) "
-                "that captures the shared principle. Return ONLY the name, nothing else."
-            )
-
-            response = client.messages.create(
-                model=os.getenv("CLUSTER_PROMOTER_MODEL", "claude-opus-4-6"),
-                max_tokens=50,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            name = response.content[0].text.strip()
-            if 2 <= len(name.split()) <= 10:
-                return name
+        if not is_llm_enabled("BRAIN_LLM_CONCEPT_NAMING"):
             return None
-        except Exception:
-            return None
+        rules_text = "\n".join(f"- {r.get('text', '')[:100]}" for r in cluster[:8])
+        system = (
+            "Synthesize a single abstract pattern name (3-7 words, Title Case) "
+            "that captures the shared principle. Return ONLY the name, nothing else."
+        )
+        user = (
+            f"Given these {len(cluster)} engineering rules that were clustered together:\n"
+            f"{rules_text}"
+        )
+        name = brain_llm_call(system, user, max_tokens=50)
+        if name and 2 <= len(name.split()) <= 10:
+            return name
+        return None
 
     def _llm_synthesize_intent(self, cluster: list[dict[str, Any]]) -> str | None:
-        """Ask Claude for a one-sentence pattern intent."""
-        try:
-            import anthropic
-            client = anthropic.Anthropic()
+        """Synthesize a one-sentence pattern intent via LLM."""
+        from engineering_brain.llm_helpers import brain_llm_call, is_llm_enabled
 
-            rules_text = "\n".join(
-                f"- {r.get('text', '')[:80]}. WHY: {r.get('why', '')[:80]}"
-                for r in cluster[:8]
-            )
-            prompt = (
-                f"These {len(cluster)} engineering rules share a common pattern:\n"
-                f"{rules_text}\n\n"
-                "Write ONE sentence describing the shared intent/principle. "
-                "Be specific and actionable. Return ONLY the sentence."
-            )
-
-            response = client.messages.create(
-                model=os.getenv("CLUSTER_PROMOTER_MODEL", "claude-opus-4-6"),
-                max_tokens=100,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return response.content[0].text.strip()
-        except Exception:
+        if not is_llm_enabled("BRAIN_LLM_CONCEPT_NAMING"):
             return None
+        rules_text = "\n".join(
+            f"- {r.get('text', '')[:80]}. WHY: {r.get('why', '')[:80]}" for r in cluster[:8]
+        )
+        system = (
+            "Write ONE sentence describing the shared intent/principle. "
+            "Be specific and actionable. Return ONLY the sentence."
+        )
+        user = f"These {len(cluster)} engineering rules share a common pattern:\n{rules_text}"
+        return brain_llm_call(system, user, max_tokens=100)
+
+    def _llm_merge_field(self, cluster: list[dict], field_name: str, hint: str = "") -> str | None:
+        """LLM-synthesized field merge. Returns None on failure."""
+        from engineering_brain.llm_helpers import brain_llm_call, is_llm_enabled
+
+        if not is_llm_enabled("BRAIN_LLM_CONCEPT_NAMING"):
+            return None
+        values = [str(r.get(field_name, "")).strip() for r in cluster[:6] if r.get(field_name)]
+        if not values:
+            return None
+        system = (
+            f"Synthesize a single coherent '{field_name}' from multiple engineering rule entries. "
+            f"{('Context: ' + hint + '. ') if hint else ''}"
+            "Max 300 chars. Return ONLY the synthesized text."
+        )
+        user = "Values:\n" + "\n".join(f"- {v[:150]}" for v in values)
+        result = brain_llm_call(system, user, max_tokens=150)
+        return result if result and len(result) <= 400 else None
 
     def _merge_field(
         self,
@@ -555,9 +630,7 @@ class ClusterPromoter:
 
     def _aggregate_epistemic(self, cluster: list[dict[str, Any]]) -> dict[str, Any]:
         """Aggregate epistemic opinions from cluster members."""
-        members_with_ep = [
-            r for r in cluster if r.get("ep_b") is not None
-        ]
+        members_with_ep = [r for r in cluster if r.get("ep_b") is not None]
         if not members_with_ep:
             return {}
 
@@ -612,7 +685,7 @@ class ClusterPromoter:
 
         for cluster in clusters:
             embeddings = [self._get_node_embedding(r) for r in cluster]
-            valid_pairs = [(r, e) for r, e in zip(cluster, embeddings) if e]
+            valid_pairs = [(r, e) for r, e in zip(cluster, embeddings, strict=False) if e]
 
             if len(valid_pairs) < 2:
                 validated.append(cluster)  # Can't validate, keep as-is
@@ -620,16 +693,10 @@ class ClusterPromoter:
 
             # Compute centroid
             dim = len(valid_pairs[0][1])
-            centroid = [
-                sum(e[d] for _, e in valid_pairs) / len(valid_pairs)
-                for d in range(dim)
-            ]
+            centroid = [sum(e[d] for _, e in valid_pairs) / len(valid_pairs) for d in range(dim)]
 
             # Filter members below similarity threshold
-            filtered = [
-                r for r, e in valid_pairs
-                if cosine_similarity(e, centroid) >= min_sim
-            ]
+            filtered = [r for r, e in valid_pairs if cosine_similarity(e, centroid) >= min_sim]
 
             if len(filtered) >= min_cluster:
                 validated.append(filtered)
