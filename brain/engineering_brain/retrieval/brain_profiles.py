@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
 
 import yaml
 
@@ -18,7 +17,8 @@ logger = logging.getLogger(__name__)
 
 # Default directory for profile YAML files
 _PROFILES_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)), "profiles",
+    os.path.dirname(os.path.dirname(__file__)),
+    "profiles",
 )
 
 # Cache loaded profiles
@@ -46,7 +46,7 @@ def load_profile(profile_id: str, profiles_dir: str | None = None) -> BrainProfi
         return None
 
     try:
-        with open(path, "r") as f:
+        with open(path) as f:
             data = yaml.safe_load(f)
         if not isinstance(data, dict):
             return None

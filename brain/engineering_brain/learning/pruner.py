@@ -13,8 +13,7 @@ Pruning rules:
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from typing import Any
+from datetime import UTC, datetime
 
 from engineering_brain.adapters.base import GraphAdapter
 from engineering_brain.core.config import BrainConfig
@@ -36,20 +35,25 @@ class KnowledgePruner:
         if node is None:
             return False
         label = node.get("_label", NodeType.RULE.value)
-        self._graph.add_node(label, node_id, {
-            **node,
-            "deprecated": True,
-            "deprecated_at": datetime.now(timezone.utc).isoformat(),
-            "deprecation_reason": reason,
-        })
+        self._graph.add_node(
+            label,
+            node_id,
+            {
+                **node,
+                "deprecated": True,
+                "deprecated_at": datetime.now(UTC).isoformat(),
+                "deprecation_reason": reason,
+            },
+        )
         logger.debug("Soft-deleted %s (reason=%s)", node_id, reason)
         # Record in observation log (non-blocking)
         try:
             from engineering_brain.observation.log import ObservationLog
+
             obs = ObservationLog()
             obs.record_deprecated(node_id, reason=reason)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to record deprecation observation: %s", exc)
         return True
 
     def prune(self) -> dict[str, int]:
@@ -66,7 +70,7 @@ class KnowledgePruner:
 
     def _prune_stale_rules(self) -> int:
         """Remove rules with 0 reinforcements past the prune deadline."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         prune_days = self._config.prune_after_days
         min_reinforcements = self._config.prune_min_reinforcements
         pruned = 0
@@ -88,7 +92,12 @@ class KnowledgePruner:
                         rule_id = rule.get("id", "")
                         if rule_id and self._soft_delete(rule_id, reason="stale"):
                             pruned += 1
-                            logger.debug("Deprecated stale rule %s (age=%dd, reinforce=%d)", rule_id, age_days, reinforcement)
+                            logger.debug(
+                                "Deprecated stale rule %s (age=%dd, reinforce=%d)",
+                                rule_id,
+                                age_days,
+                                reinforcement,
+                            )
             except (ValueError, TypeError):
                 continue
 
@@ -96,7 +105,7 @@ class KnowledgePruner:
 
     def _prune_expired_context(self) -> int:
         """Remove L5 context nodes past their TTL."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         pruned = 0
 
         tasks = self._graph.query(label=NodeType.TASK.value, limit=500)
@@ -118,12 +127,12 @@ class KnowledgePruner:
 
     def _prune_low_confidence(self) -> int:
         """Remove rules with very low confidence (contradicted or unreliable)."""
-        from engineering_brain.epistemic.temporal import get_decay_engine
         from engineering_brain.epistemic.opinion import OpinionTuple
+        from engineering_brain.epistemic.temporal import get_decay_engine
 
         pruned = 0
         rules = self._graph.query(label=NodeType.RULE.value, limit=1000)
-        now = int(datetime.now(timezone.utc).timestamp())
+        now = int(datetime.now(UTC).timestamp())
 
         for rule in rules:
             if rule.get("deprecated"):
@@ -165,6 +174,7 @@ class KnowledgePruner:
                             pass
                     if last_decay == 0:
                         import time as _time
+
                         last_decay = int(_time.time()) - 30 * 86400  # 30 days ago
                 events = rule.get("event_timestamps", [])
                 opinion = OpinionTuple(b=float(ep_b), d=ep_d, u=ep_u, a=ep_a)
@@ -179,14 +189,20 @@ class KnowledgePruner:
                 rule_id = rule.get("id", "")
                 if rule_id and self._soft_delete(rule_id, reason="low_confidence"):
                     pruned += 1
-                    logger.debug("Deprecated low-confidence rule %s (confidence=%.3f)", rule_id, confidence)
+                    logger.debug(
+                        "Deprecated low-confidence rule %s (confidence=%.3f)", rule_id, confidence
+                    )
         return pruned
 
     def dry_run(self) -> dict[str, list[str]]:
         """Preview what would be deprecated without actually modifying."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         prune_days = self._config.prune_after_days
-        candidates: dict[str, list[str]] = {"stale_rules": [], "expired_context": [], "low_confidence": []}
+        candidates: dict[str, list[str]] = {
+            "stale_rules": [],
+            "expired_context": [],
+            "low_confidence": [],
+        }
 
         rules = self._graph.query(label=NodeType.RULE.value, limit=1000)
         for rule in rules:

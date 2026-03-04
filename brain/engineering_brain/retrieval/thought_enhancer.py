@@ -26,9 +26,9 @@ from engineering_brain.core.types import (
     KnowledgeResult,
 )
 from engineering_brain.epistemic.conflict_resolution import (
+    ConflictSeverity,
     classify_conflict,
     dempster_conflict,
-    ConflictSeverity,
 )
 from engineering_brain.epistemic.opinion import OpinionTuple
 from engineering_brain.epistemic.provenance import ProvenanceChain
@@ -101,13 +101,21 @@ class ThoughtEnhancer:
 
         # 8. Compose metacognitive summary
         meta = self._compose_metacognitive_summary(
-            assessments, contradictions, gaps, base_result.total_nodes_queried,
+            assessments,
+            contradictions,
+            gaps,
+            base_result.total_nodes_queried,
         )
 
         # 9. Format enhanced output
         budget = budget_chars or self._config.enhanced_context_budget_chars
         enhanced_text = self._format_enhanced_output(
-            assessments, contradictions, gaps, meta, scored_nodes, budget,
+            assessments,
+            contradictions,
+            gaps,
+            meta,
+            scored_nodes,
+            budget,
         )
 
         return EnhancedKnowledgeResult(
@@ -128,7 +136,8 @@ class ThoughtEnhancer:
     # =========================================================================
 
     def _classify_confidence_tiers(
-        self, nodes: list[dict[str, Any]],
+        self,
+        nodes: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """Classify each node into a confidence tier."""
         assessments = []
@@ -154,16 +163,18 @@ class ThoughtEnhancer:
                 eigentrust = float(node.get("eigentrust_score", 0.5))
                 tier = self._compute_tier_fallback(confidence, validation)
 
-            assessments.append({
-                "node_id": node_id,
-                "tier": tier.value,
-                "projected_probability": round(projected, 3),
-                "evidence_strength": round(evidence_strength, 3),
-                "eigentrust_score": round(eigentrust, 3),
-                "validation_status": validation,
-                "provenance_summary": "",
-                "contradiction_ids": [],
-            })
+            assessments.append(
+                {
+                    "node_id": node_id,
+                    "tier": tier.value,
+                    "projected_probability": round(projected, 3),
+                    "evidence_strength": round(evidence_strength, 3),
+                    "eigentrust_score": round(eigentrust, 3),
+                    "validation_status": validation,
+                    "provenance_summary": "",
+                    "contradiction_ids": [],
+                }
+            )
         return assessments
 
     def _compute_tier(
@@ -201,7 +212,8 @@ class ThoughtEnhancer:
     # =========================================================================
 
     def _detect_in_result_contradictions(
-        self, nodes: list[dict[str, Any]],
+        self,
+        nodes: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """Detect contradictions between nodes in the result set."""
         result_ids = {n.get("id", "") for n in nodes if n.get("id")}
@@ -233,13 +245,15 @@ class ThoughtEnhancer:
                 op_b = self._node_to_opinion(other_node)
 
                 if op_a is None or op_b is None:
-                    contradictions.append({
-                        "node_a_id": node_id,
-                        "node_b_id": other_id,
-                        "conflict_k": 0.5,
-                        "severity": "moderate",
-                        "description": f"'{self._node_text(node)[:60]}' conflicts with '{self._node_text(other_node)[:60]}'",
-                    })
+                    contradictions.append(
+                        {
+                            "node_a_id": node_id,
+                            "node_b_id": other_id,
+                            "conflict_k": 0.5,
+                            "severity": "moderate",
+                            "description": f"'{self._node_text(node)[:60]}' conflicts with '{self._node_text(other_node)[:60]}'",
+                        }
+                    )
                     continue
 
                 k = dempster_conflict(op_a, op_b)
@@ -254,13 +268,15 @@ class ThoughtEnhancer:
                 else:
                     desc = f"Tension: '{text_a}' vs '{text_b}' (K={k:.2f})"
 
-                contradictions.append({
-                    "node_a_id": node_id,
-                    "node_b_id": other_id,
-                    "conflict_k": round(k, 3),
-                    "severity": severity.value,
-                    "description": desc,
-                })
+                contradictions.append(
+                    {
+                        "node_a_id": node_id,
+                        "node_b_id": other_id,
+                        "conflict_k": round(k, 3),
+                        "severity": severity.value,
+                        "description": desc,
+                    }
+                )
 
         return contradictions
 
@@ -279,38 +295,44 @@ class ThoughtEnhancer:
         # 1. Missing technology coverage
         returned_techs: set[str] = set()
         for node in nodes:
-            for t in (node.get("technologies") or node.get("languages") or []):
+            for t in node.get("technologies") or node.get("languages") or []:
                 returned_techs.add(t.lower())
         for tech in ctx.technologies:
             if tech.lower() not in returned_techs:
-                gaps.append({
-                    "gap_type": "missing_technology",
-                    "description": f"No knowledge found for technology '{tech}'",
-                    "severity": 0.8,
-                    "suggested_action": f"Brain has no rules for {tech}. Use general principles with caution.",
-                })
+                gaps.append(
+                    {
+                        "gap_type": "missing_technology",
+                        "description": f"No knowledge found for technology '{tech}'",
+                        "severity": 0.8,
+                        "suggested_action": f"Brain has no rules for {tech}. Use general principles with caution.",
+                    }
+                )
 
         # 2. Missing layer coverage
         layers_present = {n.get("_layer", "") for n in nodes}
         if nodes and "L1" not in layers_present:
-            gaps.append({
-                "gap_type": "missing_principles",
-                "description": "No guiding principles found for this query",
-                "severity": 0.5,
-                "suggested_action": "Rely on general engineering principles; brain lacks specific WHY guidance here.",
-            })
+            gaps.append(
+                {
+                    "gap_type": "missing_principles",
+                    "description": "No guiding principles found for this query",
+                    "severity": 0.5,
+                    "suggested_action": "Rely on general engineering principles; brain lacks specific WHY guidance here.",
+                }
+            )
 
         # 3. High aggregate uncertainty
         uncertainties = [float(n["ep_u"]) for n in nodes if n.get("ep_u") is not None]
         if uncertainties:
             avg_u = sum(uncertainties) / len(uncertainties)
             if avg_u > 0.5:
-                gaps.append({
-                    "gap_type": "high_aggregate_uncertainty",
-                    "description": f"Average uncertainty is {avg_u:.0%} across returned knowledge",
-                    "severity": round(avg_u, 2),
-                    "suggested_action": "Brain is uncertain about this topic. Cross-reference with external docs.",
-                })
+                gaps.append(
+                    {
+                        "gap_type": "high_aggregate_uncertainty",
+                        "description": f"Average uncertainty is {avg_u:.0%} across returned knowledge",
+                        "severity": round(avg_u, 2),
+                        "suggested_action": "Brain is uncertain about this topic. Cross-reference with external docs.",
+                    }
+                )
 
         # 4. Unsupported rules (no EVIDENCED_BY edges)
         rules = [n for n in nodes if n.get("_layer") == "L3"]
@@ -319,30 +341,36 @@ class ThoughtEnhancer:
             for rule in rules:
                 rid = rule.get("id", "")
                 if rid:
-                    ev_edges = self._graph.get_edges(node_id=rid, edge_type="EVIDENCED_BY", direction="outgoing")
+                    ev_edges = self._graph.get_edges(
+                        node_id=rid, edge_type="EVIDENCED_BY", direction="outgoing"
+                    )
                     if not ev_edges:
                         unsupported += 1
             if unsupported > len(rules) * 0.5:
-                gaps.append({
-                    "gap_type": "unsupported_rules",
-                    "description": f"{unsupported}/{len(rules)} returned rules have no supporting evidence",
-                    "severity": 0.6,
-                    "suggested_action": "Several rules lack concrete evidence. Treat as heuristic guidance.",
-                })
+                gaps.append(
+                    {
+                        "gap_type": "unsupported_rules",
+                        "description": f"{unsupported}/{len(rules)} returned rules have no supporting evidence",
+                        "severity": 0.6,
+                        "suggested_action": "Several rules lack concrete evidence. Treat as heuristic guidance.",
+                    }
+                )
 
         # 5. Missing domain coverage
         returned_domains: set[str] = set()
         for node in nodes:
-            for d in (node.get("domains") or []):
+            for d in node.get("domains") or []:
                 returned_domains.add(d.lower())
         for domain in ctx.domains:
             if domain.lower() not in returned_domains and domain != "general":
-                gaps.append({
-                    "gap_type": "missing_domain",
-                    "description": f"No knowledge found in domain '{domain}'",
-                    "severity": 0.5,
-                    "suggested_action": f"Brain has limited knowledge in {domain} for this query.",
-                })
+                gaps.append(
+                    {
+                        "gap_type": "missing_domain",
+                        "description": f"No knowledge found in domain '{domain}'",
+                        "severity": 0.5,
+                        "suggested_action": f"Brain has limited knowledge in {domain} for this query.",
+                    }
+                )
 
         return gaps
 
@@ -351,7 +379,8 @@ class ThoughtEnhancer:
     # =========================================================================
 
     def _extract_provenance_summaries(
-        self, nodes: list[dict[str, Any]],
+        self,
+        nodes: list[dict[str, Any]],
     ) -> dict[str, str]:
         """Extract provenance summary strings for each node."""
         summaries: dict[str, str] = {}
@@ -375,6 +404,34 @@ class ThoughtEnhancer:
     # Metacognitive Summary
     # =========================================================================
 
+    def _llm_metacognitive_summary(
+        self,
+        tier_dist: dict,
+        contradictions: list,
+        gaps: list,
+        overall: str,
+    ) -> str | None:
+        """LLM-generated metacognitive commentary. Returns None on failure."""
+        from engineering_brain.llm_helpers import brain_llm_call, is_llm_enabled
+
+        if not is_llm_enabled("BRAIN_LLM_METACOGNITION"):
+            return None
+        tiers = ", ".join(f"{v} {k}" for k, v in tier_dist.items() if v > 0)
+        high_gaps = [g.get("description", "") for g in gaps if g.get("severity", 0) >= 0.7]
+        system = (
+            "Write a metacognitive summary for an engineering knowledge graph query. "
+            "Tell the developer what the brain knows, how confident it is, and "
+            "what to watch out for. 2-3 sentences max. Be direct and specific."
+        )
+        user = (
+            f"Knowledge tiers: {tiers or 'none'}\n"
+            f"Contradictions: {len(contradictions)}\n"
+            f"Critical gaps: {'; '.join(high_gaps[:3]) if high_gaps else 'none'}\n"
+            f"Overall confidence: {overall or 'unknown'}"
+        )
+        result = brain_llm_call(system, user, max_tokens=200)
+        return result if result and len(result) >= 30 else None
+
     def _compose_metacognitive_summary(
         self,
         assessments: list[dict[str, Any]],
@@ -390,13 +447,32 @@ class ThoughtEnhancer:
                 "Proceed with general engineering principles and external documentation."
             )
 
-        parts = [f"The brain returned {n} knowledge nodes (from {total_queried} candidates)."]
-
-        # Distribution
+        # Distribution (computed early for LLM path)
         dist: dict[str, int] = {}
         for a in assessments:
             t = a["tier"]
             dist[t] = dist.get(t, 0) + 1
+
+        # Try LLM-generated summary first
+        try:
+            validated_pct = dist.get("validated", 0) / max(n, 1)
+            contested_pct = dist.get("contested", 0) / max(n, 1)
+            if contested_pct > 0.3:
+                _overall = "contested"
+            elif validated_pct >= 0.7:
+                _overall = "high"
+            elif validated_pct >= 0.4:
+                _overall = "moderate"
+            else:
+                _overall = "low"
+            llm_summary = self._llm_metacognitive_summary(dist, contradictions, gaps, _overall)
+            if llm_summary:
+                return llm_summary
+        except Exception as exc:
+            logger.debug("LLM metacognitive summary failed: %s", exc)
+
+        parts = [f"The brain returned {n} knowledge nodes (from {total_queried} candidates)."]
+
         tier_parts = [f"{count} {tier.upper()}" for tier, count in sorted(dist.items())]
         parts.append(f"Confidence: {', '.join(tier_parts)}.")
 
@@ -526,7 +602,10 @@ class ThoughtEnhancer:
         return " — ".join(parts)
 
     def _trim_to_budget(
-        self, full_text: str, sections: list[str], budget: int,
+        self,
+        full_text: str,
+        sections: list[str],
+        budget: int,
     ) -> str:
         """Progressive trimming: drop UNCERTAIN, then gaps, then provenance."""
         # Try without UNCERTAIN section

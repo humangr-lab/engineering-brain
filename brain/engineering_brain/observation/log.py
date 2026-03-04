@@ -17,7 +17,7 @@ import json
 import logging
 import os
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -78,7 +78,7 @@ class Observation:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class ObservationLog:
@@ -89,9 +89,7 @@ class ObservationLog:
 
     def __init__(self, path: str | None = None) -> None:
         if path is None:
-            path = os.path.join(
-                os.path.expanduser("~"), ".engineering_brain", "observations.jsonl"
-            )
+            path = os.path.join(os.path.expanduser("~"), ".engineering_brain", "observations.jsonl")
         self._path = Path(path)
 
     @property
@@ -121,14 +119,16 @@ class ObservationLog:
         file_type: str = "",
     ) -> None:
         """Convenience: record a query_served event."""
-        self.record(Observation(
-            timestamp=_now_iso(),
-            event_type=EVENT_QUERY_SERVED,
-            rule_ids=tuple(rule_ids),
-            query=query,
-            technologies=tuple(technologies or []),
-            file_type=file_type,
-        ))
+        self.record(
+            Observation(
+                timestamp=_now_iso(),
+                event_type=EVENT_QUERY_SERVED,
+                rule_ids=tuple(rule_ids),
+                query=query,
+                technologies=tuple(technologies or []),
+                file_type=file_type,
+            )
+        )
 
     def record_finding(
         self,
@@ -137,13 +137,15 @@ class ObservationLog:
         severity: str = "medium",
     ) -> None:
         """Convenience: record a finding_recorded event."""
-        self.record(Observation(
-            timestamp=_now_iso(),
-            event_type=EVENT_FINDING_RECORDED,
-            rule_ids=tuple(rule_ids or []),
-            query=description,
-            metadata={"severity": severity},
-        ))
+        self.record(
+            Observation(
+                timestamp=_now_iso(),
+                event_type=EVENT_FINDING_RECORDED,
+                rule_ids=tuple(rule_ids or []),
+                query=description,
+                metadata={"severity": severity},
+            )
+        )
 
     def record_reinforcement(
         self,
@@ -152,13 +154,15 @@ class ObservationLog:
         evidence_id: str = "",
     ) -> None:
         """Convenience: record reinforcement/weakening."""
-        self.record(Observation(
-            timestamp=_now_iso(),
-            event_type=EVENT_REINFORCED if positive else EVENT_WEAKENED,
-            rule_ids=(rule_id,),
-            outcome="positive" if positive else "negative",
-            metadata={"evidence_id": evidence_id},
-        ))
+        self.record(
+            Observation(
+                timestamp=_now_iso(),
+                event_type=EVENT_REINFORCED if positive else EVENT_WEAKENED,
+                rule_ids=(rule_id,),
+                outcome="positive" if positive else "negative",
+                metadata={"evidence_id": evidence_id},
+            )
+        )
 
     def record_prediction_test(
         self,
@@ -167,13 +171,15 @@ class ObservationLog:
         confidence_at_time: float = 0.0,
     ) -> None:
         """Convenience: record a prediction outcome."""
-        self.record(Observation(
-            timestamp=_now_iso(),
-            event_type=EVENT_PREDICTION_TESTED,
-            rule_ids=(rule_id,),
-            outcome="positive" if success else "negative",
-            metadata={"confidence_at_time": confidence_at_time},
-        ))
+        self.record(
+            Observation(
+                timestamp=_now_iso(),
+                event_type=EVENT_PREDICTION_TESTED,
+                rule_ids=(rule_id,),
+                outcome="positive" if success else "negative",
+                metadata={"confidence_at_time": confidence_at_time},
+            )
+        )
 
     def record_feedback(
         self,
@@ -182,13 +188,15 @@ class ObservationLog:
         context: str = "",
     ) -> None:
         """Record negative feedback (rule was unhelpful/wrong for context)."""
-        self.record(Observation(
-            timestamp=_now_iso(),
-            event_type=EVENT_WEAKENED,
-            rule_ids=(rule_id,),
-            outcome="negative",
-            metadata={"reason": reason, "context": context, "source": "agent_feedback"},
-        ))
+        self.record(
+            Observation(
+                timestamp=_now_iso(),
+                event_type=EVENT_WEAKENED,
+                rule_ids=(rule_id,),
+                outcome="negative",
+                metadata={"reason": reason, "context": context, "source": "agent_feedback"},
+            )
+        )
 
     def record_deprecated(
         self,
@@ -196,12 +204,14 @@ class ObservationLog:
         reason: str = "",
     ) -> None:
         """Convenience: record a node deprecation (soft-delete) event."""
-        self.record(Observation(
-            timestamp=_now_iso(),
-            event_type=EVENT_DEPRECATED,
-            rule_ids=(node_id,),
-            metadata={"reason": reason},
-        ))
+        self.record(
+            Observation(
+                timestamp=_now_iso(),
+                event_type=EVENT_DEPRECATED,
+                rule_ids=(node_id,),
+                metadata={"reason": reason},
+            )
+        )
 
     def get_prediction_stats(self, rule_id: str) -> dict[str, int]:
         """Get prediction test/success counts for a specific rule.
@@ -241,7 +251,7 @@ class ObservationLog:
         if not self._path.exists():
             return []
         observations: list[Observation] = []
-        with open(self._path, "r", encoding="utf-8") as f:
+        with open(self._path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -279,7 +289,7 @@ class ObservationLog:
         if not self._path.exists():
             return 0
         count = 0
-        with open(self._path, "r", encoding="utf-8") as f:
+        with open(self._path, encoding="utf-8") as f:
             for line in f:
                 if line.strip():
                     count += 1

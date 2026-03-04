@@ -17,20 +17,21 @@ logger = logging.getLogger(__name__)
 
 # Approximate costs per API call
 _COST_MAP = {
-    "voyage_embed": 0.00012,     # ~$0.12/1M tokens, ~1K tokens per call
-    "voyage_rerank": 0.001,      # ~$0.05/1K queries
-    "pypi_check": 0.0,           # Free
-    "npm_check": 0.0,            # Free
-    "nvd_check": 0.0,            # Free (with API key)
-    "so_check": 0.0,             # Free (with API key)
-    "github_check": 0.0,         # Free (with token)
-    "official_docs": 0.0,        # Free
+    "voyage_embed": 0.00012,  # ~$0.12/1M tokens, ~1K tokens per call
+    "voyage_rerank": 0.001,  # ~$0.05/1K queries
+    "pypi_check": 0.0,  # Free
+    "npm_check": 0.0,  # Free
+    "nvd_check": 0.0,  # Free (with API key)
+    "so_check": 0.0,  # Free (with API key)
+    "github_check": 0.0,  # Free (with token)
+    "official_docs": 0.0,  # Free
 }
 
 
 @dataclass
 class CostEntry:
     """A single cost entry."""
+
     operation: str
     cost: float
     timestamp: float

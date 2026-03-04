@@ -23,7 +23,7 @@ from engineering_brain.adapters.base import GraphAdapter, VectorAdapter
 from engineering_brain.core.config import BrainConfig
 from engineering_brain.core.types import Pack
 from engineering_brain.retrieval.context_extractor import ExtractedContext, extract_context
-from engineering_brain.retrieval.scorer import rank_results, score_knowledge
+from engineering_brain.retrieval.scorer import rank_results
 
 logger = logging.getLogger(__name__)
 
@@ -69,14 +69,15 @@ def _jaccard(a: list[str], b: list[str]) -> float:
         return 0.0
     try:
         from engineering_brain.core.taxonomy import get_registry
+
         registry = get_registry()
         if registry.size > 0:
             # Count how many items in 'a' match any item in 'b'
             matches = registry.overlap_count(a, b)
             total = max(len(set(x.lower() for x in a) | set(x.lower() for x in b)), 1)
             return matches / total
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("TagRegistry overlap_count failed in hierarchy Jaccard: %s", exc)
     # Fallback: exact Jaccard
     sa = {x.lower() for x in a}
     sb = {x.lower() for x in b}
@@ -94,11 +95,12 @@ def _hierarchy_match(a: list[str], b: list[str]) -> bool:
         return False
     try:
         from engineering_brain.core.taxonomy import get_registry
+
         registry = get_registry()
         if registry.size > 0:
             return registry.match_flat(a, b)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("TagRegistry match_flat failed in hierarchy match: %s", exc)
     return bool({x.lower() for x in a} & {x.lower() for x in b})
 
 
@@ -192,9 +194,9 @@ class PackManager:
         doms: set[str] = set()
         layers: set[str] = set()
         for n in nodes:
-            for t in (n.get("technologies") or n.get("languages") or []):
+            for t in n.get("technologies") or n.get("languages") or []:
                 techs.add(t)
-            for d in (n.get("domains") or []):
+            for d in n.get("domains") or []:
                 doms.add(d)
             layers.add(_infer_layer(str(n.get("id", ""))))
 
@@ -376,11 +378,13 @@ class PackManager:
             key = (from_id, to_id, edge_type)
             if key not in seen and from_id != to_id:
                 seen.add(key)
-                edges.append({
-                    "from_id": from_id,
-                    "to_id": to_id,
-                    "edge_type": edge_type,
-                })
+                edges.append(
+                    {
+                        "from_id": from_id,
+                        "to_id": to_id,
+                        "edge_type": edge_type,
+                    }
+                )
 
         # --- Rule 1: L1→L3 TRIGGERS (principles trigger rules in shared domain) ---
         l1_nodes = [n for n in nodes if _infer_layer(str(n.get("id", ""))) == "L1"]
@@ -398,7 +402,8 @@ class PackManager:
         for nid in node_ids:
             try:
                 graph_edges = self._graph.get_edges(node_id=nid)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to get edges for node %s: %s", nid, exc)
                 continue
             for edge in graph_edges:
                 from_id = edge.get("from_id", "")
@@ -486,9 +491,9 @@ class PackManager:
         for n in nodes:
             nid = str(n.get("id", ""))
             layers.add(_infer_layer(nid))
-            for t in (n.get("technologies") or n.get("languages") or []):
+            for t in n.get("technologies") or n.get("languages") or []:
                 techs.add(t)
-            for d in (n.get("domains") or []):
+            for d in n.get("domains") or []:
                 doms.add(d)
 
         return Pack(

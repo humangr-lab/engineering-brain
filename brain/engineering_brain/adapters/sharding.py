@@ -16,7 +16,6 @@ only the connection changes.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from engineering_brain.core.schema import SHARD_DOMAINS, Layer, shard_key
 
@@ -42,11 +41,13 @@ class ShardRouter:
         graph shard and/or vector collection to query.
         """
         if not self._enabled:
-            return [ShardTarget(
-                graph_shard="general",
-                vector_collections=["brain_rules", "brain_patterns"],
-                shard_key="general:all",
-            )]
+            return [
+                ShardTarget(
+                    graph_shard="general",
+                    vector_collections=["brain_rules", "brain_patterns"],
+                    shard_key="general:all",
+                )
+            ]
 
         targets: list[ShardTarget] = []
         seen_keys: set[str] = set()
@@ -75,13 +76,15 @@ class ShardRouter:
                 break
 
         if not targets:
-            targets.append(ShardTarget(
-                graph_shard="general",
-                vector_collections=["brain_rules"],
-                shard_key="general:L3",
-                domain="general",
-                layer=Layer.L3_RULES,
-            ))
+            targets.append(
+                ShardTarget(
+                    graph_shard="general",
+                    vector_collections=["brain_rules"],
+                    shard_key="general:L3",
+                    domain="general",
+                    layer=Layer.L3_RULES,
+                )
+            )
 
         return targets
 
@@ -134,6 +137,7 @@ class ShardRouter:
     def _collections_for_layer(layer: Layer) -> list[str]:
         """Get Qdrant collection names for a given layer."""
         from engineering_brain.core.schema import VECTOR_COLLECTIONS
+
         coll = VECTOR_COLLECTIONS.get(layer.value)
         if coll:
             return [coll]

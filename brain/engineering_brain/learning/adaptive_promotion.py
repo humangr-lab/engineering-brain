@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -28,19 +28,22 @@ class BetaPrior:
     Updated via Bayesian conjugate update: success → alpha += 1, failure → beta += 1.
     """
 
-    alpha: float = 1.0   # Successes + prior
-    beta: float = 1.0    # Failures + prior
+    alpha: float = 1.0  # Successes + prior
+    beta: float = 1.0  # Failures + prior
     n_observations: int = 0
 
     @property
     def mean(self) -> float:
         """Expected success rate (0.0-1.0)."""
-        return self.alpha / (self.alpha + self.beta)
+        ab = self.alpha + self.beta
+        return self.alpha / ab if ab > 0 else 0.5
 
     @property
     def variance(self) -> float:
         """Variance of the Beta distribution."""
         ab = self.alpha + self.beta
+        if ab <= 0:
+            return 0.0
         return (self.alpha * self.beta) / (ab * ab * (ab + 1))
 
     @property
@@ -83,8 +86,15 @@ class AdaptivePromotionPolicy:
 
     # Default domains to track
     DEFAULT_DOMAINS = [
-        "security", "testing", "architecture", "api", "database",
-        "performance", "devops", "ui", "general",
+        "security",
+        "testing",
+        "architecture",
+        "api",
+        "database",
+        "performance",
+        "devops",
+        "ui",
+        "general",
     ]
 
     def __init__(
@@ -138,12 +148,14 @@ class AdaptivePromotionPolicy:
             survived: Whether the promoted node survived (not deprecated within 30 days).
         """
         domain_lower = domain.lower()
-        self._outcomes.append({
-            "domain": domain_lower,
-            "promoted": promoted,
-            "survived": survived,
-            "timestamp": time.time(),
-        })
+        self._outcomes.append(
+            {
+                "domain": domain_lower,
+                "promoted": promoted,
+                "survived": survived,
+                "timestamp": time.time(),
+            }
+        )
 
         # Invalidate cache so _maybe_refresh() triggers a full rebuild.
         # _compute_priors() is the sole writer to self._priors, which
@@ -171,7 +183,7 @@ class AdaptivePromotionPolicy:
             try:
                 for obs in self._log.read_all():
                     if obs.event_type == "reinforced" and obs.outcome == "positive":
-                        for rid in obs.rule_ids:
+                        for _rid in obs.rule_ids:
                             domain = obs.metadata.get("domain", "general")
                             p = priors.setdefault(domain, BetaPrior())
                             p.alpha += 0.1  # Weak positive signal from reinforcement
@@ -181,8 +193,8 @@ class AdaptivePromotionPolicy:
                         p = priors.setdefault(domain, BetaPrior())
                         p.beta += 0.5  # Moderate negative signal from deprecation
                         p.n_observations += 1
-            except Exception:
-                pass  # Log reading is non-blocking
+            except Exception as exc:
+                logger.debug("Failed to read observation log for adaptive promotion: %s", exc)
 
         # Incorporate in-memory outcomes (stronger signal)
         for outcome in self._outcomes:

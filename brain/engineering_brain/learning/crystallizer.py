@@ -12,11 +12,11 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from engineering_brain.adapters.base import GraphAdapter
-from engineering_brain.core.schema import EdgeType, Layer, NodeType
+from engineering_brain.core.schema import EdgeType, NodeType
 from engineering_brain.core.types import Finding, Rule
 
 logger = logging.getLogger(__name__)
@@ -104,8 +104,8 @@ class KnowledgeCrystallizer:
                 match = self._find_similar_rule_semantic(description)
                 if match is not None:
                     return match
-            except Exception:
-                pass  # Fall through to key-term matching
+            except Exception as exc:
+                logger.debug("Semantic similarity search failed, falling back to key-term: %s", exc)
 
         # 2. Fallback: original key-term matching
         return self._find_similar_rule_keyterm(description)
@@ -200,8 +200,10 @@ class KnowledgeCrystallizer:
         if isinstance(source_findings, str):
             try:
                 import json
+
                 source_findings = json.loads(source_findings)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to parse source_findings JSON: %s", exc)
                 source_findings = []
 
         if finding_id not in source_findings:
@@ -217,14 +219,19 @@ class KnowledgeCrystallizer:
                 **rule,
                 "reinforcement_count": current_count + 1,
                 "confidence": new_confidence,
-                "last_violation": datetime.now(timezone.utc).isoformat(),
+                "last_violation": datetime.now(UTC).isoformat(),
                 "source_findings": source_findings,
             },
         )
 
         # Add EVIDENCED_BY edge
         self._graph.add_edge(rule_id, finding_id, EdgeType.EVIDENCED_BY.value)
-        logger.debug("Reinforced rule %s (count=%d, confidence=%.2f)", rule_id, current_count + 1, new_confidence)
+        logger.debug(
+            "Reinforced rule %s (count=%d, confidence=%.2f)",
+            rule_id,
+            current_count + 1,
+            new_confidence,
+        )
 
     def _crystallize_rule(
         self,
@@ -239,15 +246,19 @@ class KnowledgeCrystallizer:
         """Crystallize a finding + resolution into a new rule with WHY + HOW."""
         rule_id = _generate_rule_id(description, technologies, domains)
 
-        # Derive WHY from the lesson/description
-        why = lesson if lesson else _derive_why(description)
+        # Derive WHY from the lesson/description (LLM-enhanced with fallback)
+        why = (
+            lesson
+            if lesson
+            else (_llm_derive_why(description, resolution, lesson) or _derive_why(description))
+        )
 
         # Derive HOW from the resolution
         how = resolution if resolution else ""
 
         rule = Rule(
             id=rule_id,
-            text=_derive_rule_text(description),
+            text=_llm_derive_rule_text(description) or _derive_rule_text(description),
             why=why,
             how_to_do_right=how,
             severity=severity,
@@ -270,12 +281,16 @@ class KnowledgeCrystallizer:
             # Link rule to technologies
             for tech in technologies:
                 tech_id = f"tech:{tech.lower()}"
-                self._graph.add_node(NodeType.TECHNOLOGY.value, tech_id, {"id": tech_id, "name": tech})
+                self._graph.add_node(
+                    NodeType.TECHNOLOGY.value, tech_id, {"id": tech_id, "name": tech}
+                )
                 self._graph.add_edge(rule_id, tech_id, EdgeType.APPLIES_TO.value)
             # Link rule to domains
             for domain in domains:
                 domain_id = f"domain:{domain.lower()}"
-                self._graph.add_node(NodeType.DOMAIN.value, domain_id, {"id": domain_id, "name": domain})
+                self._graph.add_node(
+                    NodeType.DOMAIN.value, domain_id, {"id": domain_id, "name": domain}
+                )
                 self._graph.add_edge(rule_id, domain_id, EdgeType.IN_DOMAIN.value)
             return rule_id
 
@@ -286,7 +301,7 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Compute cosine similarity between two vectors. Returns 0.0-1.0."""
     if not a or not b or len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     norm_a = sum(x * x for x in a) ** 0.5
     norm_b = sum(x * x for x in b) ** 0.5
     if norm_a == 0.0 or norm_b == 0.0:
@@ -337,17 +352,111 @@ def _extract_key_terms(text: str) -> list[str]:
     """Extract significant terms from text for matching."""
     # Remove common words and keep significant terms
     stop_words = {
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "must", "shall", "can", "need", "dare",
-        "to", "of", "in", "for", "on", "with", "at", "by", "from", "up",
-        "about", "into", "through", "during", "before", "after", "above",
-        "below", "between", "out", "off", "over", "under", "again", "further",
-        "then", "once", "and", "but", "or", "nor", "not", "no", "so", "if",
-        "this", "that", "these", "those", "it", "its", "used", "using",
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+        "may",
+        "might",
+        "must",
+        "shall",
+        "can",
+        "need",
+        "dare",
+        "to",
+        "of",
+        "in",
+        "for",
+        "on",
+        "with",
+        "at",
+        "by",
+        "from",
+        "up",
+        "about",
+        "into",
+        "through",
+        "during",
+        "before",
+        "after",
+        "above",
+        "below",
+        "between",
+        "out",
+        "off",
+        "over",
+        "under",
+        "again",
+        "further",
+        "then",
+        "once",
+        "and",
+        "but",
+        "or",
+        "nor",
+        "not",
+        "no",
+        "so",
+        "if",
+        "this",
+        "that",
+        "these",
+        "those",
+        "it",
+        "its",
+        "used",
+        "using",
     }
     words = re.findall(r"\b\w{3,}\b", text.lower())
     return [w for w in words if w not in stop_words]
+
+
+def _llm_derive_why(description: str, resolution: str, lesson: str) -> str | None:
+    """LLM-generated WHY explanation. Returns None on failure."""
+    from engineering_brain.llm_helpers import brain_llm_call, is_llm_enabled
+
+    if not is_llm_enabled("BRAIN_LLM_CRYSTALLIZATION"):
+        return None
+    system = (
+        "Write the WHY for an engineering rule. Explain the root cause or principle "
+        "that makes this important. 1-2 sentences, max 200 chars. "
+        "Do NOT restate the description."
+    )
+    user = (
+        f"Description: {description[:300]}\nResolution: {resolution[:200]}\nLesson: {lesson[:200]}"
+    )
+    result = brain_llm_call(system, user, max_tokens=100)
+    return result if result and len(result) <= 300 else None
+
+
+def _llm_derive_rule_text(description: str) -> str | None:
+    """LLM-generated prescriptive rule text. Returns None on failure."""
+    from engineering_brain.llm_helpers import brain_llm_call, is_llm_enabled
+
+    if not is_llm_enabled("BRAIN_LLM_CRYSTALLIZATION"):
+        return None
+    system = (
+        "Write a concise engineering rule from a finding. "
+        "Start with Always/Never/Use/Avoid. Max 150 chars. Return ONLY the rule."
+    )
+    result = brain_llm_call(system, f"Finding: {description[:500]}", max_tokens=80)
+    return result if result and 10 <= len(result) <= 200 else None
 
 
 def _derive_rule_text(description: str) -> str:
@@ -357,7 +466,7 @@ def _derive_rule_text(description: str) -> str:
     for sep in (". ", "! ", "? ", "\n"):
         idx = text.find(sep)
         if 0 < idx < 150:
-            return text[:idx + 1]
+            return text[: idx + 1]
     return text[:150]
 
 
@@ -368,11 +477,19 @@ def _derive_why(description: str) -> str:
 
 # Negation patterns for opposing polarity detection
 _NEGATION_PAIRS: list[tuple[str, str]] = [
-    ("always", "never"), ("must", "must not"), ("should", "should not"),
-    ("require", "avoid"), ("use", "don't use"), ("enable", "disable"),
-    ("allow", "deny"), ("accept", "reject"), ("include", "exclude"),
-    ("do", "don't"), ("recommended", "not recommended"),
-    ("safe", "unsafe"), ("secure", "insecure"),
+    ("always", "never"),
+    ("must", "must not"),
+    ("should", "should not"),
+    ("require", "avoid"),
+    ("use", "don't use"),
+    ("enable", "disable"),
+    ("allow", "deny"),
+    ("accept", "reject"),
+    ("include", "exclude"),
+    ("do", "don't"),
+    ("recommended", "not recommended"),
+    ("safe", "unsafe"),
+    ("secure", "insecure"),
 ]
 
 

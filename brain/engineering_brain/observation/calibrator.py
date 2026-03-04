@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
 
 from engineering_brain.observation.log import (
     EVENT_PREDICTION_TESTED,
@@ -74,8 +73,7 @@ class ConfidenceCalibrator:
 
         # Initialize buckets
         bucket_data: dict[int, dict[str, int]] = {
-            i: {"total": 0, "positive": 0}
-            for i in range(len(self._bucket_ranges))
+            i: {"total": 0, "positive": 0} for i in range(len(self._bucket_ranges))
         }
 
         for obs in observations:
@@ -170,8 +168,7 @@ class ConfidenceCalibrator:
                 )
             else:
                 lines.append(
-                    f"  [{bucket.lower:.1f}-{bucket.upper:.1f}): "
-                    f"insufficient data {status}"
+                    f"  [{bucket.lower:.1f}-{bucket.upper:.1f}): insufficient data {status}"
                 )
 
         return "\n".join(lines)

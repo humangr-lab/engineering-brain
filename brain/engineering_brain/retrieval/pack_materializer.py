@@ -91,7 +91,8 @@ class PackMaterializer:
         # 7. Filter reasoning edges to only include filtered nodes
         node_id_set = set(filtered_ids)
         reasoning_edges = [
-            e for e in pack.reasoning_edges
+            e
+            for e in pack.reasoning_edges
             if e.get("from_id") in node_id_set and e.get("to_id") in node_id_set
         ]
 
@@ -102,9 +103,9 @@ class PackMaterializer:
         all_techs: set[str] = set()
         all_doms: set[str] = set()
         for n in nodes:
-            for t in (n.get("technologies") or n.get("languages") or []):
+            for t in n.get("technologies") or n.get("languages") or []:
                 all_techs.add(t)
-            for d in (n.get("domains") or []):
+            for d in n.get("domains") or []:
                 all_doms.add(d)
 
         materialized = MaterializedPack(
@@ -128,7 +129,11 @@ class PackMaterializer:
         elapsed = (time.time() - t0) * 1000
         logger.info(
             "Materialized pack %s: %d nodes, %d edges, quality=%.2f (%.0fms)",
-            template.id, len(nodes), len(edges), materialized.quality_score, elapsed,
+            template.id,
+            len(nodes),
+            len(edges),
+            materialized.quality_score,
+            elapsed,
         )
         return materialized
 
@@ -224,8 +229,11 @@ class PackMaterializer:
         """Delegate pack creation to PackManager v1/v2."""
         if self._config.pack_v2_enabled:
             from engineering_brain.retrieval.pack_manager_v2 import ScalablePackManager
+
             mgr = ScalablePackManager(
-                self._graph, self._vector, self._config,
+                self._graph,
+                self._vector,
+                self._config,
                 query_router=self._query_router,
                 embedder=self._embedder,
             )
@@ -290,7 +298,7 @@ class PackMaterializer:
 
             # Domain filter (glob matching)
             if template.domains:
-                node_doms = node.get("domains") or []
+                node.get("domains") or []
                 # Don't filter — domains are used for scoring not hard filtering
 
             filtered.append(nid)
@@ -298,13 +306,16 @@ class PackMaterializer:
         # Sort by severity if preferred
         if template.prefer_high_severity:
             severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-            filtered.sort(key=lambda nid: severity_order.get(
-                (self._graph.get_node(nid) or {}).get("severity", "medium"), 2,
-            ))
+            filtered.sort(
+                key=lambda nid: severity_order.get(
+                    (self._graph.get_node(nid) or {}).get("severity", "medium"),
+                    2,
+                )
+            )
 
         # Enforce max_nodes
         if template.max_nodes and len(filtered) > template.max_nodes:
-            filtered = filtered[:template.max_nodes]
+            filtered = filtered[: template.max_nodes]
 
         return filtered
 
@@ -337,7 +348,8 @@ class PackMaterializer:
         for nid in node_ids:
             try:
                 node_edges = self._graph.get_edges(node_id=nid)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to get edges for node %s during materialization: %s", nid, exc)
                 continue
             for edge in node_edges:
                 from_id = edge.get("from_id", "")

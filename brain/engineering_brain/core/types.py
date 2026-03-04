@@ -7,12 +7,11 @@ think, not memorize.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Any
-
 import logging
 import warnings
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -20,7 +19,7 @@ _logger = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _warn_empty_sources(model_name: str, node_id: str) -> None:
@@ -40,7 +39,8 @@ def _warn_empty_sources(model_name: str, node_id: str) -> None:
 # Source Attribution & Validation
 # =============================================================================
 
-class EpistemicStatus(str, Enum):
+
+class EpistemicStatus(StrEnum):
     """Epistemic maturity level for knowledge nodes (E0-E5 ladder).
 
     Classifies how well-established a piece of knowledge is:
@@ -66,21 +66,36 @@ class EpistemicStatus(str, Enum):
     def min_sources(self) -> int:
         """Minimum number of independent sources required."""
         return {
-            "E0": 0, "E1": 1, "E2": 2, "E3": 2, "E4": 3, "E5": 0,
+            "E0": 0,
+            "E1": 1,
+            "E2": 2,
+            "E3": 2,
+            "E4": 3,
+            "E5": 0,
         }[self.value]
 
     @property
     def min_belief(self) -> float:
         """Minimum epistemic belief mass (ep_b) required."""
         return {
-            "E0": 0.0, "E1": 0.2, "E2": 0.4, "E3": 0.6, "E4": 0.8, "E5": 0.95,
+            "E0": 0.0,
+            "E1": 0.2,
+            "E2": 0.4,
+            "E3": 0.6,
+            "E4": 0.8,
+            "E5": 0.95,
         }[self.value]
 
     @property
     def max_uncertainty(self) -> float:
         """Maximum tolerated epistemic uncertainty (ep_u)."""
         return {
-            "E0": 1.0, "E1": 0.8, "E2": 0.6, "E3": 0.4, "E4": 0.2, "E5": 0.05,
+            "E0": 1.0,
+            "E1": 0.8,
+            "E2": 0.6,
+            "E3": 0.4,
+            "E4": 0.2,
+            "E5": 0.05,
         }[self.value]
 
     @property
@@ -89,7 +104,7 @@ class EpistemicStatus(str, Enum):
         return int(self.value[1])
 
 
-class SourceType(str, Enum):
+class SourceType(StrEnum):
     """Type of authoritative source, ordered by trust weight."""
 
     OFFICIAL_DOCS = "official_docs"
@@ -103,7 +118,7 @@ class SourceType(str, Enum):
     HUMAN_CURATED = "human_curated"
 
 
-class ValidationStatus(str, Enum):
+class ValidationStatus(StrEnum):
     """Validation state of a knowledge node."""
 
     UNVALIDATED = "unvalidated"
@@ -128,6 +143,7 @@ class Source(BaseModel):
 # L0 — Axioms (immutable truths)
 # =============================================================================
 
+
 class Axiom(BaseModel):
     """Immutable software truth — the physical laws of engineering."""
 
@@ -137,7 +153,10 @@ class Axiom(BaseModel):
     formal_notation: str | None = Field(default=None, description="Formal/mathematical notation")
     proof_reference: str | None = Field(default=None, description="Reference to proof or standard")
     immutable: bool = Field(default=True, description="Always True for axioms")
-    sources: list[Source] = Field(default_factory=list, description="At least one authoritative source REQUIRED — enforced after backfill")
+    sources: list[Source] = Field(
+        default_factory=list,
+        description="At least one authoritative source REQUIRED — enforced after backfill",
+    )
     validation_status: ValidationStatus = Field(default=ValidationStatus.UNVALIDATED)
     ep_b: float | None = Field(default=None, description="Epistemic belief mass")
     ep_d: float | None = Field(default=None, description="Epistemic disbelief mass")
@@ -146,7 +165,7 @@ class Axiom(BaseModel):
     epistemic_status: str = Field(default="E5", description="Epistemic maturity level (E0-E5)")
 
     @model_validator(mode="after")
-    def _check_sources(self) -> "Axiom":
+    def _check_sources(self) -> Axiom:
         if not self.sources:
             _warn_empty_sources("Axiom", self.id)
         return self
@@ -156,6 +175,7 @@ class Axiom(BaseModel):
 # L1 — Principles (stable wisdom)
 # =============================================================================
 
+
 class Principle(BaseModel):
     """Core engineering principle — the constitution of good engineering."""
 
@@ -163,13 +183,23 @@ class Principle(BaseModel):
     name: str = Field(description="Short memorable name")
     why: str = Field(description="WHY this matters — the deeper understanding")
     how_to_apply: str = Field(description="HOW to apply — actionable steps")
-    when_applies: str = Field(default="", description="WHEN to apply — contexts/conditions that trigger this principle")
-    when_not_applies: str = Field(default="", description="WHEN NOT to apply — contexts where this principle is irrelevant or counterproductive")
+    when_applies: str = Field(
+        default="", description="WHEN to apply — contexts/conditions that trigger this principle"
+    )
+    when_not_applies: str = Field(
+        default="",
+        description="WHEN NOT to apply — contexts where this principle is irrelevant or counterproductive",
+    )
     mental_model: str = Field(description="Mental model or analogy for intuitive understanding")
     domains: list[str] = Field(default_factory=list, description="Applicable domains")
     violation_consequence: str = Field(default="", description="What happens when violated")
-    teaching_example: str = Field(default="", description="Concrete example that teaches the principle")
-    sources: list[Source] = Field(default_factory=list, description="At least one authoritative source REQUIRED — enforced after backfill")
+    teaching_example: str = Field(
+        default="", description="Concrete example that teaches the principle"
+    )
+    sources: list[Source] = Field(
+        default_factory=list,
+        description="At least one authoritative source REQUIRED — enforced after backfill",
+    )
     validation_status: ValidationStatus = Field(default=ValidationStatus.UNVALIDATED)
     ep_b: float | None = Field(default=None, description="Epistemic belief mass")
     ep_d: float | None = Field(default=None, description="Epistemic disbelief mass")
@@ -178,7 +208,7 @@ class Principle(BaseModel):
     epistemic_status: str = Field(default="E0", description="Epistemic maturity level (E0-E5)")
 
     @model_validator(mode="after")
-    def _check_sources(self) -> "Principle":
+    def _check_sources(self) -> Principle:
         if not self.sources:
             _warn_empty_sources("Principle", self.id)
         return self
@@ -187,6 +217,7 @@ class Principle(BaseModel):
 # =============================================================================
 # L2 — Patterns (established practices)
 # =============================================================================
+
 
 class Pattern(BaseModel):
     """Design pattern — the vocabulary of experienced engineers."""
@@ -201,7 +232,10 @@ class Pattern(BaseModel):
     example_good: str = Field(default="", description="Good implementation example")
     example_bad: str = Field(default="", description="Bad implementation to contrast")
     related_principles: list[str] = Field(default_factory=list, description="L1 principle IDs")
-    sources: list[Source] = Field(default_factory=list, description="At least one authoritative source REQUIRED — enforced after backfill")
+    sources: list[Source] = Field(
+        default_factory=list,
+        description="At least one authoritative source REQUIRED — enforced after backfill",
+    )
     validation_status: ValidationStatus = Field(default=ValidationStatus.UNVALIDATED)
     ep_b: float | None = Field(default=None, description="Epistemic belief mass")
     ep_d: float | None = Field(default=None, description="Epistemic disbelief mass")
@@ -209,12 +243,16 @@ class Pattern(BaseModel):
     ep_a: float | None = Field(default=None, description="Epistemic base rate")
     epistemic_status: str = Field(default="E0", description="Epistemic maturity level (E0-E5)")
     # Soft-delete fields — zero-loss deprecation
-    deprecated: bool = Field(default=False, description="Soft-deleted — invisible in queries but preserved in graph")
-    deprecated_at: datetime | None = Field(default=None, description="When this node was deprecated")
+    deprecated: bool = Field(
+        default=False, description="Soft-deleted — invisible in queries but preserved in graph"
+    )
+    deprecated_at: datetime | None = Field(
+        default=None, description="When this node was deprecated"
+    )
     deprecation_reason: str = Field(default="", description="stale|low_confidence|superseded")
 
     @model_validator(mode="after")
-    def _check_sources(self) -> "Pattern":
+    def _check_sources(self) -> Pattern:
         if not self.sources:
             _warn_empty_sources("Pattern", self.id)
         return self
@@ -223,6 +261,7 @@ class Pattern(BaseModel):
 # =============================================================================
 # L3 — Rules (learned from experience) — UPGRADED with WHY + HOW
 # =============================================================================
+
 
 class Rule(BaseModel):
     """Crystallized rule — learned constraint with WHY + HOW.
@@ -238,20 +277,32 @@ class Rule(BaseModel):
     text: str = Field(description="The rule statement")
     why: str = Field(description="WHY this rule exists — the understanding")
     how_to_do_right: str = Field(description="HOW to do it correctly — actionable steps")
-    when_applies: str = Field(default="", description="WHEN this rule applies — specific contexts, technologies, or conditions")
-    when_not_applies: str = Field(default="", description="WHEN this rule does NOT apply — exceptions, irrelevant contexts")
+    when_applies: str = Field(
+        default="",
+        description="WHEN this rule applies — specific contexts, technologies, or conditions",
+    )
+    when_not_applies: str = Field(
+        default="", description="WHEN this rule does NOT apply — exceptions, irrelevant contexts"
+    )
     severity: str = Field(default="medium", description="critical|high|medium|low")
     technologies: list[str] = Field(default_factory=list)
     file_types: list[str] = Field(default_factory=list)
     domains: list[str] = Field(default_factory=list)
     reinforcement_count: int = Field(default=0, description="Times this rule was confirmed")
-    observation_count: int = Field(default=0, description="Times this rule was observed in scoring context")
+    observation_count: int = Field(
+        default=0, description="Times this rule was observed in scoring context"
+    )
     confidence: float = Field(default=0.5, description="0.0-1.0 confidence score")
     last_violation: datetime | None = Field(default=None)
     example_good: str = Field(default="", description="Good code example")
     example_bad: str = Field(default="", description="Bad code example")
-    source_findings: list[str] = Field(default_factory=list, description="Finding IDs that generated this rule")
-    sources: list[Source] = Field(default_factory=list, description="At least one authoritative source REQUIRED — enforced after backfill")
+    source_findings: list[str] = Field(
+        default_factory=list, description="Finding IDs that generated this rule"
+    )
+    sources: list[Source] = Field(
+        default_factory=list,
+        description="At least one authoritative source REQUIRED — enforced after backfill",
+    )
     validation_status: ValidationStatus = Field(default=ValidationStatus.UNVALIDATED)
     ep_b: float | None = Field(default=None, description="Epistemic belief mass")
     ep_d: float | None = Field(default=None, description="Epistemic disbelief mass")
@@ -262,7 +313,9 @@ class Rule(BaseModel):
     updated_at: datetime | None = Field(default=None, description="Last modification timestamp")
     # Scaling fields
     version: int = Field(default=1, description="Node version for conflict detection")
-    shard_id: str | None = Field(default=None, description="Shard assignment for distributed storage")
+    shard_id: str | None = Field(
+        default=None, description="Shard assignment for distributed storage"
+    )
     etag: str | None = Field(default=None, description="Content hash for optimistic concurrency")
     # Prediction fields — testable IF/THEN knowledge
     prediction_if: str = Field(default="", description="IF condition (testable predicate)")
@@ -270,12 +323,16 @@ class Rule(BaseModel):
     prediction_tested_count: int = Field(default=0, description="Times this prediction was tested")
     prediction_success_count: int = Field(default=0, description="Times prediction was confirmed")
     # Soft-delete fields — zero-loss deprecation
-    deprecated: bool = Field(default=False, description="Soft-deleted — invisible in queries but preserved in graph")
-    deprecated_at: datetime | None = Field(default=None, description="When this node was deprecated")
+    deprecated: bool = Field(
+        default=False, description="Soft-deleted — invisible in queries but preserved in graph"
+    )
+    deprecated_at: datetime | None = Field(
+        default=None, description="When this node was deprecated"
+    )
     deprecation_reason: str = Field(default="", description="stale|low_confidence|superseded")
 
     @model_validator(mode="after")
-    def _check_sources(self) -> "Rule":
+    def _check_sources(self) -> Rule:
         if not self.sources:
             _warn_empty_sources("Rule", self.id)
         return self
@@ -284,6 +341,7 @@ class Rule(BaseModel):
 # =============================================================================
 # L4 — Evidence (concrete instances)
 # =============================================================================
+
 
 class Finding(BaseModel):
     """Concrete finding — specific bug, issue, or observation.
@@ -308,18 +366,29 @@ class Finding(BaseModel):
     actual: str = Field(default="", description="SBAR: what actually happened")
     requirement_id: str = Field(default="", description="RF/INV/EDGE ID this finding relates to")
     root_cause: str = Field(default="", description="Root cause analysis")
-    category: str = Field(default="", description="Finding category (e.g., logic_error, missing_validation)")
+    category: str = Field(
+        default="", description="Finding category (e.g., logic_error, missing_validation)"
+    )
     confidence: float = Field(default=0.5, description="Confidence in this finding (0.0-1.0)")
     verification: str = Field(default="", description="How this finding was verified")
     # Source attribution — consistent with Axiom, Principle, Pattern, Rule
-    sources: list[Source] = Field(default_factory=list, description="At least one authoritative source REQUIRED — enforced after backfill")
+    sources: list[Source] = Field(
+        default_factory=list,
+        description="At least one authoritative source REQUIRED — enforced after backfill",
+    )
     # Soft-delete fields — zero-loss deprecation (consistent with Pattern/Rule)
-    deprecated: bool = Field(default=False, description="Soft-deleted — invisible in queries but preserved in graph")
-    deprecated_at: datetime | None = Field(default=None, description="When this finding was deprecated")
-    deprecation_reason: str = Field(default="", description="stale|low_confidence|superseded|resolved")
+    deprecated: bool = Field(
+        default=False, description="Soft-deleted — invisible in queries but preserved in graph"
+    )
+    deprecated_at: datetime | None = Field(
+        default=None, description="When this finding was deprecated"
+    )
+    deprecation_reason: str = Field(
+        default="", description="stale|low_confidence|superseded|resolved"
+    )
 
     @model_validator(mode="after")
-    def _check_sources(self) -> "Finding":
+    def _check_sources(self) -> Finding:
         if not self.sources:
             _warn_empty_sources("Finding", self.id)
         return self
@@ -353,6 +422,7 @@ class TestResult(BaseModel):
 # L5 — Context (ephemeral)
 # =============================================================================
 
+
 class TaskContext(BaseModel):
     """Ephemeral task context — current session state."""
 
@@ -368,6 +438,7 @@ class TaskContext(BaseModel):
 # =============================================================================
 # Cross-cutting taxonomy
 # =============================================================================
+
 
 class Technology(BaseModel):
     """Technology node — framework, library, language."""
@@ -421,6 +492,7 @@ class Sprint(BaseModel):
 # Query & Result types
 # =============================================================================
 
+
 class KnowledgeQuery(BaseModel):
     """Query to the knowledge brain."""
 
@@ -445,9 +517,12 @@ class KnowledgeResult(BaseModel):
     cache_hit: bool = Field(default=False)
     shards_queried: list[str] = Field(default_factory=list)
     query_time_ms: float = Field(default=0.0)
+    guardrails: dict[str, Any] | None = Field(
+        default=None, description="Guardrail metadata from assembly"
+    )
 
 
-class ConfidenceTier(str, Enum):
+class ConfidenceTier(StrEnum):
     """Epistemic confidence classification for knowledge nodes."""
 
     VALIDATED = "validated"
@@ -460,20 +535,107 @@ class EnhancedKnowledgeResult(BaseModel):
     """Knowledge result enriched with epistemic context for frontier model consumption."""
 
     base_result: KnowledgeResult = Field(description="Original query result")
-    assessments: list[dict[str, Any]] = Field(default_factory=list, description="Per-node confidence assessment")
-    contradictions: list[dict[str, Any]] = Field(default_factory=list, description="In-result contradictions")
-    gaps: list[dict[str, Any]] = Field(default_factory=list, description="Query-relevant knowledge gaps")
-    metacognitive_summary: str = Field(default="", description="Natural language summary of what brain knows/doesn't know")
+    assessments: list[dict[str, Any]] = Field(
+        default_factory=list, description="Per-node confidence assessment"
+    )
+    contradictions: list[dict[str, Any]] = Field(
+        default_factory=list, description="In-result contradictions"
+    )
+    gaps: list[dict[str, Any]] = Field(
+        default_factory=list, description="Query-relevant knowledge gaps"
+    )
+    metacognitive_summary: str = Field(
+        default="", description="Natural language summary of what brain knows/doesn't know"
+    )
     enhanced_text: str = Field(default="", description="Epistemically-annotated LLM-ready text")
-    confidence_distribution: dict[str, int] = Field(default_factory=dict, description="Counts per tier")
+    confidence_distribution: dict[str, int] = Field(
+        default_factory=dict, description="Counts per tier"
+    )
     overall_confidence: str = Field(default="", description="Dominant confidence tier")
     has_contradictions: bool = Field(default=False)
     has_gaps: bool = Field(default=False)
 
 
 # =============================================================================
+# Guardrail metadata (agent-facing obligation signals)
+# =============================================================================
+
+
+class GuardrailEntry(BaseModel):
+    """Single guardrail obligation for an agent."""
+
+    node_id: str = Field(description="Source knowledge node ID")
+    obligation: str = Field(description="RFC 2119 level: MUST|MUST NOT|SHOULD|SHOULD NOT|MAY")
+    text: str = Field(default="", description="Short rule/guideline text")
+    why: str = Field(default="", description="Rationale for the obligation")
+    applicable: bool = Field(default=True, description="Whether it applies in current context")
+    excluded_by: str = Field(default="", description="Context term that excluded this node")
+
+
+class GuardrailMetadata(BaseModel):
+    """Structured guardrail metadata for programmatic compliance checking."""
+
+    must_do: list[GuardrailEntry] = Field(default_factory=list, description="MUST obligations")
+    must_not_do: list[GuardrailEntry] = Field(
+        default_factory=list, description="MUST NOT prohibitions"
+    )
+    should_do: list[GuardrailEntry] = Field(
+        default_factory=list, description="SHOULD recommendations"
+    )
+    should_not_do: list[GuardrailEntry] = Field(
+        default_factory=list, description="SHOULD NOT anti-recommendations"
+    )
+    may_do: list[GuardrailEntry] = Field(
+        default_factory=list, description="MAY informational guidance"
+    )
+    inapplicable_ids: list[str] = Field(
+        default_factory=list, description="Node IDs not applicable to current context"
+    )
+
+
+# =============================================================================
+# Assembly result (LLM-curated knowledge packs)
+# =============================================================================
+
+
+class AssemblyResult(BaseModel):
+    """Output of the LLM knowledge pack assembler.
+
+    Replaces the static enforce_budget + format_for_llm pipeline with
+    an LLM-curated, query-specific knowledge pack.
+    """
+
+    formatted_text: str = Field(default="", description="Assembled markdown knowledge pack")
+    included_nodes: list[dict[str, Any]] = Field(
+        default_factory=list, description="Nodes selected for the pack"
+    )
+    excluded_node_ids: list[str] = Field(
+        default_factory=list, description="IDs of nodes filtered out"
+    )
+    strategy: str = Field(
+        default="direct",
+        description="Assembly strategy: direct|curated|synthesized",
+        pattern=r"^(direct|curated|synthesized)$",
+    )
+    quality_score: float = Field(default=0.0, description="Pack quality 0.0-1.0")
+    assembly_time_ms: float = Field(default=0.0, description="Time to assemble in ms")
+    fallback_used: bool = Field(
+        default=False, description="True if deterministic fallback was used"
+    )
+    by_layer: dict[str, list[dict[str, Any]]] = Field(
+        default_factory=lambda: {"L1": [], "L2": [], "L3": [], "L4": []},
+        description="Included nodes split by layer — router uses this directly",
+    )
+    guardrails: GuardrailMetadata | None = Field(
+        default=None,
+        description="Structured guardrail metadata for agent compliance checking",
+    )
+
+
+# =============================================================================
 # Edge model (for graph storage)
 # =============================================================================
+
 
 class KnowledgeEdge(BaseModel):
     """Edge between two knowledge nodes."""
@@ -487,14 +649,19 @@ class KnowledgeEdge(BaseModel):
     # Bayesian edge weight fields (Beta distribution)
     edge_alpha: float = Field(default=1.0, description="Beta prior successes")
     edge_beta: float = Field(default=1.0, description="Beta prior failures")
-    edge_confidence: float = Field(default=0.5, description="Projected mean = alpha / (alpha + beta)")
-    last_reinforced: datetime | None = Field(default=None, description="Last reinforcement timestamp")
+    edge_confidence: float = Field(
+        default=0.5, description="Projected mean = alpha / (alpha + beta)"
+    )
+    last_reinforced: datetime | None = Field(
+        default=None, description="Last reinforcement timestamp"
+    )
     reinforcement_count: int = Field(default=0, description="Total reinforcement events")
 
 
 # =============================================================================
 # Seed YAML model
 # =============================================================================
+
 
 class SeedEntry(BaseModel):
     """Single entry in a seed YAML file."""
@@ -532,6 +699,7 @@ class SeedEntry(BaseModel):
         if isinstance(v, list):
             return v
         return []
+
     example_good: str = Field(default="")
     example_bad: str = Field(default="")
     intent: str = Field(default="")
@@ -543,7 +711,10 @@ class SeedEntry(BaseModel):
     statement: str = Field(default="")
     formal_notation: str | None = Field(default=None)
     related_principles: list[str] = Field(default_factory=list)
-    sources: list[dict[str, Any]] = Field(default_factory=list, description="Source dicts — at least one authoritative source REQUIRED — enforced after backfill")
+    sources: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Source dicts — at least one authoritative source REQUIRED — enforced after backfill",
+    )
 
     @field_validator("sources", mode="before")
     @classmethod
@@ -558,7 +729,10 @@ class SeedEntry(BaseModel):
             elif isinstance(item, dict):
                 result.append(item)
         return result
-    validation_status: str = Field(default="unvalidated", description="unvalidated|cross_checked|human_verified")
+
+    validation_status: str = Field(
+        default="unvalidated", description="unvalidated|cross_checked|human_verified"
+    )
     prediction_if: str = Field(default="", description="IF condition for testable prediction")
     prediction_then: str = Field(default="", description="THEN expected outcome")
     deprecated: bool = Field(default=False)
@@ -579,6 +753,7 @@ class SeedFile(BaseModel):
 # ERG — Epistemic Reasoning Graph
 # =============================================================================
 
+
 class Pack(BaseModel):
     """Materialized subgraph — a curated set of nodes with reasoning edges."""
 
@@ -598,14 +773,19 @@ class Pack(BaseModel):
 # Pack Factory — Template-driven pack creation + MCP export
 # =============================================================================
 
+
 class MCPToolSpec(BaseModel):
     """Tool definition for generated MCP servers."""
 
     name: str = Field(description="Tool name, e.g. 'check_vulnerability'")
     description: str = Field(default="", description="For LLM consumption")
     input_schema: dict[str, Any] = Field(default_factory=dict, description="JSON Schema")
-    handler_type: str = Field(default="query", description="query|filter|lookup|traverse|aggregate|reason|stats")
-    handler_config: dict[str, Any] = Field(default_factory=dict, description="Handler-specific params")
+    handler_type: str = Field(
+        default="query", description="query|filter|lookup|traverse|aggregate|reason|stats"
+    )
+    handler_config: dict[str, Any] = Field(
+        default_factory=dict, description="Handler-specific params"
+    )
 
 
 class PackTemplate(BaseModel):
@@ -618,9 +798,15 @@ class PackTemplate(BaseModel):
 
     # What knowledge to include
     layers: list[str] = Field(default_factory=list, description="Layer filter: ['L1', 'L2', 'L3']")
-    technologies: list[str] = Field(default_factory=list, description="Glob patterns: ['flask', 'python*']")
-    domains: list[str] = Field(default_factory=list, description="Domain filter: ['security', 'auth*']")
-    severities: list[str] = Field(default_factory=list, description="Severity filter: ['critical', 'high']")
+    technologies: list[str] = Field(
+        default_factory=list, description="Glob patterns: ['flask', 'python*']"
+    )
+    domains: list[str] = Field(
+        default_factory=list, description="Domain filter: ['security', 'auth*']"
+    )
+    severities: list[str] = Field(
+        default_factory=list, description="Severity filter: ['critical', 'high']"
+    )
     min_confidence: float = Field(default=0.0)
     exclude_deprecated: bool = Field(default=True)
 
@@ -645,7 +831,9 @@ class PackTemplate(BaseModel):
     tags: list[str] = Field(default_factory=list, description="Discovery tags")
 
     # Parameters accepted by brain.pack()
-    parameters: dict[str, Any] = Field(default_factory=dict, description="{param_name: default_value}")
+    parameters: dict[str, Any] = Field(
+        default_factory=dict, description="{param_name: default_value}"
+    )
 
 
 class MaterializedPack(BaseModel):
@@ -665,7 +853,9 @@ class MaterializedPack(BaseModel):
 
     # Full node data (for standalone servers)
     nodes: list[dict[str, Any]] = Field(default_factory=list, description="Complete node dicts")
-    edges: list[dict[str, Any]] = Field(default_factory=list, description="Graph edges between pack nodes")
+    edges: list[dict[str, Any]] = Field(
+        default_factory=list, description="Graph edges between pack nodes"
+    )
 
     # Template reference
     template_id: str = Field(default="")
@@ -681,6 +871,7 @@ class MaterializedPack(BaseModel):
     def serve(self, port: int | None = None) -> None:
         """Start an in-process MCP server for this pack."""
         from engineering_brain.export.pack_mcp_generator import PackMCPGenerator
+
         generator = PackMCPGenerator()
         template = self._resolve_template()
         server = generator.generate_server(self, template=template)
@@ -689,6 +880,7 @@ class MaterializedPack(BaseModel):
     def export(self, path: str) -> None:
         """Export as a standalone MCP server directory."""
         from engineering_brain.export.pack_mcp_generator import PackMCPGenerator
+
         generator = PackMCPGenerator()
         template = self._resolve_template()
         generator.export(self, output_dir=path, template=template)
@@ -701,23 +893,27 @@ class MaterializedPack(BaseModel):
             return None
         try:
             from engineering_brain.retrieval.pack_templates import get_template_registry
+
             registry = get_template_registry()
             return registry.get(self.template_id)
-        except Exception:
+        except Exception as exc:
+            _logger.debug("Failed to resolve template '%s': %s", self.template_id, exc)
             return None
 
     def save(self, path: str) -> None:
         """Persist pack state to JSON."""
         import json as _json
         from pathlib import Path as _Path
+
         _Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             _json.dump(self.model_dump(mode="json"), f, indent=2, default=str)
 
     @classmethod
-    def load(cls, path: str) -> "MaterializedPack":
+    def load(cls, path: str) -> MaterializedPack:
         """Load pack state from JSON."""
         import json as _json
+
         with open(path) as f:
             return cls(**_json.load(f))
 
@@ -734,7 +930,9 @@ class ReasoningStep(BaseModel):
     operation: str = Field(default="activate", description="activate|aggregate|score")
     node_filter: dict[str, Any] = Field(default_factory=dict)
     max_nodes: int = Field(default=8)
-    edge_to_next: str = Field(default="", description="PREREQUISITE|DEEPENS|ALTERNATIVE|TRIGGERS|COMPLEMENTS|VALIDATES")
+    edge_to_next: str = Field(
+        default="", description="PREREQUISITE|DEEPENS|ALTERNATIVE|TRIGGERS|COMPLEMENTS|VALIDATES"
+    )
 
 
 class ReasoningTemplate(BaseModel):
@@ -754,7 +952,9 @@ class BrainProfile(BaseModel):
     pack_boost: dict[str, float] = Field(default_factory=dict)
     pack_suppress: dict[str, float] = Field(default_factory=dict)
     confidence_threshold: float = Field(default=0.6)
-    contradiction_sensitivity: str = Field(default="moderate", description="low|moderate|high|extreme")
+    contradiction_sensitivity: str = Field(
+        default="moderate", description="low|moderate|high|extreme"
+    )
     default_template: str | None = Field(default=None)
 
 

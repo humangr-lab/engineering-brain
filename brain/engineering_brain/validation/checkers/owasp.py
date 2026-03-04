@@ -7,7 +7,7 @@ Uses HEAD requests to verify OWASP URLs — no API key needed.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -59,7 +59,7 @@ _OWASP_SHEETS: dict[str, str] = {
 class OWASPChecker(SourceChecker):
     """Validates security claims against OWASP cheat sheets."""
 
-    def __init__(self, rate_limit: float = 0.2):
+    def __init__(self, rate_limit: float = 0.2) -> None:
         super().__init__(rate_limit=rate_limit)
 
     @property
@@ -70,7 +70,9 @@ class OWASPChecker(SourceChecker):
         """OWASP doesn't do technology existence checks."""
         return None
 
-    async def search_claim(self, claim_text: str, technologies: list[str], domains: list[str]) -> list[Source]:
+    async def search_claim(
+        self, claim_text: str, technologies: list[str], domains: list[str]
+    ) -> list[Source]:
         """Search OWASP cheat sheets relevant to a security claim."""
         if "security" not in domains and "auth" not in " ".join(domains):
             return []
@@ -83,13 +85,15 @@ class OWASPChecker(SourceChecker):
         sources: list[Source] = []
         for title, url in matching_urls[:3]:
             # Known OWASP cheat sheet URLs are trusted
-            sources.append(Source(
-                url=url,
-                title=f"OWASP: {title}",
-                source_type=SourceType.OWASP,
-                retrieved_at=datetime.now(timezone.utc),
-                verified=True,
-            ))
+            sources.append(
+                Source(
+                    url=url,
+                    title=f"OWASP: {title}",
+                    source_type=SourceType.OWASP,
+                    retrieved_at=datetime.now(UTC),
+                    verified=True,
+                )
+            )
 
         return sources
 
@@ -100,7 +104,8 @@ class OWASPChecker(SourceChecker):
             async with httpx.AsyncClient(timeout=8) as client:
                 resp = await client.head(url, follow_redirects=True)
                 return resp.status_code == 200
-        except Exception:
+        except Exception as exc:
+            logger.debug("OWASP head check failed for %s: %s", url, exc)
             return False
 
 

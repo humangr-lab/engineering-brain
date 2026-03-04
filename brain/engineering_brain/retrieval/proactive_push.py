@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -27,9 +27,9 @@ class PushRecommendation:
     node_id: str
     title: str
     content: str
-    push_reason: str       # WHY this was pushed (human-readable)
-    signal: str            # "implication" | "proximity" | "failure_pattern" | "dependency"
-    confidence: float      # 0.0-1.0
+    push_reason: str  # WHY this was pushed (human-readable)
+    signal: str  # "implication" | "proximity" | "failure_pattern" | "dependency"
+    confidence: float  # 0.0-1.0
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -51,18 +51,27 @@ _DOMAIN_ADJACENCY: dict[str, list[str]] = {
 }
 
 
-def _get_brain():
+def _get_brain() -> Any:
     """Get brain instance (lazy import to avoid circular deps)."""
     try:
         from engineering_brain.retrieval.task_knowledge import _get_brain as _gb
+
         return _gb()
-    except Exception:
+    except Exception as exc:
+        logger.debug("Failed to get brain instance for proactive push: %s", exc)
         return None
 
 
 def _extract_task_description(task: dict[str, Any]) -> str:
     """Extract description text from a task dict."""
-    for f in ("description", "instruction", "task_description", "task_prompt", "prompt", "objective"):
+    for f in (
+        "description",
+        "instruction",
+        "task_description",
+        "task_prompt",
+        "prompt",
+        "objective",
+    ):
         v = task.get(f, "")
         if v and len(str(v)) > 20:
             return str(v)
@@ -108,15 +117,14 @@ class ProactivePush:
 
     def _tig_expansion(self, task: dict[str, Any]) -> list[PushRecommendation]:
         """Find knowledge for implied technologies not explicitly in task description."""
-        tags = task.get("knowledge_tags", [])
+        task.get("knowledge_tags", [])
         expanded_domains = task.get("knowledge_domains", [])
         provenance = task.get("knowledge_provenance", {})
         task_desc = _extract_task_description(task).lower()
 
         # Find domains that were TIG-inferred (not explicitly in description)
         implicit_domains = [
-            d for d in expanded_domains
-            if d not in task_desc and provenance.get(d) == "tig"
+            d for d in expanded_domains if d not in task_desc and provenance.get(d) == "tig"
         ]
 
         if not implicit_domains:
@@ -138,14 +146,16 @@ class ProactivePush:
                         title = node.get("title", node.get("name", ""))
                         content = node.get("description", node.get("content", ""))[:300]
                         if nid and title:
-                            recs.append(PushRecommendation(
-                                node_id=nid,
-                                title=title,
-                                content=content,
-                                push_reason=f"Implied by technologies: {', '.join(implicit_domains[:3])}",
-                                signal="implication",
-                                confidence=0.7,
-                            ))
+                            recs.append(
+                                PushRecommendation(
+                                    node_id=nid,
+                                    title=title,
+                                    content=content,
+                                    push_reason=f"Implied by technologies: {', '.join(implicit_domains[:3])}",
+                                    signal="implication",
+                                    confidence=0.7,
+                                )
+                            )
                 return recs[:3]
         except Exception as e:
             logger.debug(f"[PUSH] TIG expansion failed: {e}")
@@ -164,6 +174,19 @@ class ProactivePush:
                 if adj not in explicit_domains and adj not in task_desc:
                     adjacent.add(adj)
 
+        # LLM augmentation (additive, silent failure)
+        try:
+            llm_domains = self._llm_infer_adjacent_domains(
+                _extract_task_description(task),
+                list(explicit_domains),
+            )
+            if llm_domains:
+                for d in llm_domains:
+                    if d not in explicit_domains:
+                        adjacent.add(d)
+        except Exception as exc:
+            logger.debug("LLM adjacent domain inference failed: %s", exc)
+
         if not adjacent:
             return []
 
@@ -179,19 +202,21 @@ class ProactivePush:
             )
             if result.formatted_text:
                 recs = []
-                for node in (result.rules or []):
+                for node in result.rules or []:
                     nid = node.get("id", "")
                     title = node.get("title", node.get("name", ""))
                     content = node.get("description", node.get("content", ""))[:300]
                     if nid and title:
-                        recs.append(PushRecommendation(
-                            node_id=nid,
-                            title=title,
-                            content=content,
-                            push_reason=f"Adjacent domain: {', '.join(adjacent_list)} (task uses {', '.join(list(explicit_domains)[:2])})",
-                            signal="proximity",
-                            confidence=0.5,
-                        ))
+                        recs.append(
+                            PushRecommendation(
+                                node_id=nid,
+                                title=title,
+                                content=content,
+                                push_reason=f"Adjacent domain: {', '.join(adjacent_list)} (task uses {', '.join(list(explicit_domains)[:2])})",
+                                signal="proximity",
+                                confidence=0.5,
+                            )
+                        )
                 return recs[:2]
         except Exception as e:
             logger.debug(f"[PUSH] Domain proximity failed: {e}")
@@ -212,23 +237,23 @@ class ProactivePush:
         feed_forward = state.get("_prev_sprint_feedback", {})
         spec_quality_issues = feed_forward.get("spec_quality_issues", [])
         for issue in spec_quality_issues[:3]:
-            if isinstance(issue, dict):
-                desc = issue.get("description", str(issue))
-            else:
-                desc = str(issue)
+            desc = issue.get("description", str(issue)) if isinstance(issue, dict) else str(issue)
             if desc:
-                recs.append(PushRecommendation(
-                    node_id=f"postmortem:{hash(desc) % 10000}",
-                    title="Previous Sprint Issue",
-                    content=desc[:300],
-                    push_reason="Similar issue in previous sprint postmortem",
-                    signal="failure_pattern",
-                    confidence=0.6,
-                ))
+                recs.append(
+                    PushRecommendation(
+                        node_id=f"postmortem:{hash(desc) % 10000}",
+                        title="Previous Sprint Issue",
+                        content=desc[:300],
+                        push_reason="Similar issue in previous sprint postmortem",
+                        signal="failure_pattern",
+                        confidence=0.6,
+                    )
+                )
 
         # Check A-MEM corrective actions
         try:
             from pipeline_autonomo.amem_integration import get_amem_integration
+
             amem = get_amem_integration()
             _query = f"failures in {deliverable} {' '.join(tags[:3])}"
             _context = amem.get_relevant_context(
@@ -236,16 +261,18 @@ class ProactivePush:
                 max_notes=3,
             )
             if _context and len(_context) > 50:
-                recs.append(PushRecommendation(
-                    node_id="amem:corrective_actions",
-                    title="Historical Corrective Actions",
-                    content=_context[:500],
-                    push_reason="A-MEM: similar tasks had failures requiring these fixes",
-                    signal="failure_pattern",
-                    confidence=0.65,
-                ))
-        except Exception:
-            pass  # A-MEM not available
+                recs.append(
+                    PushRecommendation(
+                        node_id="amem:corrective_actions",
+                        title="Historical Corrective Actions",
+                        content=_context[:500],
+                        push_reason="A-MEM: similar tasks had failures requiring these fixes",
+                        signal="failure_pattern",
+                        confidence=0.65,
+                    )
+                )
+        except Exception as exc:
+            logger.debug("A-MEM failure pattern lookup failed: %s", exc)
 
         return recs[:2]
 
@@ -255,7 +282,9 @@ class ProactivePush:
         state: dict[str, Any],
     ) -> list[PushRecommendation]:
         """Push rules for files that depend on the file being modified."""
-        deliverable = task.get("deliverable", "") or (task.get("deliverables", [""])[0] if task.get("deliverables") else "")
+        deliverable = task.get("deliverable", "") or (
+            task.get("deliverables", [""])[0] if task.get("deliverables") else ""
+        )
         if not deliverable:
             return []
 
@@ -264,25 +293,47 @@ class ProactivePush:
         dependent_files: list[str] = []
         for other in granular_tasks:
             deps = other.get("depends_on", [])
-            other_del = other.get("deliverable", "") or (other.get("deliverables", [""])[0] if other.get("deliverables") else "")
+            other_del = other.get("deliverable", "") or (
+                other.get("deliverables", [""])[0] if other.get("deliverables") else ""
+            )
             if deliverable in str(deps) and other_del != deliverable:
                 dependent_files.append(other_del)
 
         if not dependent_files:
             return []
 
-        return [PushRecommendation(
-            node_id="dep:cross_file",
-            title="Cross-File Dependencies",
-            content=(
-                f"This file ({deliverable}) is depended on by: {', '.join(dependent_files[:5])}. "
-                f"Changes to public API (function signatures, return types, imports) "
-                f"MUST maintain backward compatibility or update all dependents."
-            ),
-            push_reason=f"{len(dependent_files)} file(s) depend on this deliverable",
-            signal="dependency",
-            confidence=0.8,
-        )]
+        return [
+            PushRecommendation(
+                node_id="dep:cross_file",
+                title="Cross-File Dependencies",
+                content=(
+                    f"This file ({deliverable}) is depended on by: {', '.join(dependent_files[:5])}. "
+                    f"Changes to public API (function signatures, return types, imports) "
+                    f"MUST maintain backward compatibility or update all dependents."
+                ),
+                push_reason=f"{len(dependent_files)} file(s) depend on this deliverable",
+                signal="dependency",
+                confidence=0.8,
+            )
+        ]
+
+    def _llm_infer_adjacent_domains(self, task_desc: str, current: list[str]) -> list[str] | None:
+        """LLM-inferred adjacent domains. Returns None on failure."""
+        from engineering_brain.llm_helpers import brain_llm_call_json, is_llm_enabled
+
+        if not is_llm_enabled("BRAIN_LLM_PROACTIVE_PUSH"):
+            return None
+        system = (
+            "Suggest up to 3 adjacent engineering domains relevant to a task. "
+            "Choose ONLY from: security, api, database, testing, performance, "
+            "architecture, devops, ui, general. "
+            'Return ONLY JSON: {"domains": ["security"]}. Empty list if none.'
+        )
+        user = f"Current domains: {current}\nTask: {task_desc[:600]}"
+        result = brain_llm_call_json(system, user, max_tokens=100)
+        if result and isinstance(result.get("domains"), list):
+            return [d for d in result["domains"] if isinstance(d, str)]
+        return None
 
     def _rank_and_deduplicate(
         self,

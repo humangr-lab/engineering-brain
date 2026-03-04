@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -70,7 +70,9 @@ class DecayPrediction:
             "node_id": self.node_id,
             "knowledge_type": self.knowledge_type,
             "current_freshness": round(self.current_freshness, 4),
-            "estimated_stale_date": self.estimated_stale_date.isoformat() if self.estimated_stale_date else None,
+            "estimated_stale_date": self.estimated_stale_date.isoformat()
+            if self.estimated_stale_date
+            else None,
             "days_until_stale": round(self.days_until_stale, 1),
             "half_life_days": self.half_life_days,
             "volatility": self.volatility,
@@ -98,7 +100,9 @@ class PredictiveDecayEngine:
         techs = node.get("technologies") or node.get("languages") or []
         if isinstance(techs, list) and techs:
             text = str(node.get("text", "")) + str(node.get("name", ""))
-            if any(c.isdigit() for c in text) and any(t in text.lower() for t in ("version", "v2", "v3", "update")):
+            if any(c.isdigit() for c in text) and any(
+                t in text.lower() for t in ("version", "v2", "v3", "update")
+            ):
                 return "framework_version"
 
         # Check ID prefix
@@ -118,7 +122,7 @@ class PredictiveDecayEngine:
         Uses exponential decay based on the knowledge type's half-life.
         """
         if now is None:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
 
         ktype = self.classify_knowledge_type(node)
         profile = self.get_profile(ktype)
@@ -142,14 +146,18 @@ class PredictiveDecayEngine:
         reinforcement = int(node.get("reinforcement_count", 0))
         if reinforcement > 0:
             bonus = min(reinforcement * 0.05, 0.3)  # Cap at 30% bonus
-            freshness = min(freshness + bonus * freshness, 1.0)  # multiplicative: bonus decays WITH freshness
+            freshness = min(
+                freshness + bonus * freshness, 1.0
+            )  # multiplicative: bonus decays WITH freshness
 
         return max(0.0, min(freshness, 1.0))
 
-    def predict_staleness(self, node: dict[str, Any], now: datetime | None = None) -> DecayPrediction:
+    def predict_staleness(
+        self, node: dict[str, Any], now: datetime | None = None
+    ) -> DecayPrediction:
         """Predict when a node will become stale."""
         if now is None:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
 
         nid = str(node.get("id", ""))
         ktype = self.classify_knowledge_type(node)
@@ -186,6 +194,7 @@ class PredictiveDecayEngine:
         estimated_stale = None
         if days_until < float("inf"):
             from datetime import timedelta
+
             estimated_stale = now + timedelta(days=days_until)
 
         # Confidence in prediction: lower for high-volatility types
@@ -216,7 +225,7 @@ class PredictiveDecayEngine:
         Returns predictions sorted by urgency (soonest stale first).
         """
         if now is None:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
 
         at_risk: list[DecayPrediction] = []
         for node in nodes:
@@ -229,7 +238,7 @@ class PredictiveDecayEngine:
 
     def refresh_node(self, node: dict[str, Any]) -> dict[str, Any]:
         """Reset the decay clock with new evidence (updates timestamps)."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         node["updated_at"] = now.isoformat()
         # Increment reinforcement to reflect the refresh
         node["reinforcement_count"] = int(node.get("reinforcement_count", 0)) + 1
@@ -245,7 +254,7 @@ class PredictiveDecayEngine:
             try:
                 if isinstance(val, datetime):
                     if val.tzinfo is None:
-                        return val.replace(tzinfo=timezone.utc)
+                        return val.replace(tzinfo=UTC)
                     return val
                 return datetime.fromisoformat(str(val).replace("Z", "+00:00"))
             except (ValueError, TypeError):

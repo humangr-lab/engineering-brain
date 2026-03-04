@@ -7,7 +7,7 @@ documentation pages exist. No API key needed.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -95,7 +95,10 @@ _OFFICIAL_DOCS: dict[str, tuple[str, str]] = {
     "C#": ("https://learn.microsoft.com/dotnet/csharp/", "C# Documentation"),
     # Web fundamentals
     "HTML": ("https://developer.mozilla.org/en-US/docs/Web/HTML/", "MDN HTML Reference"),
-    "JavaScript": ("https://developer.mozilla.org/en-US/docs/Web/JavaScript/", "MDN JavaScript Reference"),
+    "JavaScript": (
+        "https://developer.mozilla.org/en-US/docs/Web/JavaScript/",
+        "MDN JavaScript Reference",
+    ),
     "CSS": ("https://developer.mozilla.org/en-US/docs/Web/CSS/", "MDN CSS Reference"),
     # Mobile
     "Flutter": ("https://docs.flutter.dev/", "Flutter Documentation"),
@@ -106,7 +109,10 @@ _OFFICIAL_DOCS: dict[str, tuple[str, str]] = {
     "Kafka": ("https://kafka.apache.org/documentation/", "Apache Kafka Documentation"),
     "RabbitMQ": ("https://www.rabbitmq.com/docs/", "RabbitMQ Documentation"),
     "NATS": ("https://docs.nats.io/", "NATS Documentation"),
-    "Elasticsearch": ("https://www.elastic.co/guide/en/elasticsearch/reference/current/", "Elasticsearch Docs"),
+    "Elasticsearch": (
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/",
+        "Elasticsearch Docs",
+    ),
     "Cassandra": ("https://cassandra.apache.org/doc/latest/", "Apache Cassandra Documentation"),
     "ClickHouse": ("https://clickhouse.com/docs/", "ClickHouse Documentation"),
     "Spark": ("https://spark.apache.org/docs/latest/", "Apache Spark Documentation"),
@@ -152,14 +158,20 @@ _OFFICIAL_DOCS: dict[str, tuple[str, str]] = {
     "IBM Cloud": ("https://cloud.ibm.com/docs/", "IBM Cloud Documentation"),
     "Supabase": ("https://supabase.com/docs/", "Supabase Documentation"),
     # Frameworks & runtimes
-    "Spring Boot": ("https://docs.spring.io/spring-boot/docs/current/reference/", "Spring Boot Reference"),
+    "Spring Boot": (
+        "https://docs.spring.io/spring-boot/docs/current/reference/",
+        "Spring Boot Reference",
+    ),
     ".NET": ("https://learn.microsoft.com/dotnet/", ".NET Documentation"),
     "ASP.NET Core": ("https://learn.microsoft.com/aspnet/core/", "ASP.NET Core Documentation"),
     "Ruby on Rails": ("https://guides.rubyonrails.org/", "Ruby on Rails Guides"),
     "gRPC": ("https://grpc.io/docs/", "gRPC Documentation"),
     "Protobuf": ("https://protobuf.dev/overview/", "Protocol Buffers Documentation"),
     # Data processing
-    "Flink": ("https://nightlies.apache.org/flink/flink-docs-stable/", "Apache Flink Documentation"),
+    "Flink": (
+        "https://nightlies.apache.org/flink/flink-docs-stable/",
+        "Apache Flink Documentation",
+    ),
     "TimescaleDB": ("https://docs.timescale.com/", "TimescaleDB Documentation"),
     # Web & standards
     "PWA": ("https://developer.mozilla.org/en-US/docs/Web/Progressive_web_apps/", "MDN PWA Guide"),
@@ -207,38 +219,73 @@ def resolve_technology(tech_name: str) -> str:
 
 _TECH_ALIASES: dict[str, str] = {
     # Python
-    "flask-restful": "Flask", "flask-login": "Flask", "flask-cors": "Flask-CORS",
-    "flask-socketio": "Flask-SocketIO", "flask-migrate": "Flask",
-    "fastapi-users": "FastAPI", "django-rest-framework": "Django",
-    "django-ninja": "Django", "sqlmodel": "SQLAlchemy", "aiosqlite": "SQLAlchemy",
-    "asyncpg": "PostgreSQL", "psycopg": "PostgreSQL", "psycopg2": "PostgreSQL",
-    "redis-py": "Redis", "aioredis": "Redis", "celery-beat": "Celery",
-    "boto3": "AWS", "aioboto3": "AWS", "botocore": "AWS",
+    "flask-restful": "Flask",
+    "flask-login": "Flask",
+    "flask-cors": "Flask-CORS",
+    "flask-socketio": "Flask-SocketIO",
+    "flask-migrate": "Flask",
+    "fastapi-users": "FastAPI",
+    "django-rest-framework": "Django",
+    "django-ninja": "Django",
+    "sqlmodel": "SQLAlchemy",
+    "aiosqlite": "SQLAlchemy",
+    "asyncpg": "PostgreSQL",
+    "psycopg": "PostgreSQL",
+    "psycopg2": "PostgreSQL",
+    "redis-py": "Redis",
+    "aioredis": "Redis",
+    "celery-beat": "Celery",
+    "boto3": "AWS",
+    "aioboto3": "AWS",
+    "botocore": "AWS",
     # JavaScript / Node
-    "express.js": "Express", "expressjs": "Express",
-    "nextjs": "Next.js", "nuxtjs": "Nuxt", "vue.js": "Vue", "vuex": "Vue",
-    "react-router": "React", "react-query": "React", "react-hook-form": "React",
-    "socket.io-client": "Socket.IO", "tailwindcss": "Tailwind CSS",
-    "nestjs": "NestJS", "nx": "NestJS",
+    "express.js": "Express",
+    "expressjs": "Express",
+    "nextjs": "Next.js",
+    "nuxtjs": "Nuxt",
+    "vue.js": "Vue",
+    "vuex": "Vue",
+    "react-router": "React",
+    "react-query": "React",
+    "react-hook-form": "React",
+    "socket.io-client": "Socket.IO",
+    "tailwindcss": "Tailwind CSS",
+    "nestjs": "NestJS",
+    "nx": "NestJS",
     # Infrastructure
-    "k8s": "Kubernetes", "k3s": "Kubernetes", "kubectl": "Kubernetes",
-    "docker-compose": "Docker", "podman": "Docker",
-    "postgres": "PostgreSQL", "pg": "PostgreSQL", "mysql": "PostgreSQL",
-    "mongo": "MongoDB", "mongosh": "MongoDB",
-    "aws-cdk": "AWS", "cloudformation": "AWS",
-    "gke": "Kubernetes", "eks": "Kubernetes", "aks": "Kubernetes",
+    "k8s": "Kubernetes",
+    "k3s": "Kubernetes",
+    "kubectl": "Kubernetes",
+    "docker-compose": "Docker",
+    "podman": "Docker",
+    "postgres": "PostgreSQL",
+    "pg": "PostgreSQL",
+    "mysql": "PostgreSQL",
+    "mongo": "MongoDB",
+    "mongosh": "MongoDB",
+    "aws-cdk": "AWS",
+    "cloudformation": "AWS",
+    "gke": "Kubernetes",
+    "eks": "Kubernetes",
+    "aks": "Kubernetes",
     # Languages
-    "python3": "Python", "cpython": "Python", "pypy": "Python",
-    "golang": "Go", "rustlang": "Rust",
-    "typescript": "TypeScript", "ts": "TypeScript", "tsx": "TypeScript",
-    "csharp": "C#", "dotnet": ".NET",
+    "python3": "Python",
+    "cpython": "Python",
+    "pypy": "Python",
+    "golang": "Go",
+    "rustlang": "Rust",
+    "typescript": "TypeScript",
+    "ts": "TypeScript",
+    "tsx": "TypeScript",
+    "csharp": "C#",
+    "dotnet": ".NET",
 }
 
 
 class OfficialDocsChecker(SourceChecker):
     """Validates claims against official technology documentation."""
 
-    def __init__(self, rate_limit: float = 0.2):
+    def __init__(self, rate_limit: float = 0.2) -> None:
         super().__init__(rate_limit=rate_limit)
 
     @property
@@ -261,7 +308,9 @@ class OfficialDocsChecker(SourceChecker):
             "reachable": True,
         }
 
-    async def search_claim(self, claim_text: str, technologies: list[str], domains: list[str]) -> list[Source]:
+    async def search_claim(
+        self, claim_text: str, technologies: list[str], domains: list[str]
+    ) -> list[Source]:
         """Find official docs for technologies mentioned in a claim."""
         sources: list[Source] = []
         seen_urls: set[str] = set()
@@ -277,13 +326,15 @@ class OfficialDocsChecker(SourceChecker):
                 continue
             seen_urls.add(url)
 
-            sources.append(Source(
-                url=url,
-                title=title,
-                source_type=SourceType.OFFICIAL_DOCS,
-                retrieved_at=datetime.now(timezone.utc),
-                verified=True,
-            ))
+            sources.append(
+                Source(
+                    url=url,
+                    title=title,
+                    source_type=SourceType.OFFICIAL_DOCS,
+                    retrieved_at=datetime.now(UTC),
+                    verified=True,
+                )
+            )
 
         return sources
 
@@ -294,5 +345,6 @@ class OfficialDocsChecker(SourceChecker):
             async with httpx.AsyncClient(timeout=8) as client:
                 resp = await client.head(url, follow_redirects=True)
                 return resp.status_code == 200
-        except Exception:
+        except Exception as exc:
+            logger.debug("Official docs head check failed for %s: %s", url, exc)
             return False

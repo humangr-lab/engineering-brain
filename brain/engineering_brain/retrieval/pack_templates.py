@@ -61,8 +61,7 @@ class PackTemplateRegistry:
                 # Convert mcp_tools from dicts to MCPToolSpec objects
                 if "mcp_tools" in raw and isinstance(raw["mcp_tools"], list):
                     raw["mcp_tools"] = [
-                        MCPToolSpec(**t) if isinstance(t, dict) else t
-                        for t in raw["mcp_tools"]
+                        MCPToolSpec(**t) if isinstance(t, dict) else t for t in raw["mcp_tools"]
                     ]
                 template = PackTemplate(**raw)
                 self._templates[template.id] = template
@@ -124,13 +123,16 @@ class PackTemplateRegistry:
                 if key in ("extends",):
                     continue
                 # Only override if the child actually set a non-default value
-                if isinstance(value, list) and value:
-                    merged[key] = value
-                elif isinstance(value, dict) and value:
-                    merged[key] = value
-                elif isinstance(value, str) and value:
-                    merged[key] = value
-                elif isinstance(value, bool) and value != defaults.get(key):
+                if (
+                    isinstance(value, list)
+                    and value
+                    or isinstance(value, dict)
+                    and value
+                    or isinstance(value, str)
+                    and value
+                    or isinstance(value, bool)
+                    and value != defaults.get(key)
+                ):
                     merged[key] = value
                 elif isinstance(value, (int, float)) and value != defaults.get(key):
                     # Only override if child explicitly changed from default
@@ -145,8 +147,7 @@ class PackTemplateRegistry:
             # Convert mcp_tools back
             if "mcp_tools" in merged and isinstance(merged["mcp_tools"], list):
                 merged["mcp_tools"] = [
-                    MCPToolSpec(**t) if isinstance(t, dict) else t
-                    for t in merged["mcp_tools"]
+                    MCPToolSpec(**t) if isinstance(t, dict) else t for t in merged["mcp_tools"]
                 ]
 
             self._templates[template_id] = PackTemplate(**merged)
@@ -163,7 +164,9 @@ class PackTemplateRegistry:
         """Get a template by ID. Raises KeyError if not found."""
         self._ensure_loaded()
         if template_id not in self._templates:
-            raise KeyError(f"Pack template not found: {template_id!r}. Available: {sorted(self._templates.keys())}")
+            raise KeyError(
+                f"Pack template not found: {template_id!r}. Available: {sorted(self._templates.keys())}"
+            )
         return self._templates[template_id]
 
     def list_templates(self) -> list[PackTemplate]:
@@ -171,7 +174,9 @@ class PackTemplateRegistry:
         self._ensure_loaded()
         return sorted(self._templates.values(), key=lambda t: t.id)
 
-    def search(self, tags: list[str] | None = None, domain: str = "", technology: str = "") -> list[PackTemplate]:
+    def search(
+        self, tags: list[str] | None = None, domain: str = "", technology: str = ""
+    ) -> list[PackTemplate]:
         """Search templates by tags, domain, or technology."""
         self._ensure_loaded()
         results: list[PackTemplate] = []
@@ -191,7 +196,9 @@ class PackTemplateRegistry:
 
             # Technology match (glob)
             if technology:
-                if any(fnmatch.fnmatch(technology.lower(), t.lower()) for t in template.technologies):
+                if any(
+                    fnmatch.fnmatch(technology.lower(), t.lower()) for t in template.technologies
+                ):
                     results.append(template)
                     continue
 

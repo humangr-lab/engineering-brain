@@ -76,6 +76,7 @@ class AsyncEmbeddingPipeline:
             return self._embedder
         try:
             from pipeline_autonomo.embedding_provider import get_embedding_provider
+
             self._embedder = get_embedding_provider()
             return self._embedder
         except ImportError:
@@ -119,7 +120,10 @@ class AsyncEmbeddingPipeline:
             batch_texts = texts[batch_start:batch_end]
             task = asyncio.create_task(
                 self._embed_sub_batch(
-                    embedder, batch_texts, results, batch_start,
+                    embedder,
+                    batch_texts,
+                    results,
+                    batch_start,
                 )
             )
             tasks.append(task)
@@ -150,7 +154,9 @@ class AsyncEmbeddingPipeline:
                 # Run synchronous embedding in executor to not block event loop
                 loop = asyncio.get_event_loop()
                 embeddings = await loop.run_in_executor(
-                    None, embedder.embed_batch, texts,
+                    None,
+                    embedder.embed_batch,
+                    texts,
                 )
                 self._circuit_breaker.record_success()
                 for i, emb in enumerate(embeddings):
@@ -183,7 +189,7 @@ class AsyncEmbeddingPipeline:
         embeddings = await self.embed_batch(texts, batch_size=batch_size)
 
         result: dict[str, list[float]] = {}
-        for nid, emb in zip(ids, embeddings):
+        for nid, emb in zip(ids, embeddings, strict=False):
             if emb is not None:
                 result[nid] = emb
 

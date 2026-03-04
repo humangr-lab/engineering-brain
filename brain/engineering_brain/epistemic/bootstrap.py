@@ -9,12 +9,11 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from engineering_brain.epistemic.layer_opinions import bootstrap_opinion
-from engineering_brain.epistemic.opinion import OpinionTuple
 from engineering_brain.epistemic.provenance import ProvenanceChain, ProvenanceRecord
 
 logger = logging.getLogger(__name__)
@@ -84,7 +83,7 @@ def bootstrap_all_nodes(
     bootstrapped = 0
     skipped = 0
     total_sources = 0
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = datetime.now(UTC).isoformat()
 
     for node in all_nodes:
         node_id = node.get("id", "")
@@ -143,7 +142,9 @@ def bootstrap_all_nodes(
 
     logger.info(
         "Bootstrapped %d nodes (%d skipped, %d total sources)",
-        bootstrapped, skipped, total_sources,
+        bootstrapped,
+        skipped,
+        total_sources,
     )
 
     result: dict[str, Any] = {
@@ -156,6 +157,7 @@ def bootstrap_all_nodes(
     if enable_contradiction_detection:
         try:
             from engineering_brain.epistemic.contradiction import ContradictionDetector
+
             detector = ContradictionDetector(graph_adapter)
             reports = detector.detect_all()
             result["contradiction_reports"] = len(reports)
@@ -168,6 +170,7 @@ def bootstrap_all_nodes(
     if enable_trust_propagation:
         try:
             from engineering_brain.epistemic.trust_propagation import EigenTrustEngine
+
             engine = EigenTrustEngine()
             scores = engine.compute(graph_adapter)
             # Store scores on nodes
@@ -175,7 +178,8 @@ def bootstrap_all_nodes(
                 n = graph_adapter.get_node(nid)
                 if n is not None:
                     graph_adapter.add_node(
-                        _node_label(nid), nid,
+                        _node_label(nid),
+                        nid,
                         {**n, "eigentrust_score": score},
                     )
             result["trust_scores"] = len(scores)
@@ -188,6 +192,7 @@ def bootstrap_all_nodes(
     if enable_gap_analysis:
         try:
             from engineering_brain.epistemic.gap_analysis import GapAnalyzer
+
             analyzer = GapAnalyzer(graph_adapter)
             gaps = analyzer.analyze()
             result["gaps"] = len(gaps)

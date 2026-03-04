@@ -13,8 +13,8 @@ Integration:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any
 
 from engineering_brain.adapters.base import GraphAdapter
 from engineering_brain.epistemic.conflict_resolution import (
@@ -39,7 +39,7 @@ class ContradictionReport:
     opinion_b: OpinionTuple
     conflict_k: float
     severity: ConflictSeverity
-    resolved_opinion: Optional[OpinionTuple] = None
+    resolved_opinion: OpinionTuple | None = None
     resolution_method: str = ""
 
     @property
@@ -92,17 +92,20 @@ class ContradictionDetector:
             severity = classify_conflict(k)
 
             if severity != ConflictSeverity.NONE:
-                reports.append(ContradictionReport(
-                    node_a_id=a_id,
-                    node_b_id=b_id,
-                    opinion_a=op_a,
-                    opinion_b=op_b,
-                    conflict_k=k,
-                    severity=severity,
-                ))
+                reports.append(
+                    ContradictionReport(
+                        node_a_id=a_id,
+                        node_b_id=b_id,
+                        opinion_a=op_a,
+                        opinion_b=op_b,
+                        conflict_k=k,
+                        severity=severity,
+                    )
+                )
 
-        logger.info("Detected %d contradictions across %d CONFLICTS_WITH edges",
-                     len(reports), len(edges))
+        logger.info(
+            "Detected %d contradictions across %d CONFLICTS_WITH edges", len(reports), len(edges)
+        )
         return reports
 
     def detect_for_node(self, node_id: str) -> list[ContradictionReport]:
@@ -132,14 +135,16 @@ class ContradictionDetector:
             severity = classify_conflict(k)
 
             if severity != ConflictSeverity.NONE:
-                reports.append(ContradictionReport(
-                    node_a_id=node_id,
-                    node_b_id=other_id,
-                    opinion_a=op_self,
-                    opinion_b=op_other,
-                    conflict_k=k,
-                    severity=severity,
-                ))
+                reports.append(
+                    ContradictionReport(
+                        node_a_id=node_id,
+                        node_b_id=other_id,
+                        opinion_a=op_self,
+                        opinion_b=op_other,
+                        conflict_k=k,
+                        severity=severity,
+                    )
+                )
 
         return reports
 
@@ -171,7 +176,7 @@ class ContradictionDetector:
         else:  # HIGH or EXTREME
             resolved = murphy_weighted_average(
                 [report.opinion_a, report.opinion_b],
-                weights=[trust_a ** 2, trust_b ** 2],
+                weights=[trust_a**2, trust_b**2],
             )
             # EXTREME: inject additional uncertainty
             if report.severity == ConflictSeverity.EXTREME:
@@ -203,10 +208,7 @@ class ContradictionDetector:
 
         total_disbelief_injection = 0.0
         for report in reports:
-            if report.node_a_id == node_id:
-                other_op = report.opinion_b
-            else:
-                other_op = report.opinion_a
+            other_op = report.opinion_b if report.node_a_id == node_id else report.opinion_a
             # Inject disbelief proportional to K * other's belief
             total_disbelief_injection += report.conflict_k * other_op.b * 0.3
 

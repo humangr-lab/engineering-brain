@@ -177,6 +177,7 @@ class OntologyAligner:
             content = path.read_text(encoding="utf-8")
             if path.suffix in (".yaml", ".yml"):
                 import yaml
+
                 data = yaml.safe_load(content)
             else:
                 data = json.loads(content)
@@ -250,7 +251,8 @@ class OntologyAligner:
             tag_vec = self._embedder.embed_text(tag_text)
             if not tag_vec:
                 return {"candidates": candidates, "method": "embed_failed"}
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to embed tag '%s' for ontology alignment: %s", tag_text, exc)
             return {"candidates": candidates, "method": "embed_failed"}
 
         scored: list[dict[str, Any]] = []
@@ -263,7 +265,8 @@ class OntologyAligner:
                 if cand_vec:
                     sim = self._cosine(tag_vec, cand_vec)
                     scored.append({**cand, "similarity": round(sim, 4)})
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to embed candidate label '%s': %s", label, exc)
                 scored.append({**cand, "similarity": 0.0})
 
         scored.sort(key=lambda c: c.get("similarity", 0), reverse=True)
@@ -285,7 +288,7 @@ class OntologyAligner:
         """Expand a prefixed URI (e.g., 'wd:Q28865' → full URL)."""
         for prefix, base_url in ONTOLOGY_PREFIXES.items():
             if uri.startswith(f"{prefix}:"):
-                return base_url + uri[len(prefix) + 1:]
+                return base_url + uri[len(prefix) + 1 :]
         return uri
 
     @staticmethod
@@ -293,7 +296,7 @@ class OntologyAligner:
         """Compute cosine similarity."""
         if not a or not b or len(a) != len(b):
             return 0.0
-        dot = sum(x * y for x, y in zip(a, b))
+        dot = sum(x * y for x, y in zip(a, b, strict=False))
         na = sum(x * x for x in a) ** 0.5
         nb = sum(x * x for x in b) ** 0.5
         if na == 0.0 or nb == 0.0:

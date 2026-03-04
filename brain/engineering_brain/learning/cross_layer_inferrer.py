@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from engineering_brain.adapters.base import GraphAdapter
@@ -81,7 +81,7 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Compute cosine similarity between two vectors."""
     if not a or not b or len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     norm_a = sum(x * x for x in a) ** 0.5
     norm_b = sum(x * x for x in b) ** 0.5
     if norm_a == 0.0 or norm_b == 0.0:
@@ -184,7 +184,9 @@ class CrossLayerEdgeInferrer:
             if hasattr(config, "cross_layer_informs_threshold"):
                 self._transition_thresholds[EdgeType.INFORMS] = config.cross_layer_informs_threshold
             if hasattr(config, "cross_layer_instantiates_threshold"):
-                self._transition_thresholds[EdgeType.INSTANTIATES] = config.cross_layer_instantiates_threshold
+                self._transition_thresholds[EdgeType.INSTANTIATES] = (
+                    config.cross_layer_instantiates_threshold
+                )
 
             # Backward compat: if user explicitly set BRAIN_CROSS_LAYER_SIM env var,
             # use that single threshold for all transitions
@@ -215,7 +217,8 @@ class CrossLayerEdgeInferrer:
         if hasattr(self._embedder, "embed_batch") and len(texts) > 1:
             try:
                 vectors = self._embedder.embed_batch(texts)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Batch embedding failed, falling back to one-by-one: %s", exc)
                 vectors = []
 
         # Fallback to one-by-one
@@ -225,10 +228,11 @@ class CrossLayerEdgeInferrer:
                 try:
                     vec = self._embedder.embed_text(text)
                     vectors.append(vec if vec else [])
-                except Exception:
+                except Exception as exc:
+                    logger.debug("Single text embedding failed: %s", exc)
                     vectors.append([])
 
-        return {nid: vec for nid, vec in zip(ids, vectors) if vec}
+        return {nid: vec for nid, vec in zip(ids, vectors, strict=False) if vec}
 
     def infer_edges(self, batch_size: int = 20) -> list[InferredEdge]:
         """Scan all valid cross-layer node pairs and infer missing edges.
@@ -264,12 +268,7 @@ class CrossLayerEdgeInferrer:
             # Per-transition threshold
             threshold = self._get_threshold(edge_type)
 
-            # ANN fast-path: when vector_adapter available, use O(K log N) search
-            # instead of O(N^2) brute force. Deferred until graph > 10K nodes.
-            # if self._vector_adapter is not None and len(src_vecs) > 100:
-            #     pass  # TODO: implement ANN candidate generation
-
-            # Compare pairs
+            # Compare pairs (brute-force; ANN candidate gen deferred until >10K nodes)
             transition_edges: list[InferredEdge] = []
             for src_id, src_vec in src_vecs.items():
                 for tgt_id, tgt_vec in tgt_vecs.items():
@@ -278,23 +277,26 @@ class CrossLayerEdgeInferrer:
                         continue
 
                     confidence = self.validate_edge_score(
-                        src_vec, tgt_vec,
+                        src_vec,
+                        tgt_vec,
                         src_lookup.get(src_id, {}),
                         tgt_lookup.get(tgt_id, {}),
                     )
                     if confidence >= threshold:
-                        transition_edges.append(InferredEdge(
-                            source_id=src_id,
-                            target_id=tgt_id,
-                            edge_type=edge_type,
-                            confidence=confidence,
-                            raw_cosine=_cosine_similarity(src_vec, tgt_vec),
-                        ))
+                        transition_edges.append(
+                            InferredEdge(
+                                source_id=src_id,
+                                target_id=tgt_id,
+                                edge_type=edge_type,
+                                confidence=confidence,
+                                raw_cosine=_cosine_similarity(src_vec, tgt_vec),
+                            )
+                        )
 
             # Top-K per transition (rank-based selection)
             transition_edges.sort(key=lambda e: e.confidence, reverse=True)
             if self._top_k_per_transition > 0:
-                transition_edges = transition_edges[:self._top_k_per_transition]
+                transition_edges = transition_edges[: self._top_k_per_transition]
 
             inferred.extend(transition_edges)
 
@@ -302,7 +304,8 @@ class CrossLayerEdgeInferrer:
         inferred.sort(key=lambda e: e.confidence, reverse=True)
         logger.info(
             "Inferred %d cross-layer edges (per-transition thresholds, top-K=%d)",
-            len(inferred), self._top_k_per_transition,
+            len(inferred),
+            self._top_k_per_transition,
         )
         return inferred
 
@@ -322,7 +325,8 @@ class CrossLayerEdgeInferrer:
 
         try:
             node_vec = self._embedder.embed_text(text)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to embed node %s for inference: %s", node_id, exc)
             return []
         if not node_vec:
             return []
@@ -348,19 +352,22 @@ class CrossLayerEdgeInferrer:
                         continue
                     try:
                         cand_vec = self._embedder.embed_text(cand_text)
-                    except Exception:
+                    except Exception as exc:
+                        logger.debug("Failed to embed candidate %s: %s", cid, exc)
                         continue
                     if not cand_vec:
                         continue
                     confidence = self.validate_edge_score(node_vec, cand_vec, node, cand)
                     if confidence >= threshold:
-                        inferred.append(InferredEdge(
-                            source_id=node_id,
-                            target_id=cid,
-                            edge_type=edge_type,
-                            confidence=confidence,
-                            raw_cosine=_cosine_similarity(node_vec, cand_vec),
-                        ))
+                        inferred.append(
+                            InferredEdge(
+                                source_id=node_id,
+                                target_id=cid,
+                                edge_type=edge_type,
+                                confidence=confidence,
+                                raw_cosine=_cosine_similarity(node_vec, cand_vec),
+                            )
+                        )
 
             elif layer == tgt_layer:
                 # This node is a target -> find sources
@@ -377,19 +384,22 @@ class CrossLayerEdgeInferrer:
                         continue
                     try:
                         cand_vec = self._embedder.embed_text(cand_text)
-                    except Exception:
+                    except Exception as exc:
+                        logger.debug("Failed to embed candidate %s: %s", cid, exc)
                         continue
                     if not cand_vec:
                         continue
                     confidence = self.validate_edge_score(cand_vec, node_vec, cand, node)
                     if confidence >= threshold:
-                        inferred.append(InferredEdge(
-                            source_id=cid,
-                            target_id=node_id,
-                            edge_type=edge_type,
-                            confidence=confidence,
-                            raw_cosine=_cosine_similarity(cand_vec, node_vec),
-                        ))
+                        inferred.append(
+                            InferredEdge(
+                                source_id=cid,
+                                target_id=node_id,
+                                edge_type=edge_type,
+                                confidence=confidence,
+                                raw_cosine=_cosine_similarity(cand_vec, node_vec),
+                            )
+                        )
 
         inferred.sort(key=lambda e: e.confidence, reverse=True)
         return inferred
@@ -425,28 +435,26 @@ class CrossLayerEdgeInferrer:
         facet_sim = 0.0
         try:
             from engineering_brain.core.taxonomy import get_registry
+
             registry = get_registry()
             if registry.size > 0:
-                s_tags = list(set(
-                    (source.get("technologies") or []) + (source.get("domains") or [])
-                ))
-                t_tags = list(set(
-                    (target.get("technologies") or []) + (target.get("domains") or [])
-                ))
+                s_tags = list(
+                    set((source.get("technologies") or []) + (source.get("domains") or []))
+                )
+                t_tags = list(
+                    set((target.get("technologies") or []) + (target.get("domains") or []))
+                )
                 if s_tags and t_tags:
-                    facet_sim = min(registry.overlap_count(s_tags, t_tags) / max(len(s_tags), 1), 1.0)
-        except Exception:
-            pass
+                    facet_sim = min(
+                        registry.overlap_count(s_tags, t_tags) / max(len(s_tags), 1), 1.0
+                    )
+        except Exception as exc:
+            logger.debug("Facet similarity computation failed: %s", exc)
 
         if facet_sim == 0.0:
             # Redistribute facet weight proportionally when facets unavailable
             return norm_cosine * 0.611 + tech_sim * 0.222 + domain_sim * 0.167
-        return (
-            norm_cosine * 0.55
-            + tech_sim * 0.20
-            + domain_sim * 0.15
-            + facet_sim * 0.10
-        )
+        return norm_cosine * 0.55 + tech_sim * 0.20 + domain_sim * 0.15 + facet_sim * 0.10
 
     def calibrate(
         self,
@@ -476,7 +484,8 @@ class CrossLayerEdgeInferrer:
             try:
                 src_vec = self._embedder.embed_text(src_text)
                 tgt_vec = self._embedder.embed_text(tgt_text)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to embed calibration pair (%s, %s): %s", src_id, tgt_id, exc)
                 continue
             if not src_vec or not tgt_vec:
                 continue
@@ -488,7 +497,8 @@ class CrossLayerEdgeInferrer:
             scores.sort()
             n = len(scores)
             threshold = self._transition_thresholds.get(
-                EdgeType(edge_type_str), self._similarity_threshold,
+                EdgeType(edge_type_str),
+                self._similarity_threshold,
             )
             recall = sum(1 for s in scores if s >= threshold) / max(n, 1)
             results[edge_type_str] = {
@@ -498,7 +508,11 @@ class CrossLayerEdgeInferrer:
                 "min": round(scores[0], 4) if scores else 0,
                 "p25": round(scores[n // 4], 4) if n >= 4 else round(scores[0], 4) if scores else 0,
                 "p50": round(scores[n // 2], 4) if n >= 2 else round(scores[0], 4) if scores else 0,
-                "p75": round(scores[3 * n // 4], 4) if n >= 4 else round(scores[-1], 4) if scores else 0,
+                "p75": round(scores[3 * n // 4], 4)
+                if n >= 4
+                else round(scores[-1], 4)
+                if scores
+                else 0,
                 "max": round(scores[-1], 4) if scores else 0,
                 "mean": round(sum(scores) / max(n, 1), 4),
             }
@@ -512,8 +526,7 @@ class CrossLayerEdgeInferrer:
     ) -> list[InferredEdge]:
         """Return only inferred edges that don't conflict with hardcoded ones."""
         return [
-            edge for edge in inferred
-            if (edge.source_id, edge.target_id) not in hardcoded_edges
+            edge for edge in inferred if (edge.source_id, edge.target_id) not in hardcoded_edges
         ]
 
     @staticmethod

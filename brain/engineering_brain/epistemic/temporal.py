@@ -44,9 +44,7 @@ class HawkesDecayEngine:
         self.alpha = alpha
         self.beta = beta
 
-    def compute_intensity(
-        self, now_days: float, event_timestamps_days: list[float]
-    ) -> float:
+    def compute_intensity(self, now_days: float, event_timestamps_days: list[float]) -> float:
         """Compute Hawkes conditional intensity at time `now`.
 
         Args:
@@ -63,9 +61,7 @@ class HawkesDecayEngine:
                 excitation += self.alpha * self.beta * math.exp(-self.beta * dt)
         return self.mu + excitation
 
-    def compute_temporal_factor(
-        self, now_unix: int, event_timestamps_unix: list[int]
-    ) -> float:
+    def compute_temporal_factor(self, now_unix: int, event_timestamps_unix: list[int]) -> float:
         """Compute temporal modulation factor tau in [0, 1].
 
         tau = 1: fully maintained (active reinforcement)
@@ -130,12 +126,12 @@ class HawkesDecayEngine:
 
 # Layer-specific decay profiles
 LAYER_DECAY_PROFILES: dict[str, HawkesDecayEngine] = {
-    "L0": HawkesDecayEngine(mu=0.0, alpha=0.0, beta=0.0),         # axioms: permanent
-    "L1": HawkesDecayEngine(mu=0.0002, alpha=0.01, beta=0.003),   # principles: very slow
-    "L2": HawkesDecayEngine(mu=0.0005, alpha=0.03, beta=0.005),   # patterns: slow
-    "L3": HawkesDecayEngine(mu=0.001, alpha=0.05, beta=0.01),     # rules: moderate
-    "L4": HawkesDecayEngine(mu=0.003, alpha=0.05, beta=0.02),     # evidence: faster
-    "L5": HawkesDecayEngine(mu=0.01, alpha=0.1, beta=0.05),       # context: fast
+    "L0": HawkesDecayEngine(mu=0.0, alpha=0.0, beta=0.0),  # axioms: permanent
+    "L1": HawkesDecayEngine(mu=0.0002, alpha=0.01, beta=0.003),  # principles: very slow
+    "L2": HawkesDecayEngine(mu=0.0005, alpha=0.03, beta=0.005),  # patterns: slow
+    "L3": HawkesDecayEngine(mu=0.001, alpha=0.05, beta=0.01),  # rules: moderate
+    "L4": HawkesDecayEngine(mu=0.003, alpha=0.05, beta=0.02),  # evidence: faster
+    "L5": HawkesDecayEngine(mu=0.01, alpha=0.1, beta=0.05),  # context: fast
 }
 
 

@@ -78,7 +78,9 @@ def generate_human_map(graph: GraphAdapter) -> str:
             for r in sorted(sev_rules, key=lambda x: -int(x.get("reinforcement_count", 0))):
                 conf = float(r.get("confidence", 0))
                 count = int(r.get("reinforcement_count", 0))
-                sections.append(f"#### {r.get('id', '?')} [{sev.upper()}] (confidence={conf:.0%}, reinforced={count}x)")
+                sections.append(
+                    f"#### {r.get('id', '?')} [{sev.upper()}] (confidence={conf:.0%}, reinforced={count}x)"
+                )
                 sections.append(f"**Rule**: {r.get('text', '-')}")
                 sections.append(f"**WHY**: {r.get('why', '-')}")
                 sections.append(f"**HOW**: {r.get('how_to_do_right', '-')}")
@@ -101,7 +103,13 @@ def generate_human_map(graph: GraphAdapter) -> str:
 def generate_layer_summary(graph: GraphAdapter) -> dict[str, Any]:
     """Generate a compact summary of knowledge distribution."""
     counts = {}
-    for nt in (NodeType.AXIOM, NodeType.PRINCIPLE, NodeType.PATTERN, NodeType.RULE, NodeType.FINDING):
+    for nt in (
+        NodeType.AXIOM,
+        NodeType.PRINCIPLE,
+        NodeType.PATTERN,
+        NodeType.RULE,
+        NodeType.FINDING,
+    ):
         counts[nt.value] = graph.count(nt.value)
 
     rules = graph.query(label=NodeType.RULE.value, limit=1000)

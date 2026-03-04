@@ -20,13 +20,6 @@ from __future__ import annotations
 from engineering_brain.core.brain import Brain
 from engineering_brain.core.config import BrainConfig, get_brain_config
 from engineering_brain.core.schema import EdgeType, Layer, NodeType
-from engineering_brain.retrieval.task_knowledge import (
-    auto_tag_task,
-    enrich_task_with_knowledge,
-    enrich_tasks_batch,
-    get_knowledge_for_task,
-    init_task_knowledge,
-)
 from engineering_brain.core.types import (
     Axiom,
     CodeExample,
@@ -47,6 +40,13 @@ from engineering_brain.core.types import (
     Technology,
     TestResult,
     ValidationStatus,
+)
+from engineering_brain.retrieval.task_knowledge import (
+    auto_tag_task,
+    enrich_task_with_knowledge,
+    enrich_tasks_batch,
+    get_knowledge_for_task,
+    init_task_knowledge,
 )
 
 __all__ = [

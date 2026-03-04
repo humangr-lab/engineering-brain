@@ -80,7 +80,9 @@ class TaxonomyExpander:
 
         query = f"{context} {tag_text}" if context else tag_text
         neighbors = self._index.semantic_search(
-            query, facet=facet_hint or None, top_k=5,
+            query,
+            facet=facet_hint or None,
+            top_k=5,
         )
 
         if not neighbors:
@@ -110,7 +112,10 @@ class TaxonomyExpander:
 
         logger.info(
             "Auto-expanded tag '%s' (facet=%s, parents=%s) from %d neighbors",
-            tag_id, facet, parents, len(neighbors),
+            tag_id,
+            facet,
+            parents,
+            len(neighbors),
         )
         return tag
 
@@ -135,7 +140,7 @@ class TaxonomyExpander:
         suggestions: list[tuple[str, str, float]] = []
 
         for i in range(0, len(all_tags), batch_size):
-            batch = all_tags[i:i + batch_size]
+            batch = all_tags[i : i + batch_size]
 
             for tag in batch:
                 similar = self._index.find_similar_tags(tag.id, top_k=5)
@@ -248,9 +253,7 @@ class TaxonomyExpander:
         top = counter.most_common(3)
         parents = []
         for pid, count in top:
-            if not parents and count >= 1:
-                parents.append(pid)
-            elif count >= 2:
+            if not parents and count >= 1 or count >= 2:
                 parents.append(pid)
             if len(parents) >= 2:
                 break

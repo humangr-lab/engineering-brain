@@ -40,7 +40,9 @@ def main() -> None:
     # validate
     v_parser = sub.add_parser("validate", help="Validate knowledge against sources")
     v_group = v_parser.add_mutually_exclusive_group(required=True)
-    v_group.add_argument("--all", action="store_true", dest="validate_all", help="Validate all nodes")
+    v_group.add_argument(
+        "--all", action="store_true", dest="validate_all", help="Validate all nodes"
+    )
     v_group.add_argument("--id", dest="node_id", help="Validate a single node by ID")
     v_group.add_argument("--layer", help="Validate a layer (L0, L1, L2, L3)")
     v_parser.add_argument("--dry-run", action="store_true", help="Plan only, no API calls")
@@ -118,6 +120,7 @@ def _cmd_query(args: argparse.Namespace) -> None:
 
     if args.human:
         from engineering_brain.retrieval.formatter import format_for_human
+
         text = format_for_human(result.results_by_layer)
     else:
         text = result.formatted_text
@@ -151,31 +154,41 @@ def _cmd_validate(args: argparse.Namespace) -> None:
             print(f"  Sources: {len(result.get('sources', []))}")
             for src in result.get("sources", []):
                 if isinstance(src, dict):
-                    print(f"    - [{src.get('source_type', '')}] {src.get('title', '')} — {src.get('url', '')}")
+                    print(
+                        f"    - [{src.get('source_type', '')}] {src.get('title', '')} — {src.get('url', '')}"
+                    )
             print(f"  Time: {elapsed:.1f}s")
     else:
         # Batch validation
         layer_filter = args.layer or ""
-        report = asyncio.run(brain.validate(
-            force_refresh=args.force_refresh,
-            dry_run=args.dry_run,
-            layer_filter=layer_filter,
-            progress_callback=None if args.json_output else progress,
-        ))
+        report = asyncio.run(
+            brain.validate(
+                force_refresh=args.force_refresh,
+                dry_run=args.dry_run,
+                layer_filter=layer_filter,
+                progress_callback=None if args.json_output else progress,
+            )
+        )
 
         elapsed = time.monotonic() - start
 
         if args.json_output:
-            print(json.dumps({
-                "total_nodes": report.total_nodes,
-                "validated": report.validated,
-                "cache_hits": report.cache_hits,
-                "api_calls": report.api_calls,
-                "errors": report.errors,
-                "by_status": report.by_status,
-                "by_checker": report.by_checker,
-                "elapsed_seconds": report.elapsed_seconds,
-            }, indent=2, default=str))
+            print(
+                json.dumps(
+                    {
+                        "total_nodes": report.total_nodes,
+                        "validated": report.validated,
+                        "cache_hits": report.cache_hits,
+                        "api_calls": report.api_calls,
+                        "errors": report.errors,
+                        "by_status": report.by_status,
+                        "by_checker": report.by_checker,
+                        "elapsed_seconds": report.elapsed_seconds,
+                    },
+                    indent=2,
+                    default=str,
+                )
+            )
         else:
             print()
             print()

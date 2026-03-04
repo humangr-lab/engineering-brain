@@ -62,8 +62,8 @@ def get_brain(
                 from engineering_brain.retrieval.task_knowledge import init_task_knowledge
 
                 init_task_knowledge(_brain)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Task knowledge initialization failed (non-blocking): %s", exc)
             # Launch background embedding
             if background_embed and not os.getenv("BRAIN_SKIP_BACKGROUND_EMBED"):
                 _start_background_embed()

@@ -99,13 +99,9 @@ class LearnedSourceTrust:
 
         prior = self._priors[source_type]
         if correct:
-            self._priors[source_type] = BetaPrior(
-                alpha=prior.alpha + 1.0, beta=prior.beta
-            )
+            self._priors[source_type] = BetaPrior(alpha=prior.alpha + 1.0, beta=prior.beta)
         else:
-            self._priors[source_type] = BetaPrior(
-                alpha=prior.alpha, beta=prior.beta + 1.0
-            )
+            self._priors[source_type] = BetaPrior(alpha=prior.alpha, beta=prior.beta + 1.0)
         return self._priors[source_type].mean
 
     def get_trust(self, source_type: str) -> float:
@@ -121,9 +117,7 @@ class LearnedSourceTrust:
         """Get the BetaPrior for a source type."""
         if source_type not in self._priors:
             trust = SOURCE_TRUST_MAP.get(source_type, 0.5)
-            self._priors[source_type] = BetaPrior(
-                alpha=trust * 10.0, beta=(1.0 - trust) * 10.0
-            )
+            self._priors[source_type] = BetaPrior(alpha=trust * 10.0, beta=(1.0 - trust) * 10.0)
         return self._priors[source_type]
 
     def divergence_from_static(self) -> dict[str, float]:

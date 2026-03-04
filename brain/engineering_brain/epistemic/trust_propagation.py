@@ -17,7 +17,6 @@ Convergence guaranteed by Perron-Frobenius theorem with teleport alpha > 0.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from engineering_brain.adapters.base import GraphAdapter
 
@@ -125,7 +124,9 @@ class EigenTrustEngine:
             local = []
             for dst_id, weight in neighbors:
                 dst_idx = node_idx.get(dst_id)
-                if dst_idx is not None and weight > 0:  # Negative edges (WEAKENS, CONFLICTS_WITH) excluded — distrust not propagated (design choice)
+                if (
+                    dst_idx is not None and weight > 0
+                ):  # Negative edges (WEAKENS, CONFLICTS_WITH) excluded — distrust not propagated (design choice)
                     local.append((dst_idx, weight))
 
             total = sum(w for _, w in local)
@@ -168,7 +169,9 @@ class EigenTrustEngine:
         return result
 
     def incremental_update(
-        self, graph: GraphAdapter, affected_node_id: str,
+        self,
+        graph: GraphAdapter,
+        affected_node_id: str,
     ) -> dict[str, float]:
         """Incremental EigenTrust update after a single edge add/remove.
 
@@ -215,7 +218,9 @@ class EigenTrustEngine:
 
             # Apply teleport
             is_seed = node_id in seed_set
-            new_score = (1 - self.alpha) * incoming_trust + self.alpha * (seed_bias if is_seed else 0.0)
+            new_score = (1 - self.alpha) * incoming_trust + self.alpha * (
+                seed_bias if is_seed else 0.0
+            )
 
             # Clamp to [0, 1]
             new_score = min(max(new_score, 0.0), 1.0)
@@ -254,8 +259,7 @@ class EigenTrustEngine:
         # Identify seeds: L0 Axioms and L1 Principles
         seeds = self._identify_seeds(graph)
 
-        logger.debug("EigenTrust: %d adjacency nodes, %d seeds",
-                      len(adjacency), len(seeds))
+        logger.debug("EigenTrust: %d adjacency nodes, %d seeds", len(adjacency), len(seeds))
         return adjacency, seeds
 
     def _identify_seeds(self, graph: GraphAdapter) -> set[str]:

@@ -42,7 +42,9 @@ class SourceChecker(ABC):
         """Check if a technology exists. Returns metadata dict or None."""
 
     @abstractmethod
-    async def search_claim(self, claim_text: str, technologies: list[str], domains: list[str]) -> list[Source]:
+    async def search_claim(
+        self, claim_text: str, technologies: list[str], domains: list[str]
+    ) -> list[Source]:
         """Search for evidence related to a claim. Returns Source list."""
 
     def is_available(self) -> bool:

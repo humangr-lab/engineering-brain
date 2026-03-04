@@ -28,7 +28,7 @@ from engineering_brain.core.types import (
 )
 from engineering_brain.retrieval.context_extractor import ExtractedContext
 from engineering_brain.retrieval.pack_manager import PackManager, _infer_layer
-from engineering_brain.retrieval.scorer import rank_results, score_knowledge
+from engineering_brain.retrieval.scorer import rank_results
 
 logger = logging.getLogger(__name__)
 
@@ -43,17 +43,19 @@ def _hierarchy_match_tags(a: list[str], b: list[str]) -> bool:
         return False
     try:
         from engineering_brain.core.taxonomy import get_registry
+
         registry = get_registry()
         if registry.size > 0:
             return registry.match_flat(a, b)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("TagRegistry match_flat failed: %s", exc)
     return bool({x.lower() for x in a} & {x.lower() for x in b})
 
 
 # Default template directory
 _TEMPLATES_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)), "templates",
+    os.path.dirname(os.path.dirname(__file__)),
+    "templates",
 )
 
 # Hardcoded fallback template (used when no YAML templates exist)
@@ -126,6 +128,7 @@ class ReasoningEngine:
         # Resolve string profile to BrainProfile
         if isinstance(profile, str):
             from engineering_brain.retrieval.brain_profiles import load_profile
+
             profile = load_profile(profile)
 
         # 1. Select or generate packs
@@ -218,14 +221,16 @@ class ReasoningEngine:
         for tmpl_step in template.steps:
             if tmpl_step.operation == "score":
                 # Synthesis step — no new nodes, just aggregation
-                steps.append({
-                    "order": tmpl_step.order,
-                    "description": tmpl_step.description,
-                    "operation": "score",
-                    "nodes": [],
-                    "opinion": None,
-                    "tier": "",
-                })
+                steps.append(
+                    {
+                        "order": tmpl_step.order,
+                        "description": tmpl_step.description,
+                        "operation": "score",
+                        "nodes": [],
+                        "opinion": None,
+                        "tier": "",
+                    }
+                )
                 continue
 
             # Filter nodes from pool
@@ -245,13 +250,15 @@ class ReasoningEngine:
             step_nodes: list[dict[str, Any]] = []
             for node in scored:
                 tier = self._classify_node_tier(node)
-                step_nodes.append({
-                    "id": node.get("id", ""),
-                    "text": self._node_text(node)[:120],
-                    "tier": tier,
-                    "score": round(node.get("_relevance_score", 0), 3),
-                    "layer": _infer_layer(str(node.get("id", ""))),
-                })
+                step_nodes.append(
+                    {
+                        "id": node.get("id", ""),
+                        "text": self._node_text(node)[:120],
+                        "tier": tier,
+                        "score": round(node.get("_relevance_score", 0), 3),
+                        "layer": _infer_layer(str(node.get("id", ""))),
+                    }
+                )
 
             # Compute step opinion from node epistemic data
             step_opinion = self._compute_step_opinion(scored)
@@ -263,15 +270,17 @@ class ReasoningEngine:
             chain_contradictions.extend(step_contras)
 
             total_activated += len(step_nodes)
-            steps.append({
-                "order": tmpl_step.order,
-                "description": tmpl_step.description,
-                "operation": tmpl_step.operation,
-                "edge_to_next": tmpl_step.edge_to_next,
-                "nodes": step_nodes,
-                "opinion": step_opinion,
-                "tier": self._dominant_tier(step_nodes),
-            })
+            steps.append(
+                {
+                    "order": tmpl_step.order,
+                    "description": tmpl_step.description,
+                    "operation": tmpl_step.operation,
+                    "edge_to_next": tmpl_step.edge_to_next,
+                    "nodes": step_nodes,
+                    "opinion": step_opinion,
+                    "tier": self._dominant_tier(step_nodes),
+                }
+            )
 
         # Chain-level opinion from step opinions
         chain_opinion = self._fuse_opinions(chain_opinions)
@@ -322,57 +331,75 @@ class ReasoningEngine:
 
             ops = []
             for op_dict in chain_opinions:
-                ops.append(OpinionTuple(
-                    b=op_dict["b"], d=op_dict["d"],
-                    u=op_dict["u"], a=op_dict.get("a", 0.5),
-                ))
+                ops.append(
+                    OpinionTuple(
+                        b=op_dict["b"],
+                        d=op_dict["d"],
+                        u=op_dict["u"],
+                        a=op_dict.get("a", 0.5),
+                    )
+                )
 
             for i in range(len(ops)):
                 for j in range(i + 1, len(ops)):
                     k = dempster_conflict(ops[i], ops[j])
                     severity = classify_conflict(k)
                     if severity.value not in ("none",):
-                        contradictions.append({
-                            "chain_a": chains[i].name,
-                            "chain_b": chains[j].name,
-                            "conflict_k": round(k, 3),
-                            "severity": severity.value,
-                            "description": f"Chain '{chains[i].name}' vs '{chains[j].name}' (K={k:.2f})",
-                        })
+                        contradictions.append(
+                            {
+                                "chain_a": chains[i].name,
+                                "chain_b": chains[j].name,
+                                "conflict_k": round(k, 3),
+                                "severity": severity.value,
+                                "description": f"Chain '{chains[i].name}' vs '{chains[j].name}' (K={k:.2f})",
+                            }
+                        )
 
             # Fuse based on max conflict level
             max_k = max(
-                (dempster_conflict(ops[i], ops[j])
-                 for i in range(len(ops)) for j in range(i + 1, len(ops))),
+                (
+                    dempster_conflict(ops[i], ops[j])
+                    for i in range(len(ops))
+                    for j in range(i + 1, len(ops))
+                ),
                 default=0.0,
             )
 
             if max_k < 0.3:
                 # Low conflict — standard CBF
                 from engineering_brain.epistemic.fusion import multi_source_cbf
+
                 fused = multi_source_cbf(ops)
             elif max_k < 0.7:
                 # Moderate conflict — Murphy's weighted average
                 from engineering_brain.epistemic.conflict_resolution import murphy_weighted_average
+
                 fused = murphy_weighted_average(ops)
             else:
                 # High conflict — report both, use Murphy as fallback
                 from engineering_brain.epistemic.conflict_resolution import murphy_weighted_average
+
                 fused = murphy_weighted_average(ops)
 
             return {
-                "b": round(fused.b, 4), "d": round(fused.d, 4),
-                "u": round(fused.u, 4), "a": round(fused.a, 4),
+                "b": round(fused.b, 4),
+                "d": round(fused.d, 4),
+                "u": round(fused.u, 4),
+                "a": round(fused.a, 4),
                 "P": round(fused.projected_probability, 4),
-                "fusion_strategy": "cbf" if max_k < 0.3 else ("murphy" if max_k < 0.7 else "conflict_report"),
+                "fusion_strategy": "cbf"
+                if max_k < 0.3
+                else ("murphy" if max_k < 0.7 else "conflict_report"),
             }, contradictions
 
         except Exception as e:
             logger.debug("Cross-chain synthesis fallback: %s", e)
             # Simple average fallback
             if chain_opinions:
-                avg = {k: sum(op.get(k, 0) for op in chain_opinions) / len(chain_opinions)
-                       for k in ("b", "d", "u")}
+                avg = {
+                    k: sum(op.get(k, 0) for op in chain_opinions) / len(chain_opinions)
+                    for k in ("b", "d", "u")
+                }
                 avg["a"] = 0.5
                 avg["P"] = avg["b"] + avg["a"] * avg["u"]
                 return avg, contradictions
@@ -406,8 +433,11 @@ class ReasoningEngine:
         if domain_filter:
             domain_filter_list = [d.lower() for d in domain_filter]
             result = [
-                n for n in result
-                if _hierarchy_match_tags(domain_filter_list, [d.lower() for d in (n.get("domains") or [])])
+                n
+                for n in result
+                if _hierarchy_match_tags(
+                    domain_filter_list, [d.lower() for d in (n.get("domains") or [])]
+                )
             ]
 
         # Filter by match_query_tech (hierarchy-aware)
@@ -415,8 +445,12 @@ class ReasoningEngine:
             query_techs = [t.lower() for t in ctx.technologies]
             if query_techs:
                 result = [
-                    n for n in result
-                    if _hierarchy_match_tags(query_techs, [t.lower() for t in (n.get("technologies") or n.get("languages") or [])])
+                    n
+                    for n in result
+                    if _hierarchy_match_tags(
+                        query_techs,
+                        [t.lower() for t in (n.get("technologies") or n.get("languages") or [])],
+                    )
                 ]
 
         return result
@@ -439,27 +473,31 @@ class ReasoningEngine:
             nid = node.get("id", "")
             full_node = self._graph.get_node(nid) if nid else None
             if full_node:
-                for t in (full_node.get("technologies") or full_node.get("languages") or []):
+                for t in full_node.get("technologies") or full_node.get("languages") or []:
                     returned_techs.append(t.lower())
 
         for tech in ctx.technologies:
             if not _hierarchy_match_tags([tech.lower()], returned_techs):
-                gaps.append({
-                    "gap_type": "missing_technology",
-                    "description": f"No knowledge found for technology '{tech}'",
-                    "severity": 0.8,
-                })
+                gaps.append(
+                    {
+                        "gap_type": "missing_technology",
+                        "description": f"No knowledge found for technology '{tech}'",
+                        "severity": 0.8,
+                    }
+                )
 
         # Missing layer coverage
         layers_present: set[str] = set()
         for node in activated_nodes:
             layers_present.add(node.get("layer", _infer_layer(node.get("id", ""))))
         if activated_nodes and "L1" not in layers_present:
-            gaps.append({
-                "gap_type": "missing_principles",
-                "description": "No guiding principles activated in reasoning chains",
-                "severity": 0.5,
-            })
+            gaps.append(
+                {
+                    "gap_type": "missing_principles",
+                    "description": "No guiding principles activated in reasoning chains",
+                    "severity": 0.5,
+                }
+            )
 
         # Missing domain coverage (hierarchy-aware)
         returned_domains: list[str] = []
@@ -467,15 +505,19 @@ class ReasoningEngine:
             nid = node.get("id", "")
             full_node = self._graph.get_node(nid) if nid else None
             if full_node:
-                for d in (full_node.get("domains") or []):
+                for d in full_node.get("domains") or []:
                     returned_domains.append(d.lower())
         for domain in ctx.domains:
-            if domain != "general" and not _hierarchy_match_tags([domain.lower()], returned_domains):
-                gaps.append({
-                    "gap_type": "missing_domain",
-                    "description": f"No knowledge found in domain '{domain}'",
-                    "severity": 0.5,
-                })
+            if domain != "general" and not _hierarchy_match_tags(
+                [domain.lower()], returned_domains
+            ):
+                gaps.append(
+                    {
+                        "gap_type": "missing_domain",
+                        "description": f"No knowledge found in domain '{domain}'",
+                        "severity": 0.5,
+                    }
+                )
 
         return gaps
 
@@ -497,7 +539,7 @@ class ReasoningEngine:
                     continue
                 path = os.path.join(_TEMPLATES_DIR, fname)
                 try:
-                    with open(path, "r") as f:
+                    with open(path) as f:
                         data = yaml.safe_load(f)
                     if isinstance(data, dict) and "id" in data:
                         tmpl = ReasoningTemplate(**data)
@@ -595,8 +637,12 @@ class ReasoningEngine:
             validation = str(node.get("validation_status", "unvalidated"))
             evidence_strength = 1.0 - u
             eigentrust = float(node.get("eigentrust_score", 0.5))
-            if (validation in ("cross_checked", "human_verified")
-                    and projected >= 0.7 and evidence_strength >= 0.5 and eigentrust >= 0.4):
+            if (
+                validation in ("cross_checked", "human_verified")
+                and projected >= 0.7
+                and evidence_strength >= 0.5
+                and eigentrust >= 0.4
+            ):
                 return "validated"
             if projected >= 0.6 and evidence_strength >= 0.3:
                 return "probable"
@@ -622,12 +668,14 @@ class ReasoningEngine:
             for node in nodes:
                 ep_b = node.get("ep_b")
                 if ep_b is not None:
-                    opinions.append(OpinionTuple(
-                        b=float(ep_b),
-                        d=float(node.get("ep_d", 0.0)),
-                        u=float(node.get("ep_u", 0.5)),
-                        a=float(node.get("ep_a", 0.5)),
-                    ))
+                    opinions.append(
+                        OpinionTuple(
+                            b=float(ep_b),
+                            d=float(node.get("ep_d", 0.0)),
+                            u=float(node.get("ep_u", 0.5)),
+                            a=float(node.get("ep_a", 0.5)),
+                        )
+                    )
                 else:
                     # Construct opinion from confidence heuristic
                     conf = float(node.get("confidence", 0.5))
@@ -635,7 +683,9 @@ class ReasoningEngine:
                     if validation in ("cross_checked", "human_verified"):
                         opinions.append(OpinionTuple(b=conf, d=0.0, u=1.0 - conf, a=0.5))
                     else:
-                        opinions.append(OpinionTuple(b=conf * 0.5, d=0.0, u=1.0 - conf * 0.5, a=0.5))
+                        opinions.append(
+                            OpinionTuple(b=conf * 0.5, d=0.0, u=1.0 - conf * 0.5, a=0.5)
+                        )
 
             if not opinions:
                 return None
@@ -664,11 +714,14 @@ class ReasoningEngine:
             ops = [OpinionTuple(b=o["b"], d=o["d"], u=o["u"], a=o.get("a", 0.5)) for o in valid]
             fused = multi_source_cbf(ops)
             return {
-                "b": round(fused.b, 4), "d": round(fused.d, 4),
-                "u": round(fused.u, 4), "a": round(fused.a, 4),
+                "b": round(fused.b, 4),
+                "d": round(fused.d, 4),
+                "u": round(fused.u, 4),
+                "a": round(fused.a, 4),
                 "P": round(fused.projected_probability, 4),
             }
-        except Exception:
+        except Exception as exc:
+            logger.debug("CBF fusion failed, falling back to average: %s", exc)
             # Fallback: average
             avg = {k: sum(o.get(k, 0) for o in valid) / len(valid) for k in ("b", "d", "u")}
             avg["a"] = 0.5
@@ -687,7 +740,8 @@ class ReasoningEngine:
                 continue
             try:
                 edges = self._graph.get_edges(node_id=nid, edge_type="CONFLICTS_WITH")
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to fetch CONFLICTS_WITH edges for %s: %s", nid, exc)
                 continue
             for edge in edges:
                 other_id = edge["to_id"] if edge["from_id"] == nid else edge["from_id"]
@@ -697,12 +751,14 @@ class ReasoningEngine:
                 if pair in seen_pairs:
                     continue
                 seen_pairs.add(pair)
-                contradictions.append({
-                    "node_a_id": nid,
-                    "node_b_id": other_id,
-                    "severity": "moderate",
-                    "description": f"Intra-step conflict: {nid} vs {other_id}",
-                })
+                contradictions.append(
+                    {
+                        "node_a_id": nid,
+                        "node_b_id": other_id,
+                        "severity": "moderate",
+                        "description": f"Intra-step conflict: {nid} vs {other_id}",
+                    }
+                )
 
         return contradictions
 
@@ -853,9 +909,11 @@ class ReasoningEngine:
             strategy = overall_opinion.get("fusion_strategy", "cbf")
             p = overall_opinion.get("P", 0)
             lines.append(f"## Cross-Chain Synthesis [strategy={strategy}, P={p:.0%}]")
-            lines.append(f"  Opinion: b={overall_opinion.get('b', 0):.3f} "
-                         f"d={overall_opinion.get('d', 0):.3f} "
-                         f"u={overall_opinion.get('u', 0):.3f}")
+            lines.append(
+                f"  Opinion: b={overall_opinion.get('b', 0):.3f} "
+                f"d={overall_opinion.get('d', 0):.3f} "
+                f"u={overall_opinion.get('u', 0):.3f}"
+            )
 
             # Cross-chain contradictions
             cross = [c for c in contradictions if "chain_a" in c]

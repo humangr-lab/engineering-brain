@@ -35,6 +35,7 @@ _SKOS_KEYS = {"exact_match", "broad_match", "narrow_match", "related_match"}
 # TAXONOMY.yaml tree → DAG Tags
 # =====================================================================
 
+
 def _walk_tree(
     tree: dict[str, Any],
     facet: str,
@@ -103,12 +104,14 @@ def _parse_technologies_section(technologies: dict[str, Any]) -> list[Tag]:
 
         # The category itself becomes a root tag
         cat_id = category.lower()
-        tags.append(Tag(
-            id=cat_id,
-            facet=facet,
-            display_name=category.replace("_", " ").title(),
-            parents=[],
-        ))
+        tags.append(
+            Tag(
+                id=cat_id,
+                facet=facet,
+                display_name=category.replace("_", " ").title(),
+                parents=[],
+            )
+        )
 
         _walk_tree(subtree, facet, cat_id, tags)
 
@@ -122,7 +125,7 @@ def load_taxonomy_yaml(seeds_dir: str) -> list[Tag]:
         logger.warning("TAXONOMY.yaml not found at %s", taxonomy_path)
         return []
 
-    with open(taxonomy_path, "r", encoding="utf-8") as f:
+    with open(taxonomy_path, encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
 
     tags: list[Tag] = []
@@ -141,6 +144,7 @@ def load_taxonomy_yaml(seeds_dir: str) -> list[Tag]:
 # =====================================================================
 # Auto-discover tags from seed nodes
 # =====================================================================
+
 
 def _extract_tag_from_dotted_path(
     path: str,
@@ -172,10 +176,7 @@ def _extract_tag_from_dotted_path(
     else:
         # Try to resolve first segment
         resolved = registry.resolve(first)
-        if resolved:
-            facet = resolved.facet
-        else:
-            facet = "unknown"
+        facet = resolved.facet if resolved else "unknown"
         segments = parts
 
     # Build chain: each segment's parent is the previous segment
@@ -186,11 +187,13 @@ def _extract_tag_from_dotted_path(
         existing = registry.get(seg)
         if not existing:
             parents = [prev_id] if prev_id else []
-            tags.append(Tag(
-                id=seg,
-                facet=facet,
-                parents=parents,
-            ))
+            tags.append(
+                Tag(
+                    id=seg,
+                    facet=facet,
+                    parents=parents,
+                )
+            )
         elif prev_id and prev_id not in existing.parents:
             # Add parent link (polyhierarchy)
             existing.parents.append(prev_id)
@@ -213,14 +216,14 @@ def discover_tags_from_nodes(
 
     for node in nodes:
         # Process technologies/languages
-        for tech in (node.get("technologies") or node.get("languages") or []):
+        for tech in node.get("technologies") or node.get("languages") or []:
             path = str(tech).lower().strip()
             if path and path not in seen_paths:
                 seen_paths.add(path)
                 new_tags.extend(_extract_tag_from_dotted_path(path, registry))
 
         # Process domains
-        for domain in (node.get("domains") or []):
+        for domain in node.get("domains") or []:
             path = str(domain).lower().strip()
             if path and path not in seen_paths:
                 seen_paths.add(path)
@@ -325,6 +328,7 @@ CONCEPT_TAGS: list[Tag] = [
 # Main bootstrap function
 # =====================================================================
 
+
 def bootstrap_registry(
     seeds_dir: str,
     nodes: list[dict[str, Any]] | None = None,
@@ -368,11 +372,13 @@ def bootstrap_registry(
                     registry._alias_index[alias.lower()] = tag.id
         else:
             # Create stub tag with aliases
-            registry.register(Tag(
-                id=tag_id,
-                facet="unknown",
-                aliases=aliases,
-            ))
+            registry.register(
+                Tag(
+                    id=tag_id,
+                    facet="unknown",
+                    aliases=aliases,
+                )
+            )
 
     # 5. Discover tags from seed node data
     if nodes:

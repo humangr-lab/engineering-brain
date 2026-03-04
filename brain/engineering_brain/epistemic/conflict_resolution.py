@@ -10,21 +10,20 @@ Reference: Josang, A. (2016). Subjective Logic, Ch. 12.
 
 from __future__ import annotations
 
-from enum import Enum
-from typing import Optional
+from enum import StrEnum
 
 from engineering_brain.epistemic.fusion import cbf
 from engineering_brain.epistemic.opinion import OpinionTuple
 
 
-class ConflictSeverity(str, Enum):
+class ConflictSeverity(StrEnum):
     """Severity classification based on Dempster conflict factor K."""
 
-    NONE = "none"           # K < 0.3 — sources agree
-    LOW = "low"             # 0.3 <= K < 0.5 — mild disagreement
-    MODERATE = "moderate"   # 0.5 <= K < 0.7 — notable disagreement
-    HIGH = "high"           # 0.7 <= K < 0.9 — strong contradiction
-    EXTREME = "extreme"     # K >= 0.9 — total contradiction
+    NONE = "none"  # K < 0.3 — sources agree
+    LOW = "low"  # 0.3 <= K < 0.5 — mild disagreement
+    MODERATE = "moderate"  # 0.5 <= K < 0.7 — notable disagreement
+    HIGH = "high"  # 0.7 <= K < 0.9 — strong contradiction
+    EXTREME = "extreme"  # K >= 0.9 — total contradiction
 
 
 def dempster_conflict(omega_a: OpinionTuple, omega_b: OpinionTuple) -> float:
@@ -56,7 +55,7 @@ def classify_conflict(k: float) -> ConflictSeverity:
 
 def murphy_weighted_average(
     opinions: list[OpinionTuple],
-    weights: Optional[list[float]] = None,
+    weights: list[float] | None = None,
 ) -> OpinionTuple:
     """Murphy's weighted averaging for high-conflict evidence fusion.
 
@@ -76,16 +75,13 @@ def murphy_weighted_average(
         w = [1.0 / n] * n
     else:
         total = sum(weights)
-        if total > 1e-15:
-            w = [x / total for x in weights]
-        else:
-            w = [1.0 / n] * n
+        w = [x / total for x in weights] if total > 1e-15 else [1.0 / n] * n
 
     # Step 1: weighted average
-    avg_b = sum(wi * op.b for wi, op in zip(w, opinions))
-    avg_d = sum(wi * op.d for wi, op in zip(w, opinions))
-    avg_u = sum(wi * op.u for wi, op in zip(w, opinions))
-    avg_a = sum(wi * op.a for wi, op in zip(w, opinions))
+    avg_b = sum(wi * op.b for wi, op in zip(w, opinions, strict=False))
+    avg_d = sum(wi * op.d for wi, op in zip(w, opinions, strict=False))
+    avg_u = sum(wi * op.u for wi, op in zip(w, opinions, strict=False))
+    avg_a = sum(wi * op.a for wi, op in zip(w, opinions, strict=False))
 
     # Normalize b+d+u=1
     total = avg_b + avg_d + avg_u

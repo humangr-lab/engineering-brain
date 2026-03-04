@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from engineering_brain.epistemic.opinion import OpinionTuple
 
-
 # Edge type → initial opinion prior
 EDGE_TYPE_PRIORS: dict[str, OpinionTuple] = {
     # Hierarchical (strong trust flow)

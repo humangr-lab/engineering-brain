@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -22,23 +22,43 @@ logger = logging.getLogger(__name__)
 
 # SO tag mapping — brain technology name → SO tag
 _SO_TAGS: dict[str, str] = {
-    "Flask": "flask", "FastAPI": "fastapi", "Django": "django",
-    "React": "reactjs", "Vue": "vue.js", "Angular": "angular",
-    "TypeScript": "typescript", "JavaScript": "javascript",
-    "Python": "python", "Node.js": "node.js",
-    "Kubernetes": "kubernetes", "Docker": "docker",
-    "PostgreSQL": "postgresql", "MongoDB": "mongodb",
-    "Redis": "redis", "GraphQL": "graphql",
-    "CORS": "cors", "WebSocket": "websocket",
-    "Flask-SocketIO": "flask-socketio", "Socket.IO": "socket.io",
-    "Svelte": "svelte", "Next.js": "next.js",
-    "Express": "express", "NestJS": "nestjs",
-    "Tailwind CSS": "tailwind-css", "CSS": "css",
-    "HTML": "html", "REST": "rest",
-    "Rust": "rust", "Go": "go", "Java": "java",
-    "Spring Boot": "spring-boot", "Ruby on Rails": "ruby-on-rails",
-    "AWS": "amazon-web-services", "GCP": "google-cloud-platform",
-    "Azure": "azure", "Terraform": "terraform",
+    "Flask": "flask",
+    "FastAPI": "fastapi",
+    "Django": "django",
+    "React": "reactjs",
+    "Vue": "vue.js",
+    "Angular": "angular",
+    "TypeScript": "typescript",
+    "JavaScript": "javascript",
+    "Python": "python",
+    "Node.js": "node.js",
+    "Kubernetes": "kubernetes",
+    "Docker": "docker",
+    "PostgreSQL": "postgresql",
+    "MongoDB": "mongodb",
+    "Redis": "redis",
+    "GraphQL": "graphql",
+    "CORS": "cors",
+    "WebSocket": "websocket",
+    "Flask-SocketIO": "flask-socketio",
+    "Socket.IO": "socket.io",
+    "Svelte": "svelte",
+    "Next.js": "next.js",
+    "Express": "express",
+    "NestJS": "nestjs",
+    "Tailwind CSS": "tailwind-css",
+    "CSS": "css",
+    "HTML": "html",
+    "REST": "rest",
+    "Rust": "rust",
+    "Go": "go",
+    "Java": "java",
+    "Spring Boot": "spring-boot",
+    "Ruby on Rails": "ruby-on-rails",
+    "AWS": "amazon-web-services",
+    "GCP": "google-cloud-platform",
+    "Azure": "azure",
+    "Terraform": "terraform",
     "Helm": "kubernetes-helm",
 }
 
@@ -46,7 +66,7 @@ _SO_TAGS: dict[str, str] = {
 class StackOverflowChecker(SourceChecker):
     """Validates claims against StackOverflow community knowledge."""
 
-    def __init__(self, api_key: str = "", rate_limit: float = 0.5):
+    def __init__(self, api_key: str = "", rate_limit: float = 0.5) -> None:
         super().__init__(rate_limit=rate_limit)
         self._api_key = api_key
         self._base_url = "https://api.stackexchange.com/2.3"
@@ -85,7 +105,9 @@ class StackOverflowChecker(SourceChecker):
             logger.debug("SO tag check failed for %s: %s", tech_name, e)
             return None
 
-    async def search_claim(self, claim_text: str, technologies: list[str], domains: list[str]) -> list[Source]:
+    async def search_claim(
+        self, claim_text: str, technologies: list[str], domains: list[str]
+    ) -> list[Source]:
         """Search SO for questions related to a claim."""
         query = _build_search_query(claim_text, technologies)
         tags = _get_so_tags(technologies)
@@ -112,20 +134,22 @@ class StackOverflowChecker(SourceChecker):
             sources: list[Source] = []
             for item in data.get("items", [])[:5]:
                 score = item.get("score", 0)
-                answers = item.get("answer_count", 0)
+                item.get("answer_count", 0)
                 title = item.get("title", "")
                 link = item.get("link", "")
                 is_answered = item.get("is_answered", False)
 
-                sources.append(Source(
-                    url=link,
-                    title=f"SO: {title} (score={score})",
-                    source_type=SourceType.STACKOVERFLOW,
-                    retrieved_at=datetime.now(timezone.utc),
-                    vote_count=score,
-                    is_accepted_answer=is_answered,
-                    verified=True,
-                ))
+                sources.append(
+                    Source(
+                        url=link,
+                        title=f"SO: {title} (score={score})",
+                        source_type=SourceType.STACKOVERFLOW,
+                        retrieved_at=datetime.now(UTC),
+                        vote_count=score,
+                        is_accepted_answer=is_answered,
+                        verified=True,
+                    )
+                )
 
             return sources
 
@@ -139,8 +163,8 @@ def _build_search_query(claim_text: str, technologies: list[str]) -> str:
     # Remove common filler words, keep technical terms
     text = claim_text[:200]
     # Remove code examples
-    text = re.sub(r'`[^`]+`', '', text)
-    text = re.sub(r'"[^"]*"', '', text)
+    text = re.sub(r"`[^`]+`", "", text)
+    text = re.sub(r'"[^"]*"', "", text)
     # Keep first meaningful sentence
     sentences = text.split(".")
     query = sentences[0].strip() if sentences else text

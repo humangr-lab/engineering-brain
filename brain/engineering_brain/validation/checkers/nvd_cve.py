@@ -9,7 +9,7 @@ Rate limit: 5 req/30s without key, 10 req/s with key.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class NVDChecker(SourceChecker):
     """Cross-references security claims against NIST NVD."""
 
-    def __init__(self, api_key: str = "", rate_limit: float = 0.15):
+    def __init__(self, api_key: str = "", rate_limit: float = 0.15) -> None:
         super().__init__(rate_limit=rate_limit)
         self._api_key = api_key
         self._base_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
@@ -36,7 +36,9 @@ class NVDChecker(SourceChecker):
         """NVD doesn't do technology existence checks."""
         return None
 
-    async def search_claim(self, claim_text: str, technologies: list[str], domains: list[str]) -> list[Source]:
+    async def search_claim(
+        self, claim_text: str, technologies: list[str], domains: list[str]
+    ) -> list[Source]:
         """Search NVD for CVEs related to the security claim."""
         if "security" not in domains and "auth" not in " ".join(domains):
             return []
@@ -76,14 +78,16 @@ class NVDChecker(SourceChecker):
                         cvss_score = cvss_data.get("baseScore")
                         break
 
-                sources.append(Source(
-                    url=f"https://nvd.nist.gov/vuln/detail/{cve_id}",
-                    title=f"{cve_id}: {desc[:100]}",
-                    source_type=SourceType.SECURITY_CVE,
-                    retrieved_at=datetime.now(timezone.utc),
-                    cvss_score=cvss_score,
-                    verified=True,
-                ))
+                sources.append(
+                    Source(
+                        url=f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+                        title=f"{cve_id}: {desc[:100]}",
+                        source_type=SourceType.SECURITY_CVE,
+                        retrieved_at=datetime.now(UTC),
+                        cvss_score=cvss_score,
+                        verified=True,
+                    )
+                )
 
             return sources
 
@@ -99,9 +103,22 @@ def _extract_vuln_keyword(claim_text: str, technologies: list[str]) -> str:
     text_lower = claim_text.lower()
 
     vuln_terms = []
-    for term in ("cors", "xss", "injection", "traversal", "auth", "csrf",
-                 "ssrf", "deserialization", "overflow", "race condition",
-                 "privilege", "bypass", "arbitrary", "remote code"):
+    for term in (
+        "cors",
+        "xss",
+        "injection",
+        "traversal",
+        "auth",
+        "csrf",
+        "ssrf",
+        "deserialization",
+        "overflow",
+        "race condition",
+        "privilege",
+        "bypass",
+        "arbitrary",
+        "remote code",
+    ):
         if term in text_lower:
             vuln_terms.append(term)
 

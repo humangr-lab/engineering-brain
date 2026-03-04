@@ -61,8 +61,8 @@ class DeadLetterQueue:
             if os.path.exists(self._path):
                 with open(self._path) as f:
                     return sum(1 for _ in f)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to count dead letters from file: %s", exc)
         return self._count
 
     def read_all(self, limit: int = 100) -> list[dict[str, Any]]:
@@ -76,8 +76,8 @@ class DeadLetterQueue:
                     line = line.strip()
                     if line:
                         entries.append(json.loads(line))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to read dead letters from file: %s", exc)
         return entries[-limit:]
 
     def clear(self) -> int:
@@ -87,8 +87,8 @@ class DeadLetterQueue:
             if os.path.exists(self._path):
                 os.remove(self._path)
             self._count = 0
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to clear dead letter file: %s", exc)
         return count
 
 

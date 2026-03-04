@@ -9,25 +9,23 @@ from __future__ import annotations
 from typing import Any
 
 from engineering_brain.core.config import BrainConfig
-from engineering_brain.core.schema import Layer
-
 
 # Default per-layer character budgets (proportional allocation)
 _DEFAULT_LAYER_BUDGETS: dict[str, float] = {
-    "L1": 0.07,   # ~200 chars of 3000
-    "L2": 0.20,   # ~600 chars
-    "L3": 0.50,   # ~1500 chars
-    "L4": 0.23,   # ~700 chars
+    "L1": 0.07,  # ~200 chars of 3000
+    "L2": 0.20,  # ~600 chars
+    "L3": 0.50,  # ~1500 chars
+    "L4": 0.23,  # ~700 chars
 }
 
 # Markup overhead multiplier per layer — accounts for markdown headers,
 # bullets, labels, and formatting that _estimate_chars doesn't count.
 _MARKUP_OVERHEAD: dict[str, float] = {
-    "L0": 1.3,   # Axioms: short text + formal notation
-    "L1": 1.4,   # Principles: mental_model + when_applies + teaching_example
-    "L2": 1.3,   # Patterns: intent + when_to_use + examples
-    "L3": 1.2,   # Rules: why + how (already counted) + prediction
-    "L4": 1.1,   # Evidence: compact
+    "L0": 1.3,  # Axioms: short text + formal notation
+    "L1": 1.4,  # Principles: mental_model + when_applies + teaching_example
+    "L2": 1.3,  # Patterns: intent + when_to_use + examples
+    "L3": 1.2,  # Rules: why + how (already counted) + prediction
+    "L4": 1.1,  # Evidence: compact
 }
 
 
@@ -87,7 +85,9 @@ def _estimate_chars(node: dict[str, Any]) -> int:
     """Estimate character count for a single knowledge node when formatted."""
     chars = 0
     # Primary text
-    text = node.get("text") or node.get("name") or node.get("statement") or node.get("description", "")
+    text = (
+        node.get("text") or node.get("name") or node.get("statement") or node.get("description", "")
+    )
     chars += len(str(text))
     # WHY field
     why = node.get("why", "")

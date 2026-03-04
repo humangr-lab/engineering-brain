@@ -20,18 +20,21 @@ import logging
 import os
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from engineering_brain.core.config import BrainConfig, get_brain_config
-from engineering_brain.core.types import Source, SourceType, ValidationStatus
+from engineering_brain.core.types import Source, ValidationStatus
 from engineering_brain.validation.cache import ValidationCache
 from engineering_brain.validation.checkers import SourceChecker
+from engineering_brain.validation.checkers.architecture_patterns import ArchitecturePatternsChecker
 from engineering_brain.validation.checkers.github_advisory import GitHubAdvisoryChecker
 from engineering_brain.validation.checkers.mdn import MDNChecker
 from engineering_brain.validation.checkers.nvd_cve import NVDChecker
-from engineering_brain.validation.checkers.architecture_patterns import ArchitecturePatternsChecker
-from engineering_brain.validation.checkers.official_docs import OfficialDocsChecker, resolve_technology
+from engineering_brain.validation.checkers.official_docs import (
+    OfficialDocsChecker,
+    resolve_technology,
+)
 from engineering_brain.validation.checkers.owasp import OWASPChecker
 from engineering_brain.validation.checkers.package_registry import PackageRegistryChecker
 from engineering_brain.validation.checkers.stackoverflow import StackOverflowChecker
@@ -66,14 +69,14 @@ class ValidationReport:
     def summary(self) -> str:
         """Human-readable summary."""
         lines = [
-            f"Validation Report",
+            "Validation Report",
             f"  Total nodes:     {self.total_nodes}",
             f"  Validated:       {self.validated}",
             f"  Cache hits:      {self.cache_hits}",
             f"  API calls:       {self.api_calls}",
             f"  Errors:          {self.errors}",
             f"  Elapsed:         {self.elapsed_seconds:.1f}s",
-            f"  By status:",
+            "  By status:",
             f"    human_verified:  {self.by_status['human_verified']}",
             f"    cross_checked:   {self.by_status['cross_checked']}",
             f"    unvalidated:     {self.by_status['unvalidated']}",
@@ -141,14 +144,17 @@ def _build_checkers(config: BrainConfig) -> dict[str, SourceChecker]:
     checkers["architecture_patterns"] = ArchitecturePatternsChecker(rate_limit=0.0)
     checkers["package_registry"] = PackageRegistryChecker(rate_limit=0.1)
     checkers["stackoverflow"] = StackOverflowChecker(
-        api_key=config.so_api_key, rate_limit=config.validation_rate_so,
+        api_key=config.so_api_key,
+        rate_limit=config.validation_rate_so,
     )
     checkers["nvd_cve"] = NVDChecker(
-        api_key=config.nvd_api_key, rate_limit=config.validation_rate_nvd,
+        api_key=config.nvd_api_key,
+        rate_limit=config.validation_rate_nvd,
     )
     if config.github_token:
         checkers["github_advisory"] = GitHubAdvisoryChecker(
-            token=config.github_token, rate_limit=0.3,
+            token=config.github_token,
+            rate_limit=0.3,
         )
     return checkers
 
@@ -174,24 +180,30 @@ async def validate_all(
 
     # Load knowledge nodes (filter out tech/domain helper nodes)
     all_nodes = brain._graph.get_all_nodes()
-    knowledge_nodes = [n for n in all_nodes if n.get("id", "").startswith(("AX-", "P-", "PAT-", "CR-"))]
+    knowledge_nodes = [
+        n for n in all_nodes if n.get("id", "").startswith(("AX-", "P-", "PAT-", "CR-"))
+    ]
     if layer_filter:
         knowledge_nodes = [n for n in knowledge_nodes if _node_layer(n) == layer_filter.upper()]
     report.total_nodes = len(knowledge_nodes)
     logger.info("Validating %d knowledge nodes", len(knowledge_nodes))
 
     checkers = _build_checkers(cfg)
-    cache = ValidationCache(cache_dir=cfg.validation_cache_dir, ttl_days=cfg.validation_cache_ttl_days)
+    cache = ValidationCache(
+        cache_dir=cfg.validation_cache_dir, ttl_days=cfg.validation_cache_ttl_days
+    )
 
     if dry_run:
         router = ValidationRouter(checkers)
         for node in knowledge_nodes:
             node_checkers = router.route(node)
-            report.node_results.append({
-                "id": node.get("id", "?"),
-                "layer": _node_layer(node),
-                "checkers": [type(c).__name__ for c in node_checkers],
-            })
+            report.node_results.append(
+                {
+                    "id": node.get("id", "?"),
+                    "layer": _node_layer(node),
+                    "checkers": [type(c).__name__ for c in node_checkers],
+                }
+            )
             if _node_layer(node) == "L0":
                 report.by_status["human_verified"] += 1
             elif node_checkers:
@@ -208,7 +220,9 @@ async def validate_all(
     for node in knowledge_nodes:
         node_id = node.get("id", "")
         if _node_layer(node) == "L0":
-            brain._graph.update_node(node_id, {"validation_status": ValidationStatus.HUMAN_VERIFIED.value})
+            brain._graph.update_node(
+                node_id, {"validation_status": ValidationStatus.HUMAN_VERIFIED.value}
+            )
             report.by_status["human_verified"] += 1
             report.validated += 1
             continue
@@ -226,8 +240,12 @@ async def validate_all(
         nodes_needing_validation.append(node)
 
     total_to_validate = len(nodes_needing_validation)
-    logger.info("Phase 0 done: %d axioms marked, %d cache hits, %d need validation",
-                report.by_status["human_verified"], report.cache_hits, total_to_validate)
+    logger.info(
+        "Phase 0 done: %d axioms marked, %d cache hits, %d need validation",
+        report.by_status["human_verified"],
+        report.cache_hits,
+        total_to_validate,
+    )
 
     if not nodes_needing_validation:
         report.elapsed_seconds = time.monotonic() - t0
@@ -261,11 +279,16 @@ async def validate_all(
             try:
                 sources = await checker.search_claim(claim, techs, domains)
                 node_sources[node_id].extend(sources)
-                report.by_checker[type(checker).__name__] = (
-                    report.by_checker.get(type(checker).__name__, 0) + len(sources)
+                report.by_checker[type(checker).__name__] = report.by_checker.get(
+                    type(checker).__name__, 0
+                ) + len(sources)
+            except Exception as exc:
+                logger.debug(
+                    "Zero-cost checker %s failed for node %s: %s",
+                    type(checker).__name__,
+                    node_id,
+                    exc,
                 )
-            except Exception:
-                pass
 
     completed = 0
     if progress_callback:
@@ -298,9 +321,9 @@ async def validate_all(
                     sources = await pkg_checker.search_claim("", [tech], [])
                     tech_sources[tech] = sources
                     report.api_calls += 1
-                    report.by_checker["PackageRegistryChecker"] = (
-                        report.by_checker.get("PackageRegistryChecker", 0) + len(sources)
-                    )
+                    report.by_checker["PackageRegistryChecker"] = report.by_checker.get(
+                        "PackageRegistryChecker", 0
+                    ) + len(sources)
                 except Exception as e:
                     logger.debug("PyPI/npm check failed for %s: %s", tech, e)
                     report.errors += 1
@@ -319,8 +342,11 @@ async def validate_all(
     # =====================================================================
     nvd_checker = checkers["nvd_cve"]
     ghsa_checker = checkers.get("github_advisory")
-    security_nodes = [n for n in nodes_needing_validation
-                      if "security" in [d.lower() for d in n.get("domains", [])]]
+    security_nodes = [
+        n
+        for n in nodes_needing_validation
+        if "security" in [d.lower() for d in n.get("domains", [])]
+    ]
 
     if security_nodes and not offline:
         # Deduplicate by first technology
@@ -344,22 +370,29 @@ async def validate_all(
             async with sem:
                 all_s: list[Source] = []
                 try:
-                    s = await nvd_checker.search_claim(keyword, [tech] if tech else [], ["security"])
+                    s = await nvd_checker.search_claim(
+                        keyword, [tech] if tech else [], ["security"]
+                    )
                     all_s.extend(s)
                     report.api_calls += 1
-                    report.by_checker["NVDChecker"] = report.by_checker.get("NVDChecker", 0) + len(s)
+                    report.by_checker["NVDChecker"] = report.by_checker.get("NVDChecker", 0) + len(
+                        s
+                    )
                 except Exception as e:
                     logger.debug("NVD check failed for %s: %s", keyword, e)
                     report.errors += 1
                 if ghsa_checker:
                     try:
-                        s = await ghsa_checker.search_claim(keyword, [tech] if tech else [], ["security"])
+                        s = await ghsa_checker.search_claim(
+                            keyword, [tech] if tech else [], ["security"]
+                        )
                         all_s.extend(s)
                         report.api_calls += 1
-                        report.by_checker["GitHubAdvisoryChecker"] = (
-                            report.by_checker.get("GitHubAdvisoryChecker", 0) + len(s)
-                        )
-                    except Exception:
+                        report.by_checker["GitHubAdvisoryChecker"] = report.by_checker.get(
+                            "GitHubAdvisoryChecker", 0
+                        ) + len(s)
+                    except Exception as exc:
+                        logger.warning("GHSA checker failed for keyword %s: %s", keyword, exc)
                         report.errors += 1
                 keyword_sources[keyword] = all_s
 
@@ -397,16 +430,22 @@ async def validate_all(
             status = ValidationStatus.UNVALIDATED
 
         source_dicts = [s.model_dump(mode="json") for s in unique_sources[:5]]
-        brain._graph.update_node(node_id, {
-            "validation_status": status.value,
-            "sources": source_dicts,
-        })
+        brain._graph.update_node(
+            node_id,
+            {
+                "validation_status": status.value,
+                "sources": source_dicts,
+            },
+        )
 
-        cache.put(f"v1:{node_id}", {
-            "validation_status": status.value,
-            "sources": source_dicts,
-            "checked_at": datetime.now(timezone.utc).isoformat(),
-        })
+        cache.put(
+            f"v1:{node_id}",
+            {
+                "validation_status": status.value,
+                "sources": source_dicts,
+                "checked_at": datetime.now(UTC).isoformat(),
+            },
+        )
 
         report.by_status[status.value] = report.by_status.get(status.value, 0) + 1
         report.validated += 1
@@ -456,11 +495,13 @@ async def validate_node(
         try:
             sources = await checker.search_claim(claim_text, technologies, domains)
             all_sources.extend(sources)
-            checker_details.append({
-                "checker": checker_name,
-                "sources_found": len(sources),
-                "urls": [s.url for s in sources],
-            })
+            checker_details.append(
+                {
+                    "checker": checker_name,
+                    "sources_found": len(sources),
+                    "urls": [s.url for s in sources],
+                }
+            )
         except Exception as e:
             checker_details.append({"checker": checker_name, "error": str(e)})
 
@@ -468,10 +509,13 @@ async def validate_node(
     status = ValidationStatus.CROSS_CHECKED if verified_sources else ValidationStatus.UNVALIDATED
 
     source_dicts = [s.model_dump(mode="json") for s in all_sources[:5]]
-    brain._graph.update_node(node_id, {
-        "validation_status": status.value,
-        "sources": source_dicts,
-    })
+    brain._graph.update_node(
+        node_id,
+        {
+            "validation_status": status.value,
+            "sources": source_dicts,
+        },
+    )
 
     return {
         "id": node_id,
@@ -484,18 +528,35 @@ async def validate_node(
 
 def _apply_cached(node_id: str, cached: dict[str, Any], brain: Any) -> None:
     """Apply cached validation result."""
-    brain._graph.update_node(node_id, {
-        "validation_status": cached.get("validation_status", "unvalidated"),
-        "sources": cached.get("sources", []),
-    })
+    brain._graph.update_node(
+        node_id,
+        {
+            "validation_status": cached.get("validation_status", "unvalidated"),
+            "sources": cached.get("sources", []),
+        },
+    )
 
 
 def _extract_security_keyword(claim: str, tech: str) -> str:
     """Extract unique keyword for NVD search from a security claim."""
     text_lower = claim.lower()
-    for term in ("cors", "xss", "injection", "traversal", "auth", "csrf",
-                 "ssrf", "deserialization", "overflow", "race condition",
-                 "privilege", "bypass", "arbitrary", "remote code", "websocket"):
+    for term in (
+        "cors",
+        "xss",
+        "injection",
+        "traversal",
+        "auth",
+        "csrf",
+        "ssrf",
+        "deserialization",
+        "overflow",
+        "race condition",
+        "privilege",
+        "bypass",
+        "arbitrary",
+        "remote code",
+        "websocket",
+    ):
         if term in text_lower:
             return f"{tech} {term}".strip()
     return tech

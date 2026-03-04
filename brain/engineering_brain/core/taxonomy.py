@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 # Tag — first-class entity in the taxonomy DAG
 # =====================================================================
 
+
 @dataclass
 class Tag:
     """A single concept in the taxonomy DAG."""
@@ -42,9 +43,9 @@ class Tag:
     description: str = ""
     weight: float = 1.0
     # SKOS alignment fields (external ontology mappings)
-    exact_match: list[str] = field(default_factory=list)    # skos:exactMatch URIs
-    broad_match: list[str] = field(default_factory=list)    # skos:broadMatch URIs
-    narrow_match: list[str] = field(default_factory=list)   # skos:narrowMatch URIs
+    exact_match: list[str] = field(default_factory=list)  # skos:exactMatch URIs
+    broad_match: list[str] = field(default_factory=list)  # skos:broadMatch URIs
+    narrow_match: list[str] = field(default_factory=list)  # skos:narrowMatch URIs
     related_match: list[str] = field(default_factory=list)  # skos:relatedMatch URIs
 
     def __post_init__(self) -> None:
@@ -73,13 +74,37 @@ FACET_PREFIXES: dict[str, str] = {
 }
 
 DOMAIN_ROOTS: set[str] = {
-    "reliability", "performance", "security", "observability", "operations",
-    "architecture", "deployment", "code_quality", "testing", "databases",
-    "messaging", "mathematics", "culture", "data_engineering", "compliance",
-    "blockchain", "mobile", "ai_ml", "api", "ui", "devops",
+    "reliability",
+    "performance",
+    "security",
+    "observability",
+    "operations",
+    "architecture",
+    "deployment",
+    "code_quality",
+    "testing",
+    "databases",
+    "messaging",
+    "mathematics",
+    "culture",
+    "data_engineering",
+    "compliance",
+    "blockchain",
+    "mobile",
+    "ai_ml",
+    "api",
+    "ui",
+    "devops",
     # Knowledge enrichment v2 — cognitive + product domains
-    "reasoning", "sacada", "integration", "fintech", "realtime",
-    "antipattern", "fact_checking", "prediction_markets", "gamification",
+    "reasoning",
+    "sacada",
+    "integration",
+    "fintech",
+    "realtime",
+    "antipattern",
+    "fact_checking",
+    "prediction_markets",
+    "gamification",
     # Knowledge enrichment v3 — agent orchestration + data engineering
     "agent_orchestration",
 }
@@ -99,6 +124,7 @@ FACET_WEIGHTS: dict[str, float] = {
 # =====================================================================
 # TagRegistry — live in-memory DAG with precomputed closure
 # =====================================================================
+
 
 class TagRegistry:
     """Live in-memory faceted DAG of all tags.
@@ -305,10 +331,7 @@ class TagRegistry:
 
         # Hierarchy: nt is ancestor of qt (specific query matches broad node)
         nt_desc = self._descendants.get(nt_resolved, frozenset())
-        if qt_resolved in nt_desc:
-            return True
-
-        return False
+        return qt_resolved in nt_desc
 
     def match(
         self,
@@ -479,21 +502,18 @@ class TagRegistry:
         """
         # New format: tags dict already present
         if "tags" in node and isinstance(node["tags"], dict):
-            return {
-                facet: ([v] if isinstance(v, str) else v)
-                for facet, v in node["tags"].items()
-            }
+            return {facet: ([v] if isinstance(v, str) else v) for facet, v in node["tags"].items()}
 
         result: dict[str, list[str]] = {}
 
         # Convert technologies/languages → faceted tags
-        for t in (node.get("technologies") or node.get("languages") or []):
+        for t in node.get("technologies") or node.get("languages") or []:
             decomposed = self.decompose_dotted_path(str(t))
             for facet, ids in decomposed.items():
                 result.setdefault(facet, []).extend(ids)
 
         # Convert domains → faceted tags
-        for d in (node.get("domains") or []):
+        for d in node.get("domains") or []:
             decomposed = self.decompose_dotted_path(str(d))
             for facet, ids in decomposed.items():
                 result.setdefault(facet, []).extend(ids)

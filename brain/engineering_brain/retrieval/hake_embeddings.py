@@ -114,7 +114,7 @@ class HAKEEncoder:
         from engineering_brain.retrieval.tag_embeddings import _tag_to_text
 
         for i in range(0, len(all_tags), batch_size):
-            batch = all_tags[i:i + batch_size]
+            batch = all_tags[i : i + batch_size]
             texts = [_tag_to_text(tag, self._registry) for tag in batch]
 
             try:
@@ -124,7 +124,7 @@ class HAKEEncoder:
                 failed += len(batch)
                 continue
 
-            for tag, vec in zip(batch, vectors):
+            for tag, vec in zip(batch, vectors, strict=False):
                 if not vec:
                     skipped += 1
                     continue
@@ -132,7 +132,8 @@ class HAKEEncoder:
                     hake_vec = self.encode_tag(tag.id, vec)
                     self._hake_vectors[tag.id] = hake_vec
                     encoded += 1
-                except Exception:
+                except Exception as exc:
+                    logger.debug("Failed to encode HAKE vector for tag %s: %s", tag.id, exc)
                     failed += 1
 
             # MacBook-friendly pause
@@ -141,7 +142,9 @@ class HAKEEncoder:
 
         logger.info(
             "HAKE encoding: %d encoded, %d skipped, %d failed",
-            encoded, skipped, failed,
+            encoded,
+            skipped,
+            failed,
         )
         return {"encoded": encoded, "skipped": skipped, "failed": failed}
 
@@ -202,7 +205,7 @@ class HAKEEncoder:
         if not a or not b or len(a) != len(b):
             return 0.0
 
-        dot = sum(x * y for x, y in zip(a, b))
+        dot = sum(x * y for x, y in zip(a, b, strict=False))
         norm_a = math.sqrt(sum(x * x for x in a))
         norm_b = math.sqrt(sum(x * x for x in b))
 

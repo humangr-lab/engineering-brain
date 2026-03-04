@@ -17,7 +17,7 @@ import time
 from collections import Counter
 from typing import Any
 
-from engineering_brain.core.taxonomy import Tag, TagRegistry
+from engineering_brain.core.taxonomy import TagRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ class RelationshipLearner:
         # Update pairwise co-occurrence
         sorted_tags = sorted(tags)
         for i, a in enumerate(sorted_tags):
-            for b in sorted_tags[i + 1:]:
+            for b in sorted_tags[i + 1 :]:
                 self._cooccurrence[(a, b)] += 1
 
     def observe_batch(
@@ -71,7 +71,7 @@ class RelationshipLearner:
         Processes in batches with brief pauses to be MacBook-friendly.
         """
         for i in range(0, len(nodes), batch_size):
-            batch = nodes[i:i + batch_size]
+            batch = nodes[i : i + batch_size]
             for node in batch:
                 self.observe_node(node)
 
@@ -81,7 +81,8 @@ class RelationshipLearner:
 
         logger.info(
             "Observed %d nodes, %d unique co-occurrences tracked",
-            self._nodes_observed, len(self._cooccurrence),
+            self._nodes_observed,
+            len(self._cooccurrence),
         )
 
     # -----------------------------------------------------------------
@@ -126,12 +127,14 @@ class RelationshipLearner:
             else:
                 child, parent = tag_b, tag_a
 
-            suggestions.append({
-                "child": child,
-                "parent": parent,
-                "cooccurrence": count,
-                "confidence": min(confidence, 1.0),
-            })
+            suggestions.append(
+                {
+                    "child": child,
+                    "parent": parent,
+                    "cooccurrence": count,
+                    "confidence": min(confidence, 1.0),
+                }
+            )
 
         logger.info("Relationship suggestions: %d candidates", len(suggestions))
         return suggestions

@@ -16,28 +16,28 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 # Per edge-type half-life profiles (days until confidence halves without reinforcement)
 EDGE_DECAY_PROFILES: dict[str, float] = {
-    "GROUNDS": 3650.0,           # Axiom->Principle: very stable
-    "INFORMS": 1825.0,           # Principle->Pattern: stable
-    "INSTANTIATES": 730.0,       # Pattern->Rule: moderate
-    "EVIDENCED_BY": 365.0,       # Rule->Finding: faster decay
-    "CONFLICTS_WITH": 180.0,     # Contradiction: relatively fast
-    "WEAKENS": 180.0,            # Negative feedback: fast
-    "STRENGTHENS": 365.0,        # Positive feedback: moderate
-    "SUPERSEDES": 365.0,         # Version replacement: moderate
-    "RELATES_TO": 548.0,         # General relation: moderate-slow
-    "PREREQUISITE": 730.0,       # Dependency: moderate
-    "DEEPENS": 730.0,            # Elaboration: moderate
-    "ALTERNATIVE": 548.0,        # Alternative: moderate
-    "TRIGGERS": 365.0,           # Causal: moderate
-    "COMPLEMENTS": 548.0,        # Complementary: moderate
-    "VALIDATES": 365.0,          # Validation: moderate
+    "GROUNDS": 3650.0,  # Axiom->Principle: very stable
+    "INFORMS": 1825.0,  # Principle->Pattern: stable
+    "INSTANTIATES": 730.0,  # Pattern->Rule: moderate
+    "EVIDENCED_BY": 365.0,  # Rule->Finding: faster decay
+    "CONFLICTS_WITH": 180.0,  # Contradiction: relatively fast
+    "WEAKENS": 180.0,  # Negative feedback: fast
+    "STRENGTHENS": 365.0,  # Positive feedback: moderate
+    "SUPERSEDES": 365.0,  # Version replacement: moderate
+    "RELATES_TO": 548.0,  # General relation: moderate-slow
+    "PREREQUISITE": 730.0,  # Dependency: moderate
+    "DEEPENS": 730.0,  # Elaboration: moderate
+    "ALTERNATIVE": 548.0,  # Alternative: moderate
+    "TRIGGERS": 365.0,  # Causal: moderate
+    "COMPLEMENTS": 548.0,  # Complementary: moderate
+    "VALIDATES": 365.0,  # Validation: moderate
 }
 
 DEFAULT_HALF_LIFE = 548.0  # 1.5 years
@@ -69,7 +69,7 @@ class BayesianEdgeManager:
 
         confidence = alpha / (alpha + beta)
         count = int(edge.get("reinforcement_count", 0)) + 1
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
 
         edge["edge_alpha"] = alpha
         edge["edge_beta"] = beta
@@ -164,12 +164,14 @@ class BayesianEdgeManager:
                             updated["to_id"],
                             updated.get("edge_type", "RELATES_TO"),
                             properties={
-                                k: v for k, v in updated.items()
+                                k: v
+                                for k, v in updated.items()
                                 if k not in ("from_id", "to_id", "edge_type")
                             },
                         )
                         count += 1
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to update Bayesian edge: %s", exc)
                 continue
 
         return count

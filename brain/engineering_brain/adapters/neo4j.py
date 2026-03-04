@@ -10,6 +10,7 @@ in a single backend — no Qdrant needed for the knowledge graph).
 from __future__ import annotations
 
 import atexit
+import contextlib
 import json
 import logging
 import os
@@ -22,11 +23,11 @@ from engineering_brain.core.config import BrainConfig
 
 logger = logging.getLogger(__name__)
 
-_CYPHER_IDENT_RE = re.compile(r'[^a-zA-Z0-9_]')
+_CYPHER_IDENT_RE = re.compile(r"[^a-zA-Z0-9_]")
 
 
 def _sanitize_cypher_identifier(s: str) -> str:
-    sanitized = _CYPHER_IDENT_RE.sub('', s)
+    sanitized = _CYPHER_IDENT_RE.sub("", s)
     if not sanitized:
         raise ValueError(f"Invalid Cypher identifier: {s!r}")
     return sanitized
@@ -34,7 +35,7 @@ def _sanitize_cypher_identifier(s: str) -> str:
 
 def _sanitize_property_key(k: str) -> str:
     """Validate property key is safe for Cypher interpolation (alphanumeric + underscore only)."""
-    sanitized = _CYPHER_IDENT_RE.sub('', k)
+    sanitized = _CYPHER_IDENT_RE.sub("", k)
     if not sanitized or sanitized != k:
         raise ValueError(f"Invalid property key: {k!r}")
     return k
@@ -51,11 +52,14 @@ def _serialize_props(props: dict[str, Any]) -> dict[str, Any]:
     for k, v in props.items():
         if v is None:
             continue
-        if k in _JSON_SERIALIZED_KEYS and not isinstance(v, str):
-            out[k] = json.dumps(v, ensure_ascii=False, default=str)
-        elif isinstance(v, dict):
-            out[k] = json.dumps(v, ensure_ascii=False, default=str)
-        elif isinstance(v, list) and v and isinstance(v[0], dict):
+        if (
+            k in _JSON_SERIALIZED_KEYS
+            and not isinstance(v, str)
+            or isinstance(v, dict)
+            or isinstance(v, list)
+            and v
+            and isinstance(v[0], dict)
+        ):
             out[k] = json.dumps(v, ensure_ascii=False, default=str)
         else:
             out[k] = v
@@ -86,15 +90,17 @@ def _cleanup_driver() -> None:
     if _driver is not None:
         try:
             _driver.close()
-        except Exception:
-            pass  # atexit: logging may be unavailable
+        except Exception as exc:
+            # atexit: logging may be unavailable, but try anyway
+            with contextlib.suppress(Exception):
+                logger.debug("Neo4j driver close failed at exit: %s", exc)
         _driver = None
 
 
 atexit.register(_cleanup_driver)
 
 
-def _get_driver(config: BrainConfig | None = None):
+def _get_driver(config: BrainConfig | None = None) -> Any:
     """Lazy-load and return the Neo4j driver singleton."""
     global _driver
     if _driver is not None:
@@ -129,7 +135,7 @@ class Neo4jGraphAdapter(GraphAdapter):
         self._session = None
         self._tx = None
 
-    def _driver(self):
+    def _driver(self) -> Any:
         return _get_driver(self._config)
 
     def _run(self, cypher: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -156,14 +162,25 @@ class Neo4jGraphAdapter(GraphAdapter):
         driver = self._driver()
         if driver is None:
             return
-        labels = ("Rule", "Principle", "Pattern", "Finding", "Axiom", "Technology", "Domain",
-                  "CodeExample", "TestResult", "Task", "Sprint", "Source", "ValidationRun")
+        labels = (
+            "Rule",
+            "Principle",
+            "Pattern",
+            "Finding",
+            "Axiom",
+            "Technology",
+            "Domain",
+            "CodeExample",
+            "TestResult",
+            "Task",
+            "Sprint",
+            "Source",
+            "ValidationRun",
+        )
         with driver.session(database=self._database) as session:
             for label in labels:
                 try:
-                    session.run(
-                        f"CREATE INDEX IF NOT EXISTS FOR (n:{label}) ON (n.id)"
-                    )
+                    session.run(f"CREATE INDEX IF NOT EXISTS FOR (n:{label}) ON (n.id)")
                 except Exception as exc:
                     logger.debug("Failed to create index for label %s: %s", label, exc)
         self._indexes_ensured = True
@@ -216,7 +233,7 @@ class Neo4jGraphAdapter(GraphAdapter):
             all_nodes: list[dict[str, Any]] = []
             while True:
                 records = self._run(
-                    f"MATCH (n) RETURN n SKIP $offset LIMIT $limit",
+                    "MATCH (n) RETURN n SKIP $offset LIMIT $limit",
                     {"offset": offset, "limit": page_size},
                 )
                 batch = [_deserialize_props(dict(r["n"])) for r in records if r.get("n")]
@@ -274,10 +291,7 @@ class Neo4jGraphAdapter(GraphAdapter):
         try:
             edge_type = _sanitize_cypher_identifier(edge_type)
             props = {k: v for k, v in (properties or {}).items() if v is not None}
-            if props:
-                prop_str = " SET r += $props"
-            else:
-                prop_str = ""
+            prop_str = " SET r += $props" if props else ""
             cypher = (
                 f"MATCH (a {{id: $from_id}}), (b {{id: $to_id}}) "
                 f"MERGE (a)-[r:{edge_type}]->(b)"
@@ -355,12 +369,12 @@ class Neo4jGraphAdapter(GraphAdapter):
                 edge_type = _sanitize_cypher_identifier(edge_type)
             rel = f":{edge_type}" if edge_type else ""
             records = self._run(
-                f"MATCH (a {{id: $from_id}})-[r{rel}]->(b {{id: $to_id}}) "
-                f"RETURN count(r) AS cnt",
+                f"MATCH (a {{id: $from_id}})-[r{rel}]->(b {{id: $to_id}}) RETURN count(r) AS cnt",
                 {"from_id": from_id, "to_id": to_id},
             )
             return bool(records and records[0].get("cnt", 0) > 0)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Neo4j has_edge check failed: %s", exc)
             return False
 
     # ------------------------------------------------------------------
@@ -427,10 +441,7 @@ class Neo4jGraphAdapter(GraphAdapter):
             else:
                 pattern = f"-[{rel}*1..{max_depth}]-"
 
-            cypher = (
-                f"MATCH (start {{id: $start_id}}){pattern}(n) "
-                f"RETURN DISTINCT n LIMIT {limit}"
-            )
+            cypher = f"MATCH (start {{id: $start_id}}){pattern}(n) RETURN DISTINCT n LIMIT {limit}"
             records = self._run(cypher, {"start_id": start_id})
             return [dict(r["n"]) for r in records if r.get("n")]
         except Exception as e:
@@ -461,20 +472,16 @@ class Neo4jGraphAdapter(GraphAdapter):
         if not self._indexes_ensured:
             self._ensure_indexes()
         try:
-            cypher = (
-                f"UNWIND $nodes AS props "
-                f"MERGE (n:{label} {{id: props.id}}) "
-                f"SET n += props"
-            )
+            cypher = f"UNWIND $nodes AS props MERGE (n:{label} {{id: props.id}}) SET n += props"
             # Use an explicit write transaction for batch
             with driver.session(database=self._database) as session:
-                session.execute_write(
-                    lambda tx: tx.run(cypher, {"nodes": serialized}).consume()
-                )
+                session.execute_write(lambda tx: tx.run(cypher, {"nodes": serialized}).consume())
             return len(serialized)
-        except Exception:
+        except Exception as exc:
             # Fallback to individual inserts
-            logger.warning("Neo4j batch_add_nodes UNWIND failed, falling back to individual inserts")
+            logger.warning(
+                "Neo4j batch_add_nodes UNWIND failed, falling back to individual inserts: %s", exc
+            )
             count = 0
             for node in nodes:
                 nid = node.get("id", "")
@@ -523,12 +530,15 @@ class Neo4jGraphAdapter(GraphAdapter):
                         lambda tx, c=cypher, b=batch: tx.run(c, {"edges": b}).consume()
                     )
                 total += len(batch)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Neo4j batch_add_edges UNWIND failed for type, falling back: %s", exc)
                 # Fallback to individual inserts
                 for e in typed_edges:
                     if self.add_edge(
-                        e["from_id"], e["to_id"],
-                        e["edge_type"], e.get("properties"),
+                        e["from_id"],
+                        e["to_id"],
+                        e["edge_type"],
+                        e.get("properties"),
                     ):
                         total += 1
         return total
@@ -562,7 +572,8 @@ class Neo4jGraphAdapter(GraphAdapter):
             try:
                 records = self._run("MATCH ()-[r]->() RETURN count(r) AS cnt")
                 edge_count = int(records[0]["cnt"]) if records else 0
-            except Exception:
+            except Exception as exc:
+                logger.debug("Neo4j edge count query failed: %s", exc)
                 edge_count = 0
 
             # Label counts
@@ -635,7 +646,8 @@ class Neo4jGraphAdapter(GraphAdapter):
                 return False
             driver.verify_connectivity()
             return True
-        except Exception:
+        except Exception as exc:
+            logger.debug("Neo4j availability check failed: %s", exc)
             return False
 
     # ------------------------------------------------------------------
@@ -653,7 +665,8 @@ class Neo4jGraphAdapter(GraphAdapter):
         self._session = driver.session(database=self._database)
         try:
             self._tx = self._session.begin_transaction()
-        except Exception:
+        except Exception as exc:
+            logger.warning("Neo4j begin_transaction failed: %s", exc)
             self._session.close()
             self._session = None
             raise
@@ -710,7 +723,8 @@ class Neo4jGraphAdapter(GraphAdapter):
         try:
             records = self._run("RETURN 1 AS ok")
             return bool(records and records[0].get("ok") == 1)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Neo4j health check failed: %s", exc)
             global _driver
             _driver = None  # Force reconnect on next call
             return False
@@ -795,7 +809,7 @@ class Neo4jVectorAdapter(VectorAdapter):
         self._dimension = config.embedding_dimension if config else 1024
         self._indexes_created: set[str] = set()
 
-    def _driver(self):
+    def _driver(self) -> Any:
         return _get_driver(self._config)
 
     def _run(self, cypher: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -810,7 +824,11 @@ class Neo4jVectorAdapter(VectorAdapter):
     def _label_for_collection(self, collection: str) -> str:
         """Resolve collection name to Neo4j label."""
         # Strip prefix if present
-        clean = collection.replace("brain_", "").upper() if collection.startswith("brain_") else collection
+        clean = (
+            collection.replace("brain_", "").upper()
+            if collection.startswith("brain_")
+            else collection
+        )
         return _COLLECTION_TO_LABEL.get(collection, _COLLECTION_TO_LABEL.get(clean, "Rule"))
 
     def _index_name(self, label: str) -> str:
@@ -838,7 +856,9 @@ class Neo4jVectorAdapter(VectorAdapter):
             )
             self._run(cypher, {"dim": dimension})
             self._indexes_created.add(idx_name)
-            logger.info("Neo4j vector index '%s' ensured (label=%s, dim=%d)", idx_name, label, dimension)
+            logger.info(
+                "Neo4j vector index '%s' ensured (label=%s, dim=%d)", idx_name, label, dimension
+            )
             return True
         except Exception as e:
             # Some Neo4j versions may not support CREATE VECTOR INDEX
@@ -861,10 +881,7 @@ class Neo4jVectorAdapter(VectorAdapter):
         try:
             self.ensure_collection(collection, len(vector))
             # Update existing node with embedding + text snippet
-            cypher = (
-                "MATCH (n {id: $doc_id}) "
-                "SET n._embedding = $vector, n._embed_text = $text"
-            )
+            cypher = "MATCH (n {id: $doc_id}) SET n._embedding = $vector, n._embed_text = $text"
             params: dict[str, Any] = {
                 "doc_id": doc_id,
                 "vector": vector,
@@ -906,16 +923,16 @@ class Neo4jVectorAdapter(VectorAdapter):
                 "SET n._embedding = item.vector, n._embed_text = item.text"
             )
             with driver.session(database=self._database) as session:
-                session.execute_write(
-                    lambda tx: tx.run(cypher, {"batch": batch}).consume()
-                )
+                session.execute_write(lambda tx: tx.run(cypher, {"batch": batch}).consume())
             return len(batch)
         except Exception as e:
             logger.error("Neo4j vector batch_upsert failed: %s", e)
             # Fallback to individual upserts
             count = 0
             for doc in documents:
-                if self.upsert(collection, doc["id"], doc.get("text", ""), doc["vector"], doc.get("metadata")):
+                if self.upsert(
+                    collection, doc["id"], doc.get("text", ""), doc["vector"], doc.get("metadata")
+                ):
                     count += 1
             return count
 
@@ -935,10 +952,7 @@ class Neo4jVectorAdapter(VectorAdapter):
         idx_name = self._index_name(label)
         try:
             # Use db.index.vector.queryNodes (Neo4j 5.11+)
-            cypher = (
-                "CALL db.index.vector.queryNodes($idx, $top_k, $qvec) "
-                "YIELD node, score "
-            )
+            cypher = "CALL db.index.vector.queryNodes($idx, $top_k, $qvec) YIELD node, score "
             # Apply optional filters
             where_parts: list[str] = []
             params: dict[str, Any] = {
@@ -967,18 +981,20 @@ class Neo4jVectorAdapter(VectorAdapter):
             records = self._run(cypher, params)
             results = []
             for r in records:
-                results.append({
-                    "id": r.get("id", ""),
-                    "score": float(r.get("score", 0.0)),
-                    "text": r.get("text", ""),
-                    "metadata": {
-                        "node_id": r.get("id", ""),
-                        "layer": r.get("layer", ""),
-                        "technologies": r.get("technologies", []),
-                        "domains": r.get("domains", []),
-                        "confidence": r.get("confidence", 0.5),
-                    },
-                })
+                results.append(
+                    {
+                        "id": r.get("id", ""),
+                        "score": float(r.get("score", 0.0)),
+                        "text": r.get("text", ""),
+                        "metadata": {
+                            "node_id": r.get("id", ""),
+                            "layer": r.get("layer", ""),
+                            "technologies": r.get("technologies", []),
+                            "domains": r.get("domains", []),
+                            "confidence": r.get("confidence", 0.5),
+                        },
+                    }
+                )
             return results
         except Exception as e:
             logger.error("Neo4j vector search failed: %s", e)
@@ -1015,7 +1031,8 @@ class Neo4jVectorAdapter(VectorAdapter):
                 return False
             driver.verify_connectivity()
             return True
-        except Exception:
+        except Exception as exc:
+            logger.debug("Neo4j vector adapter availability check failed: %s", exc)
             return False
 
     def health_check(self) -> bool:
@@ -1023,5 +1040,6 @@ class Neo4jVectorAdapter(VectorAdapter):
         try:
             records = self._run("RETURN 1 AS ok")
             return bool(records and records[0].get("ok") == 1)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Neo4j vector adapter health check failed: %s", exc)
             return False
