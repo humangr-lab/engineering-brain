@@ -154,6 +154,45 @@ def cmd_cost(args: argparse.Namespace) -> None:
         )
 
 
+def cmd_strengths(args: argparse.Namespace) -> None:
+    """Run Brain Strengths benchmark — scenarios where multi-signal scoring shines."""
+    from .runner import BenchmarkRunner
+
+    dataset_path = str(Path(__file__).parent / "datasets" / "brain_strengths_v1.yaml")
+    systems = _resolve_systems(args.systems)
+    if not systems:
+        logger.error("No systems loaded. Check --systems flag.")
+        sys.exit(1)
+
+    runner = BenchmarkRunner(
+        systems=systems,
+        dataset_path=dataset_path,
+        output_dir=args.output or str(REPORTS_DIR),
+    )
+    results = runner.run(
+        categories=args.category,
+        k=args.k,
+    )
+
+    # Print summary per category
+    print("\n=== Brain Strengths Benchmark ===")
+    for name, sr in results.systems.items():
+        agg = sr.aggregate
+        print(f"\n  {name}:")
+        print(f"    NDCG@10  = {agg.avg_ndcg_at_10:.4f}")
+        print(f"    MRR      = {agg.avg_mrr:.4f}")
+        print(f"    Recall@10= {agg.avg_recall_at_10:.4f}")
+        print(f"    MAP      = {agg.avg_map:.4f}")
+        print(f"    F1@10    = {agg.avg_f1_at_10:.4f}")
+        print(f"    Latency  = {agg.avg_latency_ms:.1f}ms")
+
+        # Per-category breakdown
+        if sr.per_category:
+            print("    Per-category:")
+            for cat, cat_agg in sorted(sr.per_category.items()):
+                print(f"      {cat:<20} NDCG={cat_agg.avg_ndcg_at_10:.4f}  Recall={cat_agg.avg_recall_at_10:.4f}  MRR={cat_agg.avg_mrr:.4f}")
+
+
 def cmd_report(args: argparse.Namespace) -> None:
     """Generate PDF report from existing results."""
     from .report_generator import ReportGenerator
@@ -249,6 +288,17 @@ def main() -> None:
     # cost
     p_cost = sub.add_parser("cost", help="Run cost/benefit analysis")
     p_cost.set_defaults(func=cmd_cost)
+
+    # strengths
+    p_str = sub.add_parser("strengths", help="Run Brain Strengths benchmark (multi-hop, depth, contradiction, obsolescence)")
+    p_str.add_argument(
+        "--systems", default="all", help="Comma-separated: brain,naive_rag,graph_rag"
+    )
+    p_str.add_argument("--category", nargs="*", default=None,
+                        help="multi_hop_deep, domain_depth, contradiction, obsolescence")
+    p_str.add_argument("--k", type=int, default=10)
+    p_str.add_argument("--output", default=None)
+    p_str.set_defaults(func=cmd_strengths)
 
     # report
     p_rep = sub.add_parser("report", help="Generate PDF report")

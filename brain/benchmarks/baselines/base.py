@@ -53,11 +53,18 @@ class BaselineSystem(ABC):
         result: SystemResult,
         expected_technologies: list[str],
         expected_domains: list[str],
+        ground_truth_ids: list[str] | None = None,
     ) -> set[str]:
         """Determine which returned IDs are relevant to the query.
 
-        Default: tech/domain overlap (same logic as existing test_evaluation.py).
+        If ground_truth_ids is provided (human-annotated), uses those as the
+        authoritative relevance set — independent of system output.
+        Otherwise falls back to tech/domain overlap heuristic.
         """
+        if ground_truth_ids:
+            return set(ground_truth_ids)
+
+        # Fallback: tech/domain overlap (legacy, self-referential)
         relevant = set()
         query_techs = {t.lower() for t in expected_technologies}
         query_domains = {d.lower() for d in expected_domains}

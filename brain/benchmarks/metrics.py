@@ -37,8 +37,11 @@ def ndcg_at_k(ranked_ids: list[str], relevant_ids: set[str], k: int = 10) -> flo
         return total
 
     actual = dcg(ranked_ids, relevant_ids, k)
-    ideal_ranked = sorted(ranked_ids, key=lambda x: x in relevant_ids, reverse=True)
-    ideal = dcg(ideal_ranked, relevant_ids, k)
+    # IDCG: perfect ranking where all relevant items occupy top positions.
+    # The number of ideal hits is min(k, total_relevant), NOT limited to
+    # the relevant items that happen to appear in ranked_ids.
+    n_ideal = min(k, len(relevant_ids))
+    ideal = sum(1.0 / math.log2(i + 2) for i in range(n_ideal))
     if ideal < 1e-9:
         return 0.0
     return actual / ideal

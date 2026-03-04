@@ -36,6 +36,7 @@ class KnowledgeInjector:
             rid = rule["id"]
             # Add directly to the brain's graph as L3 rules
             brain._graph.add_node(
+                "Rule",
                 rid,
                 {
                     "id": rid,

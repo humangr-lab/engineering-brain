@@ -41,7 +41,7 @@ class TestDatasetLoader:
         loader = DatasetLoader()
         queries = loader.load()
         assert len(queries) == 50
-        assert loader.version == "1.0"
+        assert loader.version == "2.0"
 
     def test_filter_by_category(self):
         loader = DatasetLoader()
@@ -60,6 +60,79 @@ class TestDatasetLoader:
         assert "security" in cats
         assert "architecture" in cats
         assert len(cats) == 5
+
+    def test_ground_truth_ids_loaded(self):
+        loader = DatasetLoader()
+        queries = loader.load()
+        # All v2.0 queries have ground truth
+        for q in queries:
+            assert q.ground_truth_ids is not None, f"{q.id} missing ground truth"
+            assert len(q.ground_truth_ids) >= 5, f"{q.id} has too few ground truth IDs"
+
+    def test_ground_truth_used_over_heuristic(self):
+        """When ground truth is provided, it is used instead of tech/domain overlap."""
+        from benchmarks.baselines.base import BaselineSystem
+
+        system = MockSystem()
+        result = system.query("test", ["python"], ["security"])
+        # With ground truth, should return exactly those IDs
+        relevant = system.determine_relevant_ids(
+            result, ["python"], ["security"],
+            ground_truth_ids=["GT-001", "GT-002"],
+        )
+        assert relevant == {"GT-001", "GT-002"}
+        # Without ground truth, falls back to heuristic
+        relevant_heuristic = system.determine_relevant_ids(
+            result, ["python"], ["security"],
+        )
+        assert "R-001" in relevant_heuristic  # python+security overlap
+
+
+class TestStrengthsDataset:
+    def test_loads_brain_strengths_v1(self):
+        from pathlib import Path
+
+        path = str(Path(__file__).parent.parent / "datasets" / "brain_strengths_v1.yaml")
+        loader = DatasetLoader(path)
+        queries = loader.load()
+        assert len(queries) == 20
+        assert loader.version == "1.0"
+
+    def test_strengths_categories(self):
+        from pathlib import Path
+
+        path = str(Path(__file__).parent.parent / "datasets" / "brain_strengths_v1.yaml")
+        loader = DatasetLoader(path)
+        cats = loader.categories
+        assert "multi_hop_deep" in cats
+        assert "domain_depth" in cats
+        assert "contradiction" in cats
+        assert "obsolescence" in cats
+        assert len(cats) == 4
+
+    def test_strengths_ground_truth(self):
+        from pathlib import Path
+
+        path = str(Path(__file__).parent.parent / "datasets" / "brain_strengths_v1.yaml")
+        loader = DatasetLoader(path)
+        queries = loader.load()
+        for q in queries:
+            assert q.ground_truth_ids is not None, f"{q.id} missing ground truth"
+            assert len(q.ground_truth_ids) >= 5, f"{q.id} has too few ground truth IDs"
+
+    def test_strengths_per_category_count(self):
+        from pathlib import Path
+
+        path = str(Path(__file__).parent.parent / "datasets" / "brain_strengths_v1.yaml")
+        loader = DatasetLoader(path)
+        queries = loader.load()
+        from collections import Counter
+
+        counts = Counter(q.category for q in queries)
+        assert counts["multi_hop_deep"] == 5
+        assert counts["domain_depth"] == 5
+        assert counts["contradiction"] == 5
+        assert counts["obsolescence"] == 5
 
 
 class TestBenchmarkRunner:

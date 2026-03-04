@@ -32,6 +32,21 @@ class TestNDCG:
         score = ndcg_at_k(ranked, relevant, 4)
         assert 0.0 < score < 1.0
 
+    def test_unretrieved_relevant_lowers_score(self):
+        """Finding 1 of 3 relevant items at rank 1 should NOT be NDCG=1.0.
+
+        The old buggy IDCG only considered relevant items that appeared in
+        ranked_ids, inflating the score. The correct IDCG considers all
+        relevant items regardless of retrieval.
+        """
+        ranked = ["a", "x"]
+        relevant = {"a", "b", "c"}
+        score = ndcg_at_k(ranked, relevant, 2)
+        # Correct: DCG=1/log2(2)=1.0, IDCG=1/log2(2)+1/log2(3)=1.631
+        # So NDCG ≈ 0.613, definitely < 0.7
+        assert score < 0.7
+        assert score > 0.5  # But still positive — we did find one
+
 
 class TestMRR:
     def test_first_relevant(self):

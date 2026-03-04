@@ -102,6 +102,7 @@ class BenchmarkRunner:
                 result,
                 q.expected_technologies,
                 q.expected_domains,
+                ground_truth_ids=q.ground_truth_ids,
             )
 
             suite = compute_suite(

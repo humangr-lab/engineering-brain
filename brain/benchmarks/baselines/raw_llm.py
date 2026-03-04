@@ -1,7 +1,8 @@
 """Raw LLM baseline — direct query to Claude without knowledge graph.
 
 Asks the LLM to generate engineering rules/patterns for a given task,
-then matches the response against Brain node IDs by text similarity.
+then matches the response against Brain node IDs by embedding cosine
+similarity ONLY (no graph expansion, no scoring signals).
 
 Optional: requires BRAIN_AGENT_API_KEY environment variable.
 """
@@ -36,7 +37,11 @@ Return ONLY the JSON array, no other text."""
 
 
 class RawLLMSystem(BaselineSystem):
-    """Direct LLM query — no knowledge graph, no retrieval."""
+    """Direct LLM query — no knowledge graph, no retrieval.
+
+    Node matching uses embedding cosine similarity only, ensuring the
+    LLM baseline is fully independent from the Brain's scoring pipeline.
+    """
 
     def __init__(
         self,
@@ -44,7 +49,8 @@ class RawLLMSystem(BaselineSystem):
     ) -> None:
         self._model = model
         self._client: Any = None
-        self._brain: Any = None
+        self._embedder: Any = None
+        self._node_index: list[tuple[str, list[float], dict]] = []  # (id, vector, metadata)
 
     @property
     def name(self) -> str:
@@ -55,7 +61,8 @@ class RawLLMSystem(BaselineSystem):
         return (
             f"Direct query to {self._model} without any knowledge graph or retrieval. "
             "The LLM generates engineering rules from its training data. "
-            "Results are matched to Brain nodes by text overlap for metric comparison."
+            "Results are matched to Brain nodes by embedding cosine similarity only "
+            "(no graph expansion, no scoring signals)."
         )
 
     def setup(self) -> None:
@@ -75,11 +82,59 @@ class RawLLMSystem(BaselineSystem):
                 "Raw LLM baseline requires 'anthropic' package: pip install anthropic"
             ) from exc
 
-        # Also seed a Brain instance for node matching
+        # Build embedding index from seed data (independent of Brain scoring)
+        self._build_node_index()
+
+    def _build_node_index(self) -> None:
+        """Build an embedding index of all seed nodes for cosine matching.
+
+        Uses the same fastembed model as the Brain but only for embedding —
+        no graph traversal, no scoring signals, no query expansion.
+        """
+        try:
+            from fastembed import TextEmbedding
+        except ImportError as exc:
+            raise RuntimeError(
+                "Raw LLM node matching requires fastembed: pip install fastembed"
+            ) from exc
+
+        from engineering_brain.retrieval.embedder import cosine_similarity
+
+        self._cosine = cosine_similarity
+        self._embed_model = TextEmbedding()
+
+        # Load all seed nodes directly (bypass Brain query pipeline entirely)
         from engineering_brain.core.brain import Brain
 
-        self._brain = Brain()
-        self._brain.seed()
+        brain = Brain()
+        brain.seed()
+
+        # Extract all nodes from the graph
+        all_nodes = brain._graph.get_all_nodes()
+        logger.info("Raw LLM: indexing %d nodes for embedding matching", len(all_nodes))
+
+        texts_to_embed = []
+        node_data = []
+        for node in all_nodes:
+            nid = node.get("id", "")
+            text = node.get("text", "")
+            if not nid or not text:
+                continue
+            texts_to_embed.append(text[:512])  # Cap text length for embedding
+            node_data.append((nid, node))
+
+        # Batch embed all node texts
+        embeddings = list(self._embed_model.embed(texts_to_embed))
+
+        self._node_index = []
+        for i, (nid, node) in enumerate(node_data):
+            vec = [float(x) for x in embeddings[i]]
+            self._node_index.append((nid, vec, node))
+
+        logger.info("Raw LLM: indexed %d node embeddings", len(self._node_index))
+
+        # Clean up the Brain — we only needed it for node data
+        del brain
 
     def query(
         self,
@@ -117,8 +172,8 @@ class RawLLMSystem(BaselineSystem):
             else:
                 items = []
 
-        # Match LLM-generated items to Brain node IDs
-        ranked_ids, raw_results = self._match_to_brain_nodes(items, technologies, domains)
+        # Match LLM items to nodes by embedding cosine similarity only
+        ranked_ids, raw_results = self._match_by_embedding(items)
 
         return SystemResult(
             ranked_ids=ranked_ids,
@@ -128,13 +183,15 @@ class RawLLMSystem(BaselineSystem):
             metadata={"model": self._model, "raw_items": len(items)},
         )
 
-    def _match_to_brain_nodes(
+    def _match_by_embedding(
         self,
         items: list[dict],
-        technologies: list[str],
-        domains: list[str],
     ) -> tuple[list[str], list[dict[str, Any]]]:
-        """Match LLM-generated items to Brain nodes by querying for each item."""
+        """Match LLM-generated items to Brain nodes by cosine similarity only.
+
+        For each LLM item, embed its text and find the closest node in the
+        pre-computed embedding index. No graph traversal, no scoring.
+        """
         seen_ids: set[str] = set()
         ranked_ids: list[str] = []
         raw_results: list[dict[str, Any]] = []
@@ -143,23 +200,30 @@ class RawLLMSystem(BaselineSystem):
             item_text = item.get("text", "")
             if not item_text:
                 continue
-            # Use the Brain to find matching nodes
-            result = self._brain.query(
-                task_description=item_text,
-                technologies=technologies or None,
-                domains=domains or None,
-                phase="exec",
-            )
-            for layer_key in ("rules", "patterns", "principles", "evidence"):
-                for node in getattr(result, layer_key, []):
-                    nid = node.get("id", "")
-                    if nid and nid not in seen_ids:
-                        seen_ids.add(nid)
-                        ranked_ids.append(nid)
-                        raw_results.append(node)
+
+            # Embed the LLM-generated text
+            item_vec = list(self._embed_model.embed([item_text]))[0]
+            item_vec = [float(x) for x in item_vec]
+
+            # Find top-3 nearest nodes by cosine similarity
+            scored = []
+            for nid, node_vec, node in self._node_index:
+                if nid in seen_ids:
+                    continue
+                sim = self._cosine(item_vec, node_vec)
+                scored.append((sim, nid, node))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+
+            for sim, nid, node in scored[:3]:
+                if nid not in seen_ids and sim > 0.3:  # Minimum similarity threshold
+                    seen_ids.add(nid)
+                    ranked_ids.append(nid)
+                    raw_results.append(node)
 
         return ranked_ids, raw_results
 
     def teardown(self) -> None:
         self._client = None
-        self._brain = None
+        self._node_index = []
+        self._embedder = None

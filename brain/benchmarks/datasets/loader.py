@@ -18,6 +18,7 @@ class EvalQuery:
     difficulty: str
     expected_technologies: list[str]
     expected_domains: list[str]
+    ground_truth_ids: list[str] | None = None
 
 
 class DatasetLoader:
@@ -45,6 +46,7 @@ class DatasetLoader:
                 continue
             if difficulties and diff not in difficulties:
                 continue
+            gt = q.get("ground_truth_ids")
             queries.append(
                 EvalQuery(
                     id=q["id"],
@@ -53,6 +55,7 @@ class DatasetLoader:
                     difficulty=diff,
                     expected_technologies=q.get("expected_technologies", []),
                     expected_domains=q.get("expected_domains", []),
+                    ground_truth_ids=gt if gt else None,
                 )
             )
         return queries
