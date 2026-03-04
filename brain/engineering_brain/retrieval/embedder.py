@@ -290,6 +290,13 @@ def get_embedder(
 
 
 def reset_embedder() -> None:
-    """Reset singleton (for testing)."""
+    """Reset singleton and release native resources (for testing).
+
+    Explicitly deletes the fastembed/onnxruntime provider to prevent
+    'FATAL: exception not rethrown' crashes during Python shutdown on 3.12.
+    """
     global _embedder
+    if _embedder is not None:
+        _embedder._provider = None
+        _embedder._provider_attempted = False
     _embedder = None

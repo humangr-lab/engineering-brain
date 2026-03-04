@@ -737,16 +737,19 @@ class Neo4jGraphAdapter(GraphAdapter):
         return self._run(cypher, params)
 
     def __del__(self) -> None:
-        """Clean up session on garbage collection to prevent leaks."""
-        if self._session is not None:
-            try:
+        """Clean up session on garbage collection to prevent leaks.
+
+        Guards against interpreter shutdown (globals may be None).
+        """
+        try:
+            if self._session is not None:
                 if self._tx is not None:
                     self._tx.rollback()
                 self._session.close()
-            except Exception as exc:
-                logger.debug("Error during Neo4jGraphAdapter cleanup: %s", exc)
-            self._session = None
-            self._tx = None
+                self._session = None
+                self._tx = None
+        except Exception:
+            pass
 
     def close(self) -> None:
         """Close the driver connection. Call on shutdown."""

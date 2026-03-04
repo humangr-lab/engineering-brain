@@ -18,6 +18,7 @@ def _reset_global_state() -> None:  # noqa: PT004
     - context_extractor._dynamic_domain_index
     - taxonomy._global_registry
     - brain_factory singleton
+    - embedder singleton (onnxruntime native resources)
     """
     # Reset context extractor indices
     try:
@@ -51,3 +52,30 @@ def _reset_global_state() -> None:  # noqa: PT004
         clear_card_cache()
     except (ImportError, AttributeError):
         pass
+
+    # Reset embedder singleton (releases fastembed/onnxruntime native resources)
+    try:
+        from engineering_brain.retrieval.embedder import reset_embedder
+
+        reset_embedder()
+    except (ImportError, AttributeError):
+        pass
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Release native resources before interpreter shutdown.
+
+    Prevents 'FATAL: exception not rethrown' crash on Python 3.12 caused by
+    onnxruntime C++ destructors firing during garbage collection at exit.
+    """
+    try:
+        from engineering_brain.retrieval.embedder import reset_embedder
+
+        reset_embedder()
+    except (ImportError, AttributeError):
+        pass
+
+    # Force garbage collection of any lingering onnxruntime sessions
+    import gc
+
+    gc.collect()
