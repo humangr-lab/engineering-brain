@@ -62,8 +62,6 @@ class NodeType(StrEnum):
     FILE_TYPE = "FileType"
     DOMAIN = "Domain"
     HUMAN_LAYER = "HumanLayer"
-    SPRINT = "Sprint"
-
     # Source attribution
     SOURCE = "Source"
     VALIDATION_RUN = "ValidationRun"
@@ -90,8 +88,6 @@ class EdgeType(StrEnum):
     USED_IN = "USED_IN"  # Pattern → Technology
     CAUGHT_BY = "CAUGHT_BY"  # Finding → HumanLayer
     VIOLATED = "VIOLATED"  # Finding → Rule
-    IN_SPRINT = "IN_SPRINT"  # Finding → Sprint
-
     # Evolution (learning)
     SUPERSEDES = "SUPERSEDES"  # Rule → Rule (newer version)
     CONFLICTS_WITH = "CONFLICTS_WITH"  # Rule ↔ Rule (contradiction)
@@ -151,7 +147,7 @@ VECTOR_COLLECTIONS: dict[str, str] = {
 # Redis cache key prefixes
 CACHE_KEY_PREFIX = "brain"
 
-# Graph database name for engineering brain (separate from pipeline_graph)
+# Graph database name for engineering brain
 BRAIN_GRAPH_DB = "engineering_brain"
 
 
@@ -168,9 +164,9 @@ def collection_for_layer(layer: Layer) -> str | None:
     return VECTOR_COLLECTIONS.get(layer.value)
 
 
-def cache_key(domain: str, technology: str, file_type: str, phase: str) -> str:
+def cache_key(domain: str, technology: str, file_type: str) -> str:
     """Build Redis cache key for a query context."""
-    parts = [CACHE_KEY_PREFIX, domain, technology, file_type, phase]
+    parts = [CACHE_KEY_PREFIX, domain, technology, file_type]
     return ":".join(p.lower().strip() for p in parts if p)
 
 
@@ -190,7 +186,6 @@ _NODE_LAYER_MAP: dict[NodeType, Layer | None] = {
     NodeType.FILE_TYPE: None,
     NodeType.DOMAIN: None,
     NodeType.HUMAN_LAYER: None,
-    NodeType.SPRINT: None,
     NodeType.SOURCE: None,
     NodeType.VALIDATION_RUN: None,
 }

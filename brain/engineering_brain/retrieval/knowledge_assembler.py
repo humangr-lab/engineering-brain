@@ -1,6 +1,6 @@
 """LLM-powered knowledge pack assembler for the Engineering Knowledge Brain.
 
-Replaces the static enforce_budget() + format_for_llm() pipeline with an
+Replaces the static enforce_budget() + format_for_llm() flow with an
 intelligent assembly step that curates, orders, and tailor-makes knowledge
 packs per query.
 
@@ -13,7 +13,7 @@ Three strategies:
   SYNTHESIZED: Complex queries (3+ techs, design/architecture). LLM produces markdown directly.
 
 Feature-flagged via BRAIN_LLM_KNOWLEDGE_ASSEMBLY (default ON).
-Falls back to deterministic pipeline on any failure.
+Falls back to deterministic assembly on any failure.
 """
 
 from __future__ import annotations
@@ -175,7 +175,7 @@ class KnowledgeAssembler:
     """LLM-powered knowledge pack assembler.
 
     Sits between scoring/reranking and output formatting in the retrieval
-    pipeline. Replaces static budget + mechanical formatting with
+    flow. Replaces static budget + mechanical formatting with
     intelligent curation.
     """
 
@@ -224,7 +224,7 @@ class KnowledgeAssembler:
             return self._fallback(scored_nodes, total_budget, start)
 
     # -------------------------------------------------------------------------
-    # Internal pipeline
+    # Internal flow
     # -------------------------------------------------------------------------
 
     def _assemble_internal(

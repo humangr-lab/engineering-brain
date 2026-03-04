@@ -71,18 +71,25 @@ class AsyncEmbeddingPipeline:
         self._embedder = None
 
     def _get_embedder(self) -> Any:
-        """Lazy-load the embedding provider."""
+        """Lazy-load the embedding provider (fastembed or voyageai)."""
         if self._embedder is not None:
             return self._embedder
         try:
-            from pipeline_autonomo.embedding_provider import get_embedding_provider
+            from fastembed import TextEmbedding
 
-            self._embedder = get_embedding_provider()
+            self._embedder = TextEmbedding()
+            return self._embedder
+        except ImportError:
+            pass
+        try:
+            import voyageai
+
+            self._embedder = voyageai.Client()
             return self._embedder
         except ImportError:
             logger.info(
-                "pipeline_autonomo not installed — async embedding disabled. "
-                "Install fastembed or voyageai for standalone embedding support."
+                "No embedding provider available — async embedding disabled. "
+                "Install fastembed or voyageai for embedding support."
             )
             return None
         except Exception as e:

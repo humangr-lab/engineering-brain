@@ -173,7 +173,6 @@ class Neo4jGraphAdapter(GraphAdapter):
             "CodeExample",
             "TestResult",
             "Task",
-            "Sprint",
             "Source",
             "ValidationRun",
         )

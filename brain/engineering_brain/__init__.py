@@ -41,13 +41,6 @@ from engineering_brain.core.types import (
     TestResult,
     ValidationStatus,
 )
-from engineering_brain.retrieval.task_knowledge import (
-    auto_tag_task,
-    enrich_task_with_knowledge,
-    enrich_tasks_batch,
-    get_knowledge_for_task,
-    init_task_knowledge,
-)
 
 __all__ = [
     # Main entry point
@@ -83,12 +76,6 @@ __all__ = [
     "Source",
     "SourceType",
     "ValidationStatus",
-    # Task-driven knowledge API
-    "get_knowledge_for_task",
-    "enrich_task_with_knowledge",
-    "enrich_tasks_batch",
-    "auto_tag_task",
-    "init_task_knowledge",
 ]
 
 __version__ = "1.0.0"

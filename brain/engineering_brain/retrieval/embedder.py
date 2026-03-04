@@ -6,7 +6,7 @@ Computes and stores vector embeddings for all brain nodes, enabling:
 - Semantic query expansion
 
 Graceful degradation: every method returns [] on failure, never blocks.
-Uses pipeline_autonomo's embedding provider (FastEmbed/Voyage/Ollama).
+Uses FastEmbed or VoyageAI as embedding provider.
 """
 
 from __future__ import annotations
@@ -54,14 +54,21 @@ class BrainEmbedder:
             return None
         self._provider_attempted = True
         try:
-            from pipeline_autonomo.embedding_provider import get_embedding_provider
+            from fastembed import TextEmbedding
 
-            self._provider = get_embedding_provider()
+            self._provider = TextEmbedding()
+            return self._provider
+        except ImportError:
+            pass
+        try:
+            import voyageai
+
+            self._provider = voyageai.Client()
             return self._provider
         except ImportError:
             logger.info(
-                "pipeline_autonomo not installed — embedding disabled. "
-                "Install fastembed or voyageai for standalone embedding support."
+                "No embedding provider available — embedding disabled. "
+                "Install fastembed or voyageai for embedding support."
             )
             return None
         except Exception as e:

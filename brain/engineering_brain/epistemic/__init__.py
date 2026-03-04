@@ -1,8 +1,7 @@
 """Epistemic scoring for the Engineering Knowledge Brain.
 
 Lightweight Subjective Logic implementation (Josang 2016) for
-opinion-based quality scoring of knowledge nodes. Independent
-of pipeline_v2's ESL — same math, zero external dependencies.
+opinion-based quality scoring of knowledge nodes.
 """
 
 from engineering_brain.epistemic.conflict_resolution import (

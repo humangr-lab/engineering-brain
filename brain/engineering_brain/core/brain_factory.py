@@ -57,13 +57,6 @@ def get_brain(
                 "[BrainFactory] Brain initialized (%d nodes)",
                 _brain.stats().get("total", 0),
             )
-            # Wire task_knowledge with the same singleton
-            try:
-                from engineering_brain.retrieval.task_knowledge import init_task_knowledge
-
-                init_task_knowledge(_brain)
-            except Exception as exc:
-                logger.debug("Task knowledge initialization failed (non-blocking): %s", exc)
             # Launch background embedding
             if background_embed and not os.getenv("BRAIN_SKIP_BACKGROUND_EMBED"):
                 _start_background_embed()
