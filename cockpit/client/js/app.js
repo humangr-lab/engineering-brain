@@ -138,11 +138,11 @@ async function boot() {
   // ═══ End WP-4 ═══
 
   // 7. Initialize UI systems
-  initDetailPanel();
+  initDetailPanel(_openModal);
   initStatsBar();
   if (FEATURES.SEARCH) try { initSearch(_onSearchNavigate); } catch (e) { console.warn('[Boot] Search init failed:', e.message); }
   if (FEATURES.KLIB) try { initKlib(); } catch (e) { console.warn('[Boot] KLib init failed:', e.message); }
-  if (FEATURES.TOUR) try { initTour(icons); } catch (e) { console.warn('[Boot] Tour init failed:', e.message); }
+  if (FEATURES.TOUR) try { initTour(icons, _openModal); } catch (e) { console.warn('[Boot] Tour init failed:', e.message); }
 
   // ═══ WP-3: Navigation ═══
   try {
@@ -511,8 +511,7 @@ function _onNodeClick(item) {
   if (id === 'klib') {
     openKlib();
   } else if (state.submaps[id]) {
-    // ═══ WP-4: Fractal Drill — use drill FSM instead of submap modal ═══
-    drillInto(id, item.data);
+    enterSubmap(id, state.submaps, state.nodeDetails, _openModal);
   } else if (state.inSubmap && item.data?._parentId) {
     _openModal(id, item.data._parentId);
   } else if (getCurrentLevel() > LEVELS.SYSTEM && item.data?.nodeData) {

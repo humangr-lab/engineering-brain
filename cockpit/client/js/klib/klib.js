@@ -80,9 +80,16 @@ export function closeKlib() {
   document.getElementById('klibOv')?.classList.remove('open');
 }
 
+function _getKlibNodes() {
+  return state.nodes && state.nodes.length > 0
+    ? state.nodes
+    : (Array.isArray(state.klibData) ? state.klibData : Object.values(state.klibData || {}));
+}
+
 function _renderKlib() {
+  const nodes = _getKlibNodes();
   _updateStats();
-  buildFilters(state.nodes);
+  buildFilters(nodes);
   _renderCenter();
 
   // If a node was selected before, re-render detail
@@ -96,17 +103,20 @@ function _hideKlib() {
 }
 
 function _renderCenter() {
-  const filtered = _applyFilters(state.nodes);
+  const nodes = _getKlibNodes();
+  const filtered = _applyFilters(nodes);
   renderList(filtered, state.klibGroupBy);
 
   // Update result count
   const countEl = document.getElementById('klibResultCount');
   if (countEl) {
-    const total = state.nodes.length;
+    const total = nodes.length;
     const shown = filtered.length;
-    countEl.textContent = shown === total
-      ? `${total.toLocaleString()} nodes`
-      : `${shown.toLocaleString()} of ${total.toLocaleString()} nodes`;
+    countEl.textContent = total === 0
+      ? 'No data available'
+      : shown === total
+        ? `${total.toLocaleString()} nodes`
+        : `${shown.toLocaleString()} of ${total.toLocaleString()} nodes`;
   }
 }
 
