@@ -31,7 +31,7 @@ A curated knowledge graph for AI coding agents. Zero LLM by default.
 
 <br>
 
-3,700+ engineering rules, patterns, and principles organized in 6 layers — from axioms down to code-level evidence. Agents query the graph and get deterministic, source-backed answers in milliseconds. No hallucination. No token burn.
+3,700+ engineering rules, patterns, and principles organized in 6 layers — from axioms down to code-level evidence. Agents query the graph and get deterministic, source-backed answers in milliseconds.
 
 ## Quick start
 
@@ -142,7 +142,7 @@ pip install -e "brain/[all]"     # everything
 
 ```
 brain/                  Knowledge graph engine
-├── engineering_brain/  3,700+ nodes, 22 MCP tools, epistemic reasoning
+├── engineering_brain/  3,700+ knowledge nodes, 22 MCP tools
 │   └── agent/          Orchestrator + 5 domain workers (BYOK)
 ├── tests/              2,400+ tests
 └── pyproject.toml

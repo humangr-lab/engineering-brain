@@ -1,167 +1,82 @@
-# Known Gaps After Pipeline Decoupling
+# Known Limitations
 
-Gaps introduced by removing pipeline-specific components from the public repo.
-These are tracked for future resolution.
+Areas where the brain has room for improvement. Tracked for future work.
 
-## 1. Embedding Provider Fallback
+## 1. Embedding Provider Abstraction
 
 **Files**: `retrieval/embedder.py`, `adapters/async_embedding.py`
 
-The embedding provider now tries to import `fastembed` then `voyageai` directly.
-The previous `pipeline_autonomo.embedding_provider` wrapper handled provider
-selection, batching, and model configuration centrally.
+The embedding layer tries fastembed first, then voyageai. Each provider has a
+different API surface (`embed()` return types, batch semantics).
 
-**Impact**: Users must install `fastembed` or `voyageai` manually and the
-provider API surface may differ from what the adapter methods expect
-(`embed()`, `embed_batch()`).
-
-**Fix**: Create a lightweight `EmbeddingProvider` abstraction in
-`engineering_brain/retrieval/embedding_provider.py` that wraps fastembed/voyageai
-with a uniform API.
+**Fix**: Add a lightweight `EmbeddingProvider` abstraction with a uniform API
+(`embed_text() -> list[float]`, `embed_batch() -> list[list[float]]`).
 
 ---
 
-## 2. FalkorDB Client API
+## 2. FalkorDB Integration Testing
 
 **File**: `adapters/falkordb.py`
 
-The `_get_client()` now imports the native `falkordb` package directly.
-The native API (`falkordb.FalkorDB.select_graph()`) should work but
-has not been integration-tested without the pipeline wrapper.
+The FalkorDB adapter uses the native `falkordb` package directly. It has not
+been integration-tested against a live FalkorDB instance.
 
-**Impact**: FalkorDB adapter may need adjustments for the native client API.
-
-**Fix**: Integration test with a local FalkorDB instance.
+**Fix**: Add a CI job with FalkorDB service container for integration tests.
 
 ---
 
-## 3. Qdrant Client API
+## 3. Qdrant Integration Testing
 
 **File**: `adapters/qdrant.py`
 
-Fully rewritten to use native `qdrant_client.QdrantClient` API. Uses
-`PointStruct`, `VectorParams`, deterministic UUID point IDs.
+The Qdrant adapter uses `qdrant_client.QdrantClient` with deterministic UUID
+point IDs. It works in unit tests but lacks integration coverage against a
+live Qdrant instance (retries, connection pooling, etc.).
 
-**Impact**: Functional but untested against a live Qdrant instance.
-The old pipeline wrapper handled edge cases (retries, connection pooling).
-
-**Fix**: Integration test with a local Qdrant instance. Consider adding
-retry logic.
+**Fix**: Add a CI job with Qdrant service container.
 
 ---
 
-## 4. Proactive Push — Failure Patterns
+## 4. Proactive Push — Failure Pattern History
 
 **File**: `retrieval/proactive_push.py`
 
-The `_failure_patterns()` method previously queried `pipeline_autonomo.amem_integration`
-(A-MEM) for historical corrective actions and read `_prev_sprint_feedback` from
-pipeline state. Now it queries the brain's own findings.
+The `_failure_patterns()` method queries the brain's own findings for
+historical patterns. A richer signal would come from an external memory
+store with cross-session learning.
 
-**Impact**: Reduced signal — the brain's built-in findings are limited compared
-to a full A-MEM store with cross-sprint learning.
-
-**Fix**: Implement an optional memory integration (MCP-based or local store)
-that the proactive push can query for historical patterns.
+**Fix**: Add an optional memory integration (MCP-based or local) that the
+proactive push can query for historical failure patterns.
 
 ---
 
-## 5. Proactive Push — Dependency Analysis
+## 5. Proactive Push — Cross-File Dependencies
 
 **File**: `retrieval/proactive_push.py`
 
-The `_dependency_analysis()` method previously read `granular_tasks` from
-pipeline state to find cross-file dependencies. Now it only checks the
-task's own `depends_on` field.
+Cross-file dependency warnings only work if tasks explicitly declare
+`depends_on`. Implicit dependencies (imports, shared state) are not detected.
 
-**Impact**: Cross-file dependency warnings only work if tasks explicitly
-declare dependencies.
-
-**Fix**: Implement static analysis or import graph scanning to detect
-cross-file dependencies automatically.
+**Fix**: Add static analysis or import graph scanning to detect cross-file
+dependencies automatically.
 
 ---
 
-## 6. Context Extractor — Phase Detection
+## 6. Pack Templates
 
-**File**: `retrieval/context_extractor.py`
+Only generic pack templates ship today. Domain-specific templates (e.g.,
+"security review", "design review", "code review") would improve the
+`brain_pack` tool's usefulness out of the box.
 
-The `_PHASE_KEYWORDS` still includes "init", "spec", "exec", "qa" phases.
-These are generic workflow phases that work standalone, but "vote" was
-removed from `TaskContext.phase` description.
-
-**Impact**: Minimal — phases are generic enough to be useful outside
-any specific pipeline.
-
-**Fix**: None needed unless adding new phase-specific features.
+**Fix**: Add 5-10 curated pack templates covering common review scenarios.
 
 ---
 
-## 7. Removed Seed Files (15 files)
+## 7. Task-Driven Convenience API
 
-Pipeline-specific seed knowledge was removed:
-- `pipeline_cross_cutting.yaml` — cross-cutting pipeline concerns
-- `pipeline_exec_*.yaml` — execution phase knowledge
-- `pipeline_qa_*.yaml` — QA phase knowledge
-- `pipeline_spec_*.yaml` — spec phase knowledge
-- `sacadas_*.yaml` — pipeline-specific insights
-- `squad_lead_patterns.yaml` — squad coordination patterns
+The brain exposes `query()`, `search()`, and `think()` as primitives. A
+higher-level API that takes a task description and returns contextually
+relevant knowledge (auto-tagging technologies and domains) would reduce
+integration effort for agent frameworks.
 
-**Impact**: ~200 rules of pipeline-specific knowledge are no longer in
-the public brain. General engineering knowledge is unaffected.
-
-**Fix**: Consider extracting universally applicable rules from the
-removed seeds and adding them back to domain-appropriate seed files.
-
----
-
-## 8. Removed Pack Templates (4 files)
-
-- `exec-implementation.yaml` — execution implementation packs
-- `spec-analysis.yaml` — specification analysis packs
-- `qa-review.yaml` — QA review packs
-- `squad-coordination.yaml` — squad coordination packs
-
-**Impact**: Pack manager cannot generate these specific pack types.
-Generic packs still work.
-
-**Fix**: Create standalone equivalents that work outside the pipeline
-context (e.g., "code-review.yaml", "design-review.yaml").
-
----
-
-## 9. Task Knowledge API Removed
-
-**File**: `retrieval/task_knowledge.py` (deleted)
-
-The entire task-driven knowledge API was removed:
-- `get_knowledge_for_task()`
-- `enrich_task_with_knowledge()`
-- `enrich_tasks_batch()`
-- `auto_tag_task()`
-- `init_task_knowledge()`
-
-**Impact**: External tools that imported these functions need to use
-`brain.query()` directly instead.
-
-**Fix**: Consider reimplementing a simplified version as a convenience
-layer on top of `brain.query()`.
-
----
-
-## 10. Sprint / Finding SBAR Fields
-
-**Files**: `core/types.py`, `core/schema.py`
-
-Removed:
-- `Sprint` model entirely
-- `Finding.sprint`, `Finding.run_id`, `Finding.expected`, `Finding.actual`,
-  `Finding.requirement_id` fields
-- `TestResult.sprint` field
-- `NodeType.SPRINT`, `EdgeType.IN_SPRINT`
-
-**Impact**: Findings and test results lose sprint context tracking.
-The brain can still store findings but without sprint association.
-
-**Fix**: If sprint tracking is needed for standalone use, re-add it
-as an optional generic "context" or "batch_id" field.
+**Fix**: Add a `brain.knowledge_for_task(description)` convenience method.

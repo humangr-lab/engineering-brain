@@ -41,7 +41,6 @@ export let EDGE_TYPES = {
   USED_IN:        { cat: 'Cross-layer', desc: 'Pattern \u2192 Technology', color: '#5eead4' },
   CAUGHT_BY:      { cat: 'Cross-layer', desc: 'Finding \u2192 HumanLayer', color: '#5eead4' },
   VIOLATED:       { cat: 'Cross-layer', desc: 'Finding \u2192 Rule', color: '#ef4444' },
-  IN_SPRINT:      { cat: 'Cross-layer', desc: 'Finding \u2192 Sprint', color: '#5eead4' },
   // Evolution
   SUPERSEDES:     { cat: 'Evolution', desc: 'Rule \u2192 Rule (newer)', color: '#f59e0b' },
   CONFLICTS_WITH: { cat: 'Evolution', desc: 'Rule \u2194 Rule (contradiction)', color: '#ef4444' },

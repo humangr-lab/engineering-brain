@@ -27,11 +27,16 @@ Examples of unacceptable behavior:
 * Publishing others' private information without explicit permission
 * Other conduct which could reasonably be considered inappropriate in a professional setting
 
+## Scope
+
+This Code of Conduct applies within all project spaces, including issues, pull requests, discussions, and any public space where an individual is representing the project.
+
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the project maintainers. All complaints will be reviewed and
-investigated promptly and fairly.
+reported to **conduct@humangr.dev**. All complaints will be reviewed and
+investigated promptly and fairly. Maintainers who do not follow or enforce the
+Code of Conduct may face temporary or permanent repercussions.
 
 ## Attribution
 

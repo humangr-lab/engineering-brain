@@ -43,7 +43,7 @@ Add to your Claude Code config (`~/.claude/mcp.json`):
 }
 ```
 
-Restart Claude Code. You now have `brain_query`, `brain_think`, `brain_search`, and 17 more tools available.
+Restart Claude Code. You now have `brain_query`, `brain_think`, `brain_search`, and 19 more tools available.
 
 ### Option 2: Python API
 
@@ -59,12 +59,12 @@ print(result.formatted_text)
 
 ## Features
 
-- **3,724 curated rules** across 285 knowledge files — each with `why`, `how_to_do_right`, `example_good`, `example_bad`, and `sources`
+- **3,700+ curated rules** across 270 knowledge files — each with `why`, `how_to_do_right`, `example_good`, `example_bad`, and `sources`
 - **4-layer knowledge hierarchy** — Axioms (why) > Principles (how to think) > Patterns (how to design) > Rules (what to do)
 - **Cross-layer inference** — Ask about a rule, get the reasoning chain back to first principles
 - **66 technologies** — React, Flask, AWS, Kubernetes, Go, Rust, Django, Next.js, Kafka, MongoDB, and 56 more
 - **69 domains** — Security, API design, databases, testing, DevOps, architecture, performance, accessibility, and more
-- **MCP server with 20 tools** — `brain_query`, `brain_think`, `brain_reason`, `brain_search`, `brain_learn`, and more
+- **MCP server with 22 tools** — `brain_query`, `brain_think`, `brain_reason`, `brain_search`, `brain_learn`, and more
 - **Epistemic reasoning** — Confidence tiers (VALIDATED / PROBABLE / UNCERTAIN / CONTESTED) per response
 - **Adaptive retrieval** — Thompson Sampling learns which knowledge is most helpful over time
 - **Extensible** — Add your own rules as YAML files, the brain indexes them automatically
@@ -157,10 +157,10 @@ All configuration via environment variables with sensible defaults:
 | `BRAIN_QDRANT_ENABLED` | `false` | Enable Qdrant vector search |
 | `BRAIN_REDIS_ENABLED` | `false` | Enable Redis L2 cache |
 | `BRAIN_EMBEDDING_ENABLED` | `true` | Enable embedding-based retrieval |
-| `BRAIN_CONTEXT_BUDGET` | `3000` | Max characters per query response |
+| `BRAIN_CONTEXT_BUDGET` | `50000` | Max characters for context budget |
 | `BRAIN_TOP_K_RESULTS` | `10` | Max rules returned per query |
 
-Full configuration reference: [`core/config.py`](src/engineering_brain/core/config.py)
+Full configuration reference: [`core/config.py`](engineering_brain/core/config.py)
 
 ## Adding Your Own Rules
 

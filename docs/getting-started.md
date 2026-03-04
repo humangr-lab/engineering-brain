@@ -24,7 +24,7 @@ This installs both the Brain package and the Cockpit server in development mode.
 make test
 ```
 
-All 2,400+ tests should pass.
+All tests should pass.
 
 ## Using the Brain
 
@@ -77,7 +77,7 @@ Click any node to explore. Drag to rotate, scroll to zoom. Press Cmd+K to search
 For deep multi-domain reasoning, enable the LLM agent system:
 
 ```bash
-pip install -e brain/[agent]  # installs anthropic SDK
+pip install -e "brain/[agent]"  # installs anthropic SDK
 ```
 
 Set your Anthropic API key:
@@ -110,7 +110,7 @@ Simple queries still use the fast path (zero LLM). The agent only activates for 
 
 ## Knowledge Assembly
 
-Queries automatically go through the Knowledge Assembly pipeline:
+Queries go through the Knowledge Assembly process:
 
 - **Simple queries** (< 8 words) → direct rendering, zero LLM
 - **Moderate queries** → LLM-curated selection and ordering

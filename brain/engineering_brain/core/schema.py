@@ -73,7 +73,7 @@ class NodeType(StrEnum):
 
 
 class EdgeType(StrEnum):
-    """All relationship types in the knowledge graph (32 total)."""
+    """All relationship types in the knowledge graph (31 total)."""
 
     # Hierarchical (layer-to-layer)
     GROUNDS = "GROUNDS"  # Axiom → Principle

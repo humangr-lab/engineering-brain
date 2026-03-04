@@ -11,14 +11,14 @@ The Engineering Brain organizes knowledge in 6 hierarchical layers:
 | L2 | Patterns | Recurring solutions promoted from rules | "Circuit breaker pattern" |
 | L3 | Rules | Specific, actionable constraints | "Flask CORS: never use `origins='*'` in production" |
 | L4 | Evidence | Observations from code analysis and feedback | Finding: "CORS misconfiguration in server.py:42" |
-| L5 | Context | Temporal, ephemeral knowledge | Task context, sprint data |
+| L5 | Context | Temporal, ephemeral knowledge | Task context, session data |
 
 ### Edge Types
 
-32 edge types organized in 7 categories:
+31 edge types organized in 7 categories:
 
 - **Hierarchical**: GROUNDS, INFORMS, INSTANTIATES, EVIDENCED_BY, DEMONSTRATED_BY
-- **Cross-layer**: APPLIES_TO, IN_DOMAIN, USED_IN, CAUGHT_BY, VIOLATED, IN_SPRINT
+- **Cross-layer**: APPLIES_TO, IN_DOMAIN, USED_IN, CAUGHT_BY, VIOLATED
 - **Evolution**: SUPERSEDES, CONFLICTS_WITH, VARIANT_OF, REINFORCES, WEAKENS
 - **Causal**: CAUSED_BY, PREVENTS, TRIGGERS
 - **Context**: REQUIRES, PRODUCES, SUBDOMAIN_OF
@@ -174,7 +174,7 @@ Each worker:
 
 ### Runtime Cards
 
-Agent personas are defined in YAML files (same pattern as the brain's pipeline runtime cards). Cards include role, goal, key skills, constraints, and domain-specific instructions. Prompt injection sanitization is built-in.
+Agent personas are defined in YAML runtime cards. Each card specifies role, goal, key skills, constraints, and domain-specific instructions. Prompt injection sanitization is built-in.
 
 ## Configuration Flags
 

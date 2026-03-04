@@ -81,7 +81,11 @@ class BrainEmbedder:
         if not provider:
             return []
         try:
-            return provider.embed(text)
+            result = provider.embed(text)
+            # fastembed.TextEmbedding.embed() returns a generator of ndarray
+            if hasattr(result, "__next__"):
+                result = next(result)
+            return [float(x) for x in result] if result is not None else []
         except Exception as e:
             logger.debug("Embedding failed: %s", e)
             return []
@@ -92,7 +96,14 @@ class BrainEmbedder:
         if not provider:
             return []
         try:
-            return provider.embed_batch(texts)
+            if hasattr(provider, "embed_batch"):
+                result = provider.embed_batch(texts)
+            else:
+                result = provider.embed(texts)
+            # fastembed returns a generator of ndarray — materialise
+            if hasattr(result, "__next__"):
+                return [[float(x) for x in vec] for vec in result]
+            return [[float(x) for x in vec] for vec in result]
         except Exception as e:
             logger.debug("Batch embedding failed: %s", e)
             return []

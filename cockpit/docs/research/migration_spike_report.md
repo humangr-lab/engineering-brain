@@ -237,7 +237,7 @@ Six views must be verified for pixel-perfect parity:
 ### 4.6 KLIB (Knowledge Library) Open
 
 - [ ] Library panel shows taxonomy, layers, edge types, seeds
-- [ ] Stats bar: 1,975 nodes, 22 edge types, 6 layers, 158 seeds, 5 facets
+- [ ] Stats bar: 1,975 nodes, 31 edge types, 6 layers, 158 seeds, 5 facets
 - [ ] DOC_TREE categories rendered correctly
 - [ ] Note: KLIB data is a separate concern (see section 2.6, 2.7)
 

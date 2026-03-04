@@ -2,7 +2,7 @@
 
 Predicts missing edges between existing nodes using HAKE-enhanced scoring
 and type-constraint filtering. Only proposes edges that respect the valid
-node type combinations defined by the schema's 22 edge types.
+node type combinations defined by the schema's 31 edge types.
 
 Scoring uses SOTA normalized-cosine + gated composite:
 - Cosine normalization in empirical range [min, max] -> [0, 1]

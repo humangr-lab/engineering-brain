@@ -26,7 +26,7 @@ You should be up and running in under 5 minutes.
 ### Requirements
 
 - Python 3.11+
-- Node.js 18+ (for cockpit client tests)
+- Node.js 18+ (optional, for cockpit client tests)
 - pip (or uv)
 
 ### Package Structure
@@ -108,7 +108,7 @@ test: add integration tests for pack creation
 3. Run `make test && make lint` — both must pass
 4. Push and open a PR
 5. Fill in the PR template
-6. Wait for review (typically within 7 days)
+6. Wait for review
 
 ## Reporting Issues
 

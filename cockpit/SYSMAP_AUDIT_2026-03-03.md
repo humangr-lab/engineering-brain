@@ -12,9 +12,9 @@ against actual Engineering Brain code. Code is the source of truth.
 | # | Node | Sysmap Claim | Actual Code | File |
 |---|------|-------------|-------------|------|
 | C1 | linkp | Threshold >= 0.80 | Default `0.45` | link_predictor.py:151 |
-| C2 | linkp | 22 edge types | `EdgeType` enum: **32** members | schema.py:69-117 |
+| C2 | linkp | 31 edge types | `EdgeType` enum: **31** members (IN_SPRINT removed) | schema.py:69-117 |
 | C3 | xlay | Threshold >= 0.70 | Per-transition: GROUNDS=0.35, INFORMS=0.35, INSTANTIATES=0.40 | cross_layer_inferrer.py:158-162 |
-| C4 | mcp | 9 tools | **20 tools** + 5 resources. 5 claimed tools don't exist (remember, recall, verify, forget, status) | mcp_server.py:40-616 |
+| C4 | mcp | 9 tools | **22 tools** + 5 resources | mcp_server.py:40-616 |
 | C5 | kb_edges | 5 cross-layer types (CROSS_GROUNDS, INFERRED_SIMILAR...) | **None exist** — inferred edges use standard type names | schema.py (no CROSS_* types) |
 
 ## HIGH (8 findings — significant inaccuracies or missing coverage)
@@ -35,7 +35,7 @@ against actual Engineering Brain code. Code is the source of truth.
 | # | Node | Sysmap Claim | Actual Code |
 |---|------|-------------|-------------|
 | M1 | seeds | 158 YAML, 6 domains | **283 YAML**, **69 domains** (or 9 shard domains) |
-| M2 | klib | 31 edge types | **32** edge types |
+| M2 | klib | 31 edge types | **31** edge types (corrected) |
 | M3 | obslog | "Events: All interactions" | 6 specific event types |
 | M4 | l0 | Confidence = 1.0 enforced | Not explicit — enforced via Hawkes decay mu=0.0 |
 | M5 | l3 | ~800 rules | 2 in seeds — rest crystallized at runtime |

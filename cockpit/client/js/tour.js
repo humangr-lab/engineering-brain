@@ -17,10 +17,10 @@ const TOUR_SCRIPT = [
   ['exit',  null,    2000, ''],
   ['node',  'cryst', 4000, 'The Crystallizer transforms L4 evidence into L3 rules using embedding similarity matching.'],
   ['node',  'adapt', 4000, 'Thompson Sampling optimizes scoring weights from user feedback. Each signal has a Beta posterior.'],
-  ['node',  'mcp',   5000, 'The MCP Server exposes 20 tools: query, think, reason, search, learn, validate, and more.'],
-  ['enter', 'mcp',   6000, 'Full Model Context Protocol implementation with JSON-RPC 2.0, epistemic reasoning, knowledge packs, and 20 specialized tools.'],
+  ['node',  'mcp',   5000, 'The MCP Server exposes 22 tools: query, think, reason, search, learn, validate, and more.'],
+  ['enter', 'mcp',   6000, 'Full Model Context Protocol implementation with JSON-RPC 2.0, epistemic reasoning, knowledge packs, and 22 specialized tools.'],
   ['exit',  null,    2000, ''],
-  ['zone',  null,    5000, 'The Engineering Brain: self-improving, zero-LLM reasoning, 6 cortical layers, 32 edge types, and 285 seed sources. Built to scale.'],
+  ['zone',  null,    5000, 'The Engineering Brain: self-improving, zero-LLM reasoning, 6 cortical layers, 31 edge types, and 270 seed sources.'],
 ];
 
 let _timer = null;
